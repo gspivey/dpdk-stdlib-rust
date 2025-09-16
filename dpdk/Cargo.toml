@@ -1,0 +1,10 @@
+[package]
+name = "dpdk"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust wrapper for DPDK"
+
+[dependencies]
+dpdk-sys = { path = "../dpdk-sys" }
+thiserror = { workspace = true }
+libc = { workspace = true }

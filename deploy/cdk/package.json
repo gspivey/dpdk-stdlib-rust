@@ -1,0 +1,20 @@
+{
+  "name": "dpdk-stdlib-deploy",
+  "version": "1.0.0",
+  "description": "CDK deployment for DPDK-STDLIB testing infrastructure",
+  "scripts": {
+    "build": "tsc",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "synth": "cdk synth"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "aws-cdk": "^2.0.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.0.0",
+    "constructs": "^10.0.0"
+  }
+}

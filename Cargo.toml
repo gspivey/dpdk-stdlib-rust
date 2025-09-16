@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+  "dpdk-sys",
+  "dpdk",
+  "dpdk-udp",
+  "apps/echo",
+  "apps/test-client",
+]
+
+[workspace.dependencies]
+thiserror = "1"
+libc = "0.2"

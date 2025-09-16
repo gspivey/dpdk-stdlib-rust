@@ -1,0 +1,8 @@
+[package]
+name = "dpdk-udp"
+version = "0.1.0"
+edition = "2021"
+description = "UDP protocol implementation for DPDK"
+
+[dependencies]
+thiserror = { workspace = true }

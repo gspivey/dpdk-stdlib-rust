@@ -1,0 +1,13 @@
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dpdk-udp = { path = "../../dpdk-udp" }
+dpdk = { path = "../../dpdk", optional = true }
+clap = { version = "4.0", features = ["derive"] }
+
+[features]
+default = []
+dpdk-support = ["dpdk"]
