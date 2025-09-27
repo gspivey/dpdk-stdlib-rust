@@ -2,7 +2,8 @@
 name = "dpdk-udp"
 version = "0.1.0"
 edition = "2021"
-description = "UDP protocol implementation for DPDK"
+description = "UDP protocol implementation with DPDK acceleration"
 
 [dependencies]
 thiserror = { workspace = true }
+dpdk = { path = "../dpdk" }

@@ -4,10 +4,30 @@ AWS CDK infrastructure for testing DPDK-STDLIB with sender/receiver instances.
 
 ## Prerequisites
 
-1. AWS CLI configured with appropriate credentials
-2. Node.js and npm installed  
-3. AWS CDK CLI installed: `npm install -g aws-cdk`
-4. Session Manager plugin: `aws ssm install-session-manager-plugin`
+1. **AWS CLI** configured with appropriate credentials
+2. **Node.js and npm** installed  
+3. **AWS CDK CLI** installed: `npm install -g aws-cdk`
+4. **Session Manager plugin** for AWS CLI:
+
+### Installing Session Manager Plugin
+
+**macOS:**
+```bash
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/sessionmanager-bundle.zip" -o "sessionmanager-bundle.zip"
+unzip sessionmanager-bundle.zip
+sudo ./sessionmanager-bundle/install -i /usr/local/sessionmanagerplugin -b /usr/local/bin/session-manager-plugin
+rm -rf sessionmanager-bundle.zip sessionmanager-bundle/
+```
+
+**Linux:**
+```bash
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o "session-manager-plugin.rpm"
+sudo yum install -y session-manager-plugin.rpm
+rm session-manager-plugin.rpm
+```
+
+**Windows:**
+Download and run the installer from: https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe
 
 ## Quick Start
 
@@ -15,7 +35,7 @@ AWS CDK infrastructure for testing DPDK-STDLIB with sender/receiver instances.
 cd deploy/cdk
 npm install
 cdk bootstrap  # First time only
-cdk deploy
+cdk deploy --profile your-aws-profile
 ```
 
 ## Architecture
@@ -31,7 +51,7 @@ After deployment:
 
 1. **Connect to receiver**:
    ```bash
-   aws ssm start-session --target <RECEIVER_INSTANCE_ID>
+   aws ssm start-session --target <RECEIVER_INSTANCE_ID> --profile your-aws-profile
    ```
 
 2. **Start echo server** (on receiver):
@@ -46,7 +66,7 @@ After deployment:
 
 3. **Connect to sender** (new terminal):
    ```bash
-   aws ssm start-session --target <SENDER_INSTANCE_ID>
+   aws ssm start-session --target <SENDER_INSTANCE_ID> --profile your-aws-profile
    ```
 
 4. **Send test traffic** (on sender):
@@ -67,10 +87,23 @@ Each instance has:
 
 The CDK outputs provide ENI IDs for binding scripts.
 
+## Troubleshooting
+
+### User Data Script Issues
+If deployment fails, check console output:
+```bash
+aws ec2 get-console-output --instance-id <INSTANCE_ID> --profile your-aws-profile
+```
+
+### SSM Connection Issues
+- Ensure Session Manager plugin is installed
+- Verify AWS profile has SSM permissions
+- Check instance is in private subnet with NAT gateway
+
 ## Cleanup
 
 ```bash
-cdk destroy
+cdk destroy --profile your-aws-profile
 ```
 
 ## Cost Estimate

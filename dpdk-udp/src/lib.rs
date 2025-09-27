@@ -1,3 +1,75 @@
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
+
+/// Drop-in replacement for std::net::UdpSocket with DPDK acceleration
+pub struct UdpSocket {
+    local_addr: SocketAddr,
+    connected_addr: Option<SocketAddr>,
+}
+
+impl UdpSocket {
+    /// Creates a UDP socket from the given address.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+        
+        // Try to initialize DPDK
+        match dpdk::Eal::init(&["-l", "0", "-n", "4"]) {
+            Ok(_) => {
+                println!("✅ DPDK EAL initialized for {}", addr);
+                Ok(UdpSocket { 
+                    local_addr: addr,
+                    connected_addr: None,
+                })
+            }
+            Err(_) => {
+                Err(io::Error::new(io::ErrorKind::Other, "DPDK initialization failed"))
+            }
+        }
+    }
+
+    /// Receives a single datagram message on the socket.
+    pub fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // TODO: Implement DPDK packet receive
+        todo!("DPDK recv_from implementation")
+    }
+
+    /// Sends data on the socket to the given address.
+    pub fn send_to<A: ToSocketAddrs>(&self, _buf: &[u8], _addr: A) -> io::Result<usize> {
+        // TODO: Implement DPDK packet send
+        todo!("DPDK send_to implementation")
+    }
+
+    /// Returns the socket address that this socket was created from.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    /// Connects this UDP socket to a remote address.
+    pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+        self.connected_addr = Some(addr);
+        Ok(())
+    }
+
+    /// Receives a single datagram message on the socket from the remote address to which it is connected.
+    pub fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        // TODO: Implement DPDK connected recv
+        todo!("DPDK recv implementation")
+    }
+
+    /// Sends data on the socket to the remote address to which it is connected.
+    pub fn send(&self, _buf: &[u8]) -> io::Result<usize> {
+        // TODO: Implement DPDK connected send
+        todo!("DPDK send implementation")
+    }
+}
+
+// ============================================================================
+// SYNTHETIC TESTING UTILITIES (separate from main API)
+// ============================================================================
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -8,6 +80,8 @@ pub enum UdpError {
     ChecksumMismatch,
     #[error("Packet too short: expected at least {expected}, got {actual}")]
     PacketTooShort { expected: usize, actual: usize },
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type UdpResult<T> = Result<T, UdpError>;
@@ -16,13 +90,14 @@ pub trait UdpHandler {
     fn on_packet(&self, src_ip: [u8;4], src_port: u16, dst_ip: [u8;4], dst_port: u16, payload: &[u8]) -> Option<Vec<u8>>;
 }
 
-pub struct DpdkUdpSocket {
+/// Synthetic packet processor for testing protocol logic without real networking
+pub struct SyntheticUdpSocket {
     bind_ip: [u8; 4],
     bind_port: u16,
     handler: Box<dyn UdpHandler>,
 }
 
-impl DpdkUdpSocket {
+impl SyntheticUdpSocket {
     pub fn new(bind_ip: [u8; 4], bind_port: u16, handler: Box<dyn UdpHandler>) -> Self {
         Self { bind_ip, bind_port, handler }
     }

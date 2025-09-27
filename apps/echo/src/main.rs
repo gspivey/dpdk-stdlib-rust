@@ -1,36 +1,163 @@
-use dpdk_udp::{DpdkUdpSocket, UdpHandler};
 use clap::Parser;
+use std::io;
+use std::net::SocketAddr;
+
+// Trait that both std::net::UdpSocket and dpdk_udp::UdpSocket implement
+trait UdpSocketTrait {
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+// Implement trait for std::net::UdpSocket
+impl UdpSocketTrait for std::net::UdpSocket {
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf)
+    }
+    
+    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.send_to(buf, addr)
+    }
+    
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+}
+
+// Implement trait for dpdk_udp::UdpSocket
+#[cfg(feature = "dpdk")]
+impl UdpSocketTrait for dpdk_udp::UdpSocket {
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf)
+    }
+    
+    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.send_to(buf, addr)
+    }
+    
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+}
+
+// Macro for DPDK detection and fallback
+macro_rules! try_dpdk_or_std {
+    ($bind_addr:expr) => {
+        {
+            #[cfg(feature = "dpdk")]
+            {
+                match dpdk_udp::UdpSocket::bind(&$bind_addr) {
+                    Ok(socket) => {
+                        println!("🚀 Using DPDK acceleration");
+                        return run_echo_server(Box::new(socket));
+                    }
+                    Err(_) => {
+                        println!("⚠️  DPDK failed, falling back to standard networking");
+                    }
+                }
+            }
+            
+            // Standard library fallback
+            println!("📡 Using standard networking");
+            let socket = std::net::UdpSocket::bind(&$bind_addr)?;
+            run_echo_server(Box::new(socket))
+        }
+    };
+}
 
 #[derive(Parser)]
 #[command(name = "echo")]
-#[command(about = "UDP Echo Server - synthetic or DPDK mode")]
+#[command(about = "UDP Echo Server - auto-detects DPDK or uses standard networking")]
 struct Args {
-    /// Run in DPDK mode (requires --dpdk-args)
-    #[arg(long)]
-    dpdk: bool,
-    
-    /// DPDK EAL arguments (e.g., "-l 0-1 -n 4")
-    #[arg(long)]
-    dpdk_args: Option<String>,
-    
     /// IP address to bind to
-    #[arg(long, default_value = "10.0.0.2")]
+    #[arg(long, default_value = "127.0.0.1")]
     ip: String,
     
     /// Port to bind to  
     #[arg(long, default_value_t = 9000)]
     port: u16,
+    
+    /// Use synthetic packet mode (for protocol testing - developer option)
+    #[arg(long, hide = true)]
+    synthetic: bool,
 }
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    
+    println!("🚀 DPDK-STDLIB Echo Server");
+    
+    if args.synthetic {
+        #[cfg(feature = "dpdk")]
+        {
+            println!("🔧 Using synthetic packet mode for protocol testing");
+            run_synthetic_mode(&args)?;
+        }
+        #[cfg(not(feature = "dpdk"))]
+        {
+            println!("❌ Synthetic mode requires DPDK feature. Use: cargo run --features dpdk");
+        }
+    } else {
+        let bind_addr = format!("{}:{}", args.ip, args.port);
+        println!("📡 Binding to {}", bind_addr);
+        
+        // Macro to try DPDK first, fallback to std
+        try_dpdk_or_std!(bind_addr)?;
+    }
+    
+    Ok(())
+}
+
+// Single echo server function that works with any UdpSocket implementation
+fn run_echo_server(socket: Box<dyn UdpSocketTrait>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("✅ Socket created successfully!");
+    println!("📡 Local address: {}", socket.local_addr()?);
+    println!("🔄 Echo server running... (Ctrl+C to stop)");
+    
+    let mut buf = [0u8; 1024];
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, from)) => {
+                let msg = String::from_utf8_lossy(&buf[..size]);
+                println!("📨 Received from {}: {}", from, msg);
+                
+                // Echo back
+                let response = format!("echo: {}", msg);
+                match socket.send_to(response.as_bytes(), from) {
+                    Ok(sent) => println!("📤 Sent {} bytes back to {}", sent, from),
+                    Err(e) => eprintln!("❌ Send error: {}", e),
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Receive error: {}", e);
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Synthetic mode (only available with DPDK feature)
+#[cfg(feature = "dpdk")]
+use dpdk_udp::{SyntheticUdpSocket, UdpHandler};
+
+#[cfg(feature = "dpdk")]
 struct Echo;
+
+#[cfg(feature = "dpdk")]
 impl UdpHandler for Echo {
     fn on_packet(&self, _src_ip: [u8;4], _src_port: u16, _dst_ip: [u8;4], _dst_port: u16, payload: &[u8]) -> Option<Vec<u8>> {
-        println!("Received {} bytes: {:?}", payload.len(), std::str::from_utf8(payload).unwrap_or("invalid utf8"));
+        println!("📨 Received {} bytes: {:?}", payload.len(), std::str::from_utf8(payload).unwrap_or("invalid utf8"));
         Some(payload.to_vec())
     }
 }
 
+#[cfg(feature = "dpdk")]
 fn parse_ip(ip_str: &str) -> [u8; 4] {
+    if ip_str == "0.0.0.0" {
+        return [0, 0, 0, 0];
+    }
     let parts: Vec<&str> = ip_str.split('.').collect();
     if parts.len() != 4 {
         panic!("Invalid IP address format");
@@ -43,137 +170,48 @@ fn parse_ip(ip_str: &str) -> [u8; 4] {
     ]
 }
 
-fn run_synthetic_mode(ip: [u8; 4], port: u16) {
-    println!("== Userspace UDP Echo (synthetic mode) ==");
-    println!("Listening on {}:{}", 
-        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port);
+#[cfg(feature = "dpdk")]
+fn run_synthetic_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    println!("📡 Synthetic packet mode - testing protocol parsing without real networking");
+    println!("💡 This tests our UDP parsing logic with fake packets");
     
-    let socket = DpdkUdpSocket::new(ip, port, Box::new(Echo));
+    let ip = parse_ip(&args.ip);
+    let socket = SyntheticUdpSocket::new(ip, args.port, Box::new(Echo));
 
-    let mut frame = vec![0u8; 14 + 20 + 8 + 15];
-    frame[14] = 0x45;
-    frame[14+2..14+4].copy_from_slice(&(20+8+15u16).to_be_bytes());
-    frame[14+9] = 17;
-    frame[14+12..14+16].copy_from_slice(&[10,0,0,1]);
-    frame[14+16..14+20].copy_from_slice(&ip);
-    frame[14+20..14+22].copy_from_slice(&12345u16.to_be_bytes());
-    frame[14+20+2..14+20+4].copy_from_slice(&port.to_be_bytes());
-    frame[14+20+4..14+20+6].copy_from_slice(&(8+15u16).to_be_bytes());
-    frame[14+20+8..].copy_from_slice(b"hello userspace");
+    // Create a synthetic UDP packet for testing
+    let payload = b"hello synthetic";
+    let mut frame = vec![0u8; 14 + 20 + 8 + payload.len()];
+    
+    // Ethernet header (dummy)
+    frame[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
+    
+    // IP header
+    frame[14] = 0x45; // Version + IHL
+    frame[14+2..14+4].copy_from_slice(&((20+8+payload.len()) as u16).to_be_bytes()); // Total length
+    frame[14+9] = 17; // Protocol (UDP)
+    frame[14+12..14+16].copy_from_slice(&[10,0,0,1]); // Source IP
+    frame[14+16..14+20].copy_from_slice(&ip); // Dest IP
+    
+    // UDP header
+    frame[14+20..14+22].copy_from_slice(&12345u16.to_be_bytes()); // Source port
+    frame[14+20+2..14+20+4].copy_from_slice(&args.port.to_be_bytes()); // Dest port
+    frame[14+20+4..14+20+6].copy_from_slice(&((8+payload.len()) as u16).to_be_bytes()); // UDP length
+    // Checksum = 0 (skip)
+    
+    // Payload
+    frame[14+20+8..].copy_from_slice(payload);
 
     match socket.parse_and_handle(&frame) {
         Ok(Some(resp)) => {
-            println!("Generated {}-byte response frame", resp.len());
+            println!("✅ Generated {}-byte response frame", resp.len());
             let payload_start = 14 + 20 + 8;
             let payload = &resp[payload_start..];
-            println!("Echo response payload: {:?}", std::str::from_utf8(payload).unwrap_or("invalid utf8"));
+            println!("📤 Echo response: {:?}", std::str::from_utf8(payload).unwrap_or("invalid utf8"));
+            println!("✅ Protocol parsing works correctly!");
         }
-        Ok(None) => println!("Packet not for this socket"),
-        Err(e) => eprintln!("Error: {e:?}"),
+        Ok(None) => println!("❌ Packet not for this socket"),
+        Err(e) => eprintln!("❌ Error: {e:?}"),
     }
-}
-
-#[cfg(feature = "dpdk-support")]
-fn run_dpdk_mode(dpdk_args: &str, ip: [u8; 4], port: u16) {
-    println!("== Userspace UDP Echo (DPDK mode) ==");
-    println!("DPDK args: {}", dpdk_args);
-    println!("Listening on {}:{}", 
-        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port);
     
-    let args: Vec<&str> = dpdk_args.split_whitespace().collect();
-    
-    let _eal = match dpdk::Eal::init(&args) {
-        Ok(eal) => {
-            println!("DPDK EAL initialized successfully");
-            eal
-        }
-        Err(e) => {
-            eprintln!("Failed to initialize DPDK EAL: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let dpdk_port = match dpdk::Port::new(0) {
-        Ok(port) => {
-            println!("Initialized DPDK port 0");
-            port
-        }
-        Err(e) => {
-            eprintln!("Failed to initialize DPDK port: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(e) = dpdk_port.start() {
-        eprintln!("Failed to start DPDK port: {:?}", e);
-        std::process::exit(1);
-    }
-
-    println!("DPDK port started, entering packet processing loop...");
-    println!("Press Ctrl+C to stop");
-
-    let socket = DpdkUdpSocket::new(ip, port, Box::new(Echo));
-
-    loop {
-        match dpdk_port.receive_burst(32) {
-            Ok(packets) => {
-                if !packets.is_empty() {
-                    println!("Received {} packets", packets.len());
-                    
-                    let mut responses = Vec::new();
-                    
-                    for packet in packets {
-                        match socket.parse_and_handle(&packet) {
-                            Ok(Some(response)) => {
-                                responses.push(response);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("Error processing packet: {:?}", e);
-                            }
-                        }
-                    }
-                    
-                    if !responses.is_empty() {
-                        match dpdk_port.send_burst(&responses) {
-                            Ok(sent) => {
-                                println!("Sent {} response packets", sent);
-                            }
-                            Err(e) => {
-                                eprintln!("Error sending responses: {:?}", e);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error receiving packets: {:?}", e);
-                break;
-            }
-        }
-        
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-#[cfg(not(feature = "dpdk-support"))]
-fn run_dpdk_mode(_dpdk_args: &str, _ip: [u8; 4], _port: u16) {
-    eprintln!("Error: DPDK support not compiled in. Build with --features dpdk-support");
-    std::process::exit(1);
-}
-
-fn main() {
-    let args = Args::parse();
-    let ip = parse_ip(&args.ip);
-    
-    if args.dpdk {
-        if let Some(dpdk_args) = args.dpdk_args {
-            run_dpdk_mode(&dpdk_args, ip, args.port);
-        } else {
-            eprintln!("Error: DPDK mode requires --dpdk-args");
-            std::process::exit(1);
-        }
-    } else {
-        run_synthetic_mode(ip, args.port);
-    }
+    Ok(())
 }

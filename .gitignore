@@ -10,5 +10,14 @@ Cargo.lock
 *.iml
 node_modules/
 design-doc.md
-ty.md
+yt.md
 tasks.md
+
+# CDK artifacts
+deploy/cdk/cdk.out/
+deploy/cdk/cdk.context.json
+deploy/cdk/package-lock.json
+
+# Deployment test directories
+deploy/test-*/
+deploy/deploy.sh
