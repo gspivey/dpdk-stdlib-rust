@@ -1,0 +1,186 @@
+//! Socket implementations for different backends
+
+use crate::AsyncUdpSocket;
+#[cfg(feature = "dpdk")]
+use crate::SocketConfig;
+use async_trait::async_trait;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Type alias for boxed async UDP sockets
+pub type BoxedAsyncUdpSocket = Box<dyn AsyncUdpSocket>;
+
+/// Tokio-based async UDP socket implementation
+pub struct TokioUdpSocket {
+    inner: Arc<tokio::net::UdpSocket>,
+    connected_addr: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+impl TokioUdpSocket {
+    /// Bind to the given address
+    pub async fn bind<A: tokio::net::ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        Ok(Self {
+            inner: Arc::new(socket),
+            connected_addr: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Get a reference to the inner Tokio socket
+    pub fn inner(&self) -> &tokio::net::UdpSocket {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl AsyncUdpSocket for TokioUdpSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.inner.send_to(buf, addr).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        self.inner.connect(addr).await?;
+        let mut connected = self.connected_addr.lock().await;
+        *connected = Some(addr);
+        Ok(())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.send(buf).await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "tokio"
+    }
+}
+
+// DPDK-based async UDP socket implementation
+#[cfg(feature = "dpdk")]
+pub struct DpdkUdpSocket {
+    inner: Arc<Mutex<dpdk_udp::UdpSocket>>,
+    local_addr: SocketAddr,
+    connected_addr: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+#[cfg(feature = "dpdk")]
+impl DpdkUdpSocket {
+    /// Bind to the given address
+    pub async fn bind<A: std::net::ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+
+        // DPDK initialization is blocking, run in spawn_blocking
+        let socket = tokio::task::spawn_blocking(move || {
+            dpdk_udp::UdpSocket::bind(addr)
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+
+        Ok(Self {
+            local_addr: socket.local_addr()?,
+            inner: Arc::new(Mutex::new(socket)),
+            connected_addr: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Bind with custom configuration
+    pub async fn bind_with_config<A: std::net::ToSocketAddrs>(
+        addr: A,
+        _config: &SocketConfig,
+    ) -> io::Result<Self> {
+        // For now, just use default bind
+        // Future: pass EAL args from config
+        Self::bind(addr).await
+    }
+}
+
+#[cfg(feature = "dpdk")]
+#[async_trait]
+impl AsyncUdpSocket for DpdkUdpSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let socket = self.inner.clone();
+        let mut buf_owned = buf.to_vec();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned))
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+
+        let (len, addr, received_buf) = result;
+        buf[..len].copy_from_slice(&received_buf[..len]);
+        Ok((len, addr))
+    }
+
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        let socket = self.inner.clone();
+        let buf_owned = buf.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.send_to(&buf_owned, addr)
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        let socket = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut socket = socket.blocking_lock();
+            socket.connect(addr)
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+
+        let mut connected = self.connected_addr.lock().await;
+        *connected = Some(addr);
+        Ok(())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let socket = self.inner.clone();
+        let mut buf_owned = buf.to_vec();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.recv(&mut buf_owned).map(|len| (len, buf_owned))
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+
+        let (len, received_buf) = result;
+        buf[..len].copy_from_slice(&received_buf[..len]);
+        Ok(len)
+    }
+
+    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let socket = self.inner.clone();
+        let buf_owned = buf.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.send(&buf_owned)
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "dpdk"
+    }
+}

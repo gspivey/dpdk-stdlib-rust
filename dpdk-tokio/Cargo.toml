@@ -1,0 +1,21 @@
+[package]
+name = "dpdk-tokio"
+version = "0.1.0"
+edition = "2021"
+description = "Async Tokio integration for DPDK networking"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+dpdk = ["dep:dpdk-udp"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+thiserror.workspace = true
+async-trait = "0.1"
+
+# Optional DPDK support
+dpdk-udp = { path = "../dpdk-udp", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
