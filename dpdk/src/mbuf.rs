@@ -119,7 +119,7 @@ impl Drop for Mbuf {
 /// A mempool is a fixed-size pool of mbufs. All packet buffers in DPDK
 /// must be allocated from a mempool.
 pub struct Mempool {
-    raw: NonNull<libc::c_void>,
+    raw: NonNull<dpdk_sys::rte_mempool>,
     name: String,
 }
 
@@ -166,7 +166,7 @@ impl Mempool {
     }
 
     /// Get the raw pointer to the mempool
-    pub fn as_raw(&self) -> *mut libc::c_void {
+    pub fn as_raw(&self) -> *mut dpdk_sys::rte_mempool {
         self.raw.as_ptr()
     }
 }
