@@ -32,6 +32,7 @@ use thiserror::Error;
 
 pub mod socket;
 pub mod runtime;
+pub mod compat;
 
 pub use socket::{TokioUdpSocket, BoxedAsyncUdpSocket};
 #[cfg(feature = "dpdk")]
