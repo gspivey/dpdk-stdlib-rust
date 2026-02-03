@@ -3,7 +3,7 @@
 //! These stubs allow the crate to compile and run without DPDK installed.
 //! They provide the same API surface but don't perform actual packet I/O.
 
-use libc::{c_char, c_int, c_uint, c_void, size_t};
+use libc::{c_char, c_int, c_uint, c_void};
 use std::ptr;
 
 // ============================================================================
@@ -33,6 +33,9 @@ pub const RTE_ETH_RX_OFFLOAD_TCP_CKSUM: u64 = 0x00000008;
 
 // Error codes
 pub const RTE_ERRNO_BASE: c_int = 1000;
+
+// NUMA socket constants
+pub const SOCKET_ID_ANY: c_int = -1;
 
 // ============================================================================
 // Core Types
@@ -179,10 +182,20 @@ pub struct rte_mbuf_hash {
 // Memory Pool Types
 // ============================================================================
 
-/// Memory pool (opaque)
+/// Memory pool (simplified stub version for testing)
 #[repr(C)]
+#[derive(Debug, Default)]
 pub struct rte_mempool {
-    _private: [u8; 0],
+    /// Pool name
+    pub name: [c_char; 32],
+    /// Total size of the mempool
+    pub size: c_uint,
+    /// Number of elements populated
+    pub populated_size: c_uint,
+    /// Element size
+    pub elt_size: c_uint,
+    /// Flags
+    pub flags: c_uint,
 }
 
 /// Memory pool cache (opaque)
@@ -417,28 +430,107 @@ pub extern "C" fn rte_socket_id() -> c_int {
 }
 
 // Memory Pool Functions
+
+/// Stub mempool tracking for testing
+/// We use thread_local to track allocated mempools and mbufs
+use std::cell::RefCell;
+
+thread_local! {
+    static STUB_MEMPOOL_COUNTER: RefCell<u32> = const { RefCell::new(0) };
+    static STUB_MBUF_COUNTER: RefCell<u32> = const { RefCell::new(0) };
+}
+
 #[no_mangle]
 pub extern "C" fn rte_pktmbuf_pool_create(
     _name: *const c_char,
-    _n: c_uint,
+    n: c_uint,
     _cache_size: c_uint,
     _priv_size: u16,
     _data_room_size: u16,
     _socket_id: c_int,
 ) -> *mut rte_mempool {
-    ptr::null_mut()
+    // Create a stub mempool for testing
+    let mempool = Box::new(rte_mempool {
+        size: n,
+        populated_size: n,
+        ..Default::default()
+    });
+    Box::into_raw(mempool)
 }
 
 #[no_mangle]
-pub extern "C" fn rte_mempool_free(_mp: *mut rte_mempool) {}
+pub extern "C" fn rte_mempool_free(mp: *mut rte_mempool) {
+    if !mp.is_null() {
+        unsafe {
+            let _ = Box::from_raw(mp);
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn rte_pktmbuf_alloc(_mp: *mut rte_mempool) -> *mut rte_mbuf {
-    ptr::null_mut()
+    // Allocate a stub mbuf with a real buffer
+    let buf_size = 2048usize;
+    let buf: Vec<u8> = vec![0u8; buf_size];
+    let buf_ptr = Box::into_raw(buf.into_boxed_slice()) as *mut c_void;
+
+    let mbuf = Box::new(rte_mbuf {
+        buf_addr: buf_ptr,
+        buf_len: buf_size as u16,
+        data_off: RTE_PKTMBUF_HEADROOM,
+        data_len: 0,
+        pkt_len: 0,
+        ..Default::default()
+    });
+    Box::into_raw(mbuf)
 }
 
 #[no_mangle]
-pub extern "C" fn rte_pktmbuf_free(_m: *mut rte_mbuf) {}
+pub extern "C" fn rte_pktmbuf_alloc_bulk(
+    _mp: *mut rte_mempool,
+    mbufs: *mut *mut rte_mbuf,
+    count: c_uint,
+) -> c_int {
+    if mbufs.is_null() {
+        return -1;
+    }
+
+    for i in 0..count as usize {
+        let mbuf = rte_pktmbuf_alloc(_mp);
+        if mbuf.is_null() {
+            // Free previously allocated mbufs
+            for j in 0..i {
+                unsafe {
+                    rte_pktmbuf_free(*mbufs.add(j));
+                }
+            }
+            return -1;
+        }
+        unsafe {
+            *mbufs.add(i) = mbuf;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rte_pktmbuf_free(m: *mut rte_mbuf) {
+    if !m.is_null() {
+        unsafe {
+            let mbuf = Box::from_raw(m);
+            // Free the buffer if it exists
+            // We allocated it with Box::into_raw(vec.into_boxed_slice())
+            // so we need to reconstruct the boxed slice to free it
+            if !mbuf.buf_addr.is_null() && mbuf.buf_len > 0 {
+                let slice = std::slice::from_raw_parts_mut(
+                    mbuf.buf_addr as *mut u8,
+                    mbuf.buf_len as usize,
+                );
+                let _ = Box::from_raw(slice as *mut [u8]);
+            }
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn rte_pktmbuf_clone(
@@ -446,6 +538,38 @@ pub extern "C" fn rte_pktmbuf_clone(
     _mp: *mut rte_mempool,
 ) -> *mut rte_mbuf {
     ptr::null_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn rte_mempool_avail_count(mp: *mut rte_mempool) -> c_uint {
+    if mp.is_null() {
+        return 0;
+    }
+    unsafe { (*mp).populated_size }
+}
+
+#[no_mangle]
+pub extern "C" fn rte_mempool_in_use_count(_mp: *mut rte_mempool) -> c_uint {
+    // Stub: always return 0 (nothing in use)
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rte_mempool_full(mp: *mut rte_mempool) -> c_int {
+    // Stub: return 1 (true) if pool has elements
+    if mp.is_null() {
+        return 0;
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn rte_mempool_empty(mp: *mut rte_mempool) -> c_int {
+    // Stub: return 0 (false) - pool is not empty
+    if mp.is_null() {
+        return 1;
+    }
+    0
 }
 
 // Ethernet Device Functions
