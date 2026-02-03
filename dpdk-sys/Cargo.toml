@@ -3,12 +3,21 @@ name = "dpdk-sys"
 version = "0.1.0"
 edition = "2021"
 description = "Raw FFI bindings to DPDK"
+license = "MIT OR Apache-2.0"
+links = "dpdk"
+
+[features]
+default = []
+# Use real DPDK bindings (requires DPDK installed)
+# When disabled, uses stub implementations for development/testing
+bindgen = ["dep:bindgen"]
 
 [dependencies]
 libc = { workspace = true }
 
 [build-dependencies]
-bindgen = "0.70"
+bindgen = { version = "0.70", optional = true }
+pkg-config = "0.3"
 
 [lib]
 name = "dpdk_sys"

@@ -1,4 +1,4 @@
-use crate::error::{DpdkError, DpdkResult};
+use crate::error::DpdkResult;
 
 pub struct Port {
     pub port_id: u16,

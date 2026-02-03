@@ -1,29 +1,56 @@
+//! Raw FFI bindings to DPDK (Data Plane Development Kit)
+//!
+//! This crate provides low-level bindings to DPDK. It operates in two modes:
+//!
+//! ## With DPDK installed (bindgen feature)
+//!
+//! When compiled with the `bindgen` feature and DPDK is installed, this crate
+//! generates real FFI bindings using bindgen:
+//!
+//! ```toml
+//! [dependencies]
+//! dpdk-sys = { version = "0.1", features = ["bindgen"] }
+//! ```
+//!
+//! ## Without DPDK (default)
+//!
+//! By default, this crate provides stub implementations that allow development
+//! and testing without requiring DPDK to be installed. The stubs provide the
+//! same API but don't perform actual packet I/O.
+//!
+//! ## Environment Variables
+//!
+//! - `DPDK_PATH`: Path to DPDK installation (e.g., `/usr/local/dpdk`)
+//! - `PKG_CONFIG_PATH`: Can be set to help pkg-config find DPDK
+
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(dead_code)]
+#![allow(clippy::all)]
 
-use libc::{c_char, c_int, c_void};
+// When bindgen generates real bindings, include them
+#[cfg(dpdk_bindgen)]
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-#[repr(C)]
-pub struct rte_mbuf {
-    pub buf_addr: *mut c_void,
-    pub data_off: u16,
-    pub pkt_len: u32,
-    pub data_len: u16,
+// When using stubs (default), use our manual definitions
+#[cfg(dpdk_stubs)]
+mod stubs;
+
+#[cfg(dpdk_stubs)]
+pub use stubs::*;
+
+// Re-export libc types commonly used with DPDK
+pub use libc::{c_char, c_int, c_uint, c_void, size_t, ssize_t};
+
+/// Check if real DPDK bindings are being used
+#[inline]
+pub const fn is_real_dpdk() -> bool {
+    cfg!(dpdk_bindgen)
 }
 
-// Stub implementations that will link successfully
-#[no_mangle]
-pub extern "C" fn rte_eal_init(_argc: c_int, _argv: *mut *mut c_char) -> c_int { 0 }
-#[no_mangle] 
-pub extern "C" fn rte_eal_cleanup() -> c_int { 0 }
-#[no_mangle]
-pub extern "C" fn rte_eth_dev_count_avail() -> u16 { 1 }
-#[no_mangle]
-pub extern "C" fn rte_eth_dev_configure(_port_id: u16, _nb_rx_q: u16, _nb_tx_q: u16, _eth_conf: *const c_void) -> c_int { 0 }
-#[no_mangle]
-pub extern "C" fn rte_eth_dev_start(_port_id: u16) -> c_int { 0 }
-#[no_mangle]
-pub extern "C" fn rte_pktmbuf_alloc(_mp: *mut c_void) -> *mut rte_mbuf { std::ptr::null_mut() }
-#[no_mangle]
-pub extern "C" fn rte_pktmbuf_free(_m: *mut rte_mbuf) {}
+/// Check if stub implementations are being used
+#[inline]
+pub const fn is_stub() -> bool {
+    cfg!(dpdk_stubs)
+}
