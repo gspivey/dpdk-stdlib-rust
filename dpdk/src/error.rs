@@ -10,6 +10,12 @@ pub enum DpdkError {
     InvalidPortId(u16),
     #[error("Memory allocation failed")]
     MemoryAllocationFailed,
+    #[error("Mempool creation failed: {0}")]
+    MempoolCreateFailed(String),
+    #[error("Queue setup failed: {0}")]
+    QueueSetupFailed(i32),
+    #[error("Invalid name: {0}")]
+    InvalidName(String),
 }
 
 pub type DpdkResult<T> = Result<T, DpdkError>;
