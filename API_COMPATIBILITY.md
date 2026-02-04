@@ -237,3 +237,11 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 - [ ] Multicast group management via DPDK
 - [ ] Promiscuous mode integration
 - [ ] Hardware offload configuration
+
+### Phase 5: Raw Socket Backend (Non-DPDK Fallback)
+- [ ] `AF_PACKET` raw socket backend for Linux
+- [ ] Abstract backend trait (`PacketBackend`)
+- [ ] Runtime backend selection (DPDK vs raw socket)
+- [ ] Reuse packet building/parsing code
+- [ ] Reuse ARP/ICMP handlers
+- [ ] Zero-copy where possible with `mmap` ring buffers
