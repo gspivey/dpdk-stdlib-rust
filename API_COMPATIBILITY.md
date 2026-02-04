@@ -1,73 +1,176 @@
-# std::net::UdpSocket API Compatibility Checklist
+# API Compatibility Status
 
-Based on: https://doc.rust-lang.org/std/net/struct.UdpSocket.html
+## Overview
 
-## ✅ Currently Implemented
-- [ ] `bind(addr)` - Partially (our version has different signature)
-- [ ] `recv_from(&mut buf)` - Partially (our version has different signature)  
-- [ ] `send_to(buf, addr)` - Partially (our version has different signature)
+This document tracks the API compatibility between our DPDK-based socket implementation and the standard Rust networking APIs (`std::net::UdpSocket` and `tokio::net::UdpSocket`).
 
-## ❌ Missing Core Functions
-- [ ] `connect(addr)` - Connect to remote address
-- [ ] `recv(&mut buf)` - Receive from connected peer
-- [ ] `send(buf)` - Send to connected peer
-- [ ] `local_addr()` - Get local socket address
-- [ ] `peer_addr()` - Get connected peer address (if connected)
+## Compat Layer Status
 
-## ❌ Missing Configuration
-- [ ] `set_read_timeout(dur)` - Set read timeout
-- [ ] `set_write_timeout(dur)` - Set write timeout  
-- [ ] `read_timeout()` - Get read timeout
-- [ ] `write_timeout()` - Get write timeout
-- [ ] `set_broadcast(on)` - Enable/disable broadcast
-- [ ] `broadcast()` - Get broadcast setting
-- [ ] `set_multicast_loop_v4(on)` - IPv4 multicast loopback
-- [ ] `multicast_loop_v4()` - Get IPv4 multicast loopback
-- [ ] `set_multicast_ttl_v4(ttl)` - IPv4 multicast TTL
-- [ ] `multicast_ttl_v4()` - Get IPv4 multicast TTL
-- [ ] `set_multicast_loop_v6(on)` - IPv6 multicast loopback
-- [ ] `multicast_loop_v6()` - Get IPv6 multicast loopback
-- [ ] `set_ttl(ttl)` - Set TTL
-- [ ] `ttl()` - Get TTL
-- [ ] `join_multicast_v4(multiaddr, interface)` - Join IPv4 multicast
-- [ ] `join_multicast_v6(multiaddr, interface)` - Join IPv6 multicast
-- [ ] `leave_multicast_v4(multiaddr, interface)` - Leave IPv4 multicast
-- [ ] `leave_multicast_v6(multiaddr, interface)` - Leave IPv6 multicast
+The `dpdk-tokio` crate provides drop-in replacement sockets in `dpdk_tokio::compat`:
 
-## ❌ Missing Advanced Features
-- [ ] `set_nonblocking(nonblocking)` - Set non-blocking mode
-- [ ] `take_error()` - Get and clear pending error
+- `dpdk_tokio::compat::net::UdpSocket` - replaces `std::net::UdpSocket`
+- `dpdk_tokio::compat::tokio::UdpSocket` - replaces `tokio::net::UdpSocket`
 
-## ❌ Missing Trait Implementations
-- [ ] `AsRawFd` (Unix) - Get raw file descriptor
-- [ ] `AsRawSocket` (Windows) - Get raw socket handle
-- [ ] `FromRawFd` (Unix) - Create from raw file descriptor
-- [ ] `FromRawSocket` (Windows) - Create from raw socket handle
-- [ ] `IntoRawFd` (Unix) - Convert to raw file descriptor
-- [ ] `IntoRawSocket` (Windows) - Convert to raw socket handle
+### std::net::UdpSocket Compatibility
 
-## 🎯 Priority Order
-1. **Core API compatibility** - Fix `bind()`, `recv_from()`, `send_to()` signatures
-2. **Connection support** - `connect()`, `recv()`, `send()`
-3. **Address queries** - `local_addr()`, `peer_addr()`
-4. **Timeouts** - `set_read_timeout()`, `set_write_timeout()`
-5. **Broadcast** - `set_broadcast()`, `broadcast()`
-6. **Advanced features** - Non-blocking, multicast, etc.
+| Function | Status | Notes |
+|----------|--------|-------|
+| `bind()` | ✅ | Correct signature with `ToSocketAddrs` |
+| `recv_from()` | ✅ | Correct signature |
+| `send_to()` | ✅ | Correct signature with `ToSocketAddrs` |
+| `connect()` | ✅ | Implemented |
+| `recv()` | ✅ | Implemented |
+| `send()` | ✅ | Implemented |
+| `local_addr()` | ✅ | Implemented |
+| `peer_addr()` | ✅ | Implemented |
+| `set_read_timeout()` | ✅ | Implemented |
+| `read_timeout()` | ✅ | Implemented |
+| `set_write_timeout()` | ✅ | Implemented |
+| `write_timeout()` | ✅ | Implemented |
+| `set_broadcast()` | ✅ | Implemented |
+| `broadcast()` | ✅ | Implemented |
+| `set_ttl()` | ✅ | Implemented |
+| `ttl()` | ✅ | Implemented |
+| `set_multicast_loop_v4()` | ✅ | Implemented |
+| `multicast_loop_v4()` | ✅ | Implemented |
+| `set_multicast_ttl_v4()` | ✅ | Implemented |
+| `multicast_ttl_v4()` | ✅ | Implemented |
+| `set_multicast_loop_v6()` | ✅ | Implemented |
+| `multicast_loop_v6()` | ✅ | Implemented |
+| `join_multicast_v4()` | ✅ | Implemented |
+| `join_multicast_v6()` | ✅ | Implemented |
+| `leave_multicast_v4()` | ✅ | Implemented |
+| `leave_multicast_v6()` | ✅ | Implemented |
+| `set_nonblocking()` | ✅ | Implemented |
+| `take_error()` | ✅ | Implemented |
+| `try_clone()` | ✅ | Implemented |
+| `peek()` | ✅ | Implemented |
+| `peek_from()` | ✅ | Implemented |
 
-## Current Signature Mismatches
+### tokio::net::UdpSocket Compatibility
 
-### std::net::UdpSocket
-```rust
-pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket>
-pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>
-pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize>
-```
+| Function | Status | Notes |
+|----------|--------|-------|
+| `bind()` | ✅ | Async, correct signature |
+| `recv_from()` | ✅ | Async |
+| `send_to()` | ✅ | Async |
+| `connect()` | ✅ | Async |
+| `recv()` | ✅ | Async |
+| `send()` | ✅ | Async |
+| `local_addr()` | ✅ | Implemented |
+| `peer_addr()` | ✅ | Implemented |
+| `poll_recv_from()` | ✅ | Implemented |
+| `poll_send_to()` | ✅ | Implemented |
+| `poll_recv()` | ✅ | Implemented |
+| `poll_send()` | ✅ | Implemented |
+| `try_recv_from()` | ✅ | Implemented |
+| `try_send_to()` | ✅ | Implemented |
+| `try_recv()` | ✅ | Implemented |
+| `try_send()` | ✅ | Implemented |
+| `readable()` | ✅ | Async |
+| `writable()` | ✅ | Async |
+| `from_std()` | ✅ | Implemented |
+| `into_std()` | ✅ | Implemented |
+| All socket options | ✅ | Same as std::net |
 
-### Our UdpSocket (WRONG)
-```rust
-pub fn bind(ip: [u8; 4], port: u16) -> UdpResult<Self>
-pub fn recv_from(&self, buf: &mut [u8]) -> UdpResult<(usize, std::net::SocketAddr)>
-pub fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> UdpResult<usize>
-```
+### Not Implemented (OS-specific, N/A for DPDK)
 
-**NEEDS FIXING**: Our API should match std exactly!
+- `AsRawFd` / `FromRawFd` / `IntoRawFd` (Unix)
+- `AsRawSocket` / `FromRawSocket` / `IntoRawSocket` (Windows)
+
+These traits don't apply to DPDK since it bypasses the kernel networking stack.
+
+---
+
+## DPDK Backend Implementation Status
+
+The compat layer delegates to the underlying DPDK implementation. Here's the status of the actual DPDK packet I/O:
+
+### Infrastructure (dpdk crate)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| EAL initialization | ✅ | `dpdk/src/eal.rs` |
+| Port configuration | ✅ | `dpdk/src/port.rs` |
+| Port start/stop | ✅ | `dpdk/src/port.rs` |
+| MAC address handling | ✅ | `dpdk/src/port.rs` |
+| Link status | ✅ | `dpdk/src/port.rs` |
+| Port statistics | ✅ | `dpdk/src/port.rs` |
+| Mempool creation | ✅ | `dpdk/src/mbuf.rs` |
+| Mbuf allocation | ✅ | `dpdk/src/mbuf.rs` |
+| Bulk allocation | ✅ | `dpdk/src/mbuf.rs` |
+| rx_burst | ✅ | `dpdk/src/port.rs` |
+| tx_burst | ✅ | `dpdk/src/port.rs` |
+
+### UDP Layer (dpdk-udp crate)
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `bind()` | ✅ | Initializes DPDK EAL, port, and mempool |
+| `send_to()` | ✅ | Builds Eth/IP/UDP packet, calls tx_burst |
+| `send()` | ✅ | Uses connected address |
+| `recv_from()` | ❌ | Returns `todo!()` - needs rx_burst + packet parsing |
+| `recv()` | ❌ | Returns `todo!()` - depends on recv_from |
+| `local_addr()` | ✅ | Returns bound address |
+| `peer_addr()` | ✅ | Returns connected address |
+| `connect()` | ✅ | Sets connected address |
+| `set_ttl()` / `ttl()` | ✅ | Configures IP TTL |
+
+### Packet Processing
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Ethernet frame building | ✅ | `build_udp_packet()` in dpdk-udp |
+| IPv4 header building | ✅ | `build_udp_packet()` in dpdk-udp |
+| UDP header building | ✅ | `build_udp_packet()` in dpdk-udp |
+| IP checksum calculation | ✅ | `ipv4_checksum()` in dpdk-udp |
+| UDP checksum calculation | ✅ | `udp_checksum()` in dpdk-udp |
+| Ethernet frame parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
+| IPv4 header parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
+| UDP header parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
+| ARP handling | ❌ | Not implemented (needed for real networks) |
+
+### API Compatibility Tests
+
+The `dpdk-udp` crate includes compile-time API compatibility tests that verify
+our UdpSocket matches `std::net::UdpSocket` signatures:
+
+- `test_api_bind_signature` - Verifies `bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket>`
+- `test_api_send_to_signature` - Verifies `send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize>`
+- `test_api_recv_from_signature` - Verifies `recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>`
+- `test_api_local_addr_signature` - Verifies `local_addr(&self) -> io::Result<SocketAddr>`
+- `test_api_peer_addr_signature` - Verifies `peer_addr(&self) -> io::Result<SocketAddr>`
+- `test_api_connect_signature` - Verifies `connect<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()>`
+- `test_api_send_signature` - Verifies `send(&self, buf: &[u8]) -> io::Result<usize>`
+- `test_api_recv_signature` - Verifies `recv(&self, buf: &mut [u8]) -> io::Result<usize>`
+- `test_api_set_ttl_signature` - Verifies `set_ttl(&mut self, ttl: u32) -> io::Result<()>`
+- `test_api_ttl_signature` - Verifies `ttl(&self) -> io::Result<u32>`
+
+**Note:** `connect()` and `set_ttl()` take `&mut self` instead of `&self` for internal state management.
+
+---
+
+## Implementation Roadmap
+
+### Phase 1: Infrastructure ✅
+- [x] Port initialization with configuration
+- [x] Mempool creation with configuration
+- [x] rx_burst / tx_burst wrappers
+- [x] Comprehensive unit tests (48 tests in dpdk crate)
+
+### Phase 2: Packet I/O
+- [x] `send_to()` - build Ethernet/IP/UDP packet, call tx_burst ✅
+- [x] IP checksum calculation ✅
+- [x] UDP checksum calculation ✅
+- [x] API compatibility tests (10 tests) ✅
+- [ ] `recv_from()` - call rx_burst, parse Ethernet/IP/UDP packet
+
+### Phase 3: Protocol Support
+- [ ] ARP request/response handling
+- [ ] ICMP echo reply (optional, for ping)
+- [ ] Connection tracking for connected sockets
+
+### Phase 4: Advanced Features
+- [ ] Multicast group management via DPDK
+- [ ] Promiscuous mode integration
+- [ ] Hardware offload configuration

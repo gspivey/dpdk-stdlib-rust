@@ -54,9 +54,24 @@ impl MacAddress {
         Self(bytes)
     }
 
-    /// Get the bytes of the MAC address
+    /// Create a broadcast MAC address (ff:ff:ff:ff:ff:ff)
+    pub fn broadcast() -> Self {
+        Self([0xff; 6])
+    }
+
+    /// Create a zero MAC address (00:00:00:00:00:00)
+    pub fn zero() -> Self {
+        Self([0; 6])
+    }
+
+    /// Get the bytes of the MAC address as a slice
     pub fn as_bytes(&self) -> &[u8; 6] {
         &self.0
+    }
+
+    /// Get the bytes of the MAC address as an array (alias for common API)
+    pub fn octets(&self) -> [u8; 6] {
+        self.0
     }
 
     /// Check if this is a broadcast address (ff:ff:ff:ff:ff:ff)

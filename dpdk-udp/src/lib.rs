@@ -1,48 +1,418 @@
+//! DPDK-accelerated UDP socket implementation
+//!
+//! This crate provides a drop-in replacement for `std::net::UdpSocket` that uses
+//! DPDK for high-performance packet I/O, bypassing the kernel network stack.
+
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+
+use dpdk::{Mbuf, Mempool, Port};
+use dpdk::port::{MacAddress, PortConfig};
+use dpdk::mbuf::MempoolConfig;
+
+use thiserror::Error;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+#[derive(Error, Debug)]
+pub enum UdpError {
+    #[error("Invalid packet format")]
+    InvalidPacket,
+    #[error("Checksum mismatch")]
+    ChecksumMismatch,
+    #[error("Packet too short: expected at least {expected}, got {actual}")]
+    PacketTooShort { expected: usize, actual: usize },
+    #[error("Payload too large: max {max}, got {actual}")]
+    PayloadTooLarge { max: usize, actual: usize },
+    #[error("Port not started")]
+    PortNotStarted,
+    #[error("No destination address (socket not connected)")]
+    NotConnected,
+    #[error("IPv6 not supported")]
+    Ipv6NotSupported,
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("DPDK error: {0}")]
+    Dpdk(#[from] dpdk::DpdkError),
+}
+
+pub type UdpResult<T> = Result<T, UdpError>;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum UDP payload size (MTU 1500 - IP header 20 - UDP header 8)
+pub const MAX_UDP_PAYLOAD: usize = 1472;
+
+/// Ethernet header size
+pub const ETH_HEADER_LEN: usize = 14;
+
+/// IPv4 header size (no options)
+pub const IPV4_HEADER_LEN: usize = 20;
+
+/// UDP header size
+pub const UDP_HEADER_LEN: usize = 8;
+
+/// Total header overhead
+pub const TOTAL_HEADER_LEN: usize = ETH_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN;
+
+/// Ethernet type for IPv4
+pub const ETH_TYPE_IPV4: u16 = 0x0800;
+
+/// IP protocol number for UDP
+pub const IP_PROTO_UDP: u8 = 17;
+
+// ============================================================================
+// Packet Building
+// ============================================================================
+
+/// Calculate IPv4 header checksum
+pub fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Sum all 16-bit words
+    for i in (0..header.len()).step_by(2) {
+        let word = if i + 1 < header.len() {
+            ((header[i] as u32) << 8) | (header[i + 1] as u32)
+        } else {
+            (header[i] as u32) << 8
+        };
+        sum = sum.wrapping_add(word);
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    // One's complement
+    !(sum as u16)
+}
+
+/// Calculate UDP checksum (optional for IPv4, but recommended)
+pub fn udp_checksum(
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    udp_header: &[u8],
+    payload: &[u8],
+) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header
+    sum = sum.wrapping_add(((src_ip[0] as u32) << 8) | (src_ip[1] as u32));
+    sum = sum.wrapping_add(((src_ip[2] as u32) << 8) | (src_ip[3] as u32));
+    sum = sum.wrapping_add(((dst_ip[0] as u32) << 8) | (dst_ip[1] as u32));
+    sum = sum.wrapping_add(((dst_ip[2] as u32) << 8) | (dst_ip[3] as u32));
+    sum = sum.wrapping_add(IP_PROTO_UDP as u32); // Protocol
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u32;
+    sum = sum.wrapping_add(udp_len);
+
+    // UDP header (skip checksum field at bytes 6-7)
+    for i in (0..udp_header.len()).step_by(2) {
+        if i == 6 {
+            continue; // Skip checksum field
+        }
+        let word = if i + 1 < udp_header.len() {
+            ((udp_header[i] as u32) << 8) | (udp_header[i + 1] as u32)
+        } else {
+            (udp_header[i] as u32) << 8
+        };
+        sum = sum.wrapping_add(word);
+    }
+
+    // Payload
+    for i in (0..payload.len()).step_by(2) {
+        let word = if i + 1 < payload.len() {
+            ((payload[i] as u32) << 8) | (payload[i + 1] as u32)
+        } else {
+            (payload[i] as u32) << 8
+        };
+        sum = sum.wrapping_add(word);
+    }
+
+    // Fold and complement
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    let result = !(sum as u16);
+    // UDP checksum of 0 means "no checksum", so use 0xFFFF instead
+    if result == 0 { 0xFFFF } else { result }
+}
+
+/// Build a complete UDP packet in an mbuf
+pub fn build_udp_packet(
+    mbuf: &mut Mbuf,
+    src_mac: &MacAddress,
+    dst_mac: &MacAddress,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    ttl: u8,
+) -> UdpResult<()> {
+    if payload.len() > MAX_UDP_PAYLOAD {
+        return Err(UdpError::PayloadTooLarge {
+            max: MAX_UDP_PAYLOAD,
+            actual: payload.len(),
+        });
+    }
+
+    let total_len = TOTAL_HEADER_LEN + payload.len();
+    let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+    // Get mutable access to the mbuf data
+    let data = mbuf.data_mut().ok_or(UdpError::InvalidPacket)?;
+
+    if data.len() < total_len {
+        return Err(UdpError::PayloadTooLarge {
+            max: data.len() - TOTAL_HEADER_LEN,
+            actual: payload.len(),
+        });
+    }
+
+    let src_ip_bytes = src_ip.octets();
+    let dst_ip_bytes = dst_ip.octets();
+
+    // === Ethernet Header (14 bytes) ===
+    data[0..6].copy_from_slice(&dst_mac.octets());      // Destination MAC
+    data[6..12].copy_from_slice(&src_mac.octets());     // Source MAC
+    data[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes()); // EtherType
+
+    // === IPv4 Header (20 bytes) ===
+    let ip_header_start = ETH_HEADER_LEN;
+    data[ip_header_start] = 0x45;                       // Version (4) + IHL (5)
+    data[ip_header_start + 1] = 0x00;                   // DSCP + ECN
+    data[ip_header_start + 2..ip_header_start + 4]
+        .copy_from_slice(&ip_total_len.to_be_bytes());  // Total Length
+    data[ip_header_start + 4..ip_header_start + 6]
+        .copy_from_slice(&[0x00, 0x00]);                // Identification
+    data[ip_header_start + 6..ip_header_start + 8]
+        .copy_from_slice(&[0x40, 0x00]);                // Flags (DF) + Fragment Offset
+    data[ip_header_start + 8] = ttl;                    // TTL
+    data[ip_header_start + 9] = IP_PROTO_UDP;           // Protocol
+    data[ip_header_start + 10..ip_header_start + 12]
+        .copy_from_slice(&[0x00, 0x00]);                // Checksum (placeholder)
+    data[ip_header_start + 12..ip_header_start + 16]
+        .copy_from_slice(&src_ip_bytes);                // Source IP
+    data[ip_header_start + 16..ip_header_start + 20]
+        .copy_from_slice(&dst_ip_bytes);                // Destination IP
+
+    // Calculate and set IP checksum
+    let ip_checksum = ipv4_checksum(&data[ip_header_start..ip_header_start + IPV4_HEADER_LEN]);
+    data[ip_header_start + 10..ip_header_start + 12]
+        .copy_from_slice(&ip_checksum.to_be_bytes());
+
+    // === UDP Header (8 bytes) ===
+    let udp_header_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+    data[udp_header_start..udp_header_start + 2]
+        .copy_from_slice(&src_port.to_be_bytes());      // Source Port
+    data[udp_header_start + 2..udp_header_start + 4]
+        .copy_from_slice(&dst_port.to_be_bytes());      // Destination Port
+    data[udp_header_start + 4..udp_header_start + 6]
+        .copy_from_slice(&udp_len.to_be_bytes());       // Length
+    data[udp_header_start + 6..udp_header_start + 8]
+        .copy_from_slice(&[0x00, 0x00]);                // Checksum (placeholder)
+
+    // === Payload ===
+    let payload_start = TOTAL_HEADER_LEN;
+    data[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+
+    // Calculate and set UDP checksum
+    let udp_header = &data[udp_header_start..udp_header_start + UDP_HEADER_LEN];
+    let udp_cksum = udp_checksum(&src_ip_bytes, &dst_ip_bytes, udp_header, payload);
+    data[udp_header_start + 6..udp_header_start + 8]
+        .copy_from_slice(&udp_cksum.to_be_bytes());
+
+    // Set packet lengths in mbuf metadata
+    mbuf.set_data_len(total_len as u16);
+    mbuf.set_packet_len(total_len as u32);
+
+    Ok(())
+}
+
+// ============================================================================
+// DPDK Resources (shared across sockets)
+// ============================================================================
+
+/// Shared DPDK resources for a network interface
+struct DpdkResources {
+    port: Port,
+    mempool: Mempool,
+    src_mac: MacAddress,
+}
+
+/// Global DPDK resources (initialized once per port)
+static DPDK_RESOURCES: Mutex<Option<Arc<DpdkResources>>> = Mutex::new(None);
+
+fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
+    let mut guard = DPDK_RESOURCES.lock().unwrap();
+
+    if let Some(ref resources) = *guard {
+        return Ok(Arc::clone(resources));
+    }
+
+    // Initialize EAL
+    dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
+
+    // Create mempool
+    let mempool = Mempool::create_with_config(
+        "udp_pool",
+        &MempoolConfig::new()
+            .with_size(8192)
+            .with_cache_size(256),
+    ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
+
+    // Initialize port
+    let port_config = PortConfig::default();
+    let port = Port::init(port_id, port_config, &mempool)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
+
+    let src_mac = port.mac_address();
+
+    // Start the port
+    let mut port = port;
+    port.start()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port start failed: {}", e)))?;
+
+    let resources = Arc::new(DpdkResources {
+        port,
+        mempool,
+        src_mac,
+    });
+
+    *guard = Some(Arc::clone(&resources));
+    Ok(resources)
+}
+
+// ============================================================================
+// UdpSocket Implementation
+// ============================================================================
 
 /// Drop-in replacement for std::net::UdpSocket with DPDK acceleration
 pub struct UdpSocket {
     local_addr: SocketAddr,
     connected_addr: Option<SocketAddr>,
+    resources: Arc<DpdkResources>,
+    ttl: u8,
+    /// Destination MAC address (would normally come from ARP)
+    /// For now, use broadcast or a configured value
+    dst_mac: MacAddress,
 }
 
 impl UdpSocket {
-    /// Creates a UDP socket from the given address.
+    /// Creates a UDP socket bound to the given address.
+    ///
+    /// This initializes DPDK if not already initialized and binds to the specified
+    /// local address and port.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let addr = addr.to_socket_addrs()?.next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
-        
-        // Try to initialize DPDK
-        match dpdk::Eal::init(&["-l", "0", "-n", "4"]) {
-            Ok(_) => {
-                println!("✅ DPDK EAL initialized for {}", addr);
-                Ok(UdpSocket { 
-                    local_addr: addr,
-                    connected_addr: None,
-                })
+
+        // Only support IPv4 for now
+        let local_v4 = match addr {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
             }
-            Err(_) => {
-                Err(io::Error::new(io::ErrorKind::Other, "DPDK initialization failed"))
+        };
+
+        // Get or initialize DPDK resources
+        let resources = get_or_init_dpdk(0)?;
+
+        println!("✅ DPDK UDP socket bound to {} (MAC: {})", addr, resources.src_mac);
+
+        Ok(UdpSocket {
+            local_addr: SocketAddr::V4(local_v4),
+            connected_addr: None,
+            resources,
+            ttl: 64,
+            // Default to broadcast MAC - in real usage, ARP would resolve this
+            dst_mac: MacAddress::broadcast(),
+        })
+    }
+
+    /// Sends data on the socket to the given address.
+    ///
+    /// This builds a complete Ethernet/IPv4/UDP packet and transmits it
+    /// using DPDK's tx_burst.
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+
+        self.send_to_addr(buf, addr)
+    }
+
+    /// Internal send implementation with resolved address
+    fn send_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        // Extract IPv4 addresses
+        let (src_ip, src_port) = match self.local_addr {
+            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
             }
+        };
+
+        let (dst_ip, dst_port) = match addr {
+            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+            }
+        };
+
+        // Allocate an mbuf from the mempool
+        let mut mbuf = self.resources.mempool.alloc()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
+
+        // Build the packet
+        build_udp_packet(
+            &mut mbuf,
+            &self.resources.src_mac,
+            &self.dst_mac,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            buf,
+            self.ttl,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+
+        // Transmit the packet
+        let mut packets = vec![mbuf];
+        let sent = self.resources.port.tx_burst(0, &mut packets)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
+
+        if sent == 0 {
+            // Packet wasn't sent, it will be freed when dropped
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
         }
+
+        Ok(buf.len())
     }
 
     /// Receives a single datagram message on the socket.
     pub fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        // TODO: Implement DPDK packet receive
-        todo!("DPDK recv_from implementation")
-    }
-
-    /// Sends data on the socket to the given address.
-    pub fn send_to<A: ToSocketAddrs>(&self, _buf: &[u8], _addr: A) -> io::Result<usize> {
-        // TODO: Implement DPDK packet send
-        todo!("DPDK send_to implementation")
+        // TODO: Implement DPDK packet receive using rx_burst + packet parsing
+        todo!("DPDK recv_from implementation - requires rx_burst + packet parsing")
     }
 
     /// Returns the socket address that this socket was created from.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+
+    /// Returns the socket address of the remote peer this socket was connected to.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.connected_addr.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
+        })
     }
 
     /// Connects this UDP socket to a remote address.
@@ -53,41 +423,52 @@ impl UdpSocket {
         Ok(())
     }
 
-    /// Receives a single datagram message on the socket from the remote address to which it is connected.
-    pub fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
-        // TODO: Implement DPDK connected recv
-        todo!("DPDK recv implementation")
+    /// Receives a single datagram message on the socket from the remote address
+    /// to which it is connected.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let (len, _addr) = self.recv_from(buf)?;
+        Ok(len)
     }
 
     /// Sends data on the socket to the remote address to which it is connected.
-    pub fn send(&self, _buf: &[u8]) -> io::Result<usize> {
-        // TODO: Implement DPDK connected send
-        todo!("DPDK send implementation")
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let addr = self.connected_addr.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
+        })?;
+        self.send_to_addr(buf, addr)
+    }
+
+    /// Sets the TTL (Time To Live) for outgoing packets.
+    pub fn set_ttl(&mut self, ttl: u32) -> io::Result<()> {
+        self.ttl = ttl as u8;
+        Ok(())
+    }
+
+    /// Gets the TTL value for outgoing packets.
+    pub fn ttl(&self) -> io::Result<u32> {
+        Ok(self.ttl as u32)
+    }
+
+    /// Sets the destination MAC address for outgoing packets.
+    ///
+    /// In a full implementation, this would be resolved via ARP.
+    /// For testing/direct connections, this can be set manually.
+    pub fn set_dst_mac(&mut self, mac: MacAddress) {
+        self.dst_mac = mac;
+    }
+
+    /// Gets the source MAC address (from the DPDK port).
+    pub fn src_mac(&self) -> &MacAddress {
+        &self.resources.src_mac
     }
 }
 
 // ============================================================================
-// SYNTHETIC TESTING UTILITIES (separate from main API)
+// SYNTHETIC TESTING UTILITIES
 // ============================================================================
 
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum UdpError {
-    #[error("Invalid packet format")]
-    InvalidPacket,
-    #[error("Checksum mismatch")]
-    ChecksumMismatch,
-    #[error("Packet too short: expected at least {expected}, got {actual}")]
-    PacketTooShort { expected: usize, actual: usize },
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-pub type UdpResult<T> = Result<T, UdpError>;
-
 pub trait UdpHandler {
-    fn on_packet(&self, src_ip: [u8;4], src_port: u16, dst_ip: [u8;4], dst_port: u16, payload: &[u8]) -> Option<Vec<u8>>;
+    fn on_packet(&self, src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> Option<Vec<u8>>;
 }
 
 /// Synthetic packet processor for testing protocol logic without real networking
@@ -103,15 +484,16 @@ impl SyntheticUdpSocket {
     }
 
     pub fn parse_and_handle(&self, frame: &[u8]) -> UdpResult<Option<Vec<u8>>> {
-        if frame.len() < 14 + 20 + 8 {
-            return Err(UdpError::PacketTooShort { expected: 42, actual: frame.len() });
+        if frame.len() < TOTAL_HEADER_LEN {
+            return Err(UdpError::PacketTooShort { expected: TOTAL_HEADER_LEN, actual: frame.len() });
         }
 
-        let ip_header = &frame[14..34];
-        let udp_header = &frame[34..42];
-        let payload = &frame[42..];
+        let ip_header = &frame[ETH_HEADER_LEN..ETH_HEADER_LEN + IPV4_HEADER_LEN];
+        let udp_header = &frame[ETH_HEADER_LEN + IPV4_HEADER_LEN..TOTAL_HEADER_LEN];
+        let payload = &frame[TOTAL_HEADER_LEN..];
 
-        if ip_header[9] != 17 {
+        // Check if it's UDP
+        if ip_header[9] != IP_PROTO_UDP {
             return Ok(None);
         }
 
@@ -120,38 +502,295 @@ impl SyntheticUdpSocket {
         let src_port = u16::from_be_bytes([udp_header[0], udp_header[1]]);
         let dst_port = u16::from_be_bytes([udp_header[2], udp_header[3]]);
 
+        // Check if packet is for us
         if dst_ip != self.bind_ip || dst_port != self.bind_port {
             return Ok(None);
         }
 
         if let Some(response_payload) = self.handler.on_packet(src_ip, src_port, dst_ip, dst_port, payload) {
-            let mut response_frame = vec![0u8; 14 + 20 + 8 + response_payload.len()];
-            
+            let mut response_frame = vec![0u8; TOTAL_HEADER_LEN + response_payload.len()];
+
             // Ethernet header (swap src/dst)
             response_frame[0..6].copy_from_slice(&frame[6..12]);
             response_frame[6..12].copy_from_slice(&frame[0..6]);
             response_frame[12..14].copy_from_slice(&frame[12..14]);
-            
+
             // IP header
-            response_frame[14] = 0x45;
-            let total_len = (20 + 8 + response_payload.len()) as u16;
-            response_frame[16..18].copy_from_slice(&total_len.to_be_bytes());
-            response_frame[23] = 17;
-            response_frame[26..30].copy_from_slice(&dst_ip);
-            response_frame[30..34].copy_from_slice(&src_ip);
-            
+            let ip_start = ETH_HEADER_LEN;
+            response_frame[ip_start] = 0x45;
+            let total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + response_payload.len()) as u16;
+            response_frame[ip_start + 2..ip_start + 4].copy_from_slice(&total_len.to_be_bytes());
+            response_frame[ip_start + 8] = 64; // TTL
+            response_frame[ip_start + 9] = IP_PROTO_UDP;
+            response_frame[ip_start + 12..ip_start + 16].copy_from_slice(&dst_ip);
+            response_frame[ip_start + 16..ip_start + 20].copy_from_slice(&src_ip);
+
+            // Calculate IP checksum
+            let ip_cksum = ipv4_checksum(&response_frame[ip_start..ip_start + IPV4_HEADER_LEN]);
+            response_frame[ip_start + 10..ip_start + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
             // UDP header
-            response_frame[34..36].copy_from_slice(&dst_port.to_be_bytes());
-            response_frame[36..38].copy_from_slice(&src_port.to_be_bytes());
-            let udp_len = (8 + response_payload.len()) as u16;
-            response_frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
-            
+            let udp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+            response_frame[udp_start..udp_start + 2].copy_from_slice(&dst_port.to_be_bytes());
+            response_frame[udp_start + 2..udp_start + 4].copy_from_slice(&src_port.to_be_bytes());
+            let udp_len = (UDP_HEADER_LEN + response_payload.len()) as u16;
+            response_frame[udp_start + 4..udp_start + 6].copy_from_slice(&udp_len.to_be_bytes());
+
+            // UDP checksum
+            let udp_cksum = udp_checksum(&dst_ip, &src_ip, &response_frame[udp_start..udp_start + UDP_HEADER_LEN], &response_payload);
+            response_frame[udp_start + 6..udp_start + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
             // Payload
-            response_frame[42..].copy_from_slice(&response_payload);
-            
+            response_frame[TOTAL_HEADER_LEN..].copy_from_slice(&response_payload);
+
             return Ok(Some(response_frame));
         }
 
         Ok(None)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // API COMPATIBILITY TESTS
+    // ========================================================================
+    //
+    // IMPORTANT: These tests verify that our UdpSocket API matches std::net::UdpSocket.
+    // DO NOT modify these tests without ensuring the API change is intentional.
+    // These are modeled after std::net::UdpSocket to ensure drop-in compatibility.
+    //
+    // Reference: https://doc.rust-lang.org/std/net/struct.UdpSocket.html
+    // ========================================================================
+
+    /// Test that UdpSocket::bind has the same signature as std::net::UdpSocket::bind
+    /// std signature: pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket>
+    #[test]
+    fn test_api_bind_signature() {
+        // Verify bind accepts ToSocketAddrs (string form)
+        fn _bind_with_str() -> io::Result<UdpSocket> {
+            UdpSocket::bind("127.0.0.1:0")
+        }
+
+        // Verify bind accepts ToSocketAddrs (SocketAddr form)
+        fn _bind_with_socketaddr() -> io::Result<UdpSocket> {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            UdpSocket::bind(addr)
+        }
+
+        // Verify bind returns io::Result<UdpSocket>
+        fn _check_return_type(result: io::Result<UdpSocket>) -> io::Result<UdpSocket> {
+            result
+        }
+    }
+
+    /// Test that UdpSocket::send_to has the same signature as std::net::UdpSocket::send_to
+    /// std signature: pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize>
+    #[test]
+    fn test_api_send_to_signature() {
+        // Verify signature: &self, buf: &[u8], addr: impl ToSocketAddrs -> io::Result<usize>
+        fn _send_to_with_str(socket: &UdpSocket) -> io::Result<usize> {
+            socket.send_to(b"hello", "127.0.0.1:9000")
+        }
+
+        fn _send_to_with_socketaddr(socket: &UdpSocket) -> io::Result<usize> {
+            let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            socket.send_to(b"hello", addr)
+        }
+    }
+
+    /// Test that UdpSocket::recv_from has the same signature as std::net::UdpSocket::recv_from
+    /// std signature: pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>
+    #[test]
+    fn test_api_recv_from_signature() {
+        // Verify signature: &self, buf: &mut [u8] -> io::Result<(usize, SocketAddr)>
+        fn _recv_from(socket: &UdpSocket) -> io::Result<(usize, SocketAddr)> {
+            let mut buf = [0u8; 1024];
+            socket.recv_from(&mut buf)
+        }
+    }
+
+    /// Test that UdpSocket::local_addr has the same signature as std::net::UdpSocket::local_addr
+    /// std signature: pub fn local_addr(&self) -> io::Result<SocketAddr>
+    #[test]
+    fn test_api_local_addr_signature() {
+        fn _local_addr(socket: &UdpSocket) -> io::Result<SocketAddr> {
+            socket.local_addr()
+        }
+    }
+
+    /// Test that UdpSocket::peer_addr has the same signature as std::net::UdpSocket::peer_addr
+    /// std signature: pub fn peer_addr(&self) -> io::Result<SocketAddr>
+    #[test]
+    fn test_api_peer_addr_signature() {
+        fn _peer_addr(socket: &UdpSocket) -> io::Result<SocketAddr> {
+            socket.peer_addr()
+        }
+    }
+
+    /// Test that UdpSocket::connect has the same signature as std::net::UdpSocket::connect
+    /// std signature: pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()>
+    #[test]
+    fn test_api_connect_signature() {
+        // Note: Our connect takes &mut self while std takes &self
+        // This is an intentional deviation for internal state management
+        fn _connect_with_str(socket: &mut UdpSocket) -> io::Result<()> {
+            socket.connect("127.0.0.1:9000")
+        }
+
+        fn _connect_with_socketaddr(socket: &mut UdpSocket) -> io::Result<()> {
+            let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            socket.connect(addr)
+        }
+    }
+
+    /// Test that UdpSocket::send has the same signature as std::net::UdpSocket::send
+    /// std signature: pub fn send(&self, buf: &[u8]) -> io::Result<usize>
+    #[test]
+    fn test_api_send_signature() {
+        fn _send(socket: &UdpSocket) -> io::Result<usize> {
+            socket.send(b"hello")
+        }
+    }
+
+    /// Test that UdpSocket::recv has the same signature as std::net::UdpSocket::recv
+    /// std signature: pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize>
+    #[test]
+    fn test_api_recv_signature() {
+        fn _recv(socket: &UdpSocket) -> io::Result<usize> {
+            let mut buf = [0u8; 1024];
+            socket.recv(&mut buf)
+        }
+    }
+
+    /// Test that UdpSocket::set_ttl has the same signature as std::net::UdpSocket::set_ttl
+    /// std signature: pub fn set_ttl(&self, ttl: u32) -> io::Result<()>
+    #[test]
+    fn test_api_set_ttl_signature() {
+        // Note: Our set_ttl takes &mut self while std takes &self
+        fn _set_ttl(socket: &mut UdpSocket) -> io::Result<()> {
+            socket.set_ttl(64)
+        }
+    }
+
+    /// Test that UdpSocket::ttl has the same signature as std::net::UdpSocket::ttl
+    /// std signature: pub fn ttl(&self) -> io::Result<u32>
+    #[test]
+    fn test_api_ttl_signature() {
+        fn _ttl(socket: &UdpSocket) -> io::Result<u32> {
+            socket.ttl()
+        }
+    }
+
+    // ========================================================================
+    // CHECKSUM TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_ipv4_checksum() {
+        // Example IP header (without checksum)
+        let mut header = [
+            0x45, 0x00, // Version, IHL, DSCP, ECN
+            0x00, 0x3c, // Total Length
+            0x1c, 0x46, // Identification
+            0x40, 0x00, // Flags, Fragment Offset
+            0x40, 0x06, // TTL, Protocol
+            0x00, 0x00, // Checksum (placeholder)
+            0xac, 0x10, 0x0a, 0x63, // Source IP (172.16.10.99)
+            0xac, 0x10, 0x0a, 0x0c, // Destination IP (172.16.10.12)
+        ];
+
+        let checksum = ipv4_checksum(&header);
+        header[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        // Verify checksum is valid (recalculating should give 0)
+        let verify = ipv4_checksum(&header);
+        assert_eq!(verify, 0);
+    }
+
+    #[test]
+    fn test_udp_checksum() {
+        let src_ip = [192, 168, 1, 1];
+        let dst_ip = [192, 168, 1, 2];
+        let udp_header = [
+            0x30, 0x39, // Source port (12345)
+            0x23, 0x28, // Dest port (9000)
+            0x00, 0x0c, // Length (12 = 8 header + 4 payload)
+            0x00, 0x00, // Checksum (placeholder)
+        ];
+        let payload = b"test";
+
+        let checksum = udp_checksum(&src_ip, &dst_ip, &udp_header, payload);
+        // Just verify it's non-zero and computable
+        assert_ne!(checksum, 0);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(ETH_HEADER_LEN, 14);
+        assert_eq!(IPV4_HEADER_LEN, 20);
+        assert_eq!(UDP_HEADER_LEN, 8);
+        assert_eq!(TOTAL_HEADER_LEN, 42);
+        assert_eq!(MAX_UDP_PAYLOAD, 1472);
+    }
+
+    #[test]
+    fn test_payload_too_large() {
+        let large_payload = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        // This would fail in build_udp_packet, but we can test the error type exists
+        let err = UdpError::PayloadTooLarge { max: MAX_UDP_PAYLOAD, actual: large_payload.len() };
+        assert!(err.to_string().contains("too large"));
+    }
+
+    struct EchoHandler;
+    impl UdpHandler for EchoHandler {
+        fn on_packet(&self, _src_ip: [u8; 4], _src_port: u16, _dst_ip: [u8; 4], _dst_port: u16, payload: &[u8]) -> Option<Vec<u8>> {
+            Some(payload.to_vec())
+        }
+    }
+
+    #[test]
+    fn test_synthetic_socket_echo() {
+        let socket = SyntheticUdpSocket::new([192, 168, 1, 1], 9000, Box::new(EchoHandler));
+
+        // Build a test packet
+        let mut frame = vec![0u8; TOTAL_HEADER_LEN + 4];
+
+        // Ethernet
+        frame[0..6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
+        frame[6..12].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // src mac
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+        // IP header
+        let ip_start = ETH_HEADER_LEN;
+        frame[ip_start] = 0x45;
+        frame[ip_start + 2..ip_start + 4].copy_from_slice(&32u16.to_be_bytes()); // total len
+        frame[ip_start + 8] = 64; // TTL
+        frame[ip_start + 9] = IP_PROTO_UDP;
+        frame[ip_start + 12..ip_start + 16].copy_from_slice(&[10, 0, 0, 1]); // src ip
+        frame[ip_start + 16..ip_start + 20].copy_from_slice(&[192, 168, 1, 1]); // dst ip
+
+        // UDP header
+        let udp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+        frame[udp_start..udp_start + 2].copy_from_slice(&12345u16.to_be_bytes()); // src port
+        frame[udp_start + 2..udp_start + 4].copy_from_slice(&9000u16.to_be_bytes()); // dst port
+        frame[udp_start + 4..udp_start + 6].copy_from_slice(&12u16.to_be_bytes()); // length
+
+        // Payload
+        frame[TOTAL_HEADER_LEN..].copy_from_slice(b"test");
+
+        let result = socket.parse_and_handle(&frame);
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.is_some());
+
+        let resp_frame = response.unwrap();
+        assert_eq!(&resp_frame[TOTAL_HEADER_LEN..], b"test");
     }
 }
