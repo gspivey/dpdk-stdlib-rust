@@ -238,6 +238,116 @@ pub fn build_udp_packet(
 }
 
 // ============================================================================
+// Packet Parsing
+// ============================================================================
+
+/// Parsed UDP packet information
+#[derive(Debug, Clone)]
+pub struct ParsedUdpPacket {
+    /// Source MAC address
+    pub src_mac: [u8; 6],
+    /// Destination MAC address
+    pub dst_mac: [u8; 6],
+    /// Source IP address
+    pub src_ip: Ipv4Addr,
+    /// Destination IP address
+    pub dst_ip: Ipv4Addr,
+    /// Source port
+    pub src_port: u16,
+    /// Destination port
+    pub dst_port: u16,
+    /// Payload data
+    pub payload: Vec<u8>,
+}
+
+/// Parse a raw Ethernet frame containing a UDP packet
+///
+/// Returns None if the packet is not a valid UDP/IPv4 packet
+pub fn parse_udp_packet(frame: &[u8]) -> Option<ParsedUdpPacket> {
+    // Minimum size check
+    if frame.len() < TOTAL_HEADER_LEN {
+        return None;
+    }
+
+    // Parse Ethernet header
+    let dst_mac: [u8; 6] = frame[0..6].try_into().ok()?;
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+
+    // Only handle IPv4
+    if ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    // Parse IPv4 header
+    let ip_header = &frame[ETH_HEADER_LEN..];
+
+    // Check IP version (should be 4)
+    let version = (ip_header[0] >> 4) & 0x0F;
+    if version != 4 {
+        return None;
+    }
+
+    // Get IP header length (in 32-bit words)
+    let ihl = (ip_header[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+    if ip_header_len < 20 {
+        return None;
+    }
+
+    // Check protocol (should be UDP = 17)
+    let protocol = ip_header[9];
+    if protocol != IP_PROTO_UDP {
+        return None;
+    }
+
+    // Extract IP addresses
+    let src_ip = Ipv4Addr::new(
+        ip_header[12], ip_header[13], ip_header[14], ip_header[15]
+    );
+    let dst_ip = Ipv4Addr::new(
+        ip_header[16], ip_header[17], ip_header[18], ip_header[19]
+    );
+
+    // Parse UDP header (starts after IP header)
+    let udp_start = ETH_HEADER_LEN + ip_header_len;
+    if frame.len() < udp_start + UDP_HEADER_LEN {
+        return None;
+    }
+
+    let udp_header = &frame[udp_start..];
+    let src_port = u16::from_be_bytes([udp_header[0], udp_header[1]]);
+    let dst_port = u16::from_be_bytes([udp_header[2], udp_header[3]]);
+    let udp_len = u16::from_be_bytes([udp_header[4], udp_header[5]]) as usize;
+
+    // Validate UDP length
+    if udp_len < UDP_HEADER_LEN || frame.len() < udp_start + udp_len {
+        return None;
+    }
+
+    // Extract payload
+    let payload_start = udp_start + UDP_HEADER_LEN;
+    let payload_len = udp_len - UDP_HEADER_LEN;
+    let payload = frame[payload_start..payload_start + payload_len].to_vec();
+
+    Some(ParsedUdpPacket {
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        payload,
+    })
+}
+
+/// Parse UDP packet from an mbuf
+pub fn parse_udp_from_mbuf(mbuf: &Mbuf) -> Option<ParsedUdpPacket> {
+    let data = mbuf.data()?;
+    parse_udp_packet(data)
+}
+
+// ============================================================================
 // DPDK Resources (shared across sockets)
 // ============================================================================
 
@@ -398,9 +508,53 @@ impl UdpSocket {
     }
 
     /// Receives a single datagram message on the socket.
-    pub fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        // TODO: Implement DPDK packet receive using rx_burst + packet parsing
-        todo!("DPDK recv_from implementation - requires rx_burst + packet parsing")
+    ///
+    /// This calls DPDK's rx_burst to receive packets, parses the Ethernet/IPv4/UDP
+    /// headers, and copies the payload to the provided buffer.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns the number of bytes received and the source address.
+    /// Returns `WouldBlock` if no packets are available.
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // Get our local port for filtering
+        let local_port = match self.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+            }
+        };
+
+        // Try to receive packets
+        let packets = self.resources.port.rx_burst(0, 32)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+
+        if packets.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets available"));
+        }
+
+        // Process packets, looking for one destined for our port
+        for mbuf in packets {
+            if let Some(parsed) = parse_udp_from_mbuf(&mbuf) {
+                // Check if this packet is for us
+                if parsed.dst_port == local_port {
+                    // Copy payload to buffer
+                    let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+                    buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+                    // Build source address
+                    let src_addr = SocketAddr::V4(
+                        SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+                    );
+
+                    return Ok((copy_len, src_addr));
+                }
+            }
+            // Packet not for us or not valid UDP, it will be dropped when mbuf goes out of scope
+        }
+
+        // No matching packets found
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "no matching packets"))
     }
 
     /// Returns the socket address that this socket was created from.
@@ -753,6 +907,152 @@ mod tests {
         fn on_packet(&self, _src_ip: [u8; 4], _src_port: u16, _dst_ip: [u8; 4], _dst_port: u16, payload: &[u8]) -> Option<Vec<u8>> {
             Some(payload.to_vec())
         }
+    }
+
+    // ========================================================================
+    // PACKET PARSING TESTS
+    // ========================================================================
+
+    /// Helper to build a valid UDP packet for testing
+    fn build_test_udp_frame(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total_len = TOTAL_HEADER_LEN + payload.len();
+        let mut frame = vec![0u8; total_len];
+
+        // Ethernet header
+        frame[0..6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
+        frame[6..12].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // src mac
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+        // IP header
+        let ip_start = ETH_HEADER_LEN;
+        frame[ip_start] = 0x45; // version 4, IHL 5
+        frame[ip_start + 1] = 0x00; // DSCP/ECN
+        let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+        frame[ip_start + 2..ip_start + 4].copy_from_slice(&ip_total_len.to_be_bytes());
+        frame[ip_start + 8] = 64; // TTL
+        frame[ip_start + 9] = IP_PROTO_UDP;
+        frame[ip_start + 12..ip_start + 16].copy_from_slice(&src_ip);
+        frame[ip_start + 16..ip_start + 20].copy_from_slice(&dst_ip);
+
+        // UDP header
+        let udp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+        frame[udp_start..udp_start + 2].copy_from_slice(&src_port.to_be_bytes());
+        frame[udp_start + 2..udp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
+        let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+        frame[udp_start + 4..udp_start + 6].copy_from_slice(&udp_len.to_be_bytes());
+
+        // Payload
+        frame[TOTAL_HEADER_LEN..].copy_from_slice(payload);
+
+        frame
+    }
+
+    #[test]
+    fn test_parse_udp_packet_valid() {
+        let frame = build_test_udp_frame(
+            [192, 168, 1, 100],
+            [192, 168, 1, 1],
+            12345,
+            9000,
+            b"hello world",
+        );
+
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_some());
+
+        let p = parsed.unwrap();
+        assert_eq!(p.src_ip, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(p.dst_ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(p.src_port, 12345);
+        assert_eq!(p.dst_port, 9000);
+        assert_eq!(p.payload, b"hello world");
+    }
+
+    #[test]
+    fn test_parse_udp_packet_empty_payload() {
+        let frame = build_test_udp_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            8080,
+            80,
+            b"",
+        );
+
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_some());
+
+        let p = parsed.unwrap();
+        assert_eq!(p.src_port, 8080);
+        assert_eq!(p.dst_port, 80);
+        assert!(p.payload.is_empty());
+    }
+
+    #[test]
+    fn test_parse_udp_packet_too_short() {
+        let frame = vec![0u8; 10]; // Way too short
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_udp_packet_wrong_ethertype() {
+        let mut frame = build_test_udp_frame(
+            [192, 168, 1, 1],
+            [192, 168, 1, 2],
+            1234,
+            5678,
+            b"test",
+        );
+        // Change ethertype to ARP
+        frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_udp_packet_not_udp() {
+        let mut frame = build_test_udp_frame(
+            [192, 168, 1, 1],
+            [192, 168, 1, 2],
+            1234,
+            5678,
+            b"test",
+        );
+        // Change protocol to TCP (6)
+        frame[ETH_HEADER_LEN + 9] = 6;
+
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_udp_packet_extracts_macs() {
+        let frame = build_test_udp_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            1000,
+            2000,
+            b"x",
+        );
+
+        let parsed = parse_udp_packet(&frame).unwrap();
+        assert_eq!(parsed.src_mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(parsed.dst_mac, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    }
+
+    #[test]
+    fn test_parsed_udp_packet_debug() {
+        let frame = build_test_udp_frame([1, 2, 3, 4], [5, 6, 7, 8], 100, 200, b"x");
+        let parsed = parse_udp_packet(&frame).unwrap();
+        // Just ensure Debug is implemented and doesn't panic
+        let _ = format!("{:?}", parsed);
     }
 
     #[test]

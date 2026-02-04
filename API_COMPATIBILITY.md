@@ -109,8 +109,8 @@ The compat layer delegates to the underlying DPDK implementation. Here's the sta
 | `bind()` | ✅ | Initializes DPDK EAL, port, and mempool |
 | `send_to()` | ✅ | Builds Eth/IP/UDP packet, calls tx_burst |
 | `send()` | ✅ | Uses connected address |
-| `recv_from()` | ❌ | Returns `todo!()` - needs rx_burst + packet parsing |
-| `recv()` | ❌ | Returns `todo!()` - depends on recv_from |
+| `recv_from()` | ✅ | Calls rx_burst, parses Eth/IP/UDP, returns payload |
+| `recv()` | ✅ | Delegates to recv_from |
 | `local_addr()` | ✅ | Returns bound address |
 | `peer_addr()` | ✅ | Returns connected address |
 | `connect()` | ✅ | Sets connected address |
@@ -125,9 +125,9 @@ The compat layer delegates to the underlying DPDK implementation. Here's the sta
 | UDP header building | ✅ | `build_udp_packet()` in dpdk-udp |
 | IP checksum calculation | ✅ | `ipv4_checksum()` in dpdk-udp |
 | UDP checksum calculation | ✅ | `udp_checksum()` in dpdk-udp |
-| Ethernet frame parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
-| IPv4 header parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
-| UDP header parsing | ⚠️ | `SyntheticUdpSocket` has parsing |
+| Ethernet frame parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
+| IPv4 header parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
+| UDP header parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
 | ARP handling | ❌ | Not implemented (needed for real networks) |
 
 ### API Compatibility Tests
@@ -158,12 +158,13 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 - [x] rx_burst / tx_burst wrappers
 - [x] Comprehensive unit tests (48 tests in dpdk crate)
 
-### Phase 2: Packet I/O
+### Phase 2: Packet I/O ✅
 - [x] `send_to()` - build Ethernet/IP/UDP packet, call tx_burst ✅
 - [x] IP checksum calculation ✅
 - [x] UDP checksum calculation ✅
 - [x] API compatibility tests (10 tests) ✅
-- [ ] `recv_from()` - call rx_burst, parse Ethernet/IP/UDP packet
+- [x] `recv_from()` - call rx_burst, parse Ethernet/IP/UDP packet ✅
+- [x] Packet parsing tests (7 tests) ✅
 
 ### Phase 3: Protocol Support
 - [ ] ARP request/response handling
