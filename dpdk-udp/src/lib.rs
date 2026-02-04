@@ -2,16 +2,33 @@
 //!
 //! This crate provides a drop-in replacement for `std::net::UdpSocket` that uses
 //! DPDK for high-performance packet I/O, bypassing the kernel network stack.
+//!
+//! ## Features
+//!
+//! - **UDP Socket API** - Drop-in replacement for `std::net::UdpSocket`
+//! - **ARP Protocol** - Automatic address resolution for real network communication
+//! - **ICMP Protocol** - Echo reply (ping) support for network diagnostics
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::collections::VecDeque;
 
 use dpdk::{Mbuf, Mempool, Port};
 use dpdk::port::{MacAddress, PortConfig};
 use dpdk::mbuf::MempoolConfig;
 
 use thiserror::Error;
+
+// ============================================================================
+// Submodules
+// ============================================================================
+
+pub mod arp;
+pub mod icmp;
+
+pub use arp::{ArpCache, ArpHandler, ArpPacket};
+pub use icmp::{IcmpHandler, IcmpPacket};
 
 // ============================================================================
 // Error Types
@@ -356,6 +373,8 @@ struct DpdkResources {
     port: Port,
     mempool: Mempool,
     src_mac: MacAddress,
+    /// Shared ARP cache
+    arp_cache: Arc<ArpCache>,
 }
 
 /// Global DPDK resources (initialized once per port)
@@ -392,14 +411,99 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     port.start()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port start failed: {}", e)))?;
 
+    // Create shared ARP cache
+    let arp_cache = Arc::new(ArpCache::new());
+
     let resources = Arc::new(DpdkResources {
         port,
         mempool,
         src_mac,
+        arp_cache,
     });
 
     *guard = Some(Arc::clone(&resources));
     Ok(resources)
+}
+
+// ============================================================================
+// Connection Tracking
+// ============================================================================
+
+/// Connection state for connected sockets
+#[derive(Debug, Clone)]
+pub struct ConnectionState {
+    /// Local address
+    pub local_addr: SocketAddr,
+    /// Remote address
+    pub remote_addr: SocketAddr,
+    /// Packets received from remote
+    pub packets_received: u64,
+    /// Packets sent to remote
+    pub packets_sent: u64,
+    /// Bytes received from remote
+    pub bytes_received: u64,
+    /// Bytes sent to remote
+    pub bytes_sent: u64,
+}
+
+impl ConnectionState {
+    fn new(local: SocketAddr, remote: SocketAddr) -> Self {
+        Self {
+            local_addr: local,
+            remote_addr: remote,
+            packets_received: 0,
+            packets_sent: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+        }
+    }
+
+    fn record_send(&mut self, bytes: usize) {
+        self.packets_sent += 1;
+        self.bytes_sent += bytes as u64;
+    }
+
+    fn record_recv(&mut self, bytes: usize) {
+        self.packets_received += 1;
+        self.bytes_received += bytes as u64;
+    }
+}
+
+/// Receive queue for buffering packets
+struct ReceiveQueue {
+    /// Buffered packets: (payload, source_addr)
+    packets: VecDeque<(Vec<u8>, SocketAddr)>,
+    /// Maximum queue size
+    max_size: usize,
+}
+
+impl ReceiveQueue {
+    fn new(max_size: usize) -> Self {
+        Self {
+            packets: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    fn push(&mut self, payload: Vec<u8>, src: SocketAddr) -> bool {
+        if self.packets.len() >= self.max_size {
+            return false; // Queue full
+        }
+        self.packets.push_back((payload, src));
+        true
+    }
+
+    fn pop(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        self.packets.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.packets.len()
+    }
 }
 
 // ============================================================================
@@ -413,8 +517,19 @@ pub struct UdpSocket {
     resources: Arc<DpdkResources>,
     ttl: u8,
     /// Destination MAC address (would normally come from ARP)
-    /// For now, use broadcast or a configured value
     dst_mac: MacAddress,
+    /// ARP handler for address resolution
+    arp_handler: ArpHandler,
+    /// ICMP handler for ping responses
+    icmp_handler: IcmpHandler,
+    /// Connection state tracking (for connected sockets)
+    connection_state: Option<RwLock<ConnectionState>>,
+    /// Receive queue for buffered packets
+    recv_queue: Mutex<ReceiveQueue>,
+    /// Whether to automatically respond to ARP requests
+    auto_arp: bool,
+    /// Whether to automatically respond to ICMP echo requests
+    auto_icmp: bool,
 }
 
 impl UdpSocket {
@@ -437,6 +552,18 @@ impl UdpSocket {
         // Get or initialize DPDK resources
         let resources = get_or_init_dpdk(0)?;
 
+        // Create protocol handlers with shared ARP cache
+        let local_mac = resources.src_mac.octets();
+        let local_ip = *local_v4.ip();
+
+        let arp_handler = ArpHandler::with_cache(
+            local_mac,
+            local_ip,
+            Arc::clone(&resources.arp_cache),
+        );
+
+        let icmp_handler = IcmpHandler::new(local_mac, local_ip);
+
         println!("✅ DPDK UDP socket bound to {} (MAC: {})", addr, resources.src_mac);
 
         Ok(UdpSocket {
@@ -444,8 +571,13 @@ impl UdpSocket {
             connected_addr: None,
             resources,
             ttl: 64,
-            // Default to broadcast MAC - in real usage, ARP would resolve this
             dst_mac: MacAddress::broadcast(),
+            arp_handler,
+            icmp_handler,
+            connection_state: None,
+            recv_queue: Mutex::new(ReceiveQueue::new(1024)),
+            auto_arp: true,
+            auto_icmp: true,
         })
     }
 
@@ -477,6 +609,10 @@ impl UdpSocket {
             }
         };
 
+        // Resolve destination MAC via ARP (or use configured/broadcast MAC)
+        let dst_mac = self.arp_handler.resolve(&dst_ip)
+            .unwrap_or_else(|| self.dst_mac.clone());
+
         // Allocate an mbuf from the mempool
         let mut mbuf = self.resources.mempool.alloc()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
@@ -485,7 +621,7 @@ impl UdpSocket {
         build_udp_packet(
             &mut mbuf,
             &self.resources.src_mac,
-            &self.dst_mac,
+            &dst_mac,
             src_ip,
             dst_ip,
             src_port,
@@ -504,6 +640,13 @@ impl UdpSocket {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
         }
 
+        // Update connection state if connected
+        if let Some(ref state) = self.connection_state {
+            if let Ok(mut s) = state.write() {
+                s.record_send(buf.len());
+            }
+        }
+
         Ok(buf.len())
     }
 
@@ -517,6 +660,16 @@ impl UdpSocket {
     /// On success, returns the number of bytes received and the source address.
     /// Returns `WouldBlock` if no packets are available.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // First check if we have buffered packets
+        {
+            let mut queue = self.recv_queue.lock().unwrap();
+            if let Some((payload, src_addr)) = queue.pop() {
+                let copy_len = std::cmp::min(buf.len(), payload.len());
+                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                return Ok((copy_len, src_addr));
+            }
+        }
+
         // Get our local port for filtering
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
@@ -533,28 +686,98 @@ impl UdpSocket {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets available"));
         }
 
-        // Process packets, looking for one destined for our port
+        // Process packets, handling ARP/ICMP and looking for UDP packets for our port
+        let mut result: Option<(usize, SocketAddr)> = None;
+
         for mbuf in packets {
+            if let Some(data) = mbuf.data() {
+                // Check ethertype
+                if data.len() >= 14 {
+                    let ethertype = u16::from_be_bytes([data[12], data[13]]);
+
+                    // Handle ARP packets
+                    if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
+                        if let Some(reply_frame) = self.arp_handler.process_arp(data) {
+                            // Send ARP reply
+                            if let Ok(mut reply_mbuf) = self.resources.mempool.alloc() {
+                                if let Some(reply_data) = reply_mbuf.data_mut() {
+                                    let len = reply_frame.len().min(reply_data.len());
+                                    reply_data[..len].copy_from_slice(&reply_frame[..len]);
+                                    reply_mbuf.set_data_len(len as u16);
+                                    reply_mbuf.set_packet_len(len as u32);
+                                    let mut packets = vec![reply_mbuf];
+                                    let _ = self.resources.port.tx_burst(0, &mut packets);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Handle ICMP packets
+                    if ethertype == ETH_TYPE_IPV4 && data.len() > ETH_HEADER_LEN + 9 {
+                        let protocol = data[ETH_HEADER_LEN + 9];
+                        if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
+                            if let Some(reply_frame) = self.icmp_handler.process_icmp(data) {
+                                // Send ICMP reply
+                                if let Ok(mut reply_mbuf) = self.resources.mempool.alloc() {
+                                    if let Some(reply_data) = reply_mbuf.data_mut() {
+                                        let len = reply_frame.len().min(reply_data.len());
+                                        reply_data[..len].copy_from_slice(&reply_frame[..len]);
+                                        reply_mbuf.set_data_len(len as u16);
+                                        reply_mbuf.set_packet_len(len as u32);
+                                        let mut packets = vec![reply_mbuf];
+                                        let _ = self.resources.port.tx_burst(0, &mut packets);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Try to parse as UDP
             if let Some(parsed) = parse_udp_from_mbuf(&mbuf) {
                 // Check if this packet is for us
                 if parsed.dst_port == local_port {
-                    // Copy payload to buffer
-                    let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
-                    buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
-
-                    // Build source address
                     let src_addr = SocketAddr::V4(
                         SocketAddrV4::new(parsed.src_ip, parsed.src_port)
                     );
 
-                    return Ok((copy_len, src_addr));
+                    // If connected, only accept packets from the connected address
+                    if let Some(ref connected) = self.connected_addr {
+                        if src_addr != *connected {
+                            // Queue for later if not from connected peer
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            queue.push(parsed.payload, src_addr);
+                            continue;
+                        }
+                    }
+
+                    // If we haven't found a result yet, use this one
+                    if result.is_none() {
+                        let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+                        buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+                        // Update connection state
+                        if let Some(ref state) = self.connection_state {
+                            if let Ok(mut s) = state.write() {
+                                s.record_recv(copy_len);
+                            }
+                        }
+
+                        result = Some((copy_len, src_addr));
+                    } else {
+                        // Queue additional packets
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        queue.push(parsed.payload, src_addr);
+                    }
                 }
             }
             // Packet not for us or not valid UDP, it will be dropped when mbuf goes out of scope
         }
 
-        // No matching packets found
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "no matching packets"))
+        result.ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no matching packets"))
     }
 
     /// Returns the socket address that this socket was created from.
@@ -570,9 +793,19 @@ impl UdpSocket {
     }
 
     /// Connects this UDP socket to a remote address.
+    ///
+    /// After connecting, `send()` and `recv()` can be used without specifying addresses.
+    /// The socket will also track connection statistics.
     pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
         let addr = addr.to_socket_addrs()?.next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+
+        // Initialize connection tracking
+        self.connection_state = Some(RwLock::new(ConnectionState::new(
+            self.local_addr,
+            addr,
+        )));
+
         self.connected_addr = Some(addr);
         Ok(())
     }
@@ -614,6 +847,95 @@ impl UdpSocket {
     /// Gets the source MAC address (from the DPDK port).
     pub fn src_mac(&self) -> &MacAddress {
         &self.resources.src_mac
+    }
+
+    // ========================================================================
+    // ARP Configuration
+    // ========================================================================
+
+    /// Enable or disable automatic ARP response.
+    ///
+    /// When enabled (default), the socket will automatically respond to ARP
+    /// requests for its IP address.
+    pub fn set_auto_arp(&mut self, enable: bool) {
+        self.auto_arp = enable;
+    }
+
+    /// Check if automatic ARP response is enabled.
+    pub fn auto_arp(&self) -> bool {
+        self.auto_arp
+    }
+
+    /// Get a reference to the ARP cache.
+    pub fn arp_cache(&self) -> &Arc<ArpCache> {
+        &self.resources.arp_cache
+    }
+
+    /// Manually add an ARP cache entry.
+    pub fn add_arp_entry(&self, ip: Ipv4Addr, mac: MacAddress) {
+        self.resources.arp_cache.insert(ip, mac);
+    }
+
+    /// Send an ARP request for the given IP address.
+    ///
+    /// This is useful for pre-populating the ARP cache before sending data.
+    pub fn send_arp_request(&self, target_ip: Ipv4Addr) -> io::Result<()> {
+        if let Some(frame) = self.arp_handler.make_request(target_ip) {
+            let mut mbuf = self.resources.mempool.alloc()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
+
+            if let Some(data) = mbuf.data_mut() {
+                let len = frame.len().min(data.len());
+                data[..len].copy_from_slice(&frame[..len]);
+                mbuf.set_data_len(len as u16);
+                mbuf.set_packet_len(len as u32);
+
+                let mut packets = vec![mbuf];
+                self.resources.port.tx_burst(0, &mut packets)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
+            }
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // ICMP Configuration
+    // ========================================================================
+
+    /// Enable or disable automatic ICMP echo reply (ping).
+    ///
+    /// When enabled (default), the socket will automatically respond to ICMP
+    /// echo requests (ping) for its IP address.
+    pub fn set_auto_icmp(&mut self, enable: bool) {
+        self.auto_icmp = enable;
+    }
+
+    /// Check if automatic ICMP echo reply is enabled.
+    pub fn auto_icmp(&self) -> bool {
+        self.auto_icmp
+    }
+
+    // ========================================================================
+    // Connection Tracking
+    // ========================================================================
+
+    /// Get connection statistics for a connected socket.
+    ///
+    /// Returns None if the socket is not connected.
+    pub fn connection_stats(&self) -> Option<ConnectionState> {
+        self.connection_state.as_ref().and_then(|state| {
+            state.read().ok().map(|s| s.clone())
+        })
+    }
+
+    /// Check if this socket is connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected_addr.is_some()
+    }
+
+    /// Get the number of packets in the receive queue.
+    pub fn recv_queue_len(&self) -> usize {
+        self.recv_queue.lock().unwrap().len()
     }
 }
 

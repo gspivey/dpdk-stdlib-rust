@@ -128,7 +128,38 @@ The compat layer delegates to the underlying DPDK implementation. Here's the sta
 | Ethernet frame parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
 | IPv4 header parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
 | UDP header parsing | ✅ | `parse_udp_packet()` in dpdk-udp |
-| ARP handling | ❌ | Not implemented (needed for real networks) |
+| ARP handling | ✅ | `arp` module in dpdk-udp |
+
+### ARP Protocol Support (dpdk-udp/src/arp.rs)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| ARP packet parsing | ✅ | `parse_arp_packet()` |
+| ARP packet building | ✅ | `build_arp_frame()`, `build_arp_request()`, `build_arp_reply()` |
+| ARP cache | ✅ | `ArpCache` with TTL-based expiration |
+| ARP handler | ✅ | `ArpHandler` - automatic response to requests |
+| Opportunistic learning | ✅ | Learn from all ARP packets seen |
+| Multiple IP support | ✅ | Can respond to multiple local IPs |
+
+### ICMP Protocol Support (dpdk-udp/src/icmp.rs)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| ICMP packet parsing | ✅ | `parse_icmp_packet()` |
+| ICMP packet building | ✅ | `build_icmp_frame()`, `build_echo_request()`, `build_echo_reply()` |
+| Echo request/reply | ✅ | Full ping support |
+| ICMP checksum | ✅ | `icmp_checksum()` |
+| ICMP handler | ✅ | `IcmpHandler` - automatic echo reply |
+
+### Connection Tracking
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Connection state | ✅ | `ConnectionState` struct |
+| Packet counters | ✅ | packets_sent, packets_received |
+| Byte counters | ✅ | bytes_sent, bytes_received |
+| Receive queue | ✅ | Buffering for connected sockets |
+| Stats access | ✅ | `connection_stats()` method |
 
 ### API Compatibility Tests
 
@@ -148,6 +179,37 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 
 **Note:** `connect()` and `set_ttl()` take `&mut self` instead of `&self` for internal state management.
 
+### ARP Tests (14 tests)
+
+- `test_arp_constants` - Verifies ARP protocol constants
+- `test_arp_request_creation` - Tests `ArpPacket::request()` constructor
+- `test_arp_reply_creation` - Tests `ArpPacket::reply()` constructor
+- `test_build_and_parse_arp_request` - Round-trip test for ARP requests
+- `test_build_and_parse_arp_reply` - Round-trip test for ARP replies
+- `test_parse_invalid_frame` - Tests rejection of invalid frames
+- `test_arp_cache` - Tests `ArpCache` insert/lookup/remove
+- `test_arp_cache_clear` - Tests `ArpCache::clear()`
+- `test_arp_handler_request_response` - Tests automatic ARP reply generation
+- `test_arp_handler_ignores_other_requests` - Tests filtering of non-local requests
+- `test_arp_handler_learn_from_reply` - Tests opportunistic learning
+- `test_arp_handler_make_request` - Tests ARP request generation
+- `test_arp_handler_resolve` - Tests ARP resolution
+- `test_arp_handler_multiple_ips` - Tests multi-IP support
+
+### ICMP Tests (11 tests)
+
+- `test_icmp_constants` - Verifies ICMP protocol constants
+- `test_parse_echo_request` - Tests parsing of echo requests
+- `test_parse_echo_reply` - Tests parsing of echo replies
+- `test_parse_invalid_frame` - Tests rejection of invalid frames
+- `test_make_echo_reply` - Tests echo reply generation
+- `test_make_echo_reply_not_request` - Verifies only requests generate replies
+- `test_build_and_parse_roundtrip` - Round-trip test for ICMP packets
+- `test_icmp_checksum` - Tests ICMP checksum calculation
+- `test_icmp_handler_echo_reply` - Tests automatic ping response
+- `test_icmp_handler_ignores_other_ips` - Tests filtering of non-local pings
+- `test_icmp_handler_multiple_ips` - Tests multi-IP support
+
 ---
 
 ## Implementation Roadmap
@@ -166,10 +228,10 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 - [x] `recv_from()` - call rx_burst, parse Ethernet/IP/UDP packet ✅
 - [x] Packet parsing tests (7 tests) ✅
 
-### Phase 3: Protocol Support
-- [ ] ARP request/response handling
-- [ ] ICMP echo reply (optional, for ping)
-- [ ] Connection tracking for connected sockets
+### Phase 3: Protocol Support ✅
+- [x] ARP request/response handling ✅
+- [x] ICMP echo reply (ping) ✅
+- [x] Connection tracking for connected sockets ✅
 
 ### Phase 4: Advanced Features
 - [ ] Multicast group management via DPDK
