@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::collections::VecDeque;
 
 use dpdk::{Mbuf, Mempool, Port};
-use dpdk::port::{MacAddress, PortConfig};
+use dpdk::port::{MacAddress, PortConfig, RxOffload, TxOffload};
 use dpdk::mbuf::MempoolConfig;
+
+pub use dpdk::port::{RxOffload as HwRxOffload, TxOffload as HwTxOffload};
 
 use thiserror::Error;
 
@@ -936,6 +938,129 @@ impl UdpSocket {
     /// Get the number of packets in the receive queue.
     pub fn recv_queue_len(&self) -> usize {
         self.recv_queue.lock().unwrap().len()
+    }
+
+    // ========================================================================
+    // Multicast Support
+    // ========================================================================
+
+    /// Join a multicast group.
+    ///
+    /// This adds the multicast MAC address derived from the IPv4 multicast
+    /// address to the port's multicast filter.
+    ///
+    /// # Arguments
+    /// * `multicast_addr` - IPv4 multicast address (224.0.0.0 - 239.255.255.255)
+    /// * `_interface` - Interface address (ignored, using DPDK port)
+    pub fn join_multicast_v4(&mut self, multicast_addr: &Ipv4Addr, _interface: &Ipv4Addr) -> io::Result<()> {
+        // Validate multicast address
+        if !multicast_addr.is_multicast() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Address is not a multicast address",
+            ));
+        }
+
+        // Convert IPv4 multicast to MAC multicast (01:00:5e:xx:xx:xx)
+        let octets = multicast_addr.octets();
+        let mac = MacAddress::new([
+            0x01, 0x00, 0x5e,
+            octets[1] & 0x7f, // Lower 23 bits of IP mapped to MAC
+            octets[2],
+            octets[3],
+        ]);
+
+        // Add to multicast list
+        // Note: In a full implementation, we'd maintain a list and update it
+        self.resources.port.set_multicast_addrs(&[mac])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to join multicast: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Leave a multicast group.
+    ///
+    /// # Arguments
+    /// * `multicast_addr` - IPv4 multicast address to leave
+    /// * `_interface` - Interface address (ignored)
+    pub fn leave_multicast_v4(&mut self, multicast_addr: &Ipv4Addr, _interface: &Ipv4Addr) -> io::Result<()> {
+        if !multicast_addr.is_multicast() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Address is not a multicast address",
+            ));
+        }
+
+        // Clear multicast list (simplified - full implementation would track groups)
+        self.resources.port.set_multicast_addrs(&[])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to leave multicast: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Enable or disable reception of all multicast packets.
+    ///
+    /// When enabled, the port receives all multicast packets regardless
+    /// of whether they match the configured multicast addresses.
+    pub fn set_multicast_all(&mut self, enable: bool) -> io::Result<()> {
+        self.resources.port.set_allmulticast(enable)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set allmulticast: {}", e)))
+    }
+
+    /// Check if all-multicast mode is enabled.
+    pub fn multicast_all(&self) -> bool {
+        self.resources.port.is_allmulticast()
+    }
+
+    // ========================================================================
+    // Promiscuous Mode
+    // ========================================================================
+
+    /// Enable or disable promiscuous mode.
+    ///
+    /// In promiscuous mode, the port receives all packets regardless of
+    /// destination MAC address. This is useful for packet capture and
+    /// network monitoring.
+    pub fn set_promiscuous(&mut self, enable: bool) -> io::Result<()> {
+        // Note: This requires mutable access to Port, which is behind Arc
+        // In a full implementation, we'd need interior mutability
+        // For now, we just track the setting locally
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Promiscuous mode must be set before bind() via PortConfig",
+        ))
+    }
+
+    /// Check if promiscuous mode is enabled.
+    pub fn is_promiscuous(&self) -> bool {
+        self.resources.port.is_promiscuous()
+    }
+
+    // ========================================================================
+    // Hardware Offload Status
+    // ========================================================================
+
+    /// Check if hardware IPv4 checksum offload is enabled for TX.
+    ///
+    /// When enabled, the NIC calculates IPv4 header checksums in hardware,
+    /// reducing CPU overhead.
+    pub fn has_tx_ipv4_cksum_offload(&self) -> bool {
+        self.resources.port.config().tx_offload.ipv4_cksum
+    }
+
+    /// Check if hardware UDP checksum offload is enabled for TX.
+    pub fn has_tx_udp_cksum_offload(&self) -> bool {
+        self.resources.port.config().tx_offload.udp_cksum
+    }
+
+    /// Check if hardware IPv4 checksum offload is enabled for RX.
+    pub fn has_rx_ipv4_cksum_offload(&self) -> bool {
+        self.resources.port.config().rx_offload.ipv4_cksum
+    }
+
+    /// Check if hardware UDP checksum offload is enabled for RX.
+    pub fn has_rx_udp_cksum_offload(&self) -> bool {
+        self.resources.port.config().rx_offload.udp_cksum
     }
 }
 

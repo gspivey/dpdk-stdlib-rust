@@ -14,6 +14,72 @@ pub const DEFAULT_TX_DESC: u16 = 1024;
 /// Default burst size for packet I/O
 pub const DEFAULT_BURST_SIZE: u16 = 32;
 
+/// Hardware offload flags for RX
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RxOffload {
+    /// Hardware VLAN stripping
+    pub vlan_strip: bool,
+    /// Hardware IPv4 checksum verification
+    pub ipv4_cksum: bool,
+    /// Hardware UDP checksum verification
+    pub udp_cksum: bool,
+    /// Hardware TCP checksum verification
+    pub tcp_cksum: bool,
+}
+
+impl RxOffload {
+    /// Convert to DPDK offload flags
+    pub fn to_flags(&self) -> u64 {
+        let mut flags = 0u64;
+        if self.vlan_strip {
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+        }
+        if self.ipv4_cksum {
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
+        }
+        if self.udp_cksum {
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
+        }
+        if self.tcp_cksum {
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+        }
+        flags
+    }
+}
+
+/// Hardware offload flags for TX
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TxOffload {
+    /// Hardware VLAN insertion
+    pub vlan_insert: bool,
+    /// Hardware IPv4 checksum calculation
+    pub ipv4_cksum: bool,
+    /// Hardware UDP checksum calculation
+    pub udp_cksum: bool,
+    /// Hardware TCP checksum calculation
+    pub tcp_cksum: bool,
+}
+
+impl TxOffload {
+    /// Convert to DPDK offload flags
+    pub fn to_flags(&self) -> u64 {
+        let mut flags = 0u64;
+        if self.vlan_insert {
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT;
+        }
+        if self.ipv4_cksum {
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+        }
+        if self.udp_cksum {
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+        }
+        if self.tcp_cksum {
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+        }
+        flags
+    }
+}
+
 /// Configuration for an Ethernet port
 #[derive(Debug, Clone)]
 pub struct PortConfig {
@@ -29,6 +95,10 @@ pub struct PortConfig {
     pub promiscuous: bool,
     /// MTU size (0 for default)
     pub mtu: u32,
+    /// RX hardware offload configuration
+    pub rx_offload: RxOffload,
+    /// TX hardware offload configuration
+    pub tx_offload: TxOffload,
 }
 
 impl Default for PortConfig {
@@ -40,7 +110,71 @@ impl Default for PortConfig {
             nb_tx_desc: DEFAULT_TX_DESC,
             promiscuous: true,
             mtu: 0,
+            rx_offload: RxOffload::default(),
+            tx_offload: TxOffload::default(),
         }
+    }
+}
+
+impl PortConfig {
+    /// Create a new PortConfig with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the number of RX/TX queues
+    pub fn with_queues(mut self, rx: u16, tx: u16) -> Self {
+        self.nb_rx_queues = rx;
+        self.nb_tx_queues = tx;
+        self
+    }
+
+    /// Set the number of RX/TX descriptors
+    pub fn with_descriptors(mut self, rx: u16, tx: u16) -> Self {
+        self.nb_rx_desc = rx;
+        self.nb_tx_desc = tx;
+        self
+    }
+
+    /// Enable or disable promiscuous mode
+    pub fn with_promiscuous(mut self, enable: bool) -> Self {
+        self.promiscuous = enable;
+        self
+    }
+
+    /// Set the MTU
+    pub fn with_mtu(mut self, mtu: u32) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
+    /// Configure RX hardware offloads
+    pub fn with_rx_offload(mut self, offload: RxOffload) -> Self {
+        self.rx_offload = offload;
+        self
+    }
+
+    /// Configure TX hardware offloads
+    pub fn with_tx_offload(mut self, offload: TxOffload) -> Self {
+        self.tx_offload = offload;
+        self
+    }
+
+    /// Enable all checksum offloads (RX and TX)
+    pub fn with_checksum_offload(mut self) -> Self {
+        self.rx_offload = RxOffload {
+            ipv4_cksum: true,
+            udp_cksum: true,
+            tcp_cksum: true,
+            ..Default::default()
+        };
+        self.tx_offload = TxOffload {
+            ipv4_cksum: true,
+            udp_cksum: true,
+            tcp_cksum: true,
+            ..Default::default()
+        };
+        self
     }
 }
 
@@ -132,12 +266,62 @@ pub struct PortStats {
     pub tx_errors: u64,
 }
 
+/// Device capability information
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeviceCapabilities {
+    /// Supported RX offloads
+    pub rx_offload_capa: u64,
+    /// Supported TX offloads
+    pub tx_offload_capa: u64,
+    /// Maximum RX queues
+    pub max_rx_queues: u16,
+    /// Maximum TX queues
+    pub max_tx_queues: u16,
+}
+
+impl DeviceCapabilities {
+    /// Check if RX IPv4 checksum offload is supported
+    pub fn supports_rx_ipv4_cksum(&self) -> bool {
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM) != 0
+    }
+
+    /// Check if RX UDP checksum offload is supported
+    pub fn supports_rx_udp_cksum(&self) -> bool {
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM) != 0
+    }
+
+    /// Check if TX IPv4 checksum offload is supported
+    pub fn supports_tx_ipv4_cksum(&self) -> bool {
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0
+    }
+
+    /// Check if TX UDP checksum offload is supported
+    pub fn supports_tx_udp_cksum(&self) -> bool {
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0
+    }
+
+    /// Check if VLAN stripping is supported
+    pub fn supports_vlan_strip(&self) -> bool {
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP) != 0
+    }
+
+    /// Check if VLAN insertion is supported
+    pub fn supports_vlan_insert(&self) -> bool {
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+    }
+}
+
 /// A DPDK Ethernet port
 pub struct Port {
     port_id: u16,
     config: PortConfig,
     started: bool,
     mac_address: MacAddress,
+    /// Device capabilities (what the NIC supports)
+    capabilities: DeviceCapabilities,
+    /// Actual offloads enabled (may differ from config if not supported)
+    active_rx_offload: u64,
+    active_tx_offload: u64,
 }
 
 impl Port {
@@ -171,17 +355,45 @@ impl Port {
             return Err(DpdkError::PortConfigFailed(ret));
         }
 
+        // Store capabilities
+        let capabilities = DeviceCapabilities {
+            rx_offload_capa: dev_info.rx_offload_capa,
+            tx_offload_capa: dev_info.tx_offload_capa,
+            max_rx_queues: dev_info.max_rx_queues,
+            max_tx_queues: dev_info.max_tx_queues,
+        };
+
         // Validate queue counts against device limits
         let nb_rx_queues = config.nb_rx_queues.min(dev_info.max_rx_queues);
         let nb_tx_queues = config.nb_tx_queues.min(dev_info.max_tx_queues);
 
-        // Configure the port
+        // Only enable offloads that are supported by the device
+        let requested_rx_offload = config.rx_offload.to_flags();
+        let requested_tx_offload = config.tx_offload.to_flags();
+        let active_rx_offload = requested_rx_offload & dev_info.rx_offload_capa;
+        let active_tx_offload = requested_tx_offload & dev_info.tx_offload_capa;
+
+        // Log if any requested offloads were not available
+        if active_rx_offload != requested_rx_offload {
+            let unsupported = requested_rx_offload & !dev_info.rx_offload_capa;
+            eprintln!("Warning: Some RX offloads not supported by device (flags: 0x{:x})", unsupported);
+        }
+        if active_tx_offload != requested_tx_offload {
+            let unsupported = requested_tx_offload & !dev_info.tx_offload_capa;
+            eprintln!("Warning: Some TX offloads not supported by device (flags: 0x{:x})", unsupported);
+        }
+
+        // Configure the port with only supported offloads
         let eth_conf = dpdk_sys::rte_eth_conf {
             rxmode: dpdk_sys::rte_eth_rxmode {
                 mtu: config.mtu,
+                offloads: active_rx_offload,
                 ..Default::default()
             },
-            txmode: dpdk_sys::rte_eth_txmode::default(),
+            txmode: dpdk_sys::rte_eth_txmode {
+                offloads: active_tx_offload,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -246,6 +458,9 @@ impl Port {
             },
             started: false,
             mac_address,
+            capabilities,
+            active_rx_offload,
+            active_tx_offload,
         })
     }
 
@@ -260,7 +475,35 @@ impl Port {
             config: PortConfig::default(),
             started: false,
             mac_address: MacAddress::default(),
+            capabilities: DeviceCapabilities::default(),
+            active_rx_offload: 0,
+            active_tx_offload: 0,
         })
+    }
+
+    /// Get the device capabilities
+    pub fn capabilities(&self) -> &DeviceCapabilities {
+        &self.capabilities
+    }
+
+    /// Get the active RX offload flags
+    pub fn active_rx_offload(&self) -> u64 {
+        self.active_rx_offload
+    }
+
+    /// Get the active TX offload flags
+    pub fn active_tx_offload(&self) -> u64 {
+        self.active_tx_offload
+    }
+
+    /// Check if a specific RX offload is active
+    pub fn is_rx_offload_active(&self, offload: u64) -> bool {
+        (self.active_rx_offload & offload) != 0
+    }
+
+    /// Check if a specific TX offload is active
+    pub fn is_tx_offload_active(&self, offload: u64) -> bool {
+        (self.active_tx_offload & offload) != 0
     }
 
     /// Get the port ID
@@ -424,6 +667,106 @@ impl Port {
         }
 
         Ok(nb_tx)
+    }
+
+    // ========================================================================
+    // Promiscuous Mode
+    // ========================================================================
+
+    /// Enable promiscuous mode on the port
+    ///
+    /// In promiscuous mode, the port receives all packets regardless of
+    /// destination MAC address.
+    pub fn set_promiscuous(&mut self, enable: bool) -> DpdkResult<()> {
+        let ret = if enable {
+            unsafe { dpdk_sys::rte_eth_promiscuous_enable(self.port_id) }
+        } else {
+            unsafe { dpdk_sys::rte_eth_promiscuous_disable(self.port_id) }
+        };
+
+        if ret != 0 {
+            return Err(DpdkError::PortConfigFailed(ret));
+        }
+
+        self.config.promiscuous = enable;
+        Ok(())
+    }
+
+    /// Check if promiscuous mode is enabled
+    pub fn is_promiscuous(&self) -> bool {
+        unsafe { dpdk_sys::rte_eth_promiscuous_get(self.port_id) != 0 }
+    }
+
+    // ========================================================================
+    // All-Multicast Mode
+    // ========================================================================
+
+    /// Enable all-multicast mode on the port
+    ///
+    /// In all-multicast mode, the port receives all multicast packets
+    /// regardless of whether they match configured multicast addresses.
+    pub fn set_allmulticast(&self, enable: bool) -> DpdkResult<()> {
+        let ret = if enable {
+            unsafe { dpdk_sys::rte_eth_allmulticast_enable(self.port_id) }
+        } else {
+            unsafe { dpdk_sys::rte_eth_allmulticast_disable(self.port_id) }
+        };
+
+        if ret != 0 {
+            return Err(DpdkError::PortConfigFailed(ret));
+        }
+        Ok(())
+    }
+
+    /// Check if all-multicast mode is enabled
+    pub fn is_allmulticast(&self) -> bool {
+        unsafe { dpdk_sys::rte_eth_allmulticast_get(self.port_id) != 0 }
+    }
+
+    // ========================================================================
+    // Multicast Address Management
+    // ========================================================================
+
+    /// Set the list of multicast MAC addresses to receive
+    ///
+    /// This configures the hardware multicast filter. Pass an empty slice
+    /// to clear all multicast addresses.
+    pub fn set_multicast_addrs(&self, addrs: &[MacAddress]) -> DpdkResult<()> {
+        if addrs.is_empty() {
+            // Clear multicast list
+            let ret = unsafe {
+                dpdk_sys::rte_eth_dev_set_mc_addr_list(
+                    self.port_id,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret != 0 {
+                return Err(DpdkError::PortConfigFailed(ret));
+            }
+            return Ok(());
+        }
+
+        // Convert MacAddresses to rte_ether_addr
+        let mut mc_addrs: Vec<dpdk_sys::rte_ether_addr> = addrs
+            .iter()
+            .map(|mac| dpdk_sys::rte_ether_addr {
+                addr_bytes: mac.octets(),
+            })
+            .collect();
+
+        let ret = unsafe {
+            dpdk_sys::rte_eth_dev_set_mc_addr_list(
+                self.port_id,
+                mc_addrs.as_mut_ptr(),
+                mc_addrs.len() as u32,
+            )
+        };
+
+        if ret != 0 {
+            return Err(DpdkError::PortConfigFailed(ret));
+        }
+        Ok(())
     }
 }
 

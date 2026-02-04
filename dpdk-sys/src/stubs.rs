@@ -637,6 +637,35 @@ pub extern "C" fn rte_eth_promiscuous_disable(_port_id: u16) -> c_int {
 }
 
 #[no_mangle]
+pub extern "C" fn rte_eth_promiscuous_get(_port_id: u16) -> c_int {
+    1 // Promiscuous is enabled by default in stubs
+}
+
+#[no_mangle]
+pub extern "C" fn rte_eth_allmulticast_enable(_port_id: u16) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rte_eth_allmulticast_disable(_port_id: u16) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rte_eth_allmulticast_get(_port_id: u16) -> c_int {
+    0 // All-multicast disabled by default
+}
+
+#[no_mangle]
+pub extern "C" fn rte_eth_dev_set_mc_addr_list(
+    _port_id: u16,
+    _mc_addr_set: *mut rte_ether_addr,
+    _nb_mc_addr: u32,
+) -> c_int {
+    0 // Success
+}
+
+#[no_mangle]
 pub extern "C" fn rte_eth_dev_info_get(
     _port_id: u16,
     dev_info: *mut rte_eth_dev_info,

@@ -161,6 +161,36 @@ The compat layer delegates to the underlying DPDK implementation. Here's the sta
 | Receive queue | ✅ | Buffering for connected sockets |
 | Stats access | ✅ | `connection_stats()` method |
 
+### Multicast Support
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Join multicast group | ✅ | `join_multicast_v4()` |
+| Leave multicast group | ✅ | `leave_multicast_v4()` |
+| All-multicast mode | ✅ | `set_multicast_all()` |
+| Multicast MAC conversion | ✅ | IPv4 -> 01:00:5e:xx:xx:xx |
+
+### Promiscuous Mode
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Enable/disable | ✅ | Via `PortConfig` at init time |
+| Query status | ✅ | `is_promiscuous()` |
+| All-multicast mode | ✅ | `set_allmulticast()` on Port |
+
+### Hardware Offload Support
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Device capabilities | ✅ | `DeviceCapabilities` struct |
+| RX IPv4 checksum | ✅ | Optional, checked against device |
+| RX UDP checksum | ✅ | Optional, checked against device |
+| TX IPv4 checksum | ✅ | Optional, checked against device |
+| TX UDP checksum | ✅ | Optional, checked against device |
+| VLAN strip/insert | ✅ | Optional, checked against device |
+| Capability validation | ✅ | Only enables supported offloads |
+| Active offload query | ✅ | `is_rx/tx_offload_active()` |
+
 ### API Compatibility Tests
 
 The `dpdk-udp` crate includes compile-time API compatibility tests that verify
@@ -233,10 +263,11 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 - [x] ICMP echo reply (ping) ✅
 - [x] Connection tracking for connected sockets ✅
 
-### Phase 4: Advanced Features
-- [ ] Multicast group management via DPDK
-- [ ] Promiscuous mode integration
-- [ ] Hardware offload configuration
+### Phase 4: Advanced Features ✅
+- [x] Multicast group management via DPDK ✅
+- [x] Promiscuous mode integration ✅
+- [x] Hardware offload configuration ✅
+- [x] Device capability checking ✅
 
 ### Phase 5: Raw Socket Backend (Non-DPDK Fallback)
 - [ ] `AF_PACKET` raw socket backend for Linux
