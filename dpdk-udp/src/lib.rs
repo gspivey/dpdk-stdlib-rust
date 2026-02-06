@@ -8,6 +8,8 @@
 //! - **UDP Socket API** - Drop-in replacement for `std::net::UdpSocket`
 //! - **ARP Protocol** - Automatic address resolution for real network communication
 //! - **ICMP Protocol** - Echo reply (ping) support for network diagnostics
+//! - **Multiple Backends** - DPDK, AF_PACKET raw sockets, or AF_PACKET with PACKET_MMAP
+//! - **Runtime Backend Selection** - Choose backend at runtime based on availability
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
@@ -15,7 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::collections::VecDeque;
 
 use dpdk::{Mbuf, Mempool, Port};
-use dpdk::port::{MacAddress, PortConfig, RxOffload, TxOffload};
+use dpdk::port::{MacAddress, PortConfig};
 use dpdk::mbuf::MempoolConfig;
 
 pub use dpdk::port::{RxOffload as HwRxOffload, TxOffload as HwTxOffload};
@@ -28,9 +30,16 @@ use thiserror::Error;
 
 pub mod arp;
 pub mod icmp;
+pub mod backend;
+pub mod backend_dpdk;
+pub mod backend_raw;
+pub mod ring_buffer;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpHandler, IcmpPacket};
+pub use backend::{PacketBackend, BackendConfig, BackendType};
+pub use backend_dpdk::DpdkBackend;
+pub use backend_raw::RawSocketBackend;
 
 // ============================================================================
 // Error Types
@@ -256,6 +265,84 @@ pub fn build_udp_packet(
     Ok(())
 }
 
+/// Build a complete UDP packet as a raw Ethernet frame (backend-agnostic).
+///
+/// Unlike `build_udp_packet()` which writes into a DPDK mbuf, this function
+/// returns a `Vec<u8>` containing the complete Ethernet frame. This can be used
+/// with any `PacketBackend` implementation.
+///
+/// The frame includes: Ethernet header + IPv4 header + UDP header + payload.
+/// All checksums (IP and UDP) are calculated.
+pub fn build_udp_frame(
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    ttl: u8,
+) -> UdpResult<Vec<u8>> {
+    if payload.len() > MAX_UDP_PAYLOAD {
+        return Err(UdpError::PayloadTooLarge {
+            max: MAX_UDP_PAYLOAD,
+            actual: payload.len(),
+        });
+    }
+
+    let total_len = TOTAL_HEADER_LEN + payload.len();
+    let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+    let mut frame = vec![0u8; total_len];
+
+    let src_ip_bytes = src_ip.octets();
+    let dst_ip_bytes = dst_ip.octets();
+
+    // === Ethernet Header (14 bytes) ===
+    frame[0..6].copy_from_slice(dst_mac);
+    frame[6..12].copy_from_slice(src_mac);
+    frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+    // === IPv4 Header (20 bytes) ===
+    let ip = ETH_HEADER_LEN;
+    frame[ip] = 0x45;                                           // Version (4) + IHL (5)
+    frame[ip + 1] = 0x00;                                       // DSCP + ECN
+    frame[ip + 2..ip + 4].copy_from_slice(&ip_total_len.to_be_bytes()); // Total Length
+    frame[ip + 4..ip + 6].copy_from_slice(&[0x00, 0x00]);       // Identification
+    frame[ip + 6..ip + 8].copy_from_slice(&[0x40, 0x00]);       // Flags (DF) + Fragment Offset
+    frame[ip + 8] = ttl;                                         // TTL
+    frame[ip + 9] = IP_PROTO_UDP;                                // Protocol
+    frame[ip + 10..ip + 12].copy_from_slice(&[0x00, 0x00]);     // Checksum (placeholder)
+    frame[ip + 12..ip + 16].copy_from_slice(&src_ip_bytes);     // Source IP
+    frame[ip + 16..ip + 20].copy_from_slice(&dst_ip_bytes);     // Destination IP
+
+    // Calculate and set IP checksum
+    let ip_cksum = ipv4_checksum(&frame[ip..ip + IPV4_HEADER_LEN]);
+    frame[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // === UDP Header (8 bytes) ===
+    let udp = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+    frame[udp..udp + 2].copy_from_slice(&src_port.to_be_bytes());   // Source Port
+    frame[udp + 2..udp + 4].copy_from_slice(&dst_port.to_be_bytes()); // Destination Port
+    frame[udp + 4..udp + 6].copy_from_slice(&udp_len.to_be_bytes()); // Length
+    frame[udp + 6..udp + 8].copy_from_slice(&[0x00, 0x00]);         // Checksum (placeholder)
+
+    // === Payload ===
+    frame[TOTAL_HEADER_LEN..].copy_from_slice(payload);
+
+    // Calculate and set UDP checksum
+    let udp_cksum = udp_checksum(
+        &src_ip_bytes,
+        &dst_ip_bytes,
+        &frame[udp..udp + UDP_HEADER_LEN],
+        payload,
+    );
+    frame[udp + 6..udp + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
+    Ok(frame)
+}
+
 // ============================================================================
 // Packet Parsing
 // ============================================================================
@@ -428,6 +515,197 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
 }
 
 // ============================================================================
+// Socket Backend Abstraction
+// ============================================================================
+
+/// Internal enum for backend dispatch.
+///
+/// Supports both the original DPDK-direct path (for backward compatibility)
+/// and the generic `PacketBackend` trait path (for raw sockets and other backends).
+enum SocketBackend {
+    /// Direct DPDK backend (original code path)
+    Dpdk(Arc<DpdkResources>),
+    /// Generic backend via `PacketBackend` trait
+    Generic(Arc<dyn PacketBackend>),
+}
+
+impl SocketBackend {
+    fn mac_address(&self) -> [u8; 6] {
+        match self {
+            SocketBackend::Dpdk(res) => res.src_mac.octets(),
+            SocketBackend::Generic(b) => b.mac_address(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            SocketBackend::Dpdk(_) => "dpdk",
+            SocketBackend::Generic(b) => b.backend_name(),
+        }
+    }
+
+    /// Send a raw Ethernet frame via the backend.
+    fn send_frame(&self, frame: &[u8]) -> io::Result<usize> {
+        match self {
+            SocketBackend::Dpdk(res) => {
+                let mut mbuf = res.mempool.alloc()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
+                let data = mbuf.data_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
+                if data.len() < frame.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Frame too large for mbuf"));
+                }
+                data[..frame.len()].copy_from_slice(frame);
+                mbuf.set_data_len(frame.len() as u16);
+                mbuf.set_packet_len(frame.len() as u32);
+                let mut packets = vec![mbuf];
+                let sent = res.port.tx_burst(0, &mut packets)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
+                if sent == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+                }
+                Ok(frame.len())
+            }
+            SocketBackend::Generic(b) => b.send_frame(frame),
+        }
+    }
+
+    /// Receive raw Ethernet frames via the backend.
+    fn recv_frames(&self, max_frames: usize) -> io::Result<Vec<Vec<u8>>> {
+        match self {
+            SocketBackend::Dpdk(res) => {
+                let packets = res.port.rx_burst(0, max_frames as u16)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+                let mut frames = Vec::with_capacity(packets.len());
+                for mbuf in &packets {
+                    if let Some(data) = mbuf.data() {
+                        let len = mbuf.data_len() as usize;
+                        let actual_len = len.min(data.len());
+                        frames.push(data[..actual_len].to_vec());
+                    }
+                }
+                Ok(frames)
+            }
+            SocketBackend::Generic(b) => b.recv_frames(max_frames),
+        }
+    }
+
+    fn is_promiscuous(&self) -> bool {
+        match self {
+            SocketBackend::Dpdk(res) => res.port.is_promiscuous(),
+            SocketBackend::Generic(b) => b.is_promiscuous(),
+        }
+    }
+
+    fn set_promiscuous(&self, enable: bool) -> io::Result<()> {
+        match self {
+            SocketBackend::Dpdk(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Promiscuous mode must be set before bind() via PortConfig",
+            )),
+            SocketBackend::Generic(b) => b.set_promiscuous(enable),
+        }
+    }
+
+    fn is_allmulticast(&self) -> bool {
+        match self {
+            SocketBackend::Dpdk(res) => res.port.is_allmulticast(),
+            SocketBackend::Generic(b) => b.is_allmulticast(),
+        }
+    }
+
+    fn set_allmulticast(&self, enable: bool) -> io::Result<()> {
+        match self {
+            SocketBackend::Dpdk(res) => {
+                res.port.set_allmulticast(enable)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set allmulticast: {}", e)))
+            }
+            SocketBackend::Generic(b) => b.set_allmulticast(enable),
+        }
+    }
+}
+
+// ============================================================================
+// Runtime Backend Selection
+// ============================================================================
+
+/// Create a packet backend based on the given configuration.
+///
+/// This is the main entry point for runtime backend selection.
+///
+/// # Backend Selection
+///
+/// - `BackendType::Dpdk` - Initialize DPDK and use it for packet I/O
+/// - `BackendType::RawSocketMmap` - Use AF_PACKET with PACKET_MMAP ring buffers
+/// - `BackendType::RawSocket` - Use AF_PACKET with basic send/recv
+/// - `BackendType::Auto` - Try DPDK first, fall back to raw socket
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use dpdk_udp::{create_backend, BackendConfig, BackendType};
+///
+/// // Use AF_PACKET with mmap on eth0
+/// let config = BackendConfig::default()
+///     .with_raw_socket_mmap("eth0");
+/// let backend = create_backend(&config)?;
+/// ```
+pub fn create_backend(config: &BackendConfig) -> io::Result<Arc<dyn PacketBackend>> {
+    match config.backend_type {
+        BackendType::Dpdk => {
+            let backend = DpdkBackend::new(config.dpdk_port_id)?;
+            Ok(Arc::new(backend))
+        }
+        BackendType::RawSocketMmap => {
+            let iface = config.interface_name.as_deref()
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Interface name required for raw socket backend",
+                ))?;
+            let ring_config = ring_buffer::RingConfig {
+                frame_size: config.ring_frame_size,
+                frame_count: config.ring_frame_count,
+            };
+            let backend = RawSocketBackend::with_mmap(iface, true, &ring_config)?;
+            Ok(Arc::new(backend))
+        }
+        BackendType::RawSocket => {
+            let iface = config.interface_name.as_deref()
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Interface name required for raw socket backend",
+                ))?;
+            let backend = RawSocketBackend::new(iface)?;
+            Ok(Arc::new(backend))
+        }
+        BackendType::Auto => {
+            // Try DPDK first
+            if let Ok(backend) = DpdkBackend::new(config.dpdk_port_id) {
+                return Ok(Arc::new(backend));
+            }
+            // Fall back to raw socket with mmap if interface is specified
+            if let Some(ref iface) = config.interface_name {
+                let ring_config = ring_buffer::RingConfig {
+                    frame_size: config.ring_frame_size,
+                    frame_count: config.ring_frame_count,
+                };
+                if let Ok(backend) = RawSocketBackend::with_mmap(iface, true, &ring_config) {
+                    return Ok(Arc::new(backend));
+                }
+                // Fall back to basic raw socket
+                if let Ok(backend) = RawSocketBackend::new(iface) {
+                    return Ok(Arc::new(backend));
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "No packet backend available (tried DPDK, AF_PACKET+mmap, AF_PACKET)",
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // Connection Tracking
 // ============================================================================
 
@@ -499,6 +777,7 @@ impl ReceiveQueue {
         self.packets.pop_front()
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.packets.is_empty()
     }
@@ -513,9 +792,17 @@ impl ReceiveQueue {
 // ============================================================================
 
 /// Drop-in replacement for std::net::UdpSocket with DPDK acceleration
+///
+/// Supports multiple packet I/O backends:
+/// - **DPDK** (default) - High-performance userspace networking
+/// - **AF_PACKET** - Linux raw sockets (fallback when DPDK is unavailable)
+/// - **AF_PACKET+MMAP** - Linux raw sockets with zero-copy ring buffers
 pub struct UdpSocket {
     local_addr: SocketAddr,
     connected_addr: Option<SocketAddr>,
+    /// Backend for packet I/O (DPDK or generic)
+    socket_backend: SocketBackend,
+    /// Legacy DPDK resources (kept for backward-compatible methods)
     resources: Arc<DpdkResources>,
     ttl: u8,
     /// Destination MAC address (would normally come from ARP)
@@ -568,9 +855,12 @@ impl UdpSocket {
 
         println!("✅ DPDK UDP socket bound to {} (MAC: {})", addr, resources.src_mac);
 
+        let socket_backend = SocketBackend::Dpdk(Arc::clone(&resources));
+
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
             connected_addr: None,
+            socket_backend,
             resources,
             ttl: 64,
             dst_mac: MacAddress::broadcast(),
@@ -581,6 +871,79 @@ impl UdpSocket {
             auto_arp: true,
             auto_icmp: true,
         })
+    }
+
+    /// Creates a UDP socket bound to the given address using a specific packet backend.
+    ///
+    /// This allows using alternative backends like AF_PACKET raw sockets
+    /// instead of DPDK.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use dpdk_udp::{UdpSocket, BackendConfig};
+    ///
+    /// // Use AF_PACKET with mmap on eth0
+    /// let config = BackendConfig::default().with_raw_socket_mmap("eth0");
+    /// let backend = dpdk_udp::create_backend(&config)?;
+    /// let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", backend)?;
+    /// ```
+    pub fn bind_with_backend<A: ToSocketAddrs>(
+        addr: A,
+        backend: Arc<dyn PacketBackend>,
+    ) -> io::Result<UdpSocket> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
+
+        let local_v4 = match addr {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+            }
+        };
+
+        let local_mac = backend.mac_address();
+        let local_ip = *local_v4.ip();
+        let arp_cache = Arc::new(ArpCache::new());
+
+        let arp_handler = ArpHandler::with_cache(
+            local_mac,
+            local_ip,
+            Arc::clone(&arp_cache),
+        );
+
+        let icmp_handler = IcmpHandler::new(local_mac, local_ip);
+
+        let backend_name = backend.backend_name();
+
+        // We still need DpdkResources for backward-compatible methods.
+        // Initialize DPDK resources as a fallback (they're lazy-initialized).
+        let resources = get_or_init_dpdk(0)?;
+
+        println!("✅ {} UDP socket bound to {} (MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+            backend_name, addr,
+            local_mac[0], local_mac[1], local_mac[2],
+            local_mac[3], local_mac[4], local_mac[5]);
+
+        Ok(UdpSocket {
+            local_addr: SocketAddr::V4(local_v4),
+            connected_addr: None,
+            socket_backend: SocketBackend::Generic(backend),
+            resources,
+            ttl: 64,
+            dst_mac: MacAddress::broadcast(),
+            arp_handler,
+            icmp_handler,
+            connection_state: None,
+            recv_queue: Mutex::new(ReceiveQueue::new(1024)),
+            auto_arp: true,
+            auto_icmp: true,
+        })
+    }
+
+    /// Get the name of the active packet I/O backend.
+    pub fn active_backend(&self) -> &'static str {
+        self.socket_backend.backend_name()
     }
 
     /// Sends data on the socket to the given address.
@@ -594,7 +957,10 @@ impl UdpSocket {
         self.send_to_addr(buf, addr)
     }
 
-    /// Internal send implementation with resolved address
+    /// Internal send implementation with resolved address.
+    ///
+    /// Uses `build_udp_frame()` to construct the packet and sends it via the
+    /// active backend (DPDK or generic PacketBackend).
     fn send_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         // Extract IPv4 addresses
         let (src_ip, src_port) = match self.local_addr {
@@ -615,15 +981,12 @@ impl UdpSocket {
         let dst_mac = self.arp_handler.resolve(&dst_ip)
             .unwrap_or_else(|| self.dst_mac.clone());
 
-        // Allocate an mbuf from the mempool
-        let mut mbuf = self.resources.mempool.alloc()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
+        let src_mac = self.socket_backend.mac_address();
 
-        // Build the packet
-        build_udp_packet(
-            &mut mbuf,
-            &self.resources.src_mac,
-            &dst_mac,
+        // Build the frame using backend-agnostic builder
+        let frame = build_udp_frame(
+            &src_mac,
+            &dst_mac.octets(),
             src_ip,
             dst_ip,
             src_port,
@@ -632,15 +995,8 @@ impl UdpSocket {
             self.ttl,
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
 
-        // Transmit the packet
-        let mut packets = vec![mbuf];
-        let sent = self.resources.port.tx_burst(0, &mut packets)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
-
-        if sent == 0 {
-            // Packet wasn't sent, it will be freed when dropped
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
-        }
+        // Send via the active backend
+        self.socket_backend.send_frame(&frame)?;
 
         // Update connection state if connected
         if let Some(ref state) = self.connection_state {
@@ -680,66 +1036,46 @@ impl UdpSocket {
             }
         };
 
-        // Try to receive packets
-        let packets = self.resources.port.rx_burst(0, 32)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+        // Receive raw frames via the active backend
+        let frames = self.socket_backend.recv_frames(32)?;
 
-        if packets.is_empty() {
+        if frames.is_empty() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets available"));
         }
 
-        // Process packets, handling ARP/ICMP and looking for UDP packets for our port
+        // Process frames, handling ARP/ICMP and looking for UDP packets for our port
+        // (reuses ARP/ICMP handlers which are already backend-agnostic)
         let mut result: Option<(usize, SocketAddr)> = None;
 
-        for mbuf in packets {
-            if let Some(data) = mbuf.data() {
-                // Check ethertype
-                if data.len() >= 14 {
-                    let ethertype = u16::from_be_bytes([data[12], data[13]]);
+        for frame_data in &frames {
+            // Check ethertype
+            if frame_data.len() >= 14 {
+                let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
 
-                    // Handle ARP packets
-                    if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
-                        if let Some(reply_frame) = self.arp_handler.process_arp(data) {
-                            // Send ARP reply
-                            if let Ok(mut reply_mbuf) = self.resources.mempool.alloc() {
-                                if let Some(reply_data) = reply_mbuf.data_mut() {
-                                    let len = reply_frame.len().min(reply_data.len());
-                                    reply_data[..len].copy_from_slice(&reply_frame[..len]);
-                                    reply_mbuf.set_data_len(len as u16);
-                                    reply_mbuf.set_packet_len(len as u32);
-                                    let mut packets = vec![reply_mbuf];
-                                    let _ = self.resources.port.tx_burst(0, &mut packets);
-                                }
-                            }
+                // Handle ARP packets (reuse existing handler)
+                if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
+                    if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
+                        // Send ARP reply via backend
+                        let _ = self.socket_backend.send_frame(&reply_frame);
+                    }
+                    continue;
+                }
+
+                // Handle ICMP packets (reuse existing handler)
+                if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
+                    let protocol = frame_data[ETH_HEADER_LEN + 9];
+                    if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
+                        if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
+                            // Send ICMP reply via backend
+                            let _ = self.socket_backend.send_frame(&reply_frame);
                         }
                         continue;
-                    }
-
-                    // Handle ICMP packets
-                    if ethertype == ETH_TYPE_IPV4 && data.len() > ETH_HEADER_LEN + 9 {
-                        let protocol = data[ETH_HEADER_LEN + 9];
-                        if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
-                            if let Some(reply_frame) = self.icmp_handler.process_icmp(data) {
-                                // Send ICMP reply
-                                if let Ok(mut reply_mbuf) = self.resources.mempool.alloc() {
-                                    if let Some(reply_data) = reply_mbuf.data_mut() {
-                                        let len = reply_frame.len().min(reply_data.len());
-                                        reply_data[..len].copy_from_slice(&reply_frame[..len]);
-                                        reply_mbuf.set_data_len(len as u16);
-                                        reply_mbuf.set_packet_len(len as u32);
-                                        let mut packets = vec![reply_mbuf];
-                                        let _ = self.resources.port.tx_burst(0, &mut packets);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
                     }
                 }
             }
 
-            // Try to parse as UDP
-            if let Some(parsed) = parse_udp_from_mbuf(&mbuf) {
+            // Try to parse as UDP (reuse existing parser)
+            if let Some(parsed) = parse_udp_packet(frame_data) {
                 // Check if this packet is for us
                 if parsed.dst_port == local_port {
                     let src_addr = SocketAddr::V4(
@@ -776,7 +1112,7 @@ impl UdpSocket {
                     }
                 }
             }
-            // Packet not for us or not valid UDP, it will be dropped when mbuf goes out of scope
+            // Packet not for us or not valid UDP - dropped
         }
 
         result.ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no matching packets"))
@@ -846,9 +1182,9 @@ impl UdpSocket {
         self.dst_mac = mac;
     }
 
-    /// Gets the source MAC address (from the DPDK port).
-    pub fn src_mac(&self) -> &MacAddress {
-        &self.resources.src_mac
+    /// Gets the source MAC address (from the active backend).
+    pub fn src_mac(&self) -> MacAddress {
+        MacAddress::new(self.socket_backend.mac_address())
     }
 
     // ========================================================================
@@ -883,19 +1219,7 @@ impl UdpSocket {
     /// This is useful for pre-populating the ARP cache before sending data.
     pub fn send_arp_request(&self, target_ip: Ipv4Addr) -> io::Result<()> {
         if let Some(frame) = self.arp_handler.make_request(target_ip) {
-            let mut mbuf = self.resources.mempool.alloc()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
-
-            if let Some(data) = mbuf.data_mut() {
-                let len = frame.len().min(data.len());
-                data[..len].copy_from_slice(&frame[..len]);
-                mbuf.set_data_len(len as u16);
-                mbuf.set_packet_len(len as u32);
-
-                let mut packets = vec![mbuf];
-                self.resources.port.tx_burst(0, &mut packets)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
-            }
+            self.socket_backend.send_frame(&frame)?;
         }
         Ok(())
     }
@@ -1003,13 +1327,12 @@ impl UdpSocket {
     /// When enabled, the port receives all multicast packets regardless
     /// of whether they match the configured multicast addresses.
     pub fn set_multicast_all(&mut self, enable: bool) -> io::Result<()> {
-        self.resources.port.set_allmulticast(enable)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set allmulticast: {}", e)))
+        self.socket_backend.set_allmulticast(enable)
     }
 
     /// Check if all-multicast mode is enabled.
     pub fn multicast_all(&self) -> bool {
-        self.resources.port.is_allmulticast()
+        self.socket_backend.is_allmulticast()
     }
 
     // ========================================================================
@@ -1021,19 +1344,16 @@ impl UdpSocket {
     /// In promiscuous mode, the port receives all packets regardless of
     /// destination MAC address. This is useful for packet capture and
     /// network monitoring.
+    ///
+    /// Note: For DPDK backend, promiscuous mode must be set before bind()
+    /// via PortConfig. For raw socket backends, it can be set at any time.
     pub fn set_promiscuous(&mut self, enable: bool) -> io::Result<()> {
-        // Note: This requires mutable access to Port, which is behind Arc
-        // In a full implementation, we'd need interior mutability
-        // For now, we just track the setting locally
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Promiscuous mode must be set before bind() via PortConfig",
-        ))
+        self.socket_backend.set_promiscuous(enable)
     }
 
     /// Check if promiscuous mode is enabled.
     pub fn is_promiscuous(&self) -> bool {
-        self.resources.port.is_promiscuous()
+        self.socket_backend.is_promiscuous()
     }
 
     // ========================================================================
@@ -1539,5 +1859,171 @@ mod tests {
 
         let resp_frame = response.unwrap();
         assert_eq!(&resp_frame[TOTAL_HEADER_LEN..], b"test");
+    }
+
+    // ========================================================================
+    // BUILD_UDP_FRAME TESTS (backend-agnostic packet building)
+    // ========================================================================
+
+    #[test]
+    fn test_build_udp_frame_basic() {
+        let src_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let src_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let dst_ip = Ipv4Addr::new(192, 168, 1, 2);
+
+        let frame = build_udp_frame(
+            &src_mac, &dst_mac,
+            src_ip, dst_ip,
+            12345, 9000,
+            b"hello world",
+            64,
+        );
+        assert!(frame.is_ok());
+
+        let frame = frame.unwrap();
+        assert_eq!(frame.len(), TOTAL_HEADER_LEN + 11); // 42 + "hello world"
+
+        // Parse it back
+        let parsed = parse_udp_packet(&frame);
+        assert!(parsed.is_some());
+
+        let p = parsed.unwrap();
+        assert_eq!(p.src_mac, src_mac);
+        assert_eq!(p.dst_mac, dst_mac);
+        assert_eq!(p.src_ip, src_ip);
+        assert_eq!(p.dst_ip, dst_ip);
+        assert_eq!(p.src_port, 12345);
+        assert_eq!(p.dst_port, 9000);
+        assert_eq!(p.payload, b"hello world");
+    }
+
+    #[test]
+    fn test_build_udp_frame_empty_payload() {
+        let frame = build_udp_frame(
+            &[0; 6], &[0xff; 6],
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            8080, 80,
+            b"",
+            128,
+        ).unwrap();
+
+        assert_eq!(frame.len(), TOTAL_HEADER_LEN);
+        let parsed = parse_udp_packet(&frame).unwrap();
+        assert!(parsed.payload.is_empty());
+    }
+
+    #[test]
+    fn test_build_udp_frame_payload_too_large() {
+        let large_payload = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        let result = build_udp_frame(
+            &[0; 6], &[0; 6],
+            Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED,
+            0, 0,
+            &large_payload,
+            64,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_udp_frame_checksums_valid() {
+        let frame = build_udp_frame(
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 2),
+            5000, 6000,
+            b"checksum test data",
+            64,
+        ).unwrap();
+
+        // Verify IP checksum (should be valid when recalculated)
+        let ip_start = ETH_HEADER_LEN;
+        let ip_verify = ipv4_checksum(&frame[ip_start..ip_start + IPV4_HEADER_LEN]);
+        assert_eq!(ip_verify, 0, "IP checksum should verify to 0");
+    }
+
+    #[test]
+    fn test_build_udp_frame_roundtrip() {
+        // Build and parse various frame sizes
+        for payload_size in [0, 1, 100, 500, 1000, MAX_UDP_PAYLOAD] {
+            let payload = vec![0xAB; payload_size];
+            let frame = build_udp_frame(
+                &[1, 2, 3, 4, 5, 6],
+                &[7, 8, 9, 10, 11, 12],
+                Ipv4Addr::new(1, 2, 3, 4),
+                Ipv4Addr::new(5, 6, 7, 8),
+                1111, 2222,
+                &payload,
+                255,
+            ).unwrap();
+
+            let parsed = parse_udp_packet(&frame).unwrap();
+            assert_eq!(parsed.payload.len(), payload_size);
+            assert_eq!(parsed.payload, payload);
+        }
+    }
+
+    // ========================================================================
+    // BACKEND CONFIG TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_backend_config_default() {
+        let config = BackendConfig::default();
+        assert_eq!(config.backend_type, BackendType::Auto);
+        assert!(config.interface_name.is_none());
+        assert_eq!(config.dpdk_port_id, 0);
+        assert!(config.use_mmap);
+    }
+
+    #[test]
+    fn test_backend_config_dpdk() {
+        let config = BackendConfig::new().with_dpdk(1);
+        assert_eq!(config.backend_type, BackendType::Dpdk);
+        assert_eq!(config.dpdk_port_id, 1);
+    }
+
+    #[test]
+    fn test_backend_config_raw_socket() {
+        let config = BackendConfig::new().with_raw_socket("eth0");
+        assert_eq!(config.backend_type, BackendType::RawSocket);
+        assert_eq!(config.interface_name.as_deref(), Some("eth0"));
+        assert!(!config.use_mmap);
+    }
+
+    #[test]
+    fn test_backend_config_raw_socket_mmap() {
+        let config = BackendConfig::new().with_raw_socket_mmap("ens5");
+        assert_eq!(config.backend_type, BackendType::RawSocketMmap);
+        assert_eq!(config.interface_name.as_deref(), Some("ens5"));
+        assert!(config.use_mmap);
+    }
+
+    #[test]
+    fn test_backend_config_builder_chain() {
+        let config = BackendConfig::new()
+            .with_raw_socket_mmap("eth0")
+            .with_ring_frame_size(4096)
+            .with_ring_frame_count(512)
+            .with_promiscuous(true);
+        assert_eq!(config.ring_frame_size, 4096);
+        assert_eq!(config.ring_frame_count, 512);
+        assert!(config.promiscuous);
+    }
+
+    // ========================================================================
+    // BACKEND TYPE TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_backend_type_equality() {
+        assert_eq!(BackendType::Dpdk, BackendType::Dpdk);
+        assert_eq!(BackendType::RawSocket, BackendType::RawSocket);
+        assert_eq!(BackendType::RawSocketMmap, BackendType::RawSocketMmap);
+        assert_eq!(BackendType::Auto, BackendType::Auto);
+        assert_ne!(BackendType::Dpdk, BackendType::RawSocket);
     }
 }

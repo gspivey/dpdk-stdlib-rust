@@ -269,10 +269,10 @@ our UdpSocket matches `std::net::UdpSocket` signatures:
 - [x] Hardware offload configuration ✅
 - [x] Device capability checking ✅
 
-### Phase 5: Raw Socket Backend (Non-DPDK Fallback)
-- [ ] `AF_PACKET` raw socket backend for Linux
-- [ ] Abstract backend trait (`PacketBackend`)
-- [ ] Runtime backend selection (DPDK vs raw socket)
-- [ ] Reuse packet building/parsing code
-- [ ] Reuse ARP/ICMP handlers
-- [ ] Zero-copy where possible with `mmap` ring buffers
+### Phase 5: Raw Socket Backend (Non-DPDK Fallback) ✅
+- [x] `AF_PACKET` raw socket backend for Linux ✅
+- [x] Abstract backend trait (`PacketBackend`) ✅
+- [x] Runtime backend selection (DPDK vs raw socket) ✅
+- [x] Reuse packet building/parsing code ✅
+- [x] Reuse ARP/ICMP handlers ✅
+- [x] Zero-copy where possible with `mmap` ring buffers ✅
