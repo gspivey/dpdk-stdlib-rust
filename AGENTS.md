@@ -131,6 +131,62 @@ pub const TOTAL_HEADER_LEN: usize = 42;     // ETH + IPv4 + UDP
 - **Don't assume DPDK is available** - always handle the stub/fallback case
 - **Don't change method signatures on `UdpSocket`** without updating the compat layer in `dpdk-tokio`
 
+## Claude Code (Hooks & Skills)
+
+> The following hooks, skills, and workflow instructions are specific to **Claude Code** sessions.
+> Other agents (Kiro, etc.) should ignore this section.
+
+### Session Start Hook
+
+A session-start hook (`.claude/hooks/session-start.sh`) runs automatically when a Claude Code
+remote session begins. It ensures the Rust toolchain is installed and the workspace is pre-built
+so that `cargo test` and `cargo build` are fast (incremental) from the first interaction.
+
+The hook is registered in `.claude/settings.json` and only runs in remote environments
+(`$CLAUDE_CODE_REMOTE=true`). Local Claude Code sessions skip it.
+
+### Before Creating a PR
+
+Every session is responsible for validating its own work before opening a PR.
+Do NOT push a PR and hope CI catches problems — close the feedback loop in-session.
+
+1. **Run local checks first** (fast, catches most issues):
+   ```bash
+   cargo build && cargo test
+   ```
+
+2. **Push the branch and trigger integration tests** (when changes touch networking, backends, or deployment):
+   ```bash
+   ./scripts/ci-validate.sh
+   ```
+   This script:
+   - Runs `cargo build` + `cargo test` locally
+   - Pushes the current branch
+   - Triggers the `integration-tests.yml` workflow via `gh workflow run`
+   - Polls with `gh run watch --exit-status` until CI finishes
+   - Exits 0 only if everything passes
+
+3. **If integration tests fail**, read the failure output, fix the code, push again, and re-run
+   `./scripts/ci-validate.sh --skip-local` (skips the local cargo checks on retry).
+
+4. **Only after all checks pass**, create the PR:
+   ```bash
+   gh pr create --title "..." --body "..."
+   ```
+
+For changes that don't touch networking code (docs, CI config, scripts), you can skip integration
+tests with `./scripts/ci-validate.sh --skip-integration`.
+
+### Validation Script Reference
+
+```
+./scripts/ci-validate.sh [OPTIONS]
+
+  --skip-local          Skip cargo build/test (only trigger CI)
+  --skip-integration    Skip integration tests (only run local checks)
+  -h, --help            Show help
+```
+
 ## Build & Test
 
 ```bash
