@@ -137,21 +137,32 @@ See `CLAUDE.md` for agent instructions and `API_COMPATIBILITY.md` for API tracki
 ## Architecture
 
 ```
-Applications (echo, tokio-echo, test-client)
-     │
-     ├─ dpdk-tokio (async trait, compat layer, Tokio integration)
-     │       │
-     │       └─ dpdk-udp (UdpSocket, ARP, ICMP, backends)
-     │               │
-     │               ├─ DpdkBackend ──> dpdk (safe wrapper) ──> dpdk-sys (FFI)
-     │               ├─ RawSocketBackend (AF_PACKET syscalls)
-     │               └─ MmapBackend (AF_PACKET + ring buffers)
+┌──────────────────────────────────────────────────────────────────┐
+│              Applications (echo, tokio-echo, test-client)        │
+├──────────────────────────────────────────────────────────────────┤
+│  dpdk-tokio   Async runtime, compat layer (std/tokio drop-ins)  │
+├──────────────────────────────────────────────────────────────────┤
+│  dpdk-udp     UdpSocket API, ARP, ICMP, packet parsing          │
+│               ┌──────────────┬────────────────┬────────────────┐ │
+│               │ DpdkBackend  │ RawSocket      │ RawSocket+MMAP │ │
+├───────────────┴──────────────┴────────────────┴────────────────┤
+│  dpdk         Safe wrapper (Port, Mbuf, Mempool, Queue)         │
+├──────────────────────────────────────────────────────────────────┤
+│  dpdk-sys     Raw FFI bindings + stubs (no DPDK required)       │
+└──────────────────────────────────────────────────────────────────┘
+                            │
+                    ┌───────┴────────┐
+                    │  DPDK Library  │  (optional, kernel bypass)
+                    └────────────────┘
 ```
 
-- **dpdk-sys**: Raw FFI bindings with stub fallback
+- **dpdk-sys**: Raw FFI bindings with stub fallback (works without DPDK)
 - **dpdk**: Safe Rust wrapper (Port, Mbuf, Mempool, Queue)
-- **dpdk-udp**: Protocol layer (sockets, packet parsing, ARP, ICMP)
-- **dpdk-tokio**: Async support and drop-in compat layer
+- **dpdk-udp**: Protocol layer with backend abstraction (sockets, ARP, ICMP)
+  - **DpdkBackend**: Userspace DPDK with kernel bypass
+  - **RawSocketBackend**: Linux AF_PACKET raw sockets
+  - **MmapBackend**: AF_PACKET + PACKET_MMAP ring buffers (zero-copy)
+- **dpdk-tokio**: Async support and drop-in compat layer for std/tokio
 
 ## Status
 
