@@ -40,11 +40,18 @@ export class DpdkTestStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // Allow UDP traffic between DPDK interfaces
+    // Allow all UDP traffic between DPDK interfaces (iperf3 uses dynamic ports)
     dpdkSecurityGroup.addIngressRule(
       dpdkSecurityGroup,
-      ec2.Port.udp(9000),
-      'UDP echo traffic between instances'
+      ec2.Port.allUdp(),
+      'All UDP traffic between instances (echo + iperf3)'
+    );
+
+    // Allow ICMP for ARP/ping diagnostics
+    dpdkSecurityGroup.addIngressRule(
+      dpdkSecurityGroup,
+      ec2.Port.allIcmp(),
+      'ICMP traffic between instances'
     );
 
     // Bundle our project as an asset
@@ -91,7 +98,7 @@ export class DpdkTestStack extends cdk.Stack {
       'dnf update -y',
       'dnf groupinstall -y "Development Tools"',
       // Remove curl from install list - already in base AMI, causes conflicts
-      'dnf install -y git pciutils --allowerasing',
+      'dnf install -y git pciutils iperf3 --allowerasing',
       
       // Install Rust
       'echo "=== Installing Rust ==="',
@@ -444,6 +451,16 @@ export class DpdkTestStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ReceiverDpdkEniId', {
       value: receiverDpdkEni.ref,
       description: 'Receiver DPDK ENI ID for binding',
+    });
+
+    new cdk.CfnOutput(this, 'SenderDpdkEniPrivateIp', {
+      value: senderDpdkEni.attrPrimaryPrivateIpAddress,
+      description: 'Sender DPDK ENI private IP address',
+    });
+
+    new cdk.CfnOutput(this, 'ReceiverDpdkEniPrivateIp', {
+      value: receiverDpdkEni.attrPrimaryPrivateIpAddress,
+      description: 'Receiver DPDK ENI private IP address',
     });
   }
 }
