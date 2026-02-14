@@ -4,6 +4,11 @@
 
 **dpdk-stdlib-rust** is a production-ready, API-compatible DPDK-accelerated networking stack in Rust. It provides drop-in replacements for `std::net::UdpSocket` and `tokio::net::UdpSocket` that bypass the Linux kernel network stack using DPDK userspace networking, with automatic fallback to AF_PACKET raw sockets when DPDK is unavailable.
 
+Detailed requirements, designs and tasks live in .kiro/specs/**/*.md
+Whenever you are working on a task from the .kiro/specs sub directory you MUST read the design and requirements file that goes with it. For example:
+You are working on a task from `.kiro/specs/ec2-integration-tests/tasks.md` You must read `.kiro/specs/ec2-integration-tests/design.md` and `.kiro/specs/ec2-integration-tests/requirements.md` before starting any task work.
+Once you complete the task you must update `.kiro/specs/ec2-integration-tests/tasks.md` marking any tasks complete.
+
 ## Repository Layout
 
 ```
