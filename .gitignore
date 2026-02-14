@@ -11,7 +11,6 @@ Cargo.lock
 node_modules/
 design-doc.md
 yt.md
-tasks.md
 
 # CDK artifacts
 deploy/cdk/cdk.out/
