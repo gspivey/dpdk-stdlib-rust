@@ -140,10 +140,20 @@ deploy_infrastructure() {
 
     cd "$CDK_DIR"
 
+    # Pass pre-built AMI ID to CDK if available
+    local cdk_context_args=""
+    if [[ -n "${DPDK_AMI_ID:-}" ]]; then
+        cdk_context_args="-c amiId=${DPDK_AMI_ID}"
+        log_info "Using pre-built DPDK AMI: $DPDK_AMI_ID"
+    else
+        log_info "No pre-built AMI specified, using stock AL2023 with full bootstrap"
+    fi
+
     log_info "Running cdk deploy..."
     if ! npx cdk deploy "$CDK_STACK_NAME" \
         --require-approval never \
-        --outputs-file /tmp/cdk-outputs.json 2>&1; then
+        --outputs-file /tmp/cdk-outputs.json \
+        $cdk_context_args 2>&1; then
         log_error "CDK deployment failed"
         return 1
     fi

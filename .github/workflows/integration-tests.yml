@@ -46,6 +46,21 @@ jobs:
           curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
           sudo dpkg -i session-manager-plugin.deb
 
+      - name: Fetch DPDK AMI ID from SSM
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$AMI_ID" ]]; then
+            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+            echo "Using pre-built DPDK AMI: ${AMI_ID}"
+          else
+            echo "ami_id=" >> "$GITHUB_OUTPUT"
+            echo "No pre-built AMI found, will use stock AL2023 with full bootstrap"
+          fi
+
       - name: Run integration tests
         id: tests
         run: |
@@ -54,6 +69,7 @@ jobs:
           ./scripts/run-integration-tests.sh default --teardown --json-summary
         env:
           AWS_PROFILE: default
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
 
       - name: Upload test results
         if: always()

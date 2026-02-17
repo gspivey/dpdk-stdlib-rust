@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage: install_dpdk_amazon_linux.sh [WORK_DIR]
+# WORK_DIR defaults to current directory. DPDK source is downloaded and built here.
+
+WORK_DIR="${1:-$(pwd)}"
+cd "$WORK_DIR"
+
 echo "Installing DPDK on Amazon Linux 3..."
 
 if [[ ! -f /etc/os-release ]] || ! grep -q "Amazon Linux" /etc/os-release; then
@@ -24,7 +30,7 @@ sudo dnf install -y \
 pip3 install --user pyelftools
 
 DPDK_VERSION="22.11.6"
-DPDK_DIR="dpdk-${DPDK_VERSION}"
+DPDK_DIR="dpdk-stable-${DPDK_VERSION}"
 INSTALL_PREFIX="/usr/local"
 
 echo "Downloading DPDK ${DPDK_VERSION}..."
