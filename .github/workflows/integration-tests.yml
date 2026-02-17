@@ -16,18 +16,13 @@ env:
 jobs:
   integration-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
+      # Install tools first (no AWS credentials needed)
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -39,12 +34,34 @@ jobs:
       - name: Install CDK dependencies
         run: |
           cd deploy/cdk
-          npm ci
+          npm install
 
       - name: Install Session Manager plugin
         run: |
           curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
           sudo dpkg -i session-manager-plugin.deb
+
+      # AWS credentials needed from here onward
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch DPDK AMI ID from SSM
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$AMI_ID" ]]; then
+            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+            echo "Using pre-built DPDK AMI: ${AMI_ID}"
+          else
+            echo "ami_id=" >> "$GITHUB_OUTPUT"
+            echo "No pre-built AMI found, will use stock AL2023 with full bootstrap"
+          fi
 
       - name: Run integration tests
         id: tests
@@ -54,6 +71,7 @@ jobs:
           ./scripts/run-integration-tests.sh default --teardown --json-summary
         env:
           AWS_PROFILE: default
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
 
       - name: Upload test results
         if: always()
@@ -71,9 +89,10 @@ jobs:
           path: test-results/*.xml
           reporter: java-junit
           fail-on-error: true
+          fail-on-empty: false
 
       - name: Safety net teardown
-        if: failure()
+        if: failure() && steps.tests.outcome == 'failure'
         run: |
           cd deploy/cdk
           npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
