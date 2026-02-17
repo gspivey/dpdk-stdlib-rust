@@ -27,7 +27,8 @@ sudo dnf install -y \
     kernel-devel \
     kernel-headers
 
-pip3 install --user pyelftools
+# python3-pyelftools is already installed via dnf above.
+# Avoid bare pip3 install which can fail with PEP 668 on newer AL2023.
 
 DPDK_VERSION="22.11.6"
 DPDK_DIR="dpdk-stable-${DPDK_VERSION}"
@@ -42,10 +43,13 @@ fi
 cd "$DPDK_DIR"
 
 echo "Configuring DPDK build..."
+# Disable kernel module build (-Denable_kmods=false) because the igb_uio
+# module frequently fails to compile against newer AL2023 kernels and is
+# not needed — vfio-pci (shipped with the kernel) is the preferred driver.
 meson setup build \
     --prefix="$INSTALL_PREFIX" \
     --buildtype=release \
-    -Denable_kmods=true
+    -Denable_kmods=false
 
 echo "Building DPDK..."
 ninja -C build

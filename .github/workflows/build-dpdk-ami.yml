@@ -74,11 +74,16 @@ jobs:
           if [[ $PACKER_EXIT -ne 0 ]]; then
             echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
             echo ""
-            echo "=== Packer output (last 80 lines) ==="
-            tail -80 packer-output.log
+            echo "=== Human-readable error messages ==="
+            # Machine-readable error lines contain ,ui,error, or ,error,
+            grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
             echo ""
-            echo "=== Lines containing 'error' ==="
-            grep -i 'error' packer-output.log | tail -20 || echo "(none)"
+            echo "=== Human-readable UI messages (last 60 lines) ==="
+            # Extract the human-readable message portion from machine-readable output
+            grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -60 || echo "(none)"
+            echo ""
+            echo "=== Raw packer output (last 100 lines) ==="
+            tail -100 packer-output.log
             exit $PACKER_EXIT
           fi
 
