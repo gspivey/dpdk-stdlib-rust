@@ -58,13 +58,26 @@ echo "$INSTALL_PREFIX/lib" | sudo tee /etc/ld.so.conf.d/dpdk.conf
 sudo ldconfig
 
 echo "Loading DPDK kernel modules..."
-sudo modprobe uio
-sudo modprobe vfio-pci
+sudo modprobe uio || echo "Warning: could not load uio module (may not be available in this kernel)"
+sudo modprobe vfio-pci || echo "Warning: could not load vfio-pci module (may not be available in this kernel)"
 
 echo "Setting up hugepages..."
 echo 1024 | sudo tee /proc/sys/vm/nr_hugepages
 sudo mkdir -p /mnt/huge
-sudo mount -t hugetlbfs nodev /mnt/huge
+if ! mountpoint -q /mnt/huge 2>/dev/null; then
+    sudo mount -t hugetlbfs nodev /mnt/huge || echo "Warning: could not mount hugetlbfs (will be configured at boot via fstab)"
+fi
+
+echo "Verifying DPDK installation..."
+DPDK_LIB_COUNT=$(ls /usr/local/lib/librte_* 2>/dev/null | wc -l)
+if [[ "$DPDK_LIB_COUNT" -eq 0 ]]; then
+    echo "ERROR: No DPDK libraries found in /usr/local/lib/"
+    exit 1
+fi
+
+DPDK_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo "unknown")
 
 echo "DPDK installation complete!"
-echo "Hugepages configured: $(cat /proc/sys/vm/nr_hugepages) x 2MB"
+echo "  Libraries installed: ${DPDK_LIB_COUNT}"
+echo "  DPDK version: ${DPDK_VERSION}"
+echo "  Hugepages configured: $(cat /proc/sys/vm/nr_hugepages) x 2MB"

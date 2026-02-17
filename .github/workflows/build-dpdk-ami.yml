@@ -60,35 +60,58 @@ jobs:
           cd packer
           DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
 
+          # Build with machine-readable output for AMI ID extraction
+          # Use manifest post-processor output as primary, grep as fallback
           packer build \
             -var "aws_region=${{ env.AWS_REGION }}" \
             -var "dpdk_version=${DPDK_VERSION}" \
             -machine-readable \
             dpdk-ami.pkr.hcl | tee packer-output.log
 
-          # Extract the AMI ID from packer machine-readable output
-          AMI_ID=$(grep 'artifact,0,id' packer-output.log | cut -d: -f2)
+          # Extract AMI ID from packer machine-readable output
+          # Format: timestamp,target,artifact,0,id,region:ami-xxx
+          # Use awk to reliably extract the ami-xxx portion
+          AMI_ID=$(grep 'artifact,0,id' packer-output.log | awk -F, '{print $NF}' | awk -F: '{print $NF}')
+
+          if [[ -z "$AMI_ID" || ! "$AMI_ID" =~ ^ami- ]]; then
+            echo "::error::Failed to extract AMI ID from Packer output"
+            echo "Packer output (last 20 lines):"
+            tail -20 packer-output.log
+            echo "Lines matching 'artifact':"
+            grep -i 'artifact' packer-output.log || echo "(none)"
+            exit 1
+          fi
+
           echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
           echo "dpdk_version=${DPDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Built AMI: ${AMI_ID}"
 
       - name: Store AMI ID in SSM Parameter Store
         run: |
+          AMI_ID="${{ steps.build.outputs.ami_id }}"
+          DPDK_VERSION="${{ steps.build.outputs.dpdk_version }}"
+
+          if [[ -z "$AMI_ID" ]]; then
+            echo "::error::AMI ID is empty, cannot store in SSM"
+            exit 1
+          fi
+
+          echo "Storing AMI ID ${AMI_ID} in SSM..."
           aws ssm put-parameter \
             --name "${{ env.SSM_AMI_PARAMETER }}" \
             --type String \
-            --value "${{ steps.build.outputs.ami_id }}" \
+            --value "${AMI_ID}" \
             --overwrite \
             --description "Latest DPDK AMI for dpdk-stdlib-rust integration tests"
 
           aws ssm put-parameter \
             --name "${{ env.SSM_DPDK_VERSION_PARAMETER }}" \
             --type String \
-            --value "${{ steps.build.outputs.dpdk_version }}" \
+            --value "${DPDK_VERSION}" \
             --overwrite \
             --description "DPDK version in the latest pre-built AMI"
 
-          echo "Stored AMI ID ${{ steps.build.outputs.ami_id }} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
+          echo "Stored AMI ID ${AMI_ID} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
 
       - name: Deregister old AMIs (keep last 3)
         run: |

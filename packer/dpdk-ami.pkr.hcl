@@ -114,13 +114,22 @@ build {
     ]
   }
 
-  # Verify installations
+  # Verify installations - fail the build if DPDK is not properly installed
   provisioner "shell" {
     inline = [
       "echo '=== Verification ==='",
       "echo \"Rust: $(sudo /root/.cargo/bin/rustc --version)\"",
-      "echo \"DPDK libs: $(ls /usr/local/lib/librte_* 2>/dev/null | wc -l) libraries\"",
-      "echo \"pkg-config: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo 'not available')\"",
+      "",
+      "DPDK_LIB_COUNT=$(ls /usr/local/lib/librte_* 2>/dev/null | wc -l)",
+      "echo \"DPDK libs: $DPDK_LIB_COUNT libraries\"",
+      "if [ \"$DPDK_LIB_COUNT\" -lt 10 ]; then echo 'FATAL: DPDK libraries not installed correctly'; exit 1; fi",
+      "",
+      "DPDK_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo '')",
+      "echo \"DPDK version: $DPDK_VERSION\"",
+      "if [ -z \"$DPDK_VERSION\" ]; then echo 'FATAL: pkg-config cannot find libdpdk'; exit 1; fi",
+      "",
+      "echo \"DPDK headers: $(ls /usr/local/include/rte_eal.h 2>/dev/null && echo 'present' || echo 'MISSING')\"",
+      "echo \"DPDK devbind: $(ls /usr/local/bin/dpdk-devbind.py 2>/dev/null && echo 'present' || echo 'not found (ok)')\"",
       "echo \"iperf3: $(iperf3 --version 2>&1 | head -1)\"",
       "echo '=== AMI build complete ==='",
     ]
