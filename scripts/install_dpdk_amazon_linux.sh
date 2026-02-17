@@ -20,15 +20,16 @@ sudo dnf install -y \
     meson \
     ninja-build \
     python3-pip \
-    python3-pyelftools \
     libbsd-devel \
     libpcap-devel \
     numactl-devel \
     kernel-devel \
     kernel-headers
 
-# python3-pyelftools is already installed via dnf above.
-# Avoid bare pip3 install which can fail with PEP 668 on newer AL2023.
+# pyelftools is required by the DPDK build system (meson).
+# python3-pyelftools RPM is not available in AL2023 default repos,
+# so install via pip. Use --break-system-packages for AL2023 PEP 668.
+pip3 install pyelftools || pip3 install --break-system-packages pyelftools
 
 DPDK_VERSION="22.11.6"
 DPDK_DIR="dpdk-stable-${DPDK_VERSION}"

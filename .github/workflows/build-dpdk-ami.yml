@@ -106,6 +106,14 @@ jobs:
           echo "dpdk_version=${DPDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Built AMI: ${AMI_ID}"
 
+      - name: Upload Packer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-output-log
+          path: packer/packer-output.log
+          retention-days: 7
+
       - name: Store AMI ID in SSM Parameter Store
         run: |
           AMI_ID="${{ steps.build.outputs.ami_id }}"
