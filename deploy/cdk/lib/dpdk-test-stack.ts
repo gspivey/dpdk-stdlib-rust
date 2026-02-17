@@ -92,8 +92,8 @@ export class DpdkTestStack extends cdk.Stack {
           cpuType: ec2.AmazonLinuxCpuType.X86_64,
         });
 
-    // Timeout: 10 min with pre-built AMI (only cargo build needed), 25 min for full bootstrap
-    const creationTimeout = usePrebuiltAmi ? 'PT10M' : 'PT25M';
+    // Timeout: 10 min with pre-built AMI (only cargo build needed), 35 min for full bootstrap
+    const creationTimeout = usePrebuiltAmi ? 'PT10M' : 'PT35M';
 
     // Helper: generate user-data commands for an instance
     const createUserData = (cfnResourceName: string): ec2.UserData => {
