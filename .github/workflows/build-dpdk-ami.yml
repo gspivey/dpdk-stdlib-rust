@@ -27,7 +27,7 @@ env:
 jobs:
   build-ami:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -60,24 +60,39 @@ jobs:
           cd packer
           DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
 
-          # Build with machine-readable output for AMI ID extraction
-          # Use manifest post-processor output as primary, grep as fallback
+          # Run packer without pipefail swallowing diagnostics.
+          # Capture exit code manually so we can dump logs on failure.
+          set +e
           packer build \
             -var "aws_region=${{ env.AWS_REGION }}" \
             -var "dpdk_version=${DPDK_VERSION}" \
             -machine-readable \
-            dpdk-ami.pkr.hcl | tee packer-output.log
+            dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
+          PACKER_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $PACKER_EXIT -ne 0 ]]; then
+            echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
+            echo ""
+            echo "=== Packer output (last 80 lines) ==="
+            tail -80 packer-output.log
+            echo ""
+            echo "=== Lines containing 'error' ==="
+            grep -i 'error' packer-output.log | tail -20 || echo "(none)"
+            exit $PACKER_EXIT
+          fi
 
           # Extract AMI ID from packer machine-readable output
           # Format: timestamp,target,artifact,0,id,region:ami-xxx
-          # Use awk to reliably extract the ami-xxx portion
           AMI_ID=$(grep 'artifact,0,id' packer-output.log | awk -F, '{print $NF}' | awk -F: '{print $NF}')
 
           if [[ -z "$AMI_ID" || ! "$AMI_ID" =~ ^ami- ]]; then
             echo "::error::Failed to extract AMI ID from Packer output"
-            echo "Packer output (last 20 lines):"
-            tail -20 packer-output.log
-            echo "Lines matching 'artifact':"
+            echo ""
+            echo "=== Packer output (last 80 lines) ==="
+            tail -80 packer-output.log
+            echo ""
+            echo "=== Lines matching 'artifact' ==="
             grep -i 'artifact' packer-output.log || echo "(none)"
             exit 1
           fi

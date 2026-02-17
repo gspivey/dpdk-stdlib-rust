@@ -42,6 +42,10 @@ source "amazon-ebs" "dpdk" {
   }
 
   ssh_username = "ec2-user"
+  ssh_timeout  = "10m"
+
+  # Ensure Packer instance gets a public IP for SSH access
+  associate_public_ip_address = true
 
   ami_name        = "${var.ami_name_prefix}-dpdk-${var.dpdk_version}-{{timestamp}}"
   ami_description = "Amazon Linux 2023 with DPDK ${var.dpdk_version}, Rust toolchain, and test dependencies pre-installed"
