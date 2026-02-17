@@ -47,10 +47,16 @@ echo "Configuring DPDK build..."
 # Disable kernel module build (-Denable_kmods=false) because the igb_uio
 # module frequently fails to compile against newer AL2023 kernels and is
 # not needed — vfio-pci (shipped with the kernel) is the preferred driver.
+#
+# Disable net/gve (Google Cloud) and net/ionic (AMD Pensando) drivers which
+# have known compilation failures on AL2023 due to kernel header conflicts
+# (__le64 type issues, gve header conflicts). These drivers are not needed
+# on AWS — only the ENA driver is required.
 meson setup build \
     --prefix="$INSTALL_PREFIX" \
     --buildtype=release \
-    -Denable_kmods=false
+    -Denable_kmods=false \
+    -Ddisable_drivers=net/gve,net/ionic
 
 echo "Building DPDK..."
 ninja -C build

@@ -73,13 +73,27 @@ jobs:
 
           if [[ $PACKER_EXIT -ne 0 ]]; then
             echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
+
+            # Write error details to step summary (visible on run page without downloading logs)
+            {
+              echo "## Packer Build Failed (exit code ${PACKER_EXIT})"
+              echo ""
+              echo "### Error Messages"
+              echo '```'
+              grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
+              echo '```'
+              echo ""
+              echo "### Last 80 UI Messages"
+              echo '```'
+              grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -80 || echo "(none)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
             echo ""
             echo "=== Human-readable error messages ==="
-            # Machine-readable error lines contain ,ui,error, or ,error,
             grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
             echo ""
             echo "=== Human-readable UI messages (last 60 lines) ==="
-            # Extract the human-readable message portion from machine-readable output
             grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -60 || echo "(none)"
             echo ""
             echo "=== Raw packer output (last 100 lines) ==="
