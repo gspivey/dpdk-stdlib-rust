@@ -128,6 +128,38 @@ jobs:
           path: packer/packer-output.log
           retention-days: 7
 
+      - name: Show build failure diagnostics
+        if: failure()
+        run: |
+          LOG="packer/packer-output.log"
+          if [[ ! -f "$LOG" ]]; then
+            echo "No packer log found"
+            exit 0
+          fi
+
+          echo "::group::Error messages from Packer"
+          grep -E ',(ui,error|error),' "$LOG" | sed 's/.*,ui,error,//; s/.*,error,//' | tail -50 || echo "(none)"
+          echo "::endgroup::"
+
+          echo "::group::Last 120 UI messages"
+          grep ',ui,' "$LOG" | sed 's/.*,ui,[^,]*,//' | tail -120 || echo "(none)"
+          echo "::endgroup::"
+
+          # Write to step summary for visibility on the run summary page
+          {
+            echo "## Build Failure Diagnostics"
+            echo ""
+            echo "### Errors"
+            echo '```'
+            grep -E ',(ui,error|error),' "$LOG" | sed 's/.*,ui,error,//; s/.*,error,//' | tail -50 || echo "(none)"
+            echo '```'
+            echo ""
+            echo "### Last 120 UI lines"
+            echo '```'
+            grep ',ui,' "$LOG" | sed 's/.*,ui,[^,]*,//' | tail -120 || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Store AMI ID in SSM Parameter Store
         run: |
           AMI_ID="${{ steps.build.outputs.ami_id }}"
