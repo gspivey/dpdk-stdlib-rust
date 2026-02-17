@@ -34,7 +34,7 @@ jobs:
       - name: Install CDK dependencies
         run: |
           cd deploy/cdk
-          npm ci
+          npm install
 
       - name: Install Session Manager plugin
         run: |
