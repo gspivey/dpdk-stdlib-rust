@@ -147,10 +147,10 @@ gh auth status        # should show "Logged in to github.com"
 gh --version          # confirm installed
 ```
 
-If not ready, check `~/.local/bin/gh` and `$GITHUB_TOKEN`:
+If not ready, check `~/.local/bin/gh` and `$GH_TOKEN` / `$GITHUB_TOKEN`:
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-echo "$GITHUB_TOKEN" | gh auth login --with-token
+echo "${GH_TOKEN:-$GITHUB_TOKEN}" | gh auth login --with-token
 ```
 
 **List recent integration test runs:**
