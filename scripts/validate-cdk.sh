@@ -54,8 +54,25 @@ echo ""
 echo "Step 1: Running cdk synth (no AWS credentials needed)..."
 cd "$CDK_DIR"
 
-CDK_DEFAULT_ACCOUNT="${CDK_DEFAULT_ACCOUNT:-123456789012}" \
-CDK_DEFAULT_REGION="${CDK_DEFAULT_REGION:-us-east-1}" \
+# Generate a temporary cdk.context.json with pre-cached AZ data so CDK
+# doesn't need AWS credentials to resolve availability zones.
+# cdk.context.json is in .gitignore — it must never be committed because
+# running 'cdk synth/deploy' with real credentials would overwrite it with
+# the user's actual account number.
+DUMMY_ACCOUNT="${CDK_DEFAULT_ACCOUNT:-123456789012}"
+DUMMY_REGION="${CDK_DEFAULT_REGION:-us-east-1}"
+cat > "$CDK_DIR/cdk.context.json" <<EOF
+{
+  "availability-zones:account=${DUMMY_ACCOUNT}:region=${DUMMY_REGION}": [
+    "${DUMMY_REGION}a",
+    "${DUMMY_REGION}b",
+    "${DUMMY_REGION}c"
+  ]
+}
+EOF
+
+CDK_DEFAULT_ACCOUNT="${DUMMY_ACCOUNT}" \
+CDK_DEFAULT_REGION="${DUMMY_REGION}" \
     npx cdk synth \
     --quiet \
     --context "amiId=ami-dummy-for-validation" \
