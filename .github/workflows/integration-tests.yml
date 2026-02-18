@@ -5,6 +5,15 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# Only one integration test run at a time — concurrent runs race to create
+# and destroy the same CloudFormation stack (DpdkTestStack), causing one
+# run's teardown to destroy infrastructure the other run is still using.
+# cancel-in-progress: false so the in-flight run finishes cleanly (with
+# teardown) rather than being killed mid-deploy and leaving orphaned infra.
+concurrency:
+  group: integration-tests
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
