@@ -80,6 +80,16 @@ jobs:
           name: integration-test-results
           path: test-results/
           retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Publish test results
         if: always()

@@ -29,6 +29,7 @@ RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"
 SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
+LOGS_DIR="$REPO_ROOT/instance-logs"
 
 # ── CLI argument parsing ─────────────────────────────────────────────────────
 
@@ -319,27 +320,30 @@ verify_build() {
     log_info "Verifying project build on instances..."
 
     for instance_id in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
-        local cmd_id
-        cmd_id=$(aws ssm send-command \
-            --instance-ids "$instance_id" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING"]' \
-            --query "Command.CommandId" \
-            --output text 2>/dev/null)
+        log_info "Checking build on $instance_id..."
 
-        sleep 5
+        local cmd_id
+        cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+            "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+
+        if [[ -z "$cmd_id" ]]; then
+            log_error "Failed to send build verification command to $instance_id"
+            return 1
+        fi
+
+        # Poll for completion rather than fixed sleep
+        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
+            log_error "Build verification command timed out on $instance_id"
+            return 1
+        fi
 
         local result
-        result=$(aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || true)
+        result=$(ssm_get_stdout "$instance_id" "$cmd_id")
 
         if echo "$result" | grep -q "BUILD_OK"; then
             log_info "Build verified on $instance_id"
         else
-            log_error "Build not found on $instance_id"
+            log_error "Build not found on $instance_id (output: $result)"
             return 1
         fi
     done
@@ -859,6 +863,137 @@ teardown_infrastructure() {
     cd "$REPO_ROOT"
 }
 
+# ── Instance log collection ──────────────────────────────────────────────────
+#
+# Collects logs from EC2 instances using two methods:
+#   1. EC2 console output  - works even without SSM, survives instance termination
+#   2. SSM file retrieval  - richer logs when SSM is reachable
+#
+# Logs are written to $LOGS_DIR/ with <role>-<filename> naming.
+
+collect_ssm_file() {
+    local instance_id="$1"
+    local label="$2"
+    local remote_path="$3"
+
+    local filename
+    filename=$(basename "$remote_path")
+
+    local cmd_id
+    cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+        "test -f $remote_path && cat $remote_path || echo 'FILE_NOT_FOUND'") 2>/dev/null || return 0
+
+    [[ -z "$cmd_id" ]] && return 0
+
+    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
+
+    local content
+    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
+
+    if [[ -n "$content" && "$content" != "FILE_NOT_FOUND" ]]; then
+        echo "$content" > "$LOGS_DIR/${label}-${filename}"
+        log_info "  Saved: ${label}-${filename} ($(echo "$content" | wc -l) lines)"
+    fi
+}
+
+collect_ssm_command() {
+    local instance_id="$1"
+    local label="$2"
+    local name="$3"
+    local command="$4"
+
+    local cmd_id
+    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$command") 2>/dev/null || return 0
+
+    [[ -z "$cmd_id" ]] && return 0
+
+    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
+
+    local content
+    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
+
+    if [[ -n "$content" ]]; then
+        echo "$content" > "$LOGS_DIR/${label}-${name}.log"
+        log_info "  Saved: ${label}-${name}.log"
+    fi
+}
+
+collect_instance_logs() {
+    log_section "Collecting instance logs"
+    mkdir -p "$LOGS_DIR"
+
+    # Build the list of (label, instance_id) pairs to collect from
+    local -a instances=()
+    if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+        instances+=("sender:${SENDER_INSTANCE_ID}")
+    fi
+    if [[ -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+        instances+=("receiver:${RECEIVER_INSTANCE_ID}")
+    fi
+
+    # Fallback: when CDK deploy failed and we have no stack outputs, look for
+    # instances in CloudFormation events (they appear even after rollback).
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No known instance IDs, scanning CloudFormation events..."
+        local event_ids
+        event_ids=$(aws cloudformation describe-stack-events \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "StackEvents[?ResourceType=='AWS::EC2::Instance' && PhysicalResourceId!=''].PhysicalResourceId" \
+            --output text 2>/dev/null | tr '\t' '\n' | grep -E '^i-' | sort -u || true)
+
+        local idx=0
+        for inst_id in $event_ids; do
+            instances+=("instance-${idx}:${inst_id}")
+            idx=$((idx + 1))
+        done
+    fi
+
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No instances found - skipping log collection"
+        return 0
+    fi
+
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
+        log_info "Collecting logs from ${label} (${instance_id})..."
+
+        # ── EC2 console output (survives termination, no SSM needed) ─────────
+        local console_output
+        console_output=$(aws ec2 get-console-output \
+            --instance-id "$instance_id" \
+            --latest \
+            --query "Output" \
+            --output text 2>/dev/null || echo "(console output unavailable)")
+        echo "$console_output" > "$LOGS_DIR/${label}-console-output.log"
+        log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
+
+        # ── SSM-based log collection (richer, needs SSM agent) ───────────────
+        local ssm_ready
+        ssm_ready=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${instance_id}" \
+            --query "InstanceInformationList[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+        if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
+            log_info "  SSM available - collecting log files..."
+            collect_ssm_file  "$instance_id" "$label" "/var/log/user-data.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cloud-init-output.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init-cmd.log"
+            collect_ssm_command "$instance_id" "$label" "build-listing" \
+                "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
+            collect_ssm_command "$instance_id" "$label" "journal" \
+                "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
+        else
+            log_info "  SSM not available for ${label} - relying on console output only"
+        fi
+    done
+
+    log_info "Instance logs written to: $LOGS_DIR"
+}
+
 # ── Main execution ───────────────────────────────────────────────────────────
 
 main() {
@@ -874,6 +1009,8 @@ main() {
     if [[ "$FLAG_SKIP_DEPLOY" != "true" ]]; then
         if ! deploy_infrastructure; then
             log_error "Infrastructure deployment failed"
+            # Try EC2 console output - instances appear in CF events even after rollback
+            collect_instance_logs || true
             exit 2
         fi
     fi
@@ -881,12 +1018,14 @@ main() {
     # Step 2: Fetch stack outputs
     if ! fetch_stack_outputs; then
         log_error "Failed to fetch stack outputs"
+        collect_instance_logs || true
         exit 2
     fi
 
     # Step 3: Wait for SSM readiness
     if ! wait_for_ssm_readiness; then
         log_error "Instances not ready"
+        collect_instance_logs || true
         teardown_infrastructure
         exit 2
     fi
@@ -894,6 +1033,7 @@ main() {
     # Step 4: Verify build
     if ! verify_build; then
         log_error "Build verification failed"
+        collect_instance_logs || true
         teardown_infrastructure
         exit 2
     fi
@@ -921,7 +1061,10 @@ main() {
     print_summary
     generate_json_summary
 
-    # Step 8: Teardown
+    # Step 8: Collect instance logs (always - both software and cfn-init logs)
+    collect_instance_logs || true
+
+    # Step 9: Teardown
     teardown_infrastructure
 
     log_info "Exiting with code: $TEST_EXIT_CODE"

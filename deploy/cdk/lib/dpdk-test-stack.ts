@@ -92,8 +92,8 @@ export class DpdkTestStack extends cdk.Stack {
           cpuType: ec2.AmazonLinuxCpuType.X86_64,
         });
 
-    // Timeout: 10 min with pre-built AMI (only cargo build needed), 35 min for full bootstrap
-    const creationTimeout = usePrebuiltAmi ? 'PT10M' : 'PT35M';
+    // Timeout: 20 min with pre-built AMI (cargo build takes 8-12 min on c5n.large), 35 min for full bootstrap
+    const creationTimeout = usePrebuiltAmi ? 'PT20M' : 'PT35M';
 
     // Helper: generate user-data commands for an instance
     const createUserData = (cfnResourceName: string): ec2.UserData => {
@@ -431,6 +431,8 @@ export class DpdkTestStack extends cdk.Stack {
 
     // Add CreationPolicy to wait for setup completion
     const cfnSenderInstance = senderInstance.node.defaultChild as ec2.CfnInstance;
+    // Override logical ID so cfn-signal --resource DpdkSender matches the CloudFormation resource name
+    cfnSenderInstance.overrideLogicalId('DpdkSender');
     cfnSenderInstance.cfnOptions.creationPolicy = {
       resourceSignal: {
         timeout: creationTimeout,
@@ -453,6 +455,8 @@ export class DpdkTestStack extends cdk.Stack {
 
     // Add CreationPolicy for receiver too (bug fix: was previously missing)
     const cfnReceiverInstance = receiverInstance.node.defaultChild as ec2.CfnInstance;
+    // Override logical ID so cfn-signal --resource DpdkReceiver matches the CloudFormation resource name
+    cfnReceiverInstance.overrideLogicalId('DpdkReceiver');
     cfnReceiverInstance.cfnOptions.creationPolicy = {
       resourceSignal: {
         timeout: creationTimeout,
