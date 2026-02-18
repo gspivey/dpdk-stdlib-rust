@@ -136,6 +136,73 @@ pub const TOTAL_HEADER_LEN: usize = 42;     // ETH + IPv4 + UDP
 > The following hooks, skills, and workflow instructions are specific to **Claude Code** sessions.
 > Other agents (Kiro, etc.) should ignore this section.
 
+### Querying CI / GitHub Actions Results
+
+The repo is **private** — WebFetch cannot access it unauthenticated. Use the `gh` CLI.
+The session-start hook installs `gh` and authenticates it automatically in remote sessions.
+Verify it's ready:
+
+```bash
+gh auth status        # should show "Logged in to github.com"
+gh --version          # confirm installed
+```
+
+If not ready, check `~/.local/bin/gh` and `$GITHUB_TOKEN`:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+echo "$GITHUB_TOKEN" | gh auth login --with-token
+```
+
+**List recent integration test runs:**
+```bash
+gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
+```
+
+**Check a specific run (status + step breakdown):**
+```bash
+gh run view <run-id> --repo gspivey/dpdk-stdlib-rust
+```
+
+**Get only failed step logs (fastest path to root cause):**
+```bash
+gh run view <run-id> --log-failed --repo gspivey/dpdk-stdlib-rust
+```
+
+**Download structured failure context:**
+```bash
+gh run download <run-id> --name instance-logs --repo gspivey/dpdk-stdlib-rust --dir /tmp/ci-logs
+python3 -c "import json; d=json.load(open('/tmp/ci-logs/failure-summary.json')); print(d['failed_step'], ':', d['error'])"
+tail -80 /tmp/ci-logs/sender-user-data.log
+```
+
+**Interpreting exit codes:**
+
+| Exit code | Meaning | Where to look |
+|---|---|---|
+| `2` | Infrastructure/setup failure | `failure-summary.json` → `failed_step` → `scripts/integration-tests/DEBUGGING.md` |
+| `1` | Test assertion failure | `test-results/*.xml` JUnit files |
+| `0` | All tests passed | — |
+
+**Common diagnosis pattern for exit code 2:**
+```bash
+# 1. List runs, find the failing run-id
+gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 3
+
+# 2. Get the structured failure step
+gh run download <run-id> --name instance-logs --repo gspivey/dpdk-stdlib-rust --dir /tmp/ci-logs
+cat /tmp/ci-logs/failure-summary.json
+
+# 3. Look up that step in the runbook
+cat scripts/integration-tests/DEBUGGING.md
+```
+
+**GitHub Actions step summary** (last 80 lines of `user-data.log` per instance, inline):
+Each run writes this to the "Summary" tab. Without browser access, get job-level status via:
+```bash
+gh api repos/gspivey/dpdk-stdlib-rust/actions/runs/<run-id>/jobs \
+  --jq '.jobs[] | {name, conclusion, failed_steps: [.steps[] | select(.conclusion != "success") | .name]}'
+```
+
 ### Session Start Hook
 
 A session-start hook (`.claude/hooks/session-start.sh`) runs automatically when a Claude Code
