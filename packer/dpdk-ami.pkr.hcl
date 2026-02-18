@@ -42,6 +42,10 @@ source "amazon-ebs" "dpdk" {
   }
 
   ssh_username = "ec2-user"
+  ssh_timeout  = "10m"
+
+  # Ensure Packer instance gets a public IP for SSH access
+  associate_public_ip_address = true
 
   ami_name        = "${var.ami_name_prefix}-dpdk-${var.dpdk_version}-{{timestamp}}"
   ami_description = "Amazon Linux 2023 with DPDK ${var.dpdk_version}, Rust toolchain, and test dependencies pre-installed"
@@ -74,9 +78,11 @@ build {
   # System packages and dev tools
   provisioner "shell" {
     inline = [
+      "echo '=== Installing system packages ==='",
       "sudo dnf update -y",
       "sudo dnf groupinstall -y 'Development Tools'",
-      "sudo dnf install -y git pciutils iperf3 aws-cfn-bootstrap --allowerasing",
+      "sudo dnf install -y git pciutils iperf3",
+      "sudo dnf install -y aws-cfn-bootstrap || echo 'Warning: aws-cfn-bootstrap not available, skipping'",
     ]
   }
 
@@ -114,13 +120,22 @@ build {
     ]
   }
 
-  # Verify installations
+  # Verify installations - fail the build if DPDK is not properly installed
   provisioner "shell" {
     inline = [
       "echo '=== Verification ==='",
       "echo \"Rust: $(sudo /root/.cargo/bin/rustc --version)\"",
-      "echo \"DPDK libs: $(ls /usr/local/lib/librte_* 2>/dev/null | wc -l) libraries\"",
-      "echo \"pkg-config: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo 'not available')\"",
+      "",
+      "DPDK_LIB_COUNT=$(ls /usr/local/lib/librte_* 2>/dev/null | wc -l)",
+      "echo \"DPDK libs: $DPDK_LIB_COUNT libraries\"",
+      "if [ \"$DPDK_LIB_COUNT\" -lt 10 ]; then echo 'FATAL: DPDK libraries not installed correctly'; exit 1; fi",
+      "",
+      "DPDK_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo '')",
+      "echo \"DPDK version: $DPDK_VERSION\"",
+      "if [ -z \"$DPDK_VERSION\" ]; then echo 'FATAL: pkg-config cannot find libdpdk'; exit 1; fi",
+      "",
+      "echo \"DPDK headers: $(ls /usr/local/include/rte_eal.h 2>/dev/null && echo 'present' || echo 'MISSING')\"",
+      "echo \"DPDK devbind: $(ls /usr/local/bin/dpdk-devbind.py 2>/dev/null && echo 'present' || echo 'not found (ok)')\"",
       "echo \"iperf3: $(iperf3 --version 2>&1 | head -1)\"",
       "echo '=== AMI build complete ==='",
     ]

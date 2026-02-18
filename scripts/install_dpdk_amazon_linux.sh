@@ -20,14 +20,16 @@ sudo dnf install -y \
     meson \
     ninja-build \
     python3-pip \
-    python3-pyelftools \
     libbsd-devel \
     libpcap-devel \
     numactl-devel \
     kernel-devel \
     kernel-headers
 
-pip3 install --user pyelftools
+# pyelftools is required by the DPDK build system (meson).
+# python3-pyelftools RPM is not available in AL2023 default repos,
+# so install via pip. Use --break-system-packages for AL2023 PEP 668.
+pip3 install pyelftools || pip3 install --break-system-packages pyelftools
 
 DPDK_VERSION="22.11.6"
 DPDK_DIR="dpdk-stable-${DPDK_VERSION}"
@@ -42,10 +44,24 @@ fi
 cd "$DPDK_DIR"
 
 echo "Configuring DPDK build..."
+# --libdir=lib: Force libraries into $PREFIX/lib/ instead of lib64/.
+# AL2023 (Fedora-based) has a real /usr/lib64 directory, so meson
+# auto-detects lib64 as the default libdir. We pin it to lib/ so that
+# ldconfig, pkg-config, and downstream consumers use a single known path.
+#
+# -Denable_kmods=false: igb_uio frequently fails to compile against newer
+# AL2023 kernels and is not needed — vfio-pci (shipped with the kernel) is
+# the preferred driver.
+#
+# -Ddisable_drivers=net/gve,net/ionic: These drivers have known compilation
+# failures on AL2023 due to kernel header conflicts (__le64 type issues,
+# gve header conflicts). Not needed on AWS — only ENA is required.
 meson setup build \
     --prefix="$INSTALL_PREFIX" \
+    --libdir=lib \
     --buildtype=release \
-    -Denable_kmods=true
+    -Denable_kmods=false \
+    -Ddisable_drivers=net/gve,net/ionic
 
 echo "Building DPDK..."
 ninja -C build
@@ -58,13 +74,26 @@ echo "$INSTALL_PREFIX/lib" | sudo tee /etc/ld.so.conf.d/dpdk.conf
 sudo ldconfig
 
 echo "Loading DPDK kernel modules..."
-sudo modprobe uio
-sudo modprobe vfio-pci
+sudo modprobe uio || echo "Warning: could not load uio module (may not be available in this kernel)"
+sudo modprobe vfio-pci || echo "Warning: could not load vfio-pci module (may not be available in this kernel)"
 
 echo "Setting up hugepages..."
 echo 1024 | sudo tee /proc/sys/vm/nr_hugepages
 sudo mkdir -p /mnt/huge
-sudo mount -t hugetlbfs nodev /mnt/huge
+if ! mountpoint -q /mnt/huge 2>/dev/null; then
+    sudo mount -t hugetlbfs nodev /mnt/huge || echo "Warning: could not mount hugetlbfs (will be configured at boot via fstab)"
+fi
+
+echo "Verifying DPDK installation..."
+DPDK_LIB_COUNT=$(ls /usr/local/lib/librte_* 2>/dev/null | wc -l)
+if [[ "$DPDK_LIB_COUNT" -eq 0 ]]; then
+    echo "ERROR: No DPDK libraries found in /usr/local/lib/"
+    exit 1
+fi
+
+DPDK_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo "unknown")
 
 echo "DPDK installation complete!"
-echo "Hugepages configured: $(cat /proc/sys/vm/nr_hugepages) x 2MB"
+echo "  Libraries installed: ${DPDK_LIB_COUNT}"
+echo "  DPDK version: ${DPDK_VERSION}"
+echo "  Hugepages configured: $(cat /proc/sys/vm/nr_hugepages) x 2MB"

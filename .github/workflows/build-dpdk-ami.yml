@@ -27,7 +27,7 @@ env:
 jobs:
   build-ami:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -60,35 +60,132 @@ jobs:
           cd packer
           DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
 
+          # Run packer without pipefail swallowing diagnostics.
+          # Capture exit code manually so we can dump logs on failure.
+          set +e
           packer build \
             -var "aws_region=${{ env.AWS_REGION }}" \
             -var "dpdk_version=${DPDK_VERSION}" \
             -machine-readable \
-            dpdk-ami.pkr.hcl | tee packer-output.log
+            dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
+          PACKER_EXIT=${PIPESTATUS[0]}
+          set -e
 
-          # Extract the AMI ID from packer machine-readable output
-          AMI_ID=$(grep 'artifact,0,id' packer-output.log | cut -d: -f2)
+          if [[ $PACKER_EXIT -ne 0 ]]; then
+            echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
+
+            # Write error details to step summary (visible on run page without downloading logs)
+            {
+              echo "## Packer Build Failed (exit code ${PACKER_EXIT})"
+              echo ""
+              echo "### Error Messages"
+              echo '```'
+              grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
+              echo '```'
+              echo ""
+              echo "### Last 80 UI Messages"
+              echo '```'
+              grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -80 || echo "(none)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo ""
+            echo "=== Human-readable error messages ==="
+            grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
+            echo ""
+            echo "=== Human-readable UI messages (last 60 lines) ==="
+            grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -60 || echo "(none)"
+            echo ""
+            echo "=== Raw packer output (last 100 lines) ==="
+            tail -100 packer-output.log
+            exit $PACKER_EXIT
+          fi
+
+          # Extract AMI ID from packer machine-readable output
+          # Format: timestamp,target,artifact,0,id,region:ami-xxx
+          AMI_ID=$(grep 'artifact,0,id' packer-output.log | awk -F, '{print $NF}' | awk -F: '{print $NF}')
+
+          if [[ -z "$AMI_ID" || ! "$AMI_ID" =~ ^ami- ]]; then
+            echo "::error::Failed to extract AMI ID from Packer output"
+            echo ""
+            echo "=== Packer output (last 80 lines) ==="
+            tail -80 packer-output.log
+            echo ""
+            echo "=== Lines matching 'artifact' ==="
+            grep -i 'artifact' packer-output.log || echo "(none)"
+            exit 1
+          fi
+
           echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
           echo "dpdk_version=${DPDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Built AMI: ${AMI_ID}"
 
+      - name: Upload Packer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-output-log
+          path: packer/packer-output.log
+          retention-days: 7
+
+      - name: Show build failure diagnostics
+        if: failure()
+        run: |
+          LOG="packer/packer-output.log"
+          if [[ ! -f "$LOG" ]]; then
+            echo "No packer log found"
+            exit 0
+          fi
+
+          echo "::group::Error messages from Packer"
+          grep -E ',(ui,error|error),' "$LOG" | sed 's/.*,ui,error,//; s/.*,error,//' | tail -50 || echo "(none)"
+          echo "::endgroup::"
+
+          echo "::group::Last 120 UI messages"
+          grep ',ui,' "$LOG" | sed 's/.*,ui,[^,]*,//' | tail -120 || echo "(none)"
+          echo "::endgroup::"
+
+          # Write to step summary for visibility on the run summary page
+          {
+            echo "## Build Failure Diagnostics"
+            echo ""
+            echo "### Errors"
+            echo '```'
+            grep -E ',(ui,error|error),' "$LOG" | sed 's/.*,ui,error,//; s/.*,error,//' | tail -50 || echo "(none)"
+            echo '```'
+            echo ""
+            echo "### Last 120 UI lines"
+            echo '```'
+            grep ',ui,' "$LOG" | sed 's/.*,ui,[^,]*,//' | tail -120 || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Store AMI ID in SSM Parameter Store
         run: |
+          AMI_ID="${{ steps.build.outputs.ami_id }}"
+          DPDK_VERSION="${{ steps.build.outputs.dpdk_version }}"
+
+          if [[ -z "$AMI_ID" ]]; then
+            echo "::error::AMI ID is empty, cannot store in SSM"
+            exit 1
+          fi
+
+          echo "Storing AMI ID ${AMI_ID} in SSM..."
           aws ssm put-parameter \
             --name "${{ env.SSM_AMI_PARAMETER }}" \
             --type String \
-            --value "${{ steps.build.outputs.ami_id }}" \
+            --value "${AMI_ID}" \
             --overwrite \
             --description "Latest DPDK AMI for dpdk-stdlib-rust integration tests"
 
           aws ssm put-parameter \
             --name "${{ env.SSM_DPDK_VERSION_PARAMETER }}" \
             --type String \
-            --value "${{ steps.build.outputs.dpdk_version }}" \
+            --value "${DPDK_VERSION}" \
             --overwrite \
             --description "DPDK version in the latest pre-built AMI"
 
-          echo "Stored AMI ID ${{ steps.build.outputs.ami_id }} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
+          echo "Stored AMI ID ${AMI_ID} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
 
       - name: Deregister old AMIs (keep last 3)
         run: |
