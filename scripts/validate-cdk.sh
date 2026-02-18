@@ -8,6 +8,8 @@
 #
 #   1. cfn-signal resource names match CloudFormation logical IDs
 #      (the original cause of integration test failures - see DEBUGGING.md)
+#   2. Inline Cargo.toml files in user-data match the real crate Cargo.toml files
+#      (catches missing/optional deps that cause EC2 build failures)
 #
 # KNOWN BRITTLENESS
 # -----------------
@@ -76,6 +78,16 @@ else
     echo "Step 2: Checking cfn-signal resource name invariants..."
     python3 "$SCRIPT_DIR/check-cfn-signals.py" "$TEMPLATE"
 fi
+
+echo ""
+
+# ── Step 3: Validate inline Cargo.toml deps match real crates ────────────────
+# Catches drift between the Cargo.toml files embedded in CDK user-data and
+# the real crate Cargo.toml files in the repository. Prevents EC2 build
+# failures caused by missing or incorrectly optional dependencies.
+echo "Step 3: Checking inline Cargo.toml deps match real crates..."
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+python3 "$SCRIPT_DIR/check-inline-cargo.py" "$TEMPLATE" "$PROJECT_ROOT"
 
 echo ""
 echo "=== CDK validation passed ==="
