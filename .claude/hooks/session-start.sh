@@ -45,31 +45,15 @@ if ! command -v gh &>/dev/null; then
     || echo "Warning: gh installation failed — CI querying will require manual setup"
 fi
 
-# Authenticate gh using the GitHub OAuth token Claude Code received via OIDC.
-# Claude Code passes this token through a file descriptor specified by
-# CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR rather than an env var, so it
-# doesn't appear in `env` output. Fall back to GH_TOKEN/GITHUB_TOKEN if set.
-if command -v gh &>/dev/null; then
-  GH_AUTH_TOKEN=""
-
-  # Primary: read from the OAuth fd Claude Code opens for the hook process
-  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-}" ]]; then
-    GH_AUTH_TOKEN=$(cat /dev/fd/"${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR}" 2>/dev/null || true)
-  fi
-
-  # Fallback: static token the user may have set in environment settings
-  if [[ -z "$GH_AUTH_TOKEN" ]]; then
-    GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  fi
-
-  if [[ -n "$GH_AUTH_TOKEN" ]]; then
-    echo "$GH_AUTH_TOKEN" | gh auth login --with-token 2>/dev/null \
-      && echo "gh authenticated" \
-      || echo "Warning: gh auth failed (token may lack required scope)"
-  else
-    echo "Warning: no GitHub token available — gh CLI will not be authenticated"
-    echo "  Connect your GitHub account in Claude Code settings (OIDC) or set GH_TOKEN"
-  fi
+# Authenticate gh using a GitHub token set explicitly by the user.
+# Set GH_TOKEN in Claude Code's environment settings (claude.ai → project → environment)
+# with a fine-grained PAT scoped to: repo contents, actions (read), metadata (read).
+# Do NOT attempt to extract tokens from Claude Code's internal fd channel — that is an
+# intentional security boundary and not meant for hook access.
+if command -v gh &>/dev/null && [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
+  echo "${GH_TOKEN:-$GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null \
+    && echo "gh authenticated" \
+    || echo "Warning: gh auth failed (token may lack required scope)"
 fi
 
 # Build workspace so subsequent cargo test/build are incremental
