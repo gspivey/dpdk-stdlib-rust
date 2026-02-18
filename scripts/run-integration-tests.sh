@@ -29,6 +29,8 @@ RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"
 SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
+LOGS_DIR="$REPO_ROOT/instance-logs"
+FAILED_STEP=""               # Set by fail_with_logs; written to step summary / failure JSON
 
 # ── CLI argument parsing ─────────────────────────────────────────────────────
 
@@ -165,102 +167,112 @@ deploy_infrastructure() {
 fetch_stack_outputs() {
     log_info "Fetching stack outputs..."
 
-    local outputs
+    # ── Attempt 1: CDK outputs file written by cdk deploy ────────────────────
+    # CDK writes this file when --outputs-file is passed. However, when CDK
+    # cannot assume the deploy role and "proceeds anyway", it may write an
+    # empty JSON object ({}) even though the stack has real outputs.
     if [[ -f /tmp/cdk-outputs.json ]]; then
-        outputs=$(cat /tmp/cdk-outputs.json)
-    else
-        # Fetch from CloudFormation directly
-        outputs=$(aws cloudformation describe-stacks \
-            --stack-name "$CDK_STACK_NAME" \
-            --query "Stacks[0].Outputs" \
-            --output json 2>/dev/null)
+        local cdk_outputs
+        cdk_outputs=$(cat /tmp/cdk-outputs.json)
+        SENDER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
+" 2>/dev/null || true)
+        RECEIVER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
+" 2>/dev/null || true)
+        SENDER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
+" 2>/dev/null || true)
+        RECEIVER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
+" 2>/dev/null || true)
+        SENDER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
+" 2>/dev/null || true)
+        RECEIVER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
+" 2>/dev/null || true)
 
-        if [[ -z "$outputs" || "$outputs" == "null" ]]; then
-            log_error "Failed to fetch stack outputs"
-            return 1
+        if [[ -n "$SENDER_INSTANCE_ID" && -n "$RECEIVER_INSTANCE_ID" \
+              && -n "$SENDER_DPDK_ENI_IP" && -n "$RECEIVER_DPDK_ENI_IP" ]]; then
+            log_info "Stack outputs (from cdk-outputs.json):"
+            log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
+            log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
+            log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
+            log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
+            log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
+            log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
+            return 0
         fi
 
-        # Convert CF output format to CDK output format for consistent parsing
-        SENDER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
+        log_info "CDK outputs file incomplete (CDK may not have had deploy-role access) — falling back to CloudFormation"
+    fi
+
+    # ── Attempt 2: CloudFormation describe-stacks ────────────────────────────
+    # Authoritative source of truth. Used when the CDK outputs file is absent
+    # or incomplete (e.g., CDK ran without the deploy role and wrote {}).
+    local cf_outputs
+    cf_outputs=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs" \
+        --output json 2>/dev/null || true)
+
+    if [[ -z "$cf_outputs" || "$cf_outputs" == "null" ]]; then
+        log_error "CloudFormation describe-stacks returned no outputs for $CDK_STACK_NAME"
+        log_error "  Stack may not exist or may be in a failed state."
+        return 1
+    fi
+
+    SENDER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderInstanceId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
+    RECEIVER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverInstanceId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        SENDER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
+    SENDER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
+    RECEIVER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        SENDER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
+    SENDER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniPrivateIp': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
+    RECEIVER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniPrivateIp': print(o['OutputValue'])
 " 2>/dev/null || true)
 
-        log_info "Stack outputs (from CF describe):"
-        log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
-        log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
-        log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
-        log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
-        log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
-        log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
-        return 0
-    fi
-
-    # Parse CDK outputs JSON format
-    SENDER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
-" 2>/dev/null || true)
-    RECEIVER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
-" 2>/dev/null || true)
-    SENDER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
-" 2>/dev/null || true)
-    RECEIVER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
-" 2>/dev/null || true)
-    SENDER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
-    RECEIVER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
-
-    log_info "Stack outputs:"
+    log_info "Stack outputs (from CloudFormation describe-stacks):"
     log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
     log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
     log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
@@ -268,7 +280,7 @@ print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
     log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
     log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
 
-    # Validate we got all required outputs
+    # ── Final validation ─────────────────────────────────────────────────────
     if [[ -z "$SENDER_INSTANCE_ID" || -z "$RECEIVER_INSTANCE_ID" ]]; then
         log_error "Missing required stack outputs (instance IDs)"
         return 1
@@ -319,27 +331,30 @@ verify_build() {
     log_info "Verifying project build on instances..."
 
     for instance_id in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
-        local cmd_id
-        cmd_id=$(aws ssm send-command \
-            --instance-ids "$instance_id" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING"]' \
-            --query "Command.CommandId" \
-            --output text 2>/dev/null)
+        log_info "Checking build on $instance_id..."
 
-        sleep 5
+        local cmd_id
+        cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+            "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+
+        if [[ -z "$cmd_id" ]]; then
+            log_error "Failed to send build verification command to $instance_id"
+            return 1
+        fi
+
+        # Poll for completion rather than fixed sleep
+        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
+            log_error "Build verification command timed out on $instance_id"
+            return 1
+        fi
 
         local result
-        result=$(aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || true)
+        result=$(ssm_get_stdout "$instance_id" "$cmd_id")
 
         if echo "$result" | grep -q "BUILD_OK"; then
             log_info "Build verified on $instance_id"
         else
-            log_error "Build not found on $instance_id"
+            log_error "Build not found on $instance_id (output: $result)"
             return 1
         fi
     done
@@ -859,6 +874,275 @@ teardown_infrastructure() {
     cd "$REPO_ROOT"
 }
 
+# ── Instance log collection ──────────────────────────────────────────────────
+#
+# Collects logs from EC2 instances using two methods:
+#   1. EC2 console output  - works even without SSM, survives instance termination
+#   2. SSM file retrieval  - richer logs when SSM is reachable
+#
+# Logs are written to $LOGS_DIR/ with <role>-<filename> naming.
+
+collect_ssm_file() {
+    local instance_id="$1"
+    local label="$2"
+    local remote_path="$3"
+
+    local filename
+    filename=$(basename "$remote_path")
+
+    local cmd_id
+    cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+        "test -f $remote_path && cat $remote_path || echo 'FILE_NOT_FOUND'") 2>/dev/null || return 0
+
+    [[ -z "$cmd_id" ]] && return 0
+
+    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
+
+    local content
+    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
+
+    if [[ -n "$content" && "$content" != "FILE_NOT_FOUND" ]]; then
+        echo "$content" > "$LOGS_DIR/${label}-${filename}"
+        log_info "  Saved: ${label}-${filename} ($(echo "$content" | wc -l) lines)"
+    fi
+}
+
+collect_ssm_command() {
+    local instance_id="$1"
+    local label="$2"
+    local name="$3"
+    local command="$4"
+
+    local cmd_id
+    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$command") 2>/dev/null || return 0
+
+    [[ -z "$cmd_id" ]] && return 0
+
+    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
+
+    local content
+    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
+
+    if [[ -n "$content" ]]; then
+        echo "$content" > "$LOGS_DIR/${label}-${name}.log"
+        log_info "  Saved: ${label}-${name}.log"
+    fi
+}
+
+collect_instance_logs() {
+    log_section "Collecting instance logs"
+    mkdir -p "$LOGS_DIR"
+
+    # Build the list of (label, instance_id) pairs to collect from
+    local -a instances=()
+    if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+        instances+=("sender:${SENDER_INSTANCE_ID}")
+    fi
+    if [[ -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+        instances+=("receiver:${RECEIVER_INSTANCE_ID}")
+    fi
+
+    # Fallback: when CDK deploy failed and we have no stack outputs, look for
+    # instances in CloudFormation events (they appear even after rollback).
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No known instance IDs, scanning CloudFormation events..."
+        local event_ids
+        event_ids=$(aws cloudformation describe-stack-events \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "StackEvents[?ResourceType=='AWS::EC2::Instance' && PhysicalResourceId!=''].PhysicalResourceId" \
+            --output text 2>/dev/null | tr '\t' '\n' | grep -E '^i-' | sort -u || true)
+
+        local idx=0
+        for inst_id in $event_ids; do
+            instances+=("instance-${idx}:${inst_id}")
+            idx=$((idx + 1))
+        done
+    fi
+
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No instances found - skipping log collection"
+        return 0
+    fi
+
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
+        log_info "Collecting logs from ${label} (${instance_id})..."
+
+        # ── EC2 console output (survives termination, no SSM needed) ─────────
+        local console_output
+        console_output=$(aws ec2 get-console-output \
+            --instance-id "$instance_id" \
+            --latest \
+            --query "Output" \
+            --output text 2>/dev/null || echo "(console output unavailable)")
+        echo "$console_output" > "$LOGS_DIR/${label}-console-output.log"
+        log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
+
+        # ── SSM-based log collection (richer, needs SSM agent) ───────────────
+        local ssm_ready
+        ssm_ready=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${instance_id}" \
+            --query "InstanceInformationList[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+        if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
+            log_info "  SSM available - collecting log files..."
+            collect_ssm_file  "$instance_id" "$label" "/var/log/user-data.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cloud-init-output.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init.log"
+            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init-cmd.log"
+            collect_ssm_command "$instance_id" "$label" "build-listing" \
+                "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
+            collect_ssm_command "$instance_id" "$label" "journal" \
+                "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
+        else
+            log_info "  SSM not available for ${label} - relying on console output only"
+        fi
+    done
+
+    log_info "Instance logs written to: $LOGS_DIR"
+}
+
+# ── GitHub Actions step summary ──────────────────────────────────────────────
+#
+# write_step_summary: writes a markdown digest to $GITHUB_STEP_SUMMARY so the
+# failure reason and key log excerpts are visible directly in the Actions UI
+# without downloading any artifacts.  No-op when not running in GitHub Actions.
+#
+# The goal: an agent or human reviewing a failed run should be able to see
+# the root cause and last lines of user-data.log without leaving the page.
+
+write_step_summary() {
+    [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] && return 0
+
+    local result_icon status_text
+    if [[ "${TEST_EXIT_CODE:-0}" -eq 0 ]]; then
+        result_icon="✅"
+        status_text="PASSED"
+    else
+        result_icon="❌"
+        status_text="FAILED (exit ${TEST_EXIT_CODE:-2})"
+    fi
+
+    {
+        echo "## ${result_icon} Integration Tests: ${status_text}"
+        echo ""
+
+        if [[ -n "${FAILED_STEP:-}" ]]; then
+            echo "**Failed at step:** \`${FAILED_STEP}\`"
+            echo ""
+        fi
+
+        if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+            echo "**Sender:** \`${SENDER_INSTANCE_ID}\` | **Receiver:** \`${RECEIVER_INSTANCE_ID:-unknown}\`"
+            echo ""
+        fi
+
+        # Per-instance log excerpts (collapsed by default — readable without downloading)
+        for label in sender receiver; do
+            local userdata_log="$LOGS_DIR/${label}-user-data.log"
+            local console_log="$LOGS_DIR/${label}-console-output.log"
+            local build_file="$LOGS_DIR/${label}-build-listing.txt"
+
+            echo "### ${label^} instance logs"
+            echo ""
+
+            # Prefer user-data.log (richer); fall back to console output
+            if [[ -f "$userdata_log" && -s "$userdata_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$userdata_log")
+                echo "<details><summary>user-data.log — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$userdata_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            elif [[ -f "$console_log" && -s "$console_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$console_log")
+                echo "<details><summary>EC2 console output — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$console_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            else
+                echo "_No logs collected for ${label} instance._"
+                echo ""
+            fi
+
+            if [[ -f "$build_file" ]]; then
+                echo "**Build directory (\`/opt/dpdk-stdlib/target/release/\`):**"
+                echo '```'
+                cat "$build_file"
+                echo '```'
+                echo ""
+            fi
+        done
+
+        # Test result counts if JUnit XML was generated
+        if compgen -G "$RESULTS_DIR/*.xml" > /dev/null 2>&1; then
+            local total=0 failures=0
+            for xml in "$RESULTS_DIR"/*.xml; do
+                local t f
+                t=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('tests','0'))" 2>/dev/null || echo 0)
+                f=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('failures','0'))" 2>/dev/null || echo 0)
+                total=$(( total + t ))
+                failures=$(( failures + f ))
+            done
+            echo "### Test counts"
+            echo "Tests run: **${total}** | Failures: **${failures}**"
+            echo ""
+        fi
+
+        echo "---"
+        echo "_Artifacts: \`instance-logs\` (raw logs) · \`integration-test-results\` (JUnit XML)_"
+    } >> "$GITHUB_STEP_SUMMARY"
+}
+
+# write_failure_json: writes structured failure info to instance-logs/failure-summary.json.
+# An agent reading the artifact can parse this directly instead of grepping raw logs.
+
+write_failure_json() {
+    local step="$1"
+    local message="$2"
+    mkdir -p "$LOGS_DIR"
+
+    python3 - <<PYEOF
+import json, datetime
+data = {
+    "failed_step": """$step""",
+    "error": """$message""",
+    "exit_code": 2,
+    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "sender_instance_id": """${SENDER_INSTANCE_ID:-}""",
+    "receiver_instance_id": """${RECEIVER_INSTANCE_ID:-}""",
+    "commit": """${GITHUB_SHA:-unknown}""",
+    "run_url": "${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}",
+}
+with open("$LOGS_DIR/failure-summary.json", "w") as f:
+    json.dump(data, f, indent=2)
+print(f"Failure summary: $LOGS_DIR/failure-summary.json")
+PYEOF
+}
+
+# fail_with_logs: collect logs + write step summary + write failure JSON, then return.
+# Call this before exit 2 on any infrastructure failure path.
+
+fail_with_logs() {
+    local step="$1"
+    local message="$2"
+    FAILED_STEP="$step"
+    log_error "$message"
+    collect_instance_logs || true
+    write_failure_json "$step" "$message" || true
+    write_step_summary || true
+}
+
 # ── Main execution ───────────────────────────────────────────────────────────
 
 main() {
@@ -873,27 +1157,28 @@ main() {
     # Step 1: Deploy (or skip)
     if [[ "$FLAG_SKIP_DEPLOY" != "true" ]]; then
         if ! deploy_infrastructure; then
-            log_error "Infrastructure deployment failed"
+            # CF events preserve instance IDs even after rollback — collect what we can
+            fail_with_logs "deploy_infrastructure" "Infrastructure deployment failed"
             exit 2
         fi
     fi
 
     # Step 2: Fetch stack outputs
     if ! fetch_stack_outputs; then
-        log_error "Failed to fetch stack outputs"
+        fail_with_logs "fetch_stack_outputs" "Failed to fetch stack outputs"
         exit 2
     fi
 
     # Step 3: Wait for SSM readiness
     if ! wait_for_ssm_readiness; then
-        log_error "Instances not ready"
+        fail_with_logs "wait_for_ssm_readiness" "Instances not ready within SSM timeout"
         teardown_infrastructure
         exit 2
     fi
 
     # Step 4: Verify build
     if ! verify_build; then
-        log_error "Build verification failed"
+        fail_with_logs "verify_build" "Build verification failed — echo binary missing on instance"
         teardown_infrastructure
         exit 2
     fi
@@ -921,7 +1206,11 @@ main() {
     print_summary
     generate_json_summary
 
-    # Step 8: Teardown
+    # Step 8: Collect instance logs + write step summary (always, before teardown)
+    collect_instance_logs || true
+    write_step_summary || true
+
+    # Step 9: Teardown
     teardown_infrastructure
 
     log_info "Exiting with code: $TEST_EXIT_CODE"

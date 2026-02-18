@@ -20,3 +20,4 @@ deploy/cdk/package-lock.json
 # Deployment test directories
 deploy/test-*/
 deploy/deploy.sh
+scripts/__pycache__/

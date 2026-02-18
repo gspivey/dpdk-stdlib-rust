@@ -92,8 +92,8 @@ export class DpdkTestStack extends cdk.Stack {
           cpuType: ec2.AmazonLinuxCpuType.X86_64,
         });
 
-    // Timeout: 10 min with pre-built AMI (only cargo build needed), 35 min for full bootstrap
-    const creationTimeout = usePrebuiltAmi ? 'PT10M' : 'PT35M';
+    // Timeout: 20 min with pre-built AMI (cargo build takes 8-12 min on c5n.large), 35 min for full bootstrap
+    const creationTimeout = usePrebuiltAmi ? 'PT20M' : 'PT35M';
 
     // Helper: generate user-data commands for an instance
     const createUserData = (cfnResourceName: string): ec2.UserData => {
@@ -199,7 +199,7 @@ export class DpdkTestStack extends cdk.Stack {
         'tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time"] }',
         'EOF',
 
-        // dpdk-udp with feature detection
+        // dpdk-udp Cargo.toml - must match the real crate (dpdk and libc are required deps)
         'cat > dpdk-udp/Cargo.toml << \'EOF\'',
         '[package]',
         'name = "dpdk-udp"',
@@ -209,11 +209,8 @@ export class DpdkTestStack extends cdk.Stack {
         '',
         '[dependencies]',
         'thiserror = { workspace = true }',
-        'dpdk = { path = "../dpdk", optional = true }',
-        '',
-        '[features]',
-        'default = []',
-        'dpdk = ["dep:dpdk"]',
+        'libc = { workspace = true }',
+        'dpdk = { path = "../dpdk" }',
         'EOF',
 
         // Peer app for bidirectional testing
@@ -227,10 +224,6 @@ export class DpdkTestStack extends cdk.Stack {
         'dpdk-udp = { path = "../../dpdk-udp" }',
         'clap = { workspace = true }',
         'tokio = { workspace = true }',
-        '',
-        '[features]',
-        'default = []',
-        'dpdk = ["dpdk-udp/dpdk"]',
         'EOF',
 
         'cat > apps/peer-app/src/main.rs << \'EOF\'',
@@ -271,11 +264,6 @@ export class DpdkTestStack extends cdk.Stack {
         '    let args = Args::parse();',
         '    ',
         '    println!("DPDK-STDLIB Peer App");',
-        '    ',
-        '    #[cfg(feature = "dpdk")]',
-        '    println!("DPDK support compiled in");',
-        '    #[cfg(not(feature = "dpdk"))]',
-        '    println!("Standard networking mode");',
         '    ',
         '    let bind_addr: SocketAddr = format!("{}:{}", args.bind_ip, args.bind_port).parse()?;',
         '    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;',
@@ -323,7 +311,7 @@ export class DpdkTestStack extends cdk.Stack {
         'fn main() {',
         '    let args = Args::parse();',
         '    println!("DPDK Echo Server ready on port {}", args.port);',
-        '    println!("Rust: {}", env!("RUSTC_VERSION", "unknown"));',
+        '    println!("Rust: {}", option_env!("RUSTC_VERSION").unwrap_or("unknown"));',
         '    println!("DPDK libraries: {} found", std::fs::read_dir("/usr/local/lib").map(|d| d.count()).unwrap_or(0));',
         '    println!("Instance setup complete!");',
         '}',
@@ -431,6 +419,8 @@ export class DpdkTestStack extends cdk.Stack {
 
     // Add CreationPolicy to wait for setup completion
     const cfnSenderInstance = senderInstance.node.defaultChild as ec2.CfnInstance;
+    // Override logical ID so cfn-signal --resource DpdkSender matches the CloudFormation resource name
+    cfnSenderInstance.overrideLogicalId('DpdkSender');
     cfnSenderInstance.cfnOptions.creationPolicy = {
       resourceSignal: {
         timeout: creationTimeout,
@@ -453,6 +443,8 @@ export class DpdkTestStack extends cdk.Stack {
 
     // Add CreationPolicy for receiver too (bug fix: was previously missing)
     const cfnReceiverInstance = receiverInstance.node.defaultChild as ec2.CfnInstance;
+    // Override logical ID so cfn-signal --resource DpdkReceiver matches the CloudFormation resource name
+    cfnReceiverInstance.overrideLogicalId('DpdkReceiver');
     cfnReceiverInstance.cfnOptions.creationPolicy = {
       resourceSignal: {
         timeout: creationTimeout,

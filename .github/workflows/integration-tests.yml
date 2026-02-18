@@ -5,6 +5,15 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# Only one integration test run at a time — concurrent runs race to create
+# and destroy the same CloudFormation stack (DpdkTestStack), causing one
+# run's teardown to destroy infrastructure the other run is still using.
+# cancel-in-progress: false so the in-flight run finishes cleanly (with
+# teardown) rather than being killed mid-deploy and leaving orphaned infra.
+concurrency:
+  group: integration-tests
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
@@ -14,9 +23,44 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  # ── Fast pre-flight validation (no AWS credentials needed) ──────────────────
+  # Synthesizes the CDK template locally and validates infrastructure invariants
+  # in seconds. Blocks the expensive integration-tests job if anything is wrong.
+  #
+  # Why this exists: the cfn-signal resource name bug (2026-02-18) caused
+  # CloudFormation to wait the full 20-minute timeout before failing. This check
+  # catches that class of problem at synth time (scripts/validate-cdk.sh).
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Validate CDK template
+        run: |
+          chmod +x scripts/validate-cdk.sh
+          ./scripts/validate-cdk.sh
+
+  # ── Full integration test suite (requires AWS) ──────────────────────────────
   integration-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    needs: validate-cdk   # only run if CDK pre-flight passes
 
     steps:
       - name: Checkout
@@ -80,6 +124,16 @@ jobs:
           name: integration-test-results
           path: test-results/
           retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Publish test results
         if: always()
