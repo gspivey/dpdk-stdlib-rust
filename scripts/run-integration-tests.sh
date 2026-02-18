@@ -167,102 +167,112 @@ deploy_infrastructure() {
 fetch_stack_outputs() {
     log_info "Fetching stack outputs..."
 
-    local outputs
+    # ── Attempt 1: CDK outputs file written by cdk deploy ────────────────────
+    # CDK writes this file when --outputs-file is passed. However, when CDK
+    # cannot assume the deploy role and "proceeds anyway", it may write an
+    # empty JSON object ({}) even though the stack has real outputs.
     if [[ -f /tmp/cdk-outputs.json ]]; then
-        outputs=$(cat /tmp/cdk-outputs.json)
-    else
-        # Fetch from CloudFormation directly
-        outputs=$(aws cloudformation describe-stacks \
-            --stack-name "$CDK_STACK_NAME" \
-            --query "Stacks[0].Outputs" \
-            --output json 2>/dev/null)
+        local cdk_outputs
+        cdk_outputs=$(cat /tmp/cdk-outputs.json)
+        SENDER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
+" 2>/dev/null || true)
+        RECEIVER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
+" 2>/dev/null || true)
+        SENDER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
+" 2>/dev/null || true)
+        RECEIVER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
+" 2>/dev/null || true)
+        SENDER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
+" 2>/dev/null || true)
+        RECEIVER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
+" 2>/dev/null || true)
 
-        if [[ -z "$outputs" || "$outputs" == "null" ]]; then
-            log_error "Failed to fetch stack outputs"
-            return 1
+        if [[ -n "$SENDER_INSTANCE_ID" && -n "$RECEIVER_INSTANCE_ID" \
+              && -n "$SENDER_DPDK_ENI_IP" && -n "$RECEIVER_DPDK_ENI_IP" ]]; then
+            log_info "Stack outputs (from cdk-outputs.json):"
+            log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
+            log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
+            log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
+            log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
+            log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
+            log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
+            return 0
         fi
 
-        # Convert CF output format to CDK output format for consistent parsing
-        SENDER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
+        log_info "CDK outputs file incomplete (CDK may not have had deploy-role access) — falling back to CloudFormation"
+    fi
+
+    # ── Attempt 2: CloudFormation describe-stacks ────────────────────────────
+    # Authoritative source of truth. Used when the CDK outputs file is absent
+    # or incomplete (e.g., CDK ran without the deploy role and wrote {}).
+    local cf_outputs
+    cf_outputs=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs" \
+        --output json 2>/dev/null || true)
+
+    if [[ -z "$cf_outputs" || "$cf_outputs" == "null" ]]; then
+        log_error "CloudFormation describe-stacks returned no outputs for $CDK_STACK_NAME"
+        log_error "  Stack may not exist or may be in a failed state."
+        return 1
+    fi
+
+    SENDER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderInstanceId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
+    RECEIVER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverInstanceId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        SENDER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
+    SENDER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
+    RECEIVER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniId': print(o['OutputValue'])
 " 2>/dev/null || true)
-        SENDER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
+    SENDER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniPrivateIp': print(o['OutputValue'])
 " 2>/dev/null || true)
-        RECEIVER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
+    RECEIVER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniPrivateIp': print(o['OutputValue'])
 " 2>/dev/null || true)
 
-        log_info "Stack outputs (from CF describe):"
-        log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
-        log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
-        log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
-        log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
-        log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
-        log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
-        return 0
-    fi
-
-    # Parse CDK outputs JSON format
-    SENDER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
-" 2>/dev/null || true)
-    RECEIVER_INSTANCE_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
-" 2>/dev/null || true)
-    SENDER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
-" 2>/dev/null || true)
-    RECEIVER_DPDK_ENI_ID=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
-" 2>/dev/null || true)
-    SENDER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
-    RECEIVER_DPDK_ENI_IP=$(echo "$outputs" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
-
-    log_info "Stack outputs:"
+    log_info "Stack outputs (from CloudFormation describe-stacks):"
     log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
     log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
     log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
@@ -270,7 +280,7 @@ print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
     log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
     log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
 
-    # Validate we got all required outputs
+    # ── Final validation ─────────────────────────────────────────────────────
     if [[ -z "$SENDER_INSTANCE_ID" || -z "$RECEIVER_INSTANCE_ID" ]]; then
         log_error "Missing required stack outputs (instance IDs)"
         return 1
