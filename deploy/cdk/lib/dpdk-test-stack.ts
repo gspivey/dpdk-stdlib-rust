@@ -199,7 +199,7 @@ export class DpdkTestStack extends cdk.Stack {
         'tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time"] }',
         'EOF',
 
-        // dpdk-udp with feature detection
+        // dpdk-udp Cargo.toml - must match the real crate (dpdk and libc are required deps)
         'cat > dpdk-udp/Cargo.toml << \'EOF\'',
         '[package]',
         'name = "dpdk-udp"',
@@ -209,11 +209,8 @@ export class DpdkTestStack extends cdk.Stack {
         '',
         '[dependencies]',
         'thiserror = { workspace = true }',
-        'dpdk = { path = "../dpdk", optional = true }',
-        '',
-        '[features]',
-        'default = []',
-        'dpdk = ["dep:dpdk"]',
+        'libc = { workspace = true }',
+        'dpdk = { path = "../dpdk" }',
         'EOF',
 
         // Peer app for bidirectional testing
@@ -227,10 +224,6 @@ export class DpdkTestStack extends cdk.Stack {
         'dpdk-udp = { path = "../../dpdk-udp" }',
         'clap = { workspace = true }',
         'tokio = { workspace = true }',
-        '',
-        '[features]',
-        'default = []',
-        'dpdk = ["dpdk-udp/dpdk"]',
         'EOF',
 
         'cat > apps/peer-app/src/main.rs << \'EOF\'',
