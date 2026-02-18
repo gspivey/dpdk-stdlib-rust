@@ -30,6 +30,7 @@ RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"
 SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
 LOGS_DIR="$REPO_ROOT/instance-logs"
+FAILED_STEP=""               # Set by fail_with_logs; written to step summary / failure JSON
 
 # ── CLI argument parsing ─────────────────────────────────────────────────────
 
@@ -994,6 +995,144 @@ collect_instance_logs() {
     log_info "Instance logs written to: $LOGS_DIR"
 }
 
+# ── GitHub Actions step summary ──────────────────────────────────────────────
+#
+# write_step_summary: writes a markdown digest to $GITHUB_STEP_SUMMARY so the
+# failure reason and key log excerpts are visible directly in the Actions UI
+# without downloading any artifacts.  No-op when not running in GitHub Actions.
+#
+# The goal: an agent or human reviewing a failed run should be able to see
+# the root cause and last lines of user-data.log without leaving the page.
+
+write_step_summary() {
+    [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] && return 0
+
+    local result_icon status_text
+    if [[ "${TEST_EXIT_CODE:-0}" -eq 0 ]]; then
+        result_icon="✅"
+        status_text="PASSED"
+    else
+        result_icon="❌"
+        status_text="FAILED (exit ${TEST_EXIT_CODE:-2})"
+    fi
+
+    {
+        echo "## ${result_icon} Integration Tests: ${status_text}"
+        echo ""
+
+        if [[ -n "${FAILED_STEP:-}" ]]; then
+            echo "**Failed at step:** \`${FAILED_STEP}\`"
+            echo ""
+        fi
+
+        if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+            echo "**Sender:** \`${SENDER_INSTANCE_ID}\` | **Receiver:** \`${RECEIVER_INSTANCE_ID:-unknown}\`"
+            echo ""
+        fi
+
+        # Per-instance log excerpts (collapsed by default — readable without downloading)
+        for label in sender receiver; do
+            local userdata_log="$LOGS_DIR/${label}-user-data.log"
+            local console_log="$LOGS_DIR/${label}-console-output.log"
+            local build_file="$LOGS_DIR/${label}-build-listing.txt"
+
+            echo "### ${label^} instance logs"
+            echo ""
+
+            # Prefer user-data.log (richer); fall back to console output
+            if [[ -f "$userdata_log" && -s "$userdata_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$userdata_log")
+                echo "<details><summary>user-data.log — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$userdata_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            elif [[ -f "$console_log" && -s "$console_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$console_log")
+                echo "<details><summary>EC2 console output — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$console_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            else
+                echo "_No logs collected for ${label} instance._"
+                echo ""
+            fi
+
+            if [[ -f "$build_file" ]]; then
+                echo "**Build directory (\`/opt/dpdk-stdlib/target/release/\`):**"
+                echo '```'
+                cat "$build_file"
+                echo '```'
+                echo ""
+            fi
+        done
+
+        # Test result counts if JUnit XML was generated
+        if compgen -G "$RESULTS_DIR/*.xml" > /dev/null 2>&1; then
+            local total=0 failures=0
+            for xml in "$RESULTS_DIR"/*.xml; do
+                local t f
+                t=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('tests','0'))" 2>/dev/null || echo 0)
+                f=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('failures','0'))" 2>/dev/null || echo 0)
+                total=$(( total + t ))
+                failures=$(( failures + f ))
+            done
+            echo "### Test counts"
+            echo "Tests run: **${total}** | Failures: **${failures}**"
+            echo ""
+        fi
+
+        echo "---"
+        echo "_Artifacts: \`instance-logs\` (raw logs) · \`integration-test-results\` (JUnit XML)_"
+    } >> "$GITHUB_STEP_SUMMARY"
+}
+
+# write_failure_json: writes structured failure info to instance-logs/failure-summary.json.
+# An agent reading the artifact can parse this directly instead of grepping raw logs.
+
+write_failure_json() {
+    local step="$1"
+    local message="$2"
+    mkdir -p "$LOGS_DIR"
+
+    python3 - <<PYEOF
+import json, datetime
+data = {
+    "failed_step": """$step""",
+    "error": """$message""",
+    "exit_code": 2,
+    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "sender_instance_id": """${SENDER_INSTANCE_ID:-}""",
+    "receiver_instance_id": """${RECEIVER_INSTANCE_ID:-}""",
+    "commit": """${GITHUB_SHA:-unknown}""",
+    "run_url": "${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}",
+}
+with open("$LOGS_DIR/failure-summary.json", "w") as f:
+    json.dump(data, f, indent=2)
+print(f"Failure summary: $LOGS_DIR/failure-summary.json")
+PYEOF
+}
+
+# fail_with_logs: collect logs + write step summary + write failure JSON, then return.
+# Call this before exit 2 on any infrastructure failure path.
+
+fail_with_logs() {
+    local step="$1"
+    local message="$2"
+    FAILED_STEP="$step"
+    log_error "$message"
+    collect_instance_logs || true
+    write_failure_json "$step" "$message" || true
+    write_step_summary || true
+}
+
 # ── Main execution ───────────────────────────────────────────────────────────
 
 main() {
@@ -1008,32 +1147,28 @@ main() {
     # Step 1: Deploy (or skip)
     if [[ "$FLAG_SKIP_DEPLOY" != "true" ]]; then
         if ! deploy_infrastructure; then
-            log_error "Infrastructure deployment failed"
-            # Try EC2 console output - instances appear in CF events even after rollback
-            collect_instance_logs || true
+            # CF events preserve instance IDs even after rollback — collect what we can
+            fail_with_logs "deploy_infrastructure" "Infrastructure deployment failed"
             exit 2
         fi
     fi
 
     # Step 2: Fetch stack outputs
     if ! fetch_stack_outputs; then
-        log_error "Failed to fetch stack outputs"
-        collect_instance_logs || true
+        fail_with_logs "fetch_stack_outputs" "Failed to fetch stack outputs"
         exit 2
     fi
 
     # Step 3: Wait for SSM readiness
     if ! wait_for_ssm_readiness; then
-        log_error "Instances not ready"
-        collect_instance_logs || true
+        fail_with_logs "wait_for_ssm_readiness" "Instances not ready within SSM timeout"
         teardown_infrastructure
         exit 2
     fi
 
     # Step 4: Verify build
     if ! verify_build; then
-        log_error "Build verification failed"
-        collect_instance_logs || true
+        fail_with_logs "verify_build" "Build verification failed — echo binary missing on instance"
         teardown_infrastructure
         exit 2
     fi
@@ -1061,8 +1196,9 @@ main() {
     print_summary
     generate_json_summary
 
-    # Step 8: Collect instance logs (always - both software and cfn-init logs)
+    # Step 8: Collect instance logs + write step summary (always, before teardown)
     collect_instance_logs || true
+    write_step_summary || true
 
     # Step 9: Teardown
     teardown_infrastructure

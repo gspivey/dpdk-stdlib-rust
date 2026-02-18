@@ -14,9 +14,44 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  # ── Fast pre-flight validation (no AWS credentials needed) ──────────────────
+  # Synthesizes the CDK template locally and validates infrastructure invariants
+  # in seconds. Blocks the expensive integration-tests job if anything is wrong.
+  #
+  # Why this exists: the cfn-signal resource name bug (2026-02-18) caused
+  # CloudFormation to wait the full 20-minute timeout before failing. This check
+  # catches that class of problem at synth time. See DEBUGGING.md for details.
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Validate CDK template
+        run: |
+          chmod +x scripts/validate-cdk.sh
+          ./scripts/validate-cdk.sh
+
+  # ── Full integration test suite (requires AWS) ──────────────────────────────
   integration-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    needs: validate-cdk   # only run if CDK pre-flight passes
 
     steps:
       - name: Checkout
