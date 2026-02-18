@@ -29,7 +29,7 @@ jobs:
   #
   # Why this exists: the cfn-signal resource name bug (2026-02-18) caused
   # CloudFormation to wait the full 20-minute timeout before failing. This check
-  # catches that class of problem at synth time. See DEBUGGING.md for details.
+  # catches that class of problem at synth time (scripts/validate-cdk.sh).
   validate-cdk:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -122,8 +122,42 @@ if [[ "$FLAG_SKIP_INTEGRATION" != "true" ]]; then
     if gh run watch "$RUN_ID" --exit-status 2>&1; then
         log "Integration tests PASSED"
     else
-        log "Integration tests FAILED"
-        log "View details: gh run view $RUN_ID --log-failed"
+        log "Integration tests FAILED — downloading failure data..."
+
+        # Download the instance-logs artifact which contains:
+        #   failure-summary.json      - structured: failed_step, error, instance IDs
+        #   sender-user-data.log      - full EC2 user-data script output (richest source)
+        #   sender-console-output.log - EC2 console (always available, even post-teardown)
+        #   sender-journal.txt        - systemd journal (500 lines)
+        ARTIFACT_DIR="/tmp/ci-logs-${RUN_ID}"
+        if gh run download "$RUN_ID" --name instance-logs --dir "$ARTIFACT_DIR" 2>/dev/null; then
+            if [[ -f "$ARTIFACT_DIR/failure-summary.json" ]]; then
+                echo ""
+                echo "=== failure-summary.json ==="
+                cat "$ARTIFACT_DIR/failure-summary.json"
+                echo ""
+            fi
+
+            # Show the most informative log available
+            for logfile in \
+                "$ARTIFACT_DIR/sender-user-data.log" \
+                "$ARTIFACT_DIR/sender-console-output.log"; do
+                if [[ -f "$logfile" && -s "$logfile" ]]; then
+                    echo "=== $(basename "$logfile") — last 80 lines ==="
+                    tail -80 "$logfile"
+                    echo ""
+                    break
+                fi
+            done
+
+            log "Full logs: $ARTIFACT_DIR/"
+        else
+            # Artifact not yet available (upload may still be in progress)
+            log "instance-logs artifact not available; fetch manually once upload completes:"
+            log "  gh run download $RUN_ID --name instance-logs --dir /tmp/ci-logs-${RUN_ID}"
+        fi
+
+        log "Full workflow logs: gh run view $RUN_ID --log-failed"
         exit 2
     fi
 else
