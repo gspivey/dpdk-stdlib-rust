@@ -112,7 +112,7 @@ jobs:
         run: |
           chmod +x scripts/run-integration-tests.sh
           chmod +x scripts/integration-tests/*.sh
-          ./scripts/run-integration-tests.sh default --teardown --json-summary
+          ./scripts/run-integration-tests.sh default --json-summary
         env:
           AWS_PROFILE: default
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
@@ -145,10 +145,12 @@ jobs:
           fail-on-error: true
           fail-on-empty: false
 
-      - name: Safety net teardown
-        if: failure() && steps.tests.outcome == 'failure'
-        run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
-        env:
-          AWS_PROFILE: default
+      # Safety net teardown disabled — instances left running for post-failure introspection.
+      # Re-enable once integration tests are stable.
+      # - name: Safety net teardown
+      #   if: failure() && steps.tests.outcome == 'failure'
+      #   run: |
+      #     cd deploy/cdk
+      #     npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+      #   env:
+      #     AWS_PROFILE: default
