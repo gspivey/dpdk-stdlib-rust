@@ -300,9 +300,11 @@ wait_for_ssm_readiness() {
     while [[ $elapsed -lt $SSM_READINESS_TIMEOUT ]]; do
         local ready_count=0
 
-        # Check if both instances are registered with SSM
+        # Check if both instances are registered with SSM.
+        # Explicitly unset AWS_PROFILE so a stale named profile can't shadow
+        # the env-var credentials (AWS_ACCESS_KEY_ID etc.) and silently return empty.
         local ssm_info
-        ssm_info=$(aws ssm describe-instance-information \
+        ssm_info=$(unset AWS_PROFILE; aws ssm describe-instance-information \
             --filters "Key=InstanceIds,Values=${SENDER_INSTANCE_ID},${RECEIVER_INSTANCE_ID}" \
             --query "InstanceInformationList[].InstanceId" \
             --output text 2>/dev/null || true)
