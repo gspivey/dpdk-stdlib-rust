@@ -112,7 +112,7 @@ jobs:
         run: |
           chmod +x scripts/run-integration-tests.sh
           chmod +x scripts/integration-tests/*.sh
-          ./scripts/run-integration-tests.sh default --teardown --json-summary
+          ./scripts/run-integration-tests.sh --teardown --json-summary
         env:
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
 

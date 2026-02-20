@@ -5,7 +5,12 @@
 # run test tiers, collect JUnit XML results, optionally teardown.
 #
 # Usage:
-#   ./scripts/run-integration-tests.sh <AWS_PROFILE> [--teardown] [--skip-deploy] [--tier 1|3] [--json-summary]
+#   ./scripts/run-integration-tests.sh [AWS_PROFILE] [--teardown] [--skip-deploy] [--tier 1|3] [--json-summary]
+#
+# When AWS_PROFILE is omitted or set to "default", the script relies on
+# environment-variable credentials (AWS_ACCESS_KEY_ID, etc.) which is the
+# norm in GitHub Actions.  A named profile is only exported when explicitly
+# provided and not equal to "default".
 #
 # Exit codes:
 #   0 = all tests passed
@@ -42,12 +47,12 @@ TIER_FILTER=""  # empty = run all tiers
 
 usage() {
     cat <<EOF
-Usage: $0 <AWS_PROFILE> [OPTIONS]
+Usage: $0 [AWS_PROFILE] [OPTIONS]
 
 Orchestrates EC2 integration tests for dpdk-stdlib-rust.
 
 Arguments:
-  AWS_PROFILE           AWS CLI profile to use for deployment and SSM
+  AWS_PROFILE           AWS CLI profile name (optional; ignored when "default")
 
 Options:
   --teardown            Destroy AWS infrastructure after tests complete
@@ -63,14 +68,11 @@ Exit codes:
 EOF
 }
 
-if [[ $# -lt 1 ]]; then
-    usage
-    exit 2
+# First positional argument is AWS_PROFILE (optional — may be a flag instead)
+if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    AWS_PROFILE="$1"
+    shift
 fi
-
-# First positional argument is AWS_PROFILE
-AWS_PROFILE="$1"
-shift
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -97,13 +99,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$AWS_PROFILE" ]]; then
-    echo "ERROR: AWS_PROFILE argument is required" >&2
-    usage
-    exit 2
+# Only export AWS_PROFILE when it's a real named profile.
+# In GitHub Actions, credentials come from env vars (AWS_ACCESS_KEY_ID etc.)
+# and exporting AWS_PROFILE=default causes the CLI to look for a named profile
+# that doesn't exist, shadowing the env-var credentials.
+if [[ -n "$AWS_PROFILE" && "$AWS_PROFILE" != "default" ]]; then
+    export AWS_PROFILE
+else
+    # Ensure no stale AWS_PROFILE leaks into child processes
+    unset AWS_PROFILE 2>/dev/null || true
+    AWS_PROFILE=""
 fi
-
-export AWS_PROFILE
 
 # ── Logging helpers ──────────────────────────────────────────────────────────
 
@@ -301,10 +307,8 @@ wait_for_ssm_readiness() {
         local ready_count=0
 
         # Check if both instances are registered with SSM.
-        # Explicitly unset AWS_PROFILE so a stale named profile can't shadow
-        # the env-var credentials (AWS_ACCESS_KEY_ID etc.) and silently return empty.
         local ssm_info
-        ssm_info=$(unset AWS_PROFILE; aws ssm describe-instance-information \
+        ssm_info=$(aws ssm describe-instance-information \
             --filters "Key=InstanceIds,Values=${SENDER_INSTANCE_ID},${RECEIVER_INSTANCE_ID}" \
             --query "InstanceInformationList[].InstanceId" \
             --output text 2>/dev/null || true)
@@ -1150,7 +1154,7 @@ fail_with_logs() {
 main() {
     log_section "EC2 Integration Tests for dpdk-stdlib-rust"
 
-    log_info "Profile:      $AWS_PROFILE"
+    log_info "Profile:      ${AWS_PROFILE:-<env-var credentials>}"
     log_info "Teardown:     $FLAG_TEARDOWN"
     log_info "Skip deploy:  $FLAG_SKIP_DEPLOY"
     log_info "Tier filter:  ${TIER_FILTER:-all}"
