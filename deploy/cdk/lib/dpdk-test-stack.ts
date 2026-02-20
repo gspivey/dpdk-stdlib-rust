@@ -115,7 +115,7 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Updating system packages ==="',
         'dnf update -y',
         'dnf groupinstall -y "Development Tools"',
-        'dnf install -y git pciutils iperf3 --allowerasing',
+        'dnf install -y git pciutils iperf3 clang-devel --allowerasing',
 
         // Install Rust
         'echo "=== Installing Rust ==="',
@@ -150,6 +150,8 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
+        '# Ensure clang-devel is available for bindgen (may not be in older AMIs)',
+        'dnf install -y clang-devel 2>/dev/null || echo "clang-devel already installed or unavailable"',
       ];
 
       // Runtime config: kernel modules + hugepages (needed on every boot)
@@ -157,6 +159,8 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Configuring DPDK runtime ==="',
         'modprobe uio || echo "uio module already loaded"',
         'modprobe vfio-pci || echo "vfio-pci module already loaded"',
+        '# Enable noiommu mode for vfio-pci on EC2 Nitro (no hardware IOMMU exposed to guest)',
+        'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode || echo "noiommu already set"',
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
@@ -174,12 +178,12 @@ export class DpdkTestStack extends cdk.Stack {
 
 
 
-      // Build the project
+      // Build the project (with bindgen feature to use real DPDK, not stubs)
       const buildProject = [
         'echo "=== Building project ==="',
         'export HOME=/root',
         'source /root/.cargo/env',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',
         'echo "=== Setup complete! ==="',

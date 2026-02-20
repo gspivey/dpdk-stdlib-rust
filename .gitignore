@@ -21,3 +21,6 @@ deploy/cdk/package-lock.json
 deploy/test-*/
 deploy/deploy.sh
 scripts/__pycache__/
+
+# Logs from an integration test run
+integ-logs

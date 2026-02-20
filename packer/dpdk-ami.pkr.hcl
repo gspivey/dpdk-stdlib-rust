@@ -81,7 +81,7 @@ build {
       "echo '=== Installing system packages ==='",
       "sudo dnf update -y",
       "sudo dnf groupinstall -y 'Development Tools'",
-      "sudo dnf install -y git pciutils iperf3",
+      "sudo dnf install -y git pciutils iperf3 clang-devel",
       "sudo dnf install -y aws-cfn-bootstrap || echo 'Warning: aws-cfn-bootstrap not available, skipping'",
     ]
   }
