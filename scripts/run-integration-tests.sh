@@ -157,12 +157,24 @@ deploy_infrastructure() {
         log_info "No pre-built AMI specified, using stock AL2023 with full bootstrap"
     fi
 
-    log_info "Running cdk deploy..."
+    # --no-rollback: on failure, leave instances running so we can collect
+    # user-data.log via SSM.  The safety-net teardown step destroys the stack.
+    log_info "Running cdk deploy (--no-rollback for debug)..."
     if ! npx cdk deploy "$CDK_STACK_NAME" \
         --require-approval never \
+        --no-rollback \
         --outputs-file /tmp/cdk-outputs.json \
         $cdk_context_args 2>&1; then
         log_error "CDK deployment failed"
+
+        # Query CloudFormation for failure reasons — these contain the cfn-signal
+        # --reason string from the EXIT trap, showing the actual user-data error.
+        log_info "CloudFormation CREATE_FAILED events:"
+        aws cloudformation describe-stack-events \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+            --output table 2>/dev/null || true
+
         return 1
     fi
 
@@ -1163,8 +1175,16 @@ main() {
     # Step 1: Deploy (or skip)
     if [[ "$FLAG_SKIP_DEPLOY" != "true" ]]; then
         if ! deploy_infrastructure; then
-            # CF events preserve instance IDs even after rollback — collect what we can
+            # With --no-rollback, instances may still be running.
+            # Try to fetch outputs and collect logs before giving up.
+            log_info "Deploy failed — attempting to collect logs from surviving instances..."
+            fetch_stack_outputs 2>/dev/null || true
+            if [[ -n "${SENDER_INSTANCE_ID:-}" || -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+                # Wait briefly for SSM to become available
+                wait_for_ssm_readiness 2>/dev/null || true
+            fi
             fail_with_logs "deploy_infrastructure" "Infrastructure deployment failed"
+            teardown_infrastructure
             exit 2
         fi
     fi
