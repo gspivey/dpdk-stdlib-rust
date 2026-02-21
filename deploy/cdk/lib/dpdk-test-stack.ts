@@ -161,6 +161,11 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Using pre-built DPDK AMI ==="',
         '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
         'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
+        '# Diagnostic: verify key tools are present',
+        'echo "which unzip: $(which unzip 2>/dev/null || echo MISSING)"',
+        'echo "which cargo: $(which cargo 2>/dev/null || echo MISSING)"',
+        'echo "which clang: $(which clang 2>/dev/null || echo MISSING)"',
+        'echo "DPDK libs: $(ls /usr/local/lib/librte_* 2>/dev/null | wc -l) found"',
       ];
 
       // Runtime config: kernel modules + hugepages (needed on every boot)
@@ -190,8 +195,12 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Building project ==="',
         'export HOME=/root',
         'source /root/.cargo/env',
-        '# Verify DPDK is findable before cargo build',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk || echo "WARNING: pkg-config cannot find libdpdk"',
+        'echo "cargo version: $(cargo --version)"',
+        'echo "rustc version: $(rustc --version)"',
+        '# Verify DPDK is findable — fail fast if not (otherwise build silently uses stubs)',
+        'echo "Checking pkg-config for libdpdk..."',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
+        'echo "DPDK found: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk)"',
         'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',

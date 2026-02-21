@@ -116,6 +116,18 @@ jobs:
         env:
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
 
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== Failure Diagnostics ==="
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "::error::$(cat instance-logs/failure-summary.json)"
+          fi
+          for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            echo "::warning::$(basename "$log") (last 40 lines): $(tail -40 "$log" | tr '\n' '|')"
+          done
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
