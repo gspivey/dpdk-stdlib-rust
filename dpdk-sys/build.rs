@@ -115,8 +115,11 @@ fn generate_bindings() {
         .blocklist_type("max_align_t")
         // Fix E0588: packed structs that transitively contain #[repr(align)] types.
         // These are unused in our code — making them opaque turns them into [u8; N]
-        // (align 1, auto-derives Debug/Default) which resolves the conflict.
+        // which resolves the packed/aligned conflict.
+        // Note: opaque types still get #[repr(align)] from bindgen, so we must
+        // also make any packed container structs opaque.
         .opaque_type("rte_arp_ipv4")               // packed, contains aligned rte_ether_addr
+        .opaque_type("rte_arp_hdr")                 // packed, contains aligned rte_arp_ipv4
         .opaque_type("rte_l2tpv2_combined_msg_hdr") // packed, contains aligned L2TP inner type
         // Fix E0277: rte_gtp_psc_generic_hdr is missing Debug but is used in a
         // derive(Debug) container (rte_flow_item_gtp_psc). Making it opaque gives
