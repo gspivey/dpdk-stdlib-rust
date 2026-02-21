@@ -22,6 +22,7 @@ fn main() {
         println!("cargo:rustc-cfg=dpdk_bindgen");
         #[cfg(feature = "bindgen")]
         generate_bindings();
+        compile_shim();
     } else {
         println!("cargo:rustc-cfg=dpdk_stubs");
         if !dpdk_found {
@@ -91,6 +92,36 @@ fn link_dpdk_libraries() {
     println!("cargo:rustc-link-lib=numa");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");
+}
+
+/// Compile the C shim that wraps static inline DPDK functions.
+/// Called only when real DPDK is present (dpdk_bindgen mode).
+fn compile_shim() {
+    let mut build = cc::Build::new();
+    build.file("csrc/dpdk_shim.c");
+
+    // Feed the same include paths that bindgen uses
+    let common_paths = [
+        "/usr/include/dpdk",
+        "/usr/local/include/dpdk",
+        "/opt/dpdk/include",
+    ];
+    for path in &common_paths {
+        if PathBuf::from(path).exists() {
+            build.include(path);
+        }
+    }
+
+    // Also honour DPDK_PATH
+    if let Ok(dpdk_path) = env::var("DPDK_PATH") {
+        let include_path = PathBuf::from(&dpdk_path).join("include");
+        if include_path.exists() {
+            build.include(&include_path);
+        }
+    }
+
+    build.compile("dpdk_shim");
+    println!("cargo:rerun-if-changed=csrc/dpdk_shim.c");
 }
 
 #[cfg(feature = "bindgen")]

@@ -572,9 +572,9 @@ impl Port {
 
         LinkStatus {
             speed: link.link_speed,
-            full_duplex: link.link_duplex != 0,
-            autoneg: link.link_autoneg != 0,
-            link_up: link.link_status != 0,
+            full_duplex: link.link_duplex() != 0,
+            autoneg: link.link_autoneg() != 0,
+            link_up: link.link_status() != 0,
         }
     }
 

@@ -471,6 +471,20 @@ pub struct rte_eth_link {
     pub link_status: u16,
 }
 
+// Accessor methods matching the bindgen-generated bitfield accessors
+// so that `link.link_duplex()` works identically for stubs and real DPDK.
+impl rte_eth_link {
+    pub fn link_duplex(&self) -> u16 {
+        self.link_duplex
+    }
+    pub fn link_autoneg(&self) -> u16 {
+        self.link_autoneg
+    }
+    pub fn link_status(&self) -> u16 {
+        self.link_status
+    }
+}
+
 /// Ethernet statistics
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
