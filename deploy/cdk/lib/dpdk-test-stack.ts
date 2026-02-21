@@ -103,13 +103,18 @@ export class DpdkTestStack extends cdk.Stack {
       // The trap ensures cfn-signal ALWAYS fires — even when set -e kills the script
       // on a failed command.  Without the trap, CloudFormation waits the full creation
       // timeout (20-35 min) before detecting the failure.
+      //
+      // The trap also captures the last lines of user-data.log and sends them as
+      // the --reason parameter to cfn-signal, so the error appears directly in the
+      // CloudFormation events (visible in CDK deploy output).
       const preamble = [
         'exec > >(tee /var/log/user-data.log) 2>&1',
         'echo "=== User-data starting at $(date -u) ==="',
         // Install cfn-bootstrap BEFORE set -e so a missing package doesn't abort
         'dnf install -y aws-cfn-bootstrap 2>/dev/null || echo "cfn-bootstrap already present or unavailable"',
         // Trap EXIT to always signal CloudFormation (success or failure)
-        `trap '/opt/aws/bin/cfn-signal -e $? --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region} 2>/dev/null || true' EXIT`,
+        // Captures last 3 lines of user-data.log as the reason string
+        `trap 'CFN_EXIT=$?; CFN_REASON=$(tail -3 /var/log/user-data.log 2>/dev/null | tr "\\n" " " | cut -c1-200); /opt/aws/bin/cfn-signal -e $CFN_EXIT --reason "$CFN_REASON" --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region} 2>/dev/null || true' EXIT`,
         'set -euo pipefail',
       ];
 

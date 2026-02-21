@@ -121,11 +121,16 @@ jobs:
         run: |
           echo "=== Failure Diagnostics ==="
           if [ -f instance-logs/failure-summary.json ]; then
-            echo "::error::$(cat instance-logs/failure-summary.json)"
+            echo "--- failure-summary.json ---"
+            cat instance-logs/failure-summary.json
+            FAILED_STEP=$(python3 -c "import json; print(json.load(open('instance-logs/failure-summary.json')).get('failed_step','unknown'))" 2>/dev/null || echo "unknown")
+            ERROR_MSG=$(python3 -c "import json; print(json.load(open('instance-logs/failure-summary.json')).get('error','unknown'))" 2>/dev/null || echo "unknown")
+            echo "::error::Integration test failed at step: ${FAILED_STEP} - ${ERROR_MSG}"
           fi
           for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
             [ -f "$log" ] || continue
-            echo "::warning::$(basename "$log") (last 40 lines): $(tail -40 "$log" | tr '\n' '|')"
+            echo "--- $(basename "$log") (last 60 lines) ---"
+            tail -60 "$log"
           done
 
       - name: Upload test results
