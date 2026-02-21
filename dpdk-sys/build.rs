@@ -22,6 +22,7 @@ fn main() {
         println!("cargo:rustc-cfg=dpdk_bindgen");
         #[cfg(feature = "bindgen")]
         generate_bindings();
+        compile_shim();
     } else {
         println!("cargo:rustc-cfg=dpdk_stubs");
         if !dpdk_found {
@@ -93,6 +94,36 @@ fn link_dpdk_libraries() {
     println!("cargo:rustc-link-lib=dl");
 }
 
+/// Compile the C shim that wraps static inline DPDK functions.
+/// Called only when real DPDK is present (dpdk_bindgen mode).
+fn compile_shim() {
+    let mut build = cc::Build::new();
+    build.file("csrc/dpdk_shim.c");
+
+    // Feed the same include paths that bindgen uses
+    let common_paths = [
+        "/usr/include/dpdk",
+        "/usr/local/include/dpdk",
+        "/opt/dpdk/include",
+    ];
+    for path in &common_paths {
+        if PathBuf::from(path).exists() {
+            build.include(path);
+        }
+    }
+
+    // Also honour DPDK_PATH
+    if let Ok(dpdk_path) = env::var("DPDK_PATH") {
+        let include_path = PathBuf::from(&dpdk_path).join("include");
+        if include_path.exists() {
+            build.include(&include_path);
+        }
+    }
+
+    build.compile("dpdk_shim");
+    println!("cargo:rerun-if-changed=csrc/dpdk_shim.c");
+}
+
 #[cfg(feature = "bindgen")]
 fn generate_bindings() {
     use std::fs;
@@ -113,6 +144,18 @@ fn generate_bindings() {
         .allowlist_var("RTE_.*")
         // Block problematic types
         .blocklist_type("max_align_t")
+        // Fix E0588: packed structs that transitively contain #[repr(align)] types.
+        // These are unused in our code — making them opaque turns them into [u8; N]
+        // which resolves the packed/aligned conflict.
+        // Note: opaque types still get #[repr(align)] from bindgen, so we must
+        // also make any packed container structs opaque.
+        .opaque_type("rte_arp_ipv4")               // packed, contains aligned rte_ether_addr
+        .opaque_type("rte_arp_hdr")                 // packed, contains aligned rte_arp_ipv4
+        .opaque_type("rte_l2tpv2_combined_msg_hdr") // packed, contains aligned L2TP inner type
+        // Fix E0277: rte_gtp_psc_generic_hdr is missing Debug but is used in a
+        // derive(Debug) container (rte_flow_item_gtp_psc). Making it opaque gives
+        // it a byte-array body that auto-derives Debug.
+        .opaque_type("rte_gtp_psc_generic_hdr")
         // Generate derives
         .derive_default(true)
         .derive_debug(true)

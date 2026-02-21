@@ -33,6 +33,14 @@
 #[cfg(dpdk_bindgen)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+// Shim: wrappers for static inline functions and macro constants that
+// bindgen cannot capture.  Only needed with real DPDK.
+#[cfg(dpdk_bindgen)]
+mod shim;
+
+#[cfg(dpdk_bindgen)]
+pub use shim::*;
+
 // When using stubs (default), use our manual definitions
 #[cfg(dpdk_stubs)]
 mod stubs;

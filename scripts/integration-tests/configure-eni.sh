@@ -118,6 +118,14 @@ do_bind() {
     modprobe uio 2>/dev/null || true
     modprobe vfio-pci 2>/dev/null || true
 
+    # Enable noiommu mode — required on EC2 Nitro instances which don't
+    # expose hardware IOMMU to the guest.  Without this, vfio-pci refuses
+    # to bind with "No such device".
+    if [[ -f /sys/module/vfio/parameters/enable_unsafe_noiommu_mode ]]; then
+        echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+        echo "Enabled vfio noiommu mode"
+    fi
+
     # Unbind from current driver
     echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
 

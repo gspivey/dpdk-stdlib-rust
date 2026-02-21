@@ -18,6 +18,8 @@ permissions:
   id-token: write
   contents: read
   checks: write
+  pull-requests: write
+  issues: write
 
 env:
   AWS_REGION: us-east-1
@@ -112,10 +114,58 @@ jobs:
         run: |
           chmod +x scripts/run-integration-tests.sh
           chmod +x scripts/integration-tests/*.sh
-          ./scripts/run-integration-tests.sh default --teardown --json-summary
+          ./scripts/run-integration-tests.sh --teardown --json-summary
         env:
-          AWS_PROFILE: default
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== Failure Diagnostics ==="
+
+          # Build a markdown report
+          REPORT="/tmp/failure-report.md"
+          echo "## Integration Test Failure (Run ${{ github.run_id }})" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${{ github.sha }}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "### failure-summary.json" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          else
+            echo "**No failure-summary.json found**" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Include key log files
+          for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            echo "### $(basename "$log") (${LOGSIZE} bytes, last 80 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -80 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # List all files in instance-logs
+          echo "### All instance-logs files" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          ls -la instance-logs/ >> "$REPORT" 2>/dev/null || echo "directory not found" >> "$REPORT"
+          echo '```' >> "$REPORT"
+
+          # Output to step log
+          cat "$REPORT"
+
+          # Post as PR comment (PR #11) so it's readable via gh api
+          gh pr comment 11 --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post PR comment (missing permission or no PR)"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Upload test results
         if: always()
@@ -150,5 +200,3 @@ jobs:
         run: |
           cd deploy/cdk
           npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
-        env:
-          AWS_PROFILE: default

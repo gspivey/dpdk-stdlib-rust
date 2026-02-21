@@ -210,7 +210,7 @@ pub struct rte_mempool_cache {
 
 /// Ethernet device info
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct rte_eth_dev_info {
     pub device: *mut c_void,
     pub driver_name: *const c_char,
@@ -246,6 +246,45 @@ pub struct rte_eth_dev_info {
     pub dev_capa: u64,
 }
 
+impl Default for rte_eth_dev_info {
+    fn default() -> Self {
+        Self {
+            device: ptr::null_mut(),
+            driver_name: ptr::null(),
+            if_index: 0,
+            min_mtu: 0,
+            max_mtu: 0,
+            dev_flags: ptr::null(),
+            min_rx_bufsize: 0,
+            max_rx_pktlen: 0,
+            max_lro_pkt_size: 0,
+            max_rx_queues: 0,
+            max_tx_queues: 0,
+            max_mac_addrs: 0,
+            max_vfs: 0,
+            max_vmdq_pools: 0,
+            rx_offload_capa: 0,
+            tx_offload_capa: 0,
+            rx_queue_offload_capa: 0,
+            tx_queue_offload_capa: 0,
+            reta_size: 0,
+            hash_key_size: 0,
+            flow_type_rss_offloads: 0,
+            default_rxconf: rte_eth_rxconf::default(),
+            default_txconf: rte_eth_txconf::default(),
+            vmdq_queue_base: 0,
+            vmdq_queue_num: 0,
+            vmdq_pool_base: 0,
+            rx_desc_lim: rte_eth_desc_lim::default(),
+            tx_desc_lim: rte_eth_desc_lim::default(),
+            speed_capa: 0,
+            nb_rx_queues: 0,
+            nb_tx_queues: 0,
+            dev_capa: 0,
+        }
+    }
+}
+
 /// Ethernet device configuration
 #[repr(C)]
 #[derive(Debug, Default, Clone)]
@@ -261,7 +300,7 @@ pub struct rte_eth_conf {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct rte_eth_rxmode {
     pub mq_mode: u32,
     pub mtu: u32,
@@ -271,8 +310,21 @@ pub struct rte_eth_rxmode {
     pub reserved_ptrs: [*mut c_void; 2],
 }
 
+impl Default for rte_eth_rxmode {
+    fn default() -> Self {
+        Self {
+            mq_mode: 0,
+            mtu: 0,
+            max_lro_pkt_size: 0,
+            offloads: 0,
+            reserved_64s: [0; 2],
+            reserved_ptrs: [ptr::null_mut(); 2],
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct rte_eth_txmode {
     pub mq_mode: u32,
     pub offloads: u64,
@@ -281,8 +333,20 @@ pub struct rte_eth_txmode {
     pub reserved_ptrs: [*mut c_void; 2],
 }
 
+impl Default for rte_eth_txmode {
+    fn default() -> Self {
+        Self {
+            mq_mode: 0,
+            offloads: 0,
+            pvid: 0,
+            reserved_64s: [0; 2],
+            reserved_ptrs: [ptr::null_mut(); 2],
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct rte_eth_rxconf {
     pub rx_thresh: rte_eth_thresh,
     pub rx_free_thresh: u16,
@@ -297,8 +361,26 @@ pub struct rte_eth_rxconf {
     pub reserved_ptrs: [*mut c_void; 2],
 }
 
+impl Default for rte_eth_rxconf {
+    fn default() -> Self {
+        Self {
+            rx_thresh: rte_eth_thresh::default(),
+            rx_free_thresh: 0,
+            rx_drop_en: 0,
+            rx_deferred_start: 0,
+            rx_nseg: 0,
+            share_group: 0,
+            share_qid: 0,
+            offloads: 0,
+            rx_seg: ptr::null_mut(),
+            reserved_64s: [0; 2],
+            reserved_ptrs: [ptr::null_mut(); 2],
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct rte_eth_txconf {
     pub tx_thresh: rte_eth_thresh,
     pub tx_rs_thresh: u16,
@@ -307,6 +389,20 @@ pub struct rte_eth_txconf {
     pub offloads: u64,
     pub reserved_64s: [u64; 2],
     pub reserved_ptrs: [*mut c_void; 2],
+}
+
+impl Default for rte_eth_txconf {
+    fn default() -> Self {
+        Self {
+            tx_thresh: rte_eth_thresh::default(),
+            tx_rs_thresh: 0,
+            tx_free_thresh: 0,
+            tx_deferred_start: 0,
+            offloads: 0,
+            reserved_64s: [0; 2],
+            reserved_ptrs: [ptr::null_mut(); 2],
+        }
+    }
 }
 
 #[repr(C)]
@@ -340,11 +436,21 @@ pub struct rte_eth_tx_adv_conf {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct rte_eth_rss_conf {
     pub rss_key: *mut u8,
     pub rss_key_len: u8,
     pub rss_hf: u64,
+}
+
+impl Default for rte_eth_rss_conf {
+    fn default() -> Self {
+        Self {
+            rss_key: ptr::null_mut(),
+            rss_key_len: 0,
+            rss_hf: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -363,6 +469,20 @@ pub struct rte_eth_link {
     pub link_duplex: u16,
     pub link_autoneg: u16,
     pub link_status: u16,
+}
+
+// Accessor methods matching the bindgen-generated bitfield accessors
+// so that `link.link_duplex()` works identically for stubs and real DPDK.
+impl rte_eth_link {
+    pub fn link_duplex(&self) -> u16 {
+        self.link_duplex
+    }
+    pub fn link_autoneg(&self) -> u16 {
+        self.link_autoneg
+    }
+    pub fn link_status(&self) -> u16 {
+        self.link_status
+    }
 }
 
 /// Ethernet statistics

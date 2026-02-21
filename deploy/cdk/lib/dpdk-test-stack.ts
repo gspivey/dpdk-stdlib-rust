@@ -99,23 +99,34 @@ export class DpdkTestStack extends cdk.Stack {
     const createUserData = (cfnResourceName: string): ec2.UserData => {
       const ud = ec2.UserData.forLinux();
 
-      // Common preamble
+      // Common preamble: logging, cfn-bootstrap install, then EXIT trap for cfn-signal.
+      // The trap ensures cfn-signal ALWAYS fires — even when set -e kills the script
+      // on a failed command.  Without the trap, CloudFormation waits the full creation
+      // timeout (20-35 min) before detecting the failure.
+      //
+      // The trap also captures the last lines of user-data.log and sends them as
+      // the --reason parameter to cfn-signal, so the error appears directly in the
+      // CloudFormation events (visible in CDK deploy output).
       const preamble = [
-        '#!/bin/bash',
-        'set -euo pipefail',
         'exec > >(tee /var/log/user-data.log) 2>&1',
-        'dnf install -y aws-cfn-bootstrap',
+        'echo "=== User-data starting at $(date -u) ==="',
+        // Install cfn-bootstrap BEFORE set -e so a missing package doesn't abort
+        'dnf install -y aws-cfn-bootstrap 2>/dev/null || echo "cfn-bootstrap already present or unavailable"',
+        // Trap EXIT to always signal CloudFormation (success or failure)
+        // Captures last 3 lines of user-data.log as the reason string
+        `trap 'CFN_EXIT=$?; CFN_REASON=$(tail -3 /var/log/user-data.log 2>/dev/null | tr "\\n" " " | cut -c1-200); /opt/aws/bin/cfn-signal -e $CFN_EXIT --reason "$CFN_REASON" --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region} 2>/dev/null || true' EXIT`,
+        'set -euo pipefail',
       ];
 
       // Bootstrap commands: install system packages, Rust, and DPDK from source
       const fullBootstrap = [
         'echo "=== Starting DPDK-STDLIB setup on Amazon Linux 3 ==="',
 
-        // System packages
+        // System packages (include unzip for project asset extraction)
         'echo "=== Updating system packages ==="',
         'dnf update -y',
         'dnf groupinstall -y "Development Tools"',
-        'dnf install -y git pciutils iperf3 --allowerasing',
+        'dnf install -y git pciutils iperf3 clang-devel unzip --allowerasing',
 
         // Install Rust
         'echo "=== Installing Rust ==="',
@@ -129,7 +140,7 @@ export class DpdkTestStack extends cdk.Stack {
         // Install DPDK dependencies
         'echo "=== Installing DPDK dependencies ==="',
         'dnf install -y meson ninja-build python3-pip libbsd-devel libpcap-devel numactl-devel kernel-devel kernel-headers --allowerasing',
-        'pip3 install pyelftools',
+        'pip3 install pyelftools || pip3 install --break-system-packages pyelftools',
 
         // Download and build DPDK
         'echo "=== Downloading DPDK ==="',
@@ -139,8 +150,11 @@ export class DpdkTestStack extends cdk.Stack {
         'tar -xf "dpdk-${DPDK_VERSION}.tar.xz"',
         'cd dpdk-stable-${DPDK_VERSION}',
 
+        // Build DPDK — must match scripts/install_dpdk_amazon_linux.sh:
+        //   --libdir=lib   forces libs into $PREFIX/lib/ (not lib64/)
+        //   -Denable_kmods=false  avoids igb_uio build failures on AL2023 kernels
         'echo "=== Building DPDK ==="',
-        'meson setup build --prefix=/usr/local --buildtype=release -Denable_kmods=true -Ddisable_drivers=net/gve,net/ionic',
+        'meson setup build --prefix=/usr/local --libdir=lib --buildtype=release -Denable_kmods=false -Ddisable_drivers=net/gve,net/ionic',
         'ninja -C build',
         'ninja -C build install',
         'echo "/usr/local/lib" > /etc/ld.so.conf.d/dpdk.conf',
@@ -150,6 +164,13 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
+        '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
+        'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
+        '# Diagnostic: verify key tools are present',
+        'echo "which unzip: $(which unzip 2>/dev/null || echo MISSING)"',
+        'echo "which cargo: $(which cargo 2>/dev/null || echo MISSING)"',
+        'echo "which clang: $(which clang 2>/dev/null || echo MISSING)"',
+        'echo "DPDK libs: $(ls /usr/local/lib/librte_* 2>/dev/null | wc -l) found"',
       ];
 
       // Runtime config: kernel modules + hugepages (needed on every boot)
@@ -157,6 +178,8 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Configuring DPDK runtime ==="',
         'modprobe uio || echo "uio module already loaded"',
         'modprobe vfio-pci || echo "vfio-pci module already loaded"',
+        '# Enable noiommu mode for vfio-pci on EC2 Nitro (no hardware IOMMU exposed to guest)',
+        'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode || echo "noiommu already set"',
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
@@ -166,213 +189,35 @@ export class DpdkTestStack extends cdk.Stack {
       const projectSetup = [
         'echo "=== Downloading DPDK-STDLIB project ==="',
         `aws s3 cp ${projectAsset.s3ObjectUrl} /tmp/dpdk-stdlib.zip`,
-        'cd /tmp',
-        'unzip dpdk-stdlib.zip',
         'mkdir -p /opt/dpdk-stdlib',
-        'cp -r * /opt/dpdk-stdlib/',
+        'unzip -q /tmp/dpdk-stdlib.zip -d /opt/dpdk-stdlib',
         'chown -R root:root /opt/dpdk-stdlib',
         'cd /opt/dpdk-stdlib',
-
-        // Create project structure
-        'mkdir -p {dpdk-sys/src,dpdk/src,dpdk-udp/src,apps/echo/src,apps/test-client/src,apps/peer-app/src,scripts}',
       ];
 
-      // Inline project files (Cargo.toml overrides, apps, etc.)
-      const inlineProjectFiles = [
-        // Main Cargo.toml with feature flags
-        'cat > Cargo.toml << \'EOF\'',
-        '[workspace]',
-        'resolver = "2"',
-        'members = [',
-        '  "dpdk-sys",',
-        '  "dpdk",',
-        '  "dpdk-udp",',
-        '  "apps/echo",',
-        '  "apps/test-client",',
-        '  "apps/peer-app",',
-        ']',
-        '',
-        '[workspace.dependencies]',
-        'thiserror = "1"',
-        'libc = "0.2"',
-        'clap = { version = "4.0", features = ["derive"] }',
-        'tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time"] }',
-        'EOF',
-
-        // dpdk-udp Cargo.toml - must match the real crate (dpdk and libc are required deps)
-        'cat > dpdk-udp/Cargo.toml << \'EOF\'',
-        '[package]',
-        'name = "dpdk-udp"',
-        'version = "0.1.0"',
-        'edition = "2021"',
-        'description = "UDP protocol implementation with DPDK acceleration"',
-        '',
-        '[dependencies]',
-        'thiserror = { workspace = true }',
-        'libc = { workspace = true }',
-        'dpdk = { path = "../dpdk" }',
-        'EOF',
-
-        // Peer app for bidirectional testing
-        'cat > apps/peer-app/Cargo.toml << \'EOF\'',
-        '[package]',
-        'name = "peer-app"',
-        'version = "0.1.0"',
-        'edition = "2021"',
-        '',
-        '[dependencies]',
-        'dpdk-udp = { path = "../../dpdk-udp" }',
-        'clap = { workspace = true }',
-        'tokio = { workspace = true }',
-        'EOF',
-
-        'cat > apps/peer-app/src/main.rs << \'EOF\'',
-        'use clap::Parser;',
-        'use std::net::SocketAddr;',
-        '',
-        '#[derive(Parser)]',
-        '#[command(name = "peer-app")]',
-        '#[command(about = "Bidirectional UDP peer for testing")]',
-        'struct Args {',
-        '    /// Local IP to bind to',
-        '    #[arg(long, default_value = "0.0.0.0")]',
-        '    bind_ip: String,',
-        '    ',
-        '    /// Local port to bind to',
-        '    #[arg(long, default_value_t = 9000)]',
-        '    bind_port: u16,',
-        '    ',
-        '    /// Peer IP to send to (optional)',
-        '    #[arg(long)]',
-        '    peer_ip: Option<String>,',
-        '    ',
-        '    /// Peer port to send to',
-        '    #[arg(long, default_value_t = 9000)]',
-        '    peer_port: u16,',
-        '    ',
-        '    /// Message to send',
-        '    #[arg(long, default_value = "hello peer")]',
-        '    message: String,',
-        '    ',
-        '    /// Mode: listen, send, or both',
-        '    #[arg(long, default_value = "both")]',
-        '    mode: String,',
-        '}',
-        '',
-        '#[tokio::main]',
-        'async fn main() -> Result<(), Box<dyn std::error::Error>> {',
-        '    let args = Args::parse();',
-        '    ',
-        '    println!("DPDK-STDLIB Peer App");',
-        '    ',
-        '    let bind_addr: SocketAddr = format!("{}:{}", args.bind_ip, args.bind_port).parse()?;',
-        '    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;',
-        '    println!("Listening on {}", bind_addr);',
-        '    ',
-        '    if args.mode == "listen" || args.mode == "both" {',
-        '        let mut buf = [0u8; 1024];',
-        '        loop {',
-        '            match socket.recv_from(&mut buf).await {',
-        '                Ok((size, from)) => {',
-        '                    let msg = String::from_utf8_lossy(&buf[..size]);',
-        '                    println!("Received from {}: {}", from, msg);',
-        '                    ',
-        '                    // Echo back',
-        '                    let response = format!("echo: {}", msg);',
-        '                    socket.send_to(response.as_bytes(), from).await?;',
-        '                }',
-        '                Err(e) => eprintln!("Receive error: {}", e),',
-        '            }',
-        '        }',
-        '    }',
-        '    ',
-        '    Ok(())',
-        '}',
-        'EOF',
-
-        // Simple echo app for compatibility
-        'cat > apps/echo/Cargo.toml << \'EOF\'',
-        '[package]',
-        'name = "echo"',
-        'version = "0.1.0"',
-        'edition = "2021"',
-        '',
-        '[dependencies]',
-        'clap = { workspace = true }',
-        'EOF',
-
-        'cat > apps/echo/src/main.rs << \'EOF\'',
-        'use clap::Parser;',
-        '#[derive(Parser)]',
-        'struct Args {',
-        '    #[arg(long, default_value_t = 9000)]',
-        '    port: u16,',
-        '}',
-        'fn main() {',
-        '    let args = Args::parse();',
-        '    println!("DPDK Echo Server ready on port {}", args.port);',
-        '    println!("Rust: {}", option_env!("RUSTC_VERSION").unwrap_or("unknown"));',
-        '    println!("DPDK libraries: {} found", std::fs::read_dir("/usr/local/lib").map(|d| d.count()).unwrap_or(0));',
-        '    println!("Instance setup complete!");',
-        '}',
-        'EOF',
-
-        // ENI binding script
-        'cat > scripts/bind_eni.sh << \'EOF\'',
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        'ENI_ID=${1:-}',
-        'if [[ -z "$ENI_ID" ]]; then',
-        '    echo "Usage: $0 <ENI_ID>"',
-        '    echo "Available ENIs:"',
-        '    lspci | grep "Elastic Network Adapter"',
-        '    exit 1',
-        'fi',
-        'echo "Binding ENI $ENI_ID to DPDK..."',
-        'PCI_ADDR=$(lspci -D | grep "Elastic Network Adapter" | tail -1 | cut -d\' \' -f1)',
-        'if [[ -z "$PCI_ADDR" ]]; then',
-        '    echo "Could not find ENA device PCI address"',
-        '    exit 1',
-        'fi',
-        'echo "Found ENA device at PCI address: $PCI_ADDR"',
-        'modprobe uio',
-        'modprobe vfio-pci',
-        'echo "$PCI_ADDR" > /sys/bus/pci/devices/$PCI_ADDR/driver/unbind 2>/dev/null || true',
-        'echo "1d0f 0ec2" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true',
-        'echo "$PCI_ADDR" > /sys/bus/pci/drivers/vfio-pci/bind',
-        'echo "Successfully bound $PCI_ADDR to vfio-pci"',
-        'echo "ENI $ENI_ID ready for DPDK"',
-        'EOF',
-
-        'chmod +x scripts/bind_eni.sh',
-      ];
-
-      // Build the project
+      // Build the project (with bindgen feature to use real DPDK, not stubs)
       const buildProject = [
         'echo "=== Building project ==="',
         'export HOME=/root',
         'source /root/.cargo/env',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release',
-
-        'echo "=== Testing build ==="',
-        'export HOME=/root',
-        'source /root/.cargo/env',
-        './target/release/echo --port 9000',
-        './target/release/peer-app --help',
-
+        'echo "cargo version: $(cargo --version)"',
+        'echo "rustc version: $(rustc --version)"',
+        '# Verify DPDK is findable — fail fast if not (otherwise build silently uses stubs)',
+        'echo "Checking pkg-config for libdpdk..."',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
+        'echo "DPDK found: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk)"',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
+        'echo "=== Build complete ==="',
+        'ls -la target/release/echo target/release/test-client',
         'echo "=== Setup complete! ==="',
-        'echo "DPDK libraries: $(ls /usr/local/lib/libdpdk* 2>/dev/null | wc -l)"',
         'echo "Rust project built successfully"',
         'echo "Instance ready for testing"',
         'echo "Project location: /opt/dpdk-stdlib"',
       ];
 
-      // Signal CloudFormation with the correct resource name
-      const cfnSignal = [
-        'echo "=== Signaling CloudFormation success ==="',
-        `/opt/aws/bin/cfn-signal -e $? --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region}`,
-        'echo "CloudFormation signaled successfully"',
-      ];
+      // No explicit cfn-signal needed — the EXIT trap handles it automatically.
+      // On success ($? == 0 from the last echo), the trap signals success.
+      // On failure ($? != 0 from the failed command), the trap signals failure.
 
       // Assemble the full command list based on AMI type
       if (usePrebuiltAmi) {
@@ -381,9 +226,7 @@ export class DpdkTestStack extends cdk.Stack {
           ...prebuiltPreamble,
           ...runtimeConfig,
           ...projectSetup,
-          ...inlineProjectFiles,
           ...buildProject,
-          ...cfnSignal,
         );
       } else {
         ud.addCommands(
@@ -391,9 +234,7 @@ export class DpdkTestStack extends cdk.Stack {
           ...fullBootstrap,
           ...runtimeConfig,
           ...projectSetup,
-          ...inlineProjectFiles,
           ...buildProject,
-          ...cfnSignal,
         );
       }
 

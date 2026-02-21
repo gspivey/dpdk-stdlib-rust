@@ -17,6 +17,7 @@ libc = { workspace = true }
 
 [build-dependencies]
 bindgen = { version = "0.70", optional = true }
+cc = "1"
 pkg-config = "0.3"
 
 [lib]
