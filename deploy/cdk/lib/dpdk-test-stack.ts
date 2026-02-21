@@ -99,23 +99,29 @@ export class DpdkTestStack extends cdk.Stack {
     const createUserData = (cfnResourceName: string): ec2.UserData => {
       const ud = ec2.UserData.forLinux();
 
-      // Common preamble
+      // Common preamble: logging, cfn-bootstrap install, then EXIT trap for cfn-signal.
+      // The trap ensures cfn-signal ALWAYS fires — even when set -e kills the script
+      // on a failed command.  Without the trap, CloudFormation waits the full creation
+      // timeout (20-35 min) before detecting the failure.
       const preamble = [
-        '#!/bin/bash',
-        'set -euo pipefail',
         'exec > >(tee /var/log/user-data.log) 2>&1',
-        'dnf install -y aws-cfn-bootstrap',
+        'echo "=== User-data starting at $(date -u) ==="',
+        // Install cfn-bootstrap BEFORE set -e so a missing package doesn't abort
+        'dnf install -y aws-cfn-bootstrap 2>/dev/null || echo "cfn-bootstrap already present or unavailable"',
+        // Trap EXIT to always signal CloudFormation (success or failure)
+        `trap '/opt/aws/bin/cfn-signal -e $? --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region} 2>/dev/null || true' EXIT`,
+        'set -euo pipefail',
       ];
 
       // Bootstrap commands: install system packages, Rust, and DPDK from source
       const fullBootstrap = [
         'echo "=== Starting DPDK-STDLIB setup on Amazon Linux 3 ==="',
 
-        // System packages
+        // System packages (include unzip for project asset extraction)
         'echo "=== Updating system packages ==="',
         'dnf update -y',
         'dnf groupinstall -y "Development Tools"',
-        'dnf install -y git pciutils iperf3 clang-devel --allowerasing',
+        'dnf install -y git pciutils iperf3 clang-devel unzip --allowerasing',
 
         // Install Rust
         'echo "=== Installing Rust ==="',
@@ -129,7 +135,7 @@ export class DpdkTestStack extends cdk.Stack {
         // Install DPDK dependencies
         'echo "=== Installing DPDK dependencies ==="',
         'dnf install -y meson ninja-build python3-pip libbsd-devel libpcap-devel numactl-devel kernel-devel kernel-headers --allowerasing',
-        'pip3 install pyelftools',
+        'pip3 install pyelftools || pip3 install --break-system-packages pyelftools',
 
         // Download and build DPDK
         'echo "=== Downloading DPDK ==="',
@@ -139,8 +145,11 @@ export class DpdkTestStack extends cdk.Stack {
         'tar -xf "dpdk-${DPDK_VERSION}.tar.xz"',
         'cd dpdk-stable-${DPDK_VERSION}',
 
+        // Build DPDK — must match scripts/install_dpdk_amazon_linux.sh:
+        //   --libdir=lib   forces libs into $PREFIX/lib/ (not lib64/)
+        //   -Denable_kmods=false  avoids igb_uio build failures on AL2023 kernels
         'echo "=== Building DPDK ==="',
-        'meson setup build --prefix=/usr/local --buildtype=release -Denable_kmods=true -Ddisable_drivers=net/gve,net/ionic',
+        'meson setup build --prefix=/usr/local --libdir=lib --buildtype=release -Denable_kmods=false -Ddisable_drivers=net/gve,net/ionic',
         'ninja -C build',
         'ninja -C build install',
         'echo "/usr/local/lib" > /etc/ld.so.conf.d/dpdk.conf',
@@ -150,8 +159,8 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
-        '# Ensure clang-devel is available for bindgen (may not be in older AMIs)',
-        'dnf install -y clang-devel 2>/dev/null || echo "clang-devel already installed or unavailable"',
+        '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
+        'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
       ];
 
       // Runtime config: kernel modules + hugepages (needed on every boot)
@@ -176,13 +185,13 @@ export class DpdkTestStack extends cdk.Stack {
         'cd /opt/dpdk-stdlib',
       ];
 
-
-
       // Build the project (with bindgen feature to use real DPDK, not stubs)
       const buildProject = [
         'echo "=== Building project ==="',
         'export HOME=/root',
         'source /root/.cargo/env',
+        '# Verify DPDK is findable before cargo build',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk || echo "WARNING: pkg-config cannot find libdpdk"',
         'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',
@@ -192,12 +201,9 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "Project location: /opt/dpdk-stdlib"',
       ];
 
-      // Signal CloudFormation with the correct resource name
-      const cfnSignal = [
-        'echo "=== Signaling CloudFormation success ==="',
-        `/opt/aws/bin/cfn-signal -e $? --stack ${this.stackName} --resource ${cfnResourceName} --region ${this.region}`,
-        'echo "CloudFormation signaled successfully"',
-      ];
+      // No explicit cfn-signal needed — the EXIT trap handles it automatically.
+      // On success ($? == 0 from the last echo), the trap signals success.
+      // On failure ($? != 0 from the failed command), the trap signals failure.
 
       // Assemble the full command list based on AMI type
       if (usePrebuiltAmi) {
@@ -207,7 +213,6 @@ export class DpdkTestStack extends cdk.Stack {
           ...runtimeConfig,
           ...projectSetup,
           ...buildProject,
-          ...cfnSignal,
         );
       } else {
         ud.addCommands(
@@ -216,7 +221,6 @@ export class DpdkTestStack extends cdk.Stack {
           ...runtimeConfig,
           ...projectSetup,
           ...buildProject,
-          ...cfnSignal,
         );
       }
 

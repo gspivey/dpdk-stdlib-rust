@@ -149,5 +149,3 @@ jobs:
         run: |
           cd deploy/cdk
           npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
-        env:
-          AWS_PROFILE: default
