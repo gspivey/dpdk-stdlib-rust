@@ -1,11 +1,158 @@
 # Integration Test Debug Notes
 
 **Session date:** 2026-02-21
-**Status:** Three new fixes applied. Ready for CI run.
+**Status:** Four root causes fixed across two sessions. Latest fix: C shim for real-DPDK build.
 
 ---
 
-## Root Cause Analysis (2026-02-21)
+## Root Cause Analysis (2026-02-21, session 2)
+
+Run failed at `cargo build --release --features dpdk-sys/bindgen` with 26 compilation
+errors.  The build succeeded locally (stubs) but failed on EC2 with real DPDK 22.11.6
+installed.  Three categories of failures:
+
+### Root Cause 6: bindgen cannot wrap static inline DPDK functions
+
+DPDK defines performance-critical functions as `static inline` in headers:
+- `rte_eth_rx_burst`, `rte_eth_tx_burst` (packet I/O)
+- `rte_pktmbuf_alloc`, `rte_pktmbuf_alloc_bulk`, `rte_pktmbuf_free` (mbuf lifecycle)
+- `rte_mempool_full`, `rte_mempool_empty` (pool queries)
+- `rte_errno` (per-lcore error variable accessed via macro)
+
+bindgen skips `static inline` functions entirely — they don't appear in the generated
+`bindings.rs`.  The stubs define them as regular Rust functions, so the mismatch is
+invisible locally.
+
+**Fix:** Added a C shim (`dpdk-sys/csrc/dpdk_shim.c`) that wraps each inline function
+with a non-inline `dpdk_shim_*` variant.  A Rust shim module (`dpdk-sys/src/shim.rs`)
+declares the externs and re-exports them under the original names.  `build.rs` compiles
+the C shim via `cc` crate when in bindgen mode.
+
+### Root Cause 7: bindgen cannot capture C preprocessor macro constants
+
+DPDK offload flags and NUMA constants are `#define` macros:
+```c
+#define RTE_ETH_RX_OFFLOAD_VLAN_STRIP  RTE_BIT64(0)   // 0x1
+#define RTE_ETH_RX_OFFLOAD_IPV4_CKSUM  RTE_BIT64(1)   // 0x2
+#define RTE_ETH_TX_OFFLOAD_IPV4_CKSUM  RTE_BIT64(1)   // 0x2
+// ... 8 total offload constants
+#define SOCKET_ID_ANY  -1
+```
+
+bindgen does not evaluate arbitrary `#define` expressions, especially those involving
+other macros like `RTE_BIT64()`.
+
+**Fix:** Defined all 9 missing constants directly in the Rust shim module with values
+matching DPDK 22.11.  These are only compiled under `#[cfg(dpdk_bindgen)]`; the stubs
+already have their own copies.
+
+### Root Cause 8: bindgen generates methods for bitfield accessors
+
+`rte_eth_link` uses C bitfields for `link_duplex`, `link_autoneg`, `link_status`.
+bindgen generates accessor methods (e.g., `link.link_duplex()`) rather than fields.
+The stubs had plain struct fields, so `link.link_duplex` compiled locally but not
+against real bindings.
+
+**Fix:** Added accessor methods to the stub `rte_eth_link` (`fn link_duplex(&self) -> u16`)
+matching bindgen's generated API.  Changed `dpdk/src/port.rs` to use method-call syntax
+(`link.link_duplex()`) which works with both stubs and real bindings.
+
+---
+
+## Changes Made (2026-02-21, session 2)
+
+1. `dpdk-sys/csrc/dpdk_shim.c` — **NEW**: C wrappers for 8 static inline DPDK functions
+2. `dpdk-sys/src/shim.rs` — **NEW**: Rust extern declarations + pub wrappers + 9 constants
+3. `dpdk-sys/src/lib.rs` — Include shim module under `#[cfg(dpdk_bindgen)]`
+4. `dpdk-sys/Cargo.toml` — Add `cc = "1"` build dependency
+5. `dpdk-sys/build.rs` — Call `compile_shim()` when in bindgen mode
+6. `dpdk-sys/src/stubs.rs` — Add `link_duplex()`, `link_autoneg()`, `link_status()` methods
+7. `dpdk/src/port.rs` — Use method syntax for bitfield access
+
+All 133 tests pass locally (stubs mode).
+
+---
+
+## Stub Improvement Recommendations
+
+The stubs serve development well today, but have gaps that limit local test coverage.
+These are ranked by impact on catching real-DPDK integration issues earlier:
+
+### 1. Loopback packet I/O (HIGH IMPACT)
+
+**Current:** `rte_eth_rx_burst` and `rte_eth_tx_burst` always return 0 (no packets).
+This means no end-to-end socket path exercises the actual packet build → send → recv
+→ parse loop without real hardware.
+
+**Proposal:** Add a per-port `VecDeque<Vec<u8>>` ring behind a `Mutex`.  `tx_burst`
+copies frame bytes into the ring; `rx_burst` drains from it.  A loopback flag (default
+on for stubs) would connect a port's TX to its own RX.
+
+```
+Thread A: UdpSocket::send_to → build_udp_frame → tx_burst → ring.push_back(frame)
+Thread B: UdpSocket::recv_from → rx_burst → ring.pop_front() → parse_udp_packet
+```
+
+This would allow `test_synthetic_socket_echo` to exercise the real packet path instead
+of faking recv data.  It also unlocks multi-threaded send/recv stress tests.
+
+### 2. Device capability reporting (MEDIUM IMPACT)
+
+**Current:** `rte_eth_dev_info_get` reports `rx_offload_capa: 0`, `tx_offload_capa: 0`.
+
+**Proposal:** Report realistic capabilities (IPv4/UDP/TCP checksum offload, VLAN
+strip/insert) so the offload negotiation path in `Port::new()` is exercised:
+
+```rust
+rx_offload_capa: RTE_ETH_RX_OFFLOAD_IPV4_CKSUM | RTE_ETH_RX_OFFLOAD_UDP_CKSUM
+                 | RTE_ETH_RX_OFFLOAD_TCP_CKSUM | RTE_ETH_RX_OFFLOAD_VLAN_STRIP,
+tx_offload_capa: RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM
+                 | RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_VLAN_INSERT,
+```
+
+### 3. Statistics tracking (MEDIUM IMPACT)
+
+**Current:** `rte_eth_stats_get` always returns zeros.
+
+**Proposal:** Increment `opackets`/`obytes` on `tx_burst` and `ipackets`/`ibytes` on
+`rx_burst`.  Reset to zero on `rte_eth_stats_reset`.  This validates that the stats
+reporting path in `Port::stats()` actually reflects I/O activity.
+
+### 4. Error injection (LOW-MEDIUM IMPACT)
+
+**Current:** All functions return success unconditionally.
+
+**Proposal:** Add a `thread_local!` or global configuration that lets tests inject:
+- Mempool exhaustion (`rte_pktmbuf_alloc` returns null)
+- Port start failure (`rte_eth_dev_start` returns -1)
+- EAL init failure
+
+This tests error handling paths that are currently dead code under stubs.
+
+### 5. Multi-port support (LOW IMPACT)
+
+**Current:** `rte_eth_dev_count_avail()` returns 1; all port ops use port_id 0.
+
+**Proposal:** Support configurable port count (2–4 simulated ports) with independent
+MAC addresses, stats, and loopback rings.  Enables testing multi-NIC scenarios.
+
+---
+
+## Architectural Note: Stub vs Bindgen Parity
+
+The root cause of issues 6–8 is a **parity gap** between the stub API surface and the
+real bindgen output.  The stubs were written by hand against the DPDK documentation, but:
+- They define regular functions where DPDK uses `static inline`
+- They define struct fields where DPDK uses bitfields (bindgen generates methods)
+- They define constants where DPDK uses macro chains
+
+**Going forward**, any new DPDK function or constant added to the stubs should be
+cross-checked against a real bindgen output.  The C shim + Rust shim pattern established
+here is the canonical way to bridge the gap.
+
+---
+
+## Root Cause Analysis (2026-02-21, session 1)
 
 Run 22213572134 (2026-02-20) failed with exit code 2 (infrastructure failure) after
 ~25 minutes — consistent with a 20-minute CloudFormation creation timeout. The previous
@@ -61,7 +208,7 @@ but in a different step).
 
 ---
 
-## Changes Made (2026-02-21)
+## Changes Made (2026-02-21, session 1)
 
 1. `deploy/cdk/lib/dpdk-test-stack.ts`:
    - cfn-signal: replaced explicit call with EXIT trap (fires on success AND failure)
