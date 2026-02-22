@@ -146,10 +146,9 @@ build {
   # and may fail to re-register in a new VPC/subnet.
   provisioner "shell" {
     inline = [
-      "sudo systemctl stop amazon-ssm-agent || true",
-      "sudo rm -rf /var/lib/amazon/ssm/ipc/",
-      "sudo rm -rf /var/lib/amazon/ssm/Vault/",
-      "sudo rm -rf /var/lib/amazon/ssm/registration",
+      "SSM_SVC=$(systemctl list-unit-files --type=service | grep -i ssm | awk '{print $1}' | head -1)",
+      "if [ -n \"$SSM_SVC\" ]; then sudo systemctl stop \"$SSM_SVC\" || true; fi",
+      "sudo rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration",
     ]
   }
 
