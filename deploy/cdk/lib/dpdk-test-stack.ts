@@ -195,9 +195,10 @@ export class DpdkTestStack extends cdk.Stack {
         // the agent keeps the old instance's registration and fails to
         // re-register in the new VPC/subnet (root cause of SSM timeouts).
         'echo "=== Clearing stale SSM agent registration ==="',
-        // Find the SSM service dynamically (name varies across AL2023 versions)
-        'SSM_SVC=$(systemctl list-unit-files --type=service | grep -i ssm | awk \'{print $1}\' | head -1)',
-        'if [ -n "$SSM_SVC" ]; then systemctl stop "$SSM_SVC" || true; rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration; systemctl start "$SSM_SVC" || true; echo "SSM agent ($SSM_SVC) restarted with clean state"; else echo "WARNING: No SSM agent service found"; fi',
+        // Find the SSM service dynamically (name varies across AL2023 versions).
+        // grep returns exit 1 if no match — must use "|| true" under pipefail.
+        'SSM_SVC=$(systemctl list-unit-files --type=service 2>/dev/null | grep -i ssm | awk \'{print $1}\' | head -1 || true)',
+        'if [ -n "$SSM_SVC" ]; then systemctl stop "$SSM_SVC" 2>/dev/null || true; rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration; systemctl start "$SSM_SVC" 2>/dev/null || true; echo "SSM agent ($SSM_SVC) restarted with clean state"; else echo "WARNING: No SSM agent service found — skipping cleanup"; fi',
         '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
         'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
