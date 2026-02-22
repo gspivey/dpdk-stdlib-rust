@@ -191,14 +191,17 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
-        // Clear stale SSM agent state from the Packer build — without this,
-        // the agent keeps the old instance's registration and fails to
-        // re-register in the new VPC/subnet (root cause of SSM timeouts).
-        'echo "=== Clearing stale SSM agent registration ==="',
-        // Find the SSM service dynamically (name varies across AL2023 versions).
-        // grep returns exit 1 if no match — must use "|| true" under pipefail.
-        'SSM_SVC=$(systemctl list-unit-files --type=service 2>/dev/null | grep -i ssm | awk \'{print $1}\' | head -1 || true)',
-        'if [ -n "$SSM_SVC" ]; then systemctl stop "$SSM_SVC" 2>/dev/null || true; rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration; systemctl start "$SSM_SVC" 2>/dev/null || true; echo "SSM agent ($SSM_SVC) restarted with clean state"; else echo "WARNING: No SSM agent service found — skipping cleanup"; fi',
+        // Ensure SSM agent is installed, has clean state, and is running.
+        // The pre-built AMI may lack SSM agent (base AL2023 variants differ),
+        // and Packer builds bake in stale registration data.
+        'echo "=== Ensuring SSM agent is installed and running ==="',
+        'if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi',
+        '# Clear stale registration from AMI build and restart fresh',
+        'systemctl stop amazon-ssm-agent 2>/dev/null || true',
+        'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
+        'systemctl enable amazon-ssm-agent 2>/dev/null || true',
+        'systemctl start amazon-ssm-agent 2>/dev/null || true',
+        'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo not-running)"',
         '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
         'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
