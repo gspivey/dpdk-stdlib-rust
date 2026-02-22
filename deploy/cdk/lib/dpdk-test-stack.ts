@@ -198,11 +198,15 @@ export class DpdkTestStack extends cdk.Stack {
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
-        '# Ensure SSM agent is running (critical for test orchestration)',
-        'echo "=== Verifying SSM agent ==="',
+        '# Ensure SSM agent registers with correct instance identity.',
+        '# Pre-built AMIs carry stale registration from the original instance;',
+        '# clearing the Vault and registration file forces a clean re-registration.',
+        'echo "=== Configuring SSM agent ==="',
+        'rm -rf /var/lib/amazon/ssm/Vault 2>/dev/null || true',
+        'rm -f /var/lib/amazon/ssm/registration 2>/dev/null || true',
         'systemctl enable amazon-ssm-agent 2>/dev/null || true',
         'systemctl restart amazon-ssm-agent 2>/dev/null || true',
-        'sleep 2',
+        'sleep 3',
         'systemctl is-active amazon-ssm-agent && echo "SSM agent: running" || echo "WARNING: SSM agent not running"',
       ];
 
