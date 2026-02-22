@@ -58,6 +58,21 @@ export class DpdkTestStack extends cdk.Stack {
       'ICMP traffic between instances'
     );
 
+    // Allow UDP from management interfaces (test-client sends from primary ENI
+    // which is in the mgmt security group, targeting the DPDK ENI)
+    dpdkSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allUdp(),
+      'Test traffic from management interfaces'
+    );
+
+    // Allow TCP from management interfaces (iperf3 control connections)
+    dpdkSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allTcp(),
+      'iperf3 control connections from management interfaces'
+    );
+
     // Bundle our project as an asset
     const projectAsset = new s3assets.Asset(this, 'DpdkStdlibProject', {
       path: '../../',  // Points to dpdk-stdlib root directory
@@ -206,7 +221,7 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "Checking pkg-config for libdpdk..."',
         'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
         'echo "DPDK found: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk)"',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen,echo/dpdk',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',
         'echo "=== Setup complete! ==="',

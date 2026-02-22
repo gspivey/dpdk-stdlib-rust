@@ -1,7 +1,107 @@
 # Integration Test Debug Notes
 
-**Session date:** 2026-02-21
-**Status:** Four root causes fixed across two sessions. Latest fix: C shim for real-DPDK build.
+**Session date:** 2026-02-22
+**Status:** Five more root causes fixed (9–13). Build compiles with real DPDK;
+now fixing runtime issues so the echo server actually works on EC2.
+
+---
+
+## Root Cause Analysis (2026-02-22, session 3)
+
+Build succeeded on EC2 (root causes 6–8 from session 2 were correct), but the
+echo server fails at runtime with a binding error. The `echo` binary falls back
+to `std::net::UdpSocket` which cannot bind to the DPDK ENI IP (the ENI is bound
+to vfio-pci, so the kernel has no interface with that IP). Five root causes:
+
+### Root Cause 9: Echo app built without `dpdk` feature
+
+The CDK build command was:
+```bash
+cargo build --release --features dpdk-sys/bindgen
+```
+This only enables bindgen for the FFI crate. The echo app's `dpdk` feature
+(which brings in `dpdk-udp`) was never enabled, so `#[cfg(feature = "dpdk")]`
+blocks were compiled out. The echo binary always used `std::net::UdpSocket`.
+
+**Fix:** Changed build command to include `echo/dpdk`:
+```bash
+cargo build --release --features dpdk-sys/bindgen,echo/dpdk
+```
+
+### Root Cause 10: EAL init passes `--no-pci`
+
+`get_or_init_dpdk()` in `dpdk-udp/src/lib.rs` hardcoded:
+```rust
+dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
+```
+The `--no-pci` flag prevents DPDK from scanning the PCI bus. On EC2 where the
+secondary ENI is bound to vfio-pci, this means DPDK finds zero ports and
+`Port::init(0)` fails.
+
+**Fix:** Removed `--no-pci` from default EAL args. Added `DPDK_EAL_ARGS` env
+var override for custom configurations.
+
+### Root Cause 11: EAL init missing argv[0] program name
+
+`rte_eal_init` expects `argv[0]` to be the program name and skips it. The args
+`["-l", "0", "-n", "4"]` caused `-l` to be consumed as the program name,
+breaking argument parsing for real DPDK.
+
+**Fix:** Added `"dpdk-app"` as argv[0]:
+```rust
+vec!["dpdk-app", "-l", "0", "-n", "4"]
+```
+
+### Root Cause 12: Security group blocks test-client traffic
+
+The DPDK security group only allows ingress from other DPDK SG interfaces:
+```typescript
+dpdkSecurityGroup.addIngressRule(dpdkSecurityGroup, ec2.Port.allUdp(), ...)
+```
+The test-client uses `tokio::net::UdpSocket` (kernel networking), sending from
+the primary ENI (management SG). Packets to the receiver's DPDK ENI were
+blocked because the source SG (mgmt) was not the DPDK SG.
+
+**Fix:** Added ingress rules allowing UDP and TCP from management SG to DPDK SG:
+```typescript
+dpdkSecurityGroup.addIngressRule(mgmtSecurityGroup, ec2.Port.allUdp(), ...)
+dpdkSecurityGroup.addIngressRule(mgmtSecurityGroup, ec2.Port.allTcp(), ...)
+```
+
+### Root Cause 13: `recv_from()` returns WouldBlock immediately
+
+The DPDK `UdpSocket::recv_from()` returned `io::ErrorKind::WouldBlock` when no
+packets were available (DPDK `rx_burst` is non-blocking). But
+`std::net::UdpSocket::recv_from()` blocks until a packet arrives. The echo
+server's `loop { recv_from() }` treated `WouldBlock` as a fatal error and
+exited immediately after starting.
+
+**Fix:** Changed `recv_from()` to poll in a loop with 100μs sleep between
+iterations, matching `std::net` blocking behavior. ARP and ICMP are still
+handled in each iteration while waiting.
+
+Also added source MAC learning: when receiving a UDP packet, the source IP/MAC
+mapping is added to the ARP cache. This ensures echo replies use the correct
+destination MAC instead of broadcast.
+
+---
+
+## Changes Made (2026-02-22, session 3)
+
+1. `dpdk-udp/src/lib.rs` — `get_or_init_dpdk()`:
+   - Added `"dpdk-app"` as argv[0] for `rte_eal_init`
+   - Removed `--no-pci` from default EAL args
+   - Added `DPDK_EAL_ARGS` env var override
+2. `dpdk-udp/src/lib.rs` — `recv_from()`:
+   - Changed from non-blocking (returns WouldBlock) to blocking (poll loop)
+   - Added source MAC learning from incoming UDP packets into ARP cache
+3. `deploy/cdk/lib/dpdk-test-stack.ts` — Build command:
+   - Added `echo/dpdk` to `--features` flag
+4. `deploy/cdk/lib/dpdk-test-stack.ts` — Security groups:
+   - Added UDP ingress rule: mgmt SG → DPDK SG
+   - Added TCP ingress rule: mgmt SG → DPDK SG (for iperf3 control)
+
+All 133 tests pass locally (stubs mode).
 
 ---
 
