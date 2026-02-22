@@ -81,8 +81,9 @@ build {
       "echo '=== Installing system packages ==='",
       "sudo dnf update -y",
       "sudo dnf groupinstall -y 'Development Tools'",
-      "sudo dnf install -y git pciutils iperf3 clang-devel",
+      "sudo dnf install -y git pciutils iperf3 clang-devel amazon-ssm-agent",
       "sudo dnf install -y aws-cfn-bootstrap || echo 'Warning: aws-cfn-bootstrap not available, skipping'",
+      "sudo systemctl enable amazon-ssm-agent",
     ]
   }
 
@@ -138,6 +139,17 @@ build {
       "echo \"DPDK devbind: $(ls /usr/local/bin/dpdk-devbind.py 2>/dev/null && echo 'present' || echo 'not found (ok)')\"",
       "echo \"iperf3: $(iperf3 --version 2>&1 | head -1)\"",
       "echo '=== AMI build complete ==='",
+    ]
+  }
+
+  # Clean SSM agent state so instances launched from this AMI register fresh.
+  # Without this, the agent retains the Packer build instance's registration
+  # and may fail to re-register in a new VPC/subnet.
+  provisioner "shell" {
+    inline = [
+      "SSM_SVC=$(systemctl list-unit-files --type=service | grep -i ssm | awk '{print $1}' | head -1)",
+      "if [ -n \"$SSM_SVC\" ]; then sudo systemctl stop \"$SSM_SVC\" || true; fi",
+      "sudo rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration",
     ]
   }
 

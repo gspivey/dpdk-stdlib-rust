@@ -30,6 +30,18 @@ export class DpdkTestStack extends cdk.Stack {
       ],
     });
 
+    // VPC Interface Endpoints for SSM — ensures SSM agent connectivity from
+    // private subnets without depending on NAT gateway timing/availability.
+    vpc.addInterfaceEndpoint('SsmEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.SSM,
+    });
+    vpc.addInterfaceEndpoint('SsmMessagesEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES,
+    });
+    vpc.addInterfaceEndpoint('Ec2MessagesEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES,
+    });
+
     // Security group for management traffic (SSM)
     const mgmtSecurityGroup = new ec2.SecurityGroup(this, 'DpdkMgmtSG', {
       vpc,
@@ -56,6 +68,21 @@ export class DpdkTestStack extends cdk.Stack {
       dpdkSecurityGroup,
       ec2.Port.allIcmp(),
       'ICMP traffic between instances'
+    );
+
+    // Allow UDP from management interfaces (test-client sends from primary ENI
+    // which is in the mgmt security group, targeting the DPDK ENI)
+    dpdkSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allUdp(),
+      'Test traffic from management interfaces'
+    );
+
+    // Allow TCP from management interfaces (iperf3 control connections)
+    dpdkSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allTcp(),
+      'iperf3 control connections from management interfaces'
     );
 
     // Bundle our project as an asset
@@ -164,6 +191,17 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
+        // Ensure SSM agent is installed, has clean state, and is running.
+        // The pre-built AMI may lack SSM agent (base AL2023 variants differ),
+        // and Packer builds bake in stale registration data.
+        'echo "=== Ensuring SSM agent is installed and running ==="',
+        'if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi',
+        '# Clear stale registration from AMI build and restart fresh',
+        'systemctl stop amazon-ssm-agent 2>/dev/null || true',
+        'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
+        'systemctl enable amazon-ssm-agent 2>/dev/null || true',
+        'systemctl start amazon-ssm-agent 2>/dev/null || true',
+        'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo not-running)"',
         '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
         'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
@@ -183,6 +221,7 @@ export class DpdkTestStack extends cdk.Stack {
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
+        'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo unknown)"',
       ];
 
       // Download project and set up workspace
@@ -206,7 +245,7 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "Checking pkg-config for libdpdk..."',
         'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
         'echo "DPDK found: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk)"',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen,echo/dpdk',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',
         'echo "=== Setup complete! ==="',

@@ -477,7 +477,21 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     }
 
     // Initialize EAL
-    dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
+    // EAL args can be overridden via DPDK_EAL_ARGS env var (space-separated).
+    // Default: program name + lcore 0 + 4 memory channels.
+    // Note: do NOT include --no-pci — DPDK needs PCI scanning to find vfio-pci devices.
+    let eal_args: Vec<String> = if let Ok(args_str) = std::env::var("DPDK_EAL_ARGS") {
+        args_str.split_whitespace().map(String::from).collect()
+    } else {
+        vec![
+            "dpdk-app".into(), // argv[0]: program name (rte_eal_init skips this)
+            "-l".into(), "0".into(),
+            "-n".into(), "4".into(),
+        ]
+    };
+    let eal_args_ref: Vec<&str> = eal_args.iter().map(|s| s.as_str()).collect();
+
+    dpdk::Eal::init(&eal_args_ref)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
     // Create mempool
@@ -1013,22 +1027,14 @@ impl UdpSocket {
     /// This calls DPDK's rx_burst to receive packets, parses the Ethernet/IPv4/UDP
     /// headers, and copies the payload to the provided buffer.
     ///
+    /// Blocks until a packet is received (matching `std::net::UdpSocket` behavior).
+    /// While waiting, ARP requests and ICMP pings are handled automatically.
+    ///
     /// # Returns
     ///
     /// On success, returns the number of bytes received and the source address.
-    /// Returns `WouldBlock` if no packets are available.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        // First check if we have buffered packets
-        {
-            let mut queue = self.recv_queue.lock().unwrap();
-            if let Some((payload, src_addr)) = queue.pop() {
-                let copy_len = std::cmp::min(buf.len(), payload.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                return Ok((copy_len, src_addr));
-            }
-        }
-
-        // Get our local port for filtering
+        // Get our local port for filtering (do this once outside the loop)
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
             SocketAddr::V6(_) => {
@@ -1036,86 +1042,117 @@ impl UdpSocket {
             }
         };
 
-        // Receive raw frames via the active backend
-        let frames = self.socket_backend.recv_frames(32)?;
-
-        if frames.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets available"));
-        }
-
-        // Process frames, handling ARP/ICMP and looking for UDP packets for our port
-        // (reuses ARP/ICMP handlers which are already backend-agnostic)
-        let mut result: Option<(usize, SocketAddr)> = None;
-
-        for frame_data in &frames {
-            // Check ethertype
-            if frame_data.len() >= 14 {
-                let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
-
-                // Handle ARP packets (reuse existing handler)
-                if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
-                    if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                        // Send ARP reply via backend
-                        let _ = self.socket_backend.send_frame(&reply_frame);
-                    }
-                    continue;
+        // Block until we receive a matching packet (std::net::UdpSocket behavior).
+        // DPDK rx_burst is non-blocking, so we poll in a loop with a short sleep
+        // to avoid burning 100% CPU while still achieving low latency.
+        loop {
+            // First check if we have buffered packets
+            {
+                let mut queue = self.recv_queue.lock().unwrap();
+                if let Some((payload, src_addr)) = queue.pop() {
+                    let copy_len = std::cmp::min(buf.len(), payload.len());
+                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    return Ok((copy_len, src_addr));
                 }
+            }
 
-                // Handle ICMP packets (reuse existing handler)
-                if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
-                    let protocol = frame_data[ETH_HEADER_LEN + 9];
-                    if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
-                        if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
-                            // Send ICMP reply via backend
+            // Receive raw frames via the active backend
+            let frames = self.socket_backend.recv_frames(32)?;
+
+            if frames.is_empty() {
+                // No packets available — sleep briefly and retry (blocking behavior)
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                continue;
+            }
+
+            // Process frames, handling ARP/ICMP and looking for UDP packets for our port
+            let mut result: Option<(usize, SocketAddr)> = None;
+
+            for frame_data in &frames {
+                // Check ethertype
+                if frame_data.len() >= 14 {
+                    let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+
+                    // Handle ARP packets (reuse existing handler)
+                    if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
+                        if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
+                            // Send ARP reply via backend
                             let _ = self.socket_backend.send_frame(&reply_frame);
                         }
                         continue;
                     }
-                }
-            }
 
-            // Try to parse as UDP (reuse existing parser)
-            if let Some(parsed) = parse_udp_packet(frame_data) {
-                // Check if this packet is for us
-                if parsed.dst_port == local_port {
-                    let src_addr = SocketAddr::V4(
-                        SocketAddrV4::new(parsed.src_ip, parsed.src_port)
-                    );
-
-                    // If connected, only accept packets from the connected address
-                    if let Some(ref connected) = self.connected_addr {
-                        if src_addr != *connected {
-                            // Queue for later if not from connected peer
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            queue.push(parsed.payload, src_addr);
+                    // Handle ICMP packets (reuse existing handler)
+                    if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
+                        let protocol = frame_data[ETH_HEADER_LEN + 9];
+                        if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
+                            if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
+                                // Send ICMP reply via backend
+                                let _ = self.socket_backend.send_frame(&reply_frame);
+                            }
                             continue;
                         }
                     }
+                }
 
-                    // If we haven't found a result yet, use this one
-                    if result.is_none() {
-                        let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
-                        buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+                // Try to parse as UDP (reuse existing parser)
+                if let Some(parsed) = parse_udp_packet(frame_data) {
+                    // Learn source MAC from incoming packets for reply routing.
+                    // This ensures send_to() uses the correct destination MAC
+                    // instead of broadcast, which is important for DPDK backends
+                    // where the NIC doesn't handle ARP automatically.
+                    if frame_data.len() >= 12 {
+                        let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
+                        self.arp_handler.cache.insert(
+                            parsed.src_ip,
+                            MacAddress::new(src_mac),
+                        );
+                    }
 
-                        // Update connection state
-                        if let Some(ref state) = self.connection_state {
-                            if let Ok(mut s) = state.write() {
-                                s.record_recv(copy_len);
+                    // Check if this packet is for us
+                    if parsed.dst_port == local_port {
+                        let src_addr = SocketAddr::V4(
+                            SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+                        );
+
+                        // If connected, only accept packets from the connected address
+                        if let Some(ref connected) = self.connected_addr {
+                            if src_addr != *connected {
+                                // Queue for later if not from connected peer
+                                let mut queue = self.recv_queue.lock().unwrap();
+                                queue.push(parsed.payload, src_addr);
+                                continue;
                             }
                         }
 
-                        result = Some((copy_len, src_addr));
-                    } else {
-                        // Queue additional packets
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        queue.push(parsed.payload, src_addr);
+                        // If we haven't found a result yet, use this one
+                        if result.is_none() {
+                            let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+                            buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+                            // Update connection state
+                            if let Some(ref state) = self.connection_state {
+                                if let Ok(mut s) = state.write() {
+                                    s.record_recv(copy_len);
+                                }
+                            }
+
+                            result = Some((copy_len, src_addr));
+                        } else {
+                            // Queue additional packets
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            queue.push(parsed.payload, src_addr);
+                        }
                     }
                 }
+                // Packet not for us or not valid UDP - dropped
             }
-            // Packet not for us or not valid UDP - dropped
-        }
 
-        result.ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no matching packets"))
+            if let Some(r) = result {
+                return Ok(r);
+            }
+            // No matching UDP packets in this batch — continue polling
+        }
     }
 
     /// Returns the socket address that this socket was created from.
