@@ -30,6 +30,18 @@ export class DpdkTestStack extends cdk.Stack {
       ],
     });
 
+    // VPC Interface Endpoints for SSM — ensures SSM agent connectivity from
+    // private subnets without depending on NAT gateway timing/availability.
+    vpc.addInterfaceEndpoint('SsmEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.SSM,
+    });
+    vpc.addInterfaceEndpoint('SsmMessagesEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES,
+    });
+    vpc.addInterfaceEndpoint('Ec2MessagesEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES,
+    });
+
     // Security group for management traffic (SSM)
     const mgmtSecurityGroup = new ec2.SecurityGroup(this, 'DpdkMgmtSG', {
       vpc,
