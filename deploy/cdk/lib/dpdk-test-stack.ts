@@ -191,6 +191,14 @@ export class DpdkTestStack extends cdk.Stack {
       // Pre-built AMI: DPDK, Rust, and system packages are already installed
       const prebuiltPreamble = [
         'echo "=== Using pre-built DPDK AMI ==="',
+        // Clear stale SSM agent state from the Packer build — without this,
+        // the agent keeps the old instance's registration and fails to
+        // re-register in the new VPC/subnet (root cause of SSM timeouts).
+        'echo "=== Clearing stale SSM agent registration ==="',
+        'systemctl stop amazon-ssm-agent 2>/dev/null || true',
+        'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
+        'systemctl start amazon-ssm-agent',
+        'echo "SSM agent restarted with clean state"',
         '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
         'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
@@ -210,7 +218,6 @@ export class DpdkTestStack extends cdk.Stack {
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
-        '# Log SSM agent status for diagnostics (do NOT modify agent state)',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo unknown)"',
       ];
 

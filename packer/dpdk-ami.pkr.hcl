@@ -141,6 +141,18 @@ build {
     ]
   }
 
+  # Clean SSM agent state so instances launched from this AMI register fresh.
+  # Without this, the agent retains the Packer build instance's registration
+  # and may fail to re-register in a new VPC/subnet.
+  provisioner "shell" {
+    inline = [
+      "sudo systemctl stop amazon-ssm-agent || true",
+      "sudo rm -rf /var/lib/amazon/ssm/ipc/",
+      "sudo rm -rf /var/lib/amazon/ssm/Vault/",
+      "sudo rm -rf /var/lib/amazon/ssm/registration",
+    ]
+  }
+
   # Clean up to reduce AMI size
   provisioner "shell" {
     inline = [
