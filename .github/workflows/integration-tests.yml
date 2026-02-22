@@ -161,9 +161,14 @@ jobs:
           # Output to step log
           cat "$REPORT"
 
-          # Post as PR comment (PR #11) so it's readable via gh api
-          gh pr comment 11 --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
-            || echo "::warning::Could not post PR comment (missing permission or no PR)"
+          # Post as PR comment so diagnostics are readable via gh api
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post PR comment (missing permission)"
+          else
+            echo "::warning::No PR number available (workflow_dispatch?), skipping PR comment"
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
 
