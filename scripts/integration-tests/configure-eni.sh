@@ -129,8 +129,10 @@ do_bind() {
     # Unbind from current driver
     echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
 
-    # Register ENA vendor/device ID with vfio-pci
-    echo "1d0f 0ec2" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true
+    # Use driver_override to tell the kernel which driver to use for this device.
+    # This is more reliable than new_id because it doesn't depend on matching
+    # vendor/device IDs (ENA uses 1d0f:ec20 on c5n instances).
+    echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override"
 
     # Bind to vfio-pci
     echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind
@@ -162,6 +164,9 @@ do_unbind() {
 
     # Unbind from vfio-pci
     echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+
+    # Clear driver_override so the kernel uses the default (ena) driver
+    echo "" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>/dev/null || true
 
     # Bind to kernel ena driver
     echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind 2>/dev/null || true
