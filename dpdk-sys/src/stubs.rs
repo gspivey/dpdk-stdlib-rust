@@ -543,6 +543,13 @@ pub fn stub_eal_is_cleaned_up() -> bool {
     STUB_EAL_STATE.load(Ordering::SeqCst) == -1
 }
 
+/// Reset EAL state to "never initialized" (0). For use in test teardown
+/// so serial tests don't leak state to the next test.
+pub fn stub_eal_reset() {
+    STUB_EAL_STATE.store(0, Ordering::SeqCst);
+    STUB_RTE_ERRNO.store(0, Ordering::SeqCst);
+}
+
 #[no_mangle]
 pub extern "C" fn rte_eal_init(_argc: c_int, _argv: *mut *mut c_char) -> c_int {
     STUB_EAL_STATE.store(1, Ordering::SeqCst);
