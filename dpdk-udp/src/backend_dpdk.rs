@@ -19,6 +19,9 @@ use crate::backend::PacketBackend;
 /// send/receive operations. Packets are transmitted and received via
 /// DPDK's `tx_burst` and `rx_burst` functions.
 pub struct DpdkBackend {
+    /// EAL handle — must stay alive for the lifetime of all DPDK resources.
+    /// `None` when EAL lifetime is managed externally (e.g. by `DpdkResources`).
+    _eal: Option<dpdk::Eal>,
     port: Mutex<Port>,
     mempool: Arc<Mempool>,
     mac_address: [u8; 6],
@@ -31,8 +34,8 @@ impl DpdkBackend {
     ///
     /// Initializes DPDK EAL, creates a mempool, configures and starts the port.
     pub fn new(port_id: u16) -> io::Result<Self> {
-        // Initialize EAL
-        dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
+        // Initialize EAL — must keep the handle alive for the lifetime of this backend
+        let eal = dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
         // Create mempool
@@ -59,6 +62,7 @@ impl DpdkBackend {
         let allmulticast = port.is_allmulticast();
 
         Ok(Self {
+            _eal: Some(eal),
             port: Mutex::new(port),
             mempool: Arc::new(mempool),
             mac_address: mac,
@@ -76,6 +80,7 @@ impl DpdkBackend {
         let allmulticast = port.is_allmulticast();
 
         Self {
+            _eal: None, // EAL lifetime managed by caller
             port: Mutex::new(port),
             mempool: Arc::new(mempool),
             mac_address: mac,

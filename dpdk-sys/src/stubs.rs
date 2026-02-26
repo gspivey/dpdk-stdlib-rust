@@ -519,13 +519,39 @@ pub struct rte_ring {
 // ============================================================================
 
 // EAL Functions
+
+/// EAL lifecycle state tracking — detects use-after-cleanup bugs in stubs.
+/// Real DPDK segfaults when you call rte_pktmbuf_pool_create after rte_eal_cleanup
+/// because rte_config->mem_config is NULL. This state lets stubs catch the same bug.
+///
+/// Three states:
+///   0 = never initialized (permissive — allows mempool creation for backward compat)
+///   1 = initialized (rte_eal_init called)
+///  -1 = cleaned up (rte_eal_cleanup called after init — mempool creation denied)
+use std::sync::atomic::{AtomicI32, Ordering};
+static STUB_EAL_STATE: AtomicI32 = AtomicI32::new(0);
+
+/// Returns true if EAL is currently initialized (init called, cleanup not yet called).
+/// Exposed for tests to verify lifecycle behavior.
+pub fn stub_eal_is_initialized() -> bool {
+    STUB_EAL_STATE.load(Ordering::SeqCst) == 1
+}
+
+/// Returns true if EAL was cleaned up after being initialized.
+/// This is the state that causes segfaults with real DPDK.
+pub fn stub_eal_is_cleaned_up() -> bool {
+    STUB_EAL_STATE.load(Ordering::SeqCst) == -1
+}
+
 #[no_mangle]
 pub extern "C" fn rte_eal_init(_argc: c_int, _argv: *mut *mut c_char) -> c_int {
+    STUB_EAL_STATE.store(1, Ordering::SeqCst);
     0 // Success
 }
 
 #[no_mangle]
 pub extern "C" fn rte_eal_cleanup() -> c_int {
+    STUB_EAL_STATE.store(-1, Ordering::SeqCst);
     0
 }
 
@@ -569,6 +595,16 @@ pub extern "C" fn rte_pktmbuf_pool_create(
     _data_room_size: u16,
     _socket_id: c_int,
 ) -> *mut rte_mempool {
+    // Guard: real DPDK segfaults if EAL was cleaned up (rte_config->mem_config is NULL).
+    // Return NULL to surface the same class of bug without crashing.
+    // Only block when EAL was explicitly cleaned up (-1), not when never initialized (0),
+    // so existing tests that create mempools without calling rte_eal_init() still work.
+    if stub_eal_is_cleaned_up() {
+        // Set rte_errno to ENODEV so callers get a meaningful error
+        STUB_RTE_ERRNO.store(19, Ordering::SeqCst); // ENODEV
+        return ptr::null_mut();
+    }
+
     // Create a stub mempool for testing
     let mempool = Box::new(rte_mempool {
         size: n,
@@ -858,9 +894,13 @@ pub extern "C" fn rte_eth_tx_burst(
 }
 
 // Error handling
+
+/// Stub rte_errno — set by stub functions that need to report errors
+static STUB_RTE_ERRNO: AtomicI32 = AtomicI32::new(0);
+
 #[no_mangle]
 pub extern "C" fn rte_errno() -> c_int {
-    0
+    STUB_RTE_ERRNO.load(Ordering::SeqCst)
 }
 
 #[no_mangle]
