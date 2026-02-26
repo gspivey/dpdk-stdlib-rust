@@ -72,7 +72,10 @@ jobs:
           set -e
 
           if [[ $PACKER_EXIT -ne 0 ]]; then
-            echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
+            # Include error details in annotation (readable via gh api .../check-runs/.../annotations)
+            PACKER_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
+            PACKER_LAST_UI=$(grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -3 | tr '\n' ' ' || echo "unknown")
+            echo "::error::Packer build failed (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}. Last output: ${PACKER_LAST_UI}"
 
             # Write error details to step summary (visible on run page without downloading logs)
             {
