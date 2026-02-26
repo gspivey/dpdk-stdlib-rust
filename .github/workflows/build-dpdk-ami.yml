@@ -59,24 +59,44 @@ jobs:
         run: |
           cd packer
           DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
+          MAX_ATTEMPTS=3
 
-          # Run packer without pipefail swallowing diagnostics.
-          # Capture exit code manually so we can dump logs on failure.
-          set +e
-          packer build \
-            -var "aws_region=${{ env.AWS_REGION }}" \
-            -var "dpdk_version=${DPDK_VERSION}" \
-            -machine-readable \
-            dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
-          PACKER_EXIT=${PIPESTATUS[0]}
-          set -e
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Packer build attempt ${attempt}/${MAX_ATTEMPTS} ==="
+
+            # Run packer without pipefail swallowing diagnostics.
+            # Capture exit code manually so we can dump logs on failure.
+            set +e
+            packer build \
+              -var "aws_region=${{ env.AWS_REGION }}" \
+              -var "dpdk_version=${DPDK_VERSION}" \
+              -machine-readable \
+              dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
+            PACKER_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [[ $PACKER_EXIT -eq 0 ]]; then
+              break
+            fi
+
+            echo "::warning::Packer build attempt ${attempt} failed with exit code ${PACKER_EXIT}"
+            echo ""
+            echo "=== Error messages (attempt ${attempt}) ==="
+            grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -20 || echo "(none)"
+
+            if [[ $attempt -lt $MAX_ATTEMPTS ]]; then
+              WAIT=$((30 * attempt))
+              echo "Retrying in ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
 
           if [[ $PACKER_EXIT -ne 0 ]]; then
-            echo "::error::Packer build failed with exit code ${PACKER_EXIT}"
+            echo "::error::Packer build failed after ${MAX_ATTEMPTS} attempts (exit code ${PACKER_EXIT})"
 
             # Write error details to step summary (visible on run page without downloading logs)
             {
-              echo "## Packer Build Failed (exit code ${PACKER_EXIT})"
+              echo "## Packer Build Failed after ${MAX_ATTEMPTS} attempts (exit code ${PACKER_EXIT})"
               echo ""
               echo "### Error Messages"
               echo '```'
