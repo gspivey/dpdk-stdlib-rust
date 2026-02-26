@@ -221,6 +221,10 @@ export class DpdkTestStack extends cdk.Stack {
         'echo 1024 > /proc/sys/vm/nr_hugepages',
         'mkdir -p /mnt/huge',
         'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
+        '# Enable coredumps for crash diagnostics — captures segfaults/aborts during integration tests',
+        'ulimit -c unlimited',
+        'mkdir -p /tmp/coredumps',
+        'echo "/tmp/coredumps/core.%e.%p.%t" > /proc/sys/kernel/core_pattern',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo unknown)"',
       ];
 

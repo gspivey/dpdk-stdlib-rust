@@ -66,6 +66,9 @@ fi
 run_listener() {
     log_info "Starting Tier 1 listener on ${BIND_IP}:${PORT}"
 
+    # Enable coredumps for this shell and its children
+    ulimit -c unlimited 2>/dev/null || true
+
     # Start the echo server in the background
     log_info "Launching echo server: $ECHO_BINARY --ip $BIND_IP --port $PORT"
     "$ECHO_BINARY" --ip "$BIND_IP" --port "$PORT" &
@@ -75,10 +78,12 @@ run_listener() {
     # Wait for the echo server to be ready (give it a moment to bind)
     sleep 3
 
-    # Verify the echo server is still running
+    # Verify the echo server is still running — if it crashed, capture diagnostics
     if ! kill -0 "$echo_pid" 2>/dev/null; then
         log_error "Echo server exited prematurely"
-        wait "$echo_pid" || true
+        if check_process_crash "$echo_pid" "echo"; then
+            log_error "Echo server CRASHED during startup (see crash report above)"
+        fi
         return 1
     fi
 
@@ -93,9 +98,14 @@ run_listener() {
         waited=$(( waited + 5 ))
     done
 
-    # Clean up
-    kill "$echo_pid" 2>/dev/null || true
-    wait "$echo_pid" 2>/dev/null || true
+    # Check if the echo server crashed during the test (vs. being killed normally)
+    if ! kill -0 "$echo_pid" 2>/dev/null; then
+        check_process_crash "$echo_pid" "echo" || true
+    else
+        # Still running — clean shutdown
+        kill "$echo_pid" 2>/dev/null || true
+        wait "$echo_pid" 2>/dev/null || true
+    fi
     log_info "Listener finished"
 }
 

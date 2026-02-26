@@ -1015,6 +1015,14 @@ collect_instance_logs() {
                 "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
             collect_ssm_command "$instance_id" "$label" "journal" \
                 "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
+
+            # Crash diagnostics: dmesg, coredump listing, and crash reports
+            collect_ssm_command "$instance_id" "$label" "dmesg-crashes" \
+                "dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash-related dmesg entries'"
+            collect_ssm_command "$instance_id" "$label" "coredump-listing" \
+                "ls -lh /tmp/coredumps/ 2>/dev/null || echo 'no coredump directory'"
+            collect_ssm_command "$instance_id" "$label" "crash-reports" \
+                "cat /tmp/crash-report-*.txt 2>/dev/null || echo 'no crash reports'"
         else
             log_info "  SSM not available for ${label} - relying on console output only"
         fi

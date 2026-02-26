@@ -153,6 +153,108 @@ junit_write() {
     log_info "JUnit XML written to: $output_path"
 }
 
+# ── Crash diagnostics ────────────────────────────────────────────────────────
+#
+# These helpers detect and report crashes (segfaults, aborts) for binaries
+# started as background processes. They capture signal info, coredumps,
+# and kernel dmesg output to make CI failures debuggable without SSH access.
+
+# Map signal numbers to names for readable diagnostics
+_signal_name() {
+    case "$1" in
+        1) echo "SIGHUP";;    2) echo "SIGINT";;    3) echo "SIGQUIT";;
+        4) echo "SIGILL";;    6) echo "SIGABRT";;   7) echo "SIGBUS";;
+        8) echo "SIGFPE";;    9) echo "SIGKILL";;   11) echo "SIGSEGV";;
+        13) echo "SIGPIPE";;  14) echo "SIGALRM";;  15) echo "SIGTERM";;
+        *) echo "signal $1";;
+    esac
+}
+
+# Check if a background process crashed (exited due to signal).
+# Usage: check_process_crash <pid> <binary_name>
+# Returns 0 if the process crashed, 1 if it exited normally or is still running.
+# Prints detailed crash diagnostics to stderr on crash.
+check_process_crash() {
+    local pid="$1"
+    local binary_name="$2"
+
+    # Still running — not a crash
+    if kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    local exit_code=0
+    wait "$pid" 2>/dev/null || exit_code=$?
+
+    if [[ $exit_code -le 128 ]]; then
+        # Normal exit (or error exit) — not a signal-based crash
+        if [[ $exit_code -ne 0 ]]; then
+            log_error "${binary_name} exited with code ${exit_code}"
+        fi
+        return 1
+    fi
+
+    # Exit code > 128 means killed by signal (exit_code = 128 + signal_number)
+    local signal_num=$(( exit_code - 128 ))
+    local signal_name
+    signal_name=$(_signal_name "$signal_num")
+
+    log_error "=========================================="
+    log_error "CRASH DETECTED: ${binary_name} killed by ${signal_name} (signal ${signal_num})"
+    log_error "  PID: ${pid}"
+    log_error "  Exit code: ${exit_code}"
+    log_error "=========================================="
+
+    # Dump kernel messages related to the crash (segfault logs show the faulting address)
+    log_error "--- dmesg (last 20 lines, filtered for crash/segfault) ---"
+    dmesg | grep -iE "segfault|trap|fault|oom|killed|${binary_name}" | tail -20 >&2 || true
+
+    log_error "--- dmesg (last 10 lines, unfiltered) ---"
+    dmesg | tail -10 >&2 || true
+
+    # Check for coredumps
+    local coredump_dir="/tmp/coredumps"
+    if ls "${coredump_dir}/core.${binary_name}."* 2>/dev/null; then
+        log_error "--- Coredump(s) found ---"
+        ls -lh "${coredump_dir}/core.${binary_name}."* >&2 || true
+        # If gdb is available, extract a backtrace from the most recent coredump
+        local latest_core
+        latest_core=$(ls -t "${coredump_dir}/core.${binary_name}."* 2>/dev/null | head -1)
+        if [[ -n "$latest_core" ]] && command -v gdb >/dev/null 2>&1; then
+            local binary_path
+            binary_path=$(command -v "$binary_name" 2>/dev/null || echo "/opt/dpdk-stdlib/target/release/${binary_name}")
+            if [[ -f "$binary_path" ]]; then
+                log_error "--- GDB backtrace from coredump ---"
+                gdb -batch -ex "thread apply all bt full" "$binary_path" "$latest_core" 2>&1 | head -100 >&2 || true
+            fi
+        fi
+    else
+        log_error "No coredumps found in ${coredump_dir}/"
+        log_error "  (check that ulimit -c unlimited and core_pattern are set)"
+    fi
+
+    # Write a crash summary file for the log collector to pick up
+    local crash_summary="/tmp/crash-report-${binary_name}-${pid}.txt"
+    {
+        echo "CRASH REPORT"
+        echo "============"
+        echo "binary: ${binary_name}"
+        echo "pid: ${pid}"
+        echo "signal: ${signal_name} (${signal_num})"
+        echo "exit_code: ${exit_code}"
+        echo "timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo ""
+        echo "=== dmesg (crash-related) ==="
+        dmesg | grep -iE "segfault|trap|fault|oom|killed|${binary_name}" | tail -20 2>/dev/null || echo "(none)"
+        echo ""
+        echo "=== coredumps ==="
+        ls -lh "${coredump_dir}/core.${binary_name}."* 2>/dev/null || echo "(none found)"
+    } > "$crash_summary" 2>/dev/null || true
+
+    log_error "Crash report written to: ${crash_summary}"
+    return 0
+}
+
 # ── Timer helpers ────────────────────────────────────────────────────────────
 
 # Get current time in seconds (with fractional precision)
