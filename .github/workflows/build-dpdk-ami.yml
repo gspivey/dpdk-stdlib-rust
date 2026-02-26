@@ -59,48 +59,27 @@ jobs:
         run: |
           cd packer
           DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
-          MAX_ATTEMPTS=3
 
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            echo "=== Packer build attempt ${attempt}/${MAX_ATTEMPTS} ==="
-
-            # Run packer without pipefail swallowing diagnostics.
-            # Capture exit code manually so we can dump logs on failure.
-            set +e
-            packer build \
-              -var "aws_region=${{ env.AWS_REGION }}" \
-              -var "dpdk_version=${DPDK_VERSION}" \
-              -machine-readable \
-              dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
-            PACKER_EXIT=${PIPESTATUS[0]}
-            set -e
-
-            if [[ $PACKER_EXIT -eq 0 ]]; then
-              break
-            fi
-
-            ATTEMPT_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
-            echo "::warning::Packer attempt ${attempt}/${MAX_ATTEMPTS} failed (exit ${PACKER_EXIT}): ${ATTEMPT_ERRORS}"
-            echo ""
-            echo "=== Error messages (attempt ${attempt}) ==="
-            grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -20 || echo "(none)"
-
-            if [[ $attempt -lt $MAX_ATTEMPTS ]]; then
-              WAIT=$((30 * attempt))
-              echo "Retrying in ${WAIT}s..."
-              sleep $WAIT
-            fi
-          done
+          # Run packer without pipefail swallowing diagnostics.
+          # Capture exit code manually so we can dump logs on failure.
+          set +e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "dpdk_version=${DPDK_VERSION}" \
+            -machine-readable \
+            dpdk-ami.pkr.hcl 2>&1 | tee packer-output.log
+          PACKER_EXIT=${PIPESTATUS[0]}
+          set -e
 
           if [[ $PACKER_EXIT -ne 0 ]]; then
-            # Extract error details for annotations (readable via gh api .../check-runs/.../annotations)
+            # Include error details in annotation (readable via gh api .../check-runs/.../annotations)
             PACKER_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
             PACKER_LAST_UI=$(grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -3 | tr '\n' ' ' || echo "unknown")
-            echo "::error::Packer build failed after ${MAX_ATTEMPTS} attempts (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}. Last output: ${PACKER_LAST_UI}"
+            echo "::error::Packer build failed (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}. Last output: ${PACKER_LAST_UI}"
 
             # Write error details to step summary (visible on run page without downloading logs)
             {
-              echo "## Packer Build Failed after ${MAX_ATTEMPTS} attempts (exit code ${PACKER_EXIT})"
+              echo "## Packer Build Failed (exit code ${PACKER_EXIT})"
               echo ""
               echo "### Error Messages"
               echo '```'

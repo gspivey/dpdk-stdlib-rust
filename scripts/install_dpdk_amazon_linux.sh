@@ -22,9 +22,15 @@ sudo dnf install -y \
     python3-pip \
     libbsd-devel \
     libpcap-devel \
-    numactl-devel \
-    kernel-devel \
-    kernel-headers
+    numactl-devel
+
+# Install kernel headers matching the running kernel.
+# AL2023 moved to kernel 6.12 where the new kernel6.12-headers package
+# conflicts with the legacy kernel-headers (6.1) package. Since DPDK is
+# built with -Denable_kmods=false (no kernel modules), the pre-installed
+# headers from the running kernel's package are sufficient.
+sudo dnf install -y kernel-devel kernel-headers 2>&1 || \
+    echo "Note: kernel-headers conflict (expected on AL2023 kernel 6.12); using pre-installed headers"
 
 # pyelftools is required by the DPDK build system (meson).
 # python3-pyelftools RPM is not available in AL2023 default repos,

@@ -19,11 +19,7 @@ variable "dpdk_version" {
 
 variable "instance_type" {
   type    = string
-  default = "m5.large"
-  # m5.large is broadly available across all AZs and sufficient for compiling
-  # DPDK. c5n.large has limited AZ availability and causes intermittent
-  # InsufficientInstanceCapacity failures. The produced AMI works on any
-  # x86_64 instance type (including c5n for integration tests).
+  default = "c5n.large"
 }
 
 variable "ami_name_prefix" {
@@ -50,17 +46,6 @@ source "amazon-ebs" "dpdk" {
 
   # Ensure Packer instance gets a public IP for SSH access
   associate_public_ip_address = true
-
-  # Pick a subnet in the default VPC that maps public IPs on launch.
-  # This avoids AZ selection failures when the chosen instance type has
-  # limited capacity in certain availability zones.
-  subnet_filter {
-    filters = {
-      "default-for-az" = "true"
-    }
-    most_free = true
-    random    = true
-  }
 
   ami_name        = "${var.ami_name_prefix}-dpdk-${var.dpdk_version}-{{timestamp}}"
   ami_description = "Amazon Linux 2023 with DPDK ${var.dpdk_version}, Rust toolchain, and test dependencies pre-installed"
