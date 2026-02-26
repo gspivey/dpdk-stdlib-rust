@@ -79,7 +79,8 @@ jobs:
               break
             fi
 
-            echo "::warning::Packer build attempt ${attempt} failed with exit code ${PACKER_EXIT}"
+            ATTEMPT_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
+            echo "::warning::Packer attempt ${attempt}/${MAX_ATTEMPTS} failed (exit ${PACKER_EXIT}): ${ATTEMPT_ERRORS}"
             echo ""
             echo "=== Error messages (attempt ${attempt}) ==="
             grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -20 || echo "(none)"
@@ -92,7 +93,10 @@ jobs:
           done
 
           if [[ $PACKER_EXIT -ne 0 ]]; then
-            echo "::error::Packer build failed after ${MAX_ATTEMPTS} attempts (exit code ${PACKER_EXIT})"
+            # Extract error details for annotations (readable via gh api .../check-runs/.../annotations)
+            PACKER_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
+            PACKER_LAST_UI=$(grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -3 | tr '\n' ' ' || echo "unknown")
+            echo "::error::Packer build failed after ${MAX_ATTEMPTS} attempts (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}. Last output: ${PACKER_LAST_UI}"
 
             # Write error details to step summary (visible on run page without downloading logs)
             {
