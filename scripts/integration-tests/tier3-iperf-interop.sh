@@ -142,6 +142,9 @@ run_iperf_sends_server() {
     # Instance A: run dpdk-stdlib echo server as listener
     log_info "Starting dpdk-stdlib listener on ${LOCAL_IP}:${PORT} (iperf-sends direction)"
 
+    # Enable coredumps for this shell and its children
+    ulimit -c unlimited 2>/dev/null || true
+
     "$ECHO_BINARY" --ip "$LOCAL_IP" --port "$PORT" &
     local echo_pid=$!
     log_info "Echo server started with PID $echo_pid"
@@ -149,6 +152,9 @@ run_iperf_sends_server() {
     sleep 3
     if ! kill -0 "$echo_pid" 2>/dev/null; then
         log_error "Echo server exited prematurely"
+        if check_process_crash "$echo_pid" "echo"; then
+            log_error "Echo server CRASHED during startup (see crash report above)"
+        fi
         return 1
     fi
 
@@ -160,8 +166,13 @@ run_iperf_sends_server() {
         waited=$(( waited + 5 ))
     done
 
-    kill "$echo_pid" 2>/dev/null || true
-    wait "$echo_pid" 2>/dev/null || true
+    # Check if the echo server crashed during the test (vs. being killed normally)
+    if ! kill -0 "$echo_pid" 2>/dev/null; then
+        check_process_crash "$echo_pid" "echo" || true
+    else
+        kill "$echo_pid" 2>/dev/null || true
+        wait "$echo_pid" 2>/dev/null || true
+    fi
     log_info "Echo server finished"
 }
 

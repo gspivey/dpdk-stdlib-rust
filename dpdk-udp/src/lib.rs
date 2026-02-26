@@ -459,6 +459,11 @@ pub fn parse_udp_from_mbuf(mbuf: &Mbuf) -> Option<ParsedUdpPacket> {
 
 /// Shared DPDK resources for a network interface
 struct DpdkResources {
+    /// EAL handle — must stay alive for the lifetime of all DPDK resources.
+    /// `Eal::drop()` calls `rte_eal_cleanup()`, which tears down the memory subsystem.
+    /// If dropped early, subsequent DPDK calls (e.g. `rte_pktmbuf_pool_create`) segfault
+    /// because `rte_config->mem_config` becomes NULL.
+    _eal: dpdk::Eal,
     port: Port,
     mempool: Mempool,
     src_mac: MacAddress,
@@ -491,7 +496,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     };
     let eal_args_ref: Vec<&str> = eal_args.iter().map(|s| s.as_str()).collect();
 
-    dpdk::Eal::init(&eal_args_ref)
+    let eal = dpdk::Eal::init(&eal_args_ref)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
     // Create mempool
@@ -518,6 +523,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let arp_cache = Arc::new(ArpCache::new());
 
     let resources = Arc::new(DpdkResources {
+        _eal: eal,
         port,
         mempool,
         src_mac,
