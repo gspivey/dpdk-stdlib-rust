@@ -226,6 +226,12 @@ export class DpdkTestStack extends cdk.Stack {
         'mkdir -p /tmp/coredumps',
         'echo "/tmp/coredumps/core.%e.%p.%t" > /proc/sys/kernel/core_pattern',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo unknown)"',
+        '# Bind secondary ENI (ens6 at 0000:00:06.0) to vfio-pci for DPDK',
+        'echo "=== Binding secondary ENI to DPDK ==="',
+        'ip link set ens6 down 2>/dev/null || echo "ens6 already down or not found"',
+        '/usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 || echo "Failed to bind ENI"',
+        'echo "DPDK device status:"',
+        '/usr/local/bin/dpdk-devbind.py --status | head -15',
       ];
 
       // Download project and set up workspace
