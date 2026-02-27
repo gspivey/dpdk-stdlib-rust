@@ -66,7 +66,9 @@ run_our_app_sends_server() {
     # Instance B: run iperf3 in UDP server mode
     log_info "Starting iperf3 UDP server on ${LOCAL_IP}:${PORT} (our-app-sends direction)"
 
-    iperf3 -s -B "$LOCAL_IP" -p "$PORT" --one-off &
+    local iperf_log="/tmp/iperf3-server.log"
+    log_info "iperf3 server output will be logged to: $iperf_log"
+    iperf3 -s -B "$LOCAL_IP" -p "$PORT" --one-off > "$iperf_log" 2>&1 &
     local iperf_pid=$!
     log_info "iperf3 server started with PID $iperf_pid"
 
@@ -86,6 +88,11 @@ run_our_app_sends_server() {
 run_our_app_sends_client() {
     # Instance A: run dpdk-stdlib sending UDP to iperf3 server
     log_info "Sending UDP traffic from dpdk-stdlib to iperf3 server at ${PEER_IP}:${PORT}"
+
+    # Capture test-client output to a log file
+    local client_log="/tmp/test-client-iperf.log"
+    log_info "Test client output will be logged to: $client_log"
+    exec > >(tee -a "$client_log") 2>&1
 
     junit_start_suite "tier3-iperf-interop" 1
 

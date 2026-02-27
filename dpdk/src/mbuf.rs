@@ -62,6 +62,11 @@ impl Mbuf {
         unsafe { (*self.raw.as_ptr()).data_len }
     }
 
+    /// Get the buffer length (total available space)
+    pub fn buf_len(&self) -> u16 {
+        unsafe { (*self.raw.as_ptr()).buf_len }
+    }
+
     /// Get a slice to the packet data
     ///
     /// Returns None if the buffer address is null

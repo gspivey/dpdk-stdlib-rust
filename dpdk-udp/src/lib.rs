@@ -570,14 +570,22 @@ impl SocketBackend {
             SocketBackend::Dpdk(res) => {
                 let mut mbuf = res.mempool.alloc()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
-                let data = mbuf.data_mut()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
-                if data.len() < frame.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Frame too large for mbuf"));
+                
+                // Check if frame fits in the mbuf buffer
+                let buf_capacity = mbuf.buf_len() as usize - mbuf.data_offset() as usize;
+                if buf_capacity < frame.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, 
+                        format!("Frame too large for mbuf: {} bytes needed, {} available", frame.len(), buf_capacity)));
                 }
-                data[..frame.len()].copy_from_slice(frame);
+                
+                // Set data_len first so data_mut() returns the right size slice
                 mbuf.set_data_len(frame.len() as u16);
                 mbuf.set_packet_len(frame.len() as u32);
+                
+                let data = mbuf.data_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
+                data.copy_from_slice(frame);
+                
                 let mut packets = vec![mbuf];
                 let sent = res.port.tx_burst(0, &mut packets)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;

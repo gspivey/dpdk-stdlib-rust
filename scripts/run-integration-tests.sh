@@ -1011,6 +1011,13 @@ collect_instance_logs() {
             collect_ssm_file  "$instance_id" "$label" "/var/log/cloud-init-output.log"
             collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init.log"
             collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init-cmd.log"
+            
+            # Application logs from test execution
+            collect_ssm_file  "$instance_id" "$label" "/tmp/echo-server.log"
+            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client.log"
+            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client-iperf.log"
+            collect_ssm_file  "$instance_id" "$label" "/tmp/iperf3-server.log"
+            
             collect_ssm_command "$instance_id" "$label" "build-listing" \
                 "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
             collect_ssm_command "$instance_id" "$label" "journal" \

@@ -69,9 +69,11 @@ run_listener() {
     # Enable coredumps for this shell and its children
     ulimit -c unlimited 2>/dev/null || true
 
-    # Start the echo server in the background
+    # Start the echo server in the background, capturing output
+    local echo_log="/tmp/echo-server.log"
     log_info "Launching echo server: $ECHO_BINARY --ip $BIND_IP --port $PORT"
-    "$ECHO_BINARY" --ip "$BIND_IP" --port "$PORT" &
+    log_info "Echo server output will be logged to: $echo_log"
+    "$ECHO_BINARY" --ip "$BIND_IP" --port "$PORT" > "$echo_log" 2>&1 &
     local echo_pid=$!
     log_info "Echo server started with PID $echo_pid"
 
@@ -114,6 +116,11 @@ run_listener() {
 run_sender() {
     log_info "Starting Tier 1 sender: ${BIND_IP} -> ${PEER_IP}:${PORT}"
     log_info "Output will be written to: $OUTPUT"
+
+    # Capture test-client output to a log file
+    local client_log="/tmp/test-client.log"
+    log_info "Test client output will be logged to: $client_log"
+    exec > >(tee -a "$client_log") 2>&1
 
     junit_start_suite "tier1-dpdk-echo" 4
 
