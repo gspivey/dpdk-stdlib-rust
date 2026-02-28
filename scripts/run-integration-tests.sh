@@ -1037,6 +1037,8 @@ collect_instance_logs() {
             
             collect_ssm_command "$instance_id" "$label" "build-listing" \
                 "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
+            collect_ssm_command "$instance_id" "$label" "network-interfaces" \
+                "ip addr show 2>/dev/null || ifconfig -a 2>/dev/null || echo 'network info unavailable'"
             collect_ssm_command "$instance_id" "$label" "journal" \
                 "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
 

@@ -1,0 +1,242 @@
+# Implementation Plan: Integration Test Fixes
+
+## Overview
+
+Fix three interrelated bugs in the integration test suite: (1) test-client uses kernel sockets instead of DPDK, (2) test-client hardcodes bind address preventing DPDK→DPDK testing, (3) ENI state transitions race between tiers causing Tier 3 failures. Additionally, add missing Tier 2 (Kernel→DPDK) test and wire it into the orchestrator.
+
+The implementation follows the exploratory bugfix workflow: write exploration tests BEFORE the fix to confirm the bugs exist, write preservation tests to capture baseline behavior, then implement the fix and verify both pass.
+
+## Tasks
+
+- [ ] 1. Write bug condition exploration tests
+  - **Property 1: Fault Condition** - Integration Test Bug Conditions
+  - **CRITICAL**: These tests MUST FAIL on unfixed code — failure confirms the bugs exist
+  - **DO NOT attempt to fix the tests or the code when they fail**
+  - **NOTE**: These tests encode the expected behavior — they will validate the fix when they pass after implementation
+  - **GOAL**: Surface counterexamples that demonstrate all four bug conditions exist in the current codebase
+  - **Scoped PBT Approach**: Each sub-condition is deterministic, so scope properties to concrete failing cases
+  - [ ] 1.1 Verify test-client uses wrong socket import (Bug 1)
+    - Inspect `apps/test-client/src/main.rs` line 2
+    - Assert the file contains `use dpdk_tokio::compat::tokio::UdpSocket` (expected behavior)
+    - **EXPECTED**: Test FAILS because file currently has `use tokio::net::UdpSocket`
+    - Document counterexample: "test-client imports tokio::net::UdpSocket instead of dpdk_tokio::compat::tokio::UdpSocket"
+    - _Requirements: 2.2_
+  - [ ] 1.2 Verify test-client has no --bind-ip argument (Bug 2)
+    - Inspect `apps/test-client/src/main.rs` Args struct
+    - Assert the struct contains a `bind_ip` field (expected behavior)
+    - Assert the bind address is constructed from `--bind-ip` when provided (expected behavior)
+    - **EXPECTED**: Test FAILS because Args struct has no `bind_ip` field and bind is hardcoded to `"0.0.0.0:0"`
+    - Document counterexample: "Args struct has no bind_ip field; UdpSocket::bind uses hardcoded '0.0.0.0:0'"
+    - _Requirements: 2.3_
+  - [ ] 1.3 Verify orchestrator rejects --tier 2 (Bug 4)
+    - Inspect `scripts/run-integration-tests.sh` CLI parsing section
+    - Assert the `--tier` validation accepts `2` as a valid value (expected behavior)
+    - **EXPECTED**: Test FAILS because validation only accepts `1` or `3`
+    - Document counterexample: "Orchestrator --tier validation rejects '2' with error: 'ERROR: --tier must be 1 or 3'"
+    - _Requirements: 2.5_
+  - [ ] 1.4 Verify configure-eni.sh do_unbind() lacks polling (Bug 3)
+    - Inspect `scripts/integration-tests/configure-eni.sh` do_unbind function
+    - Assert the function contains a polling/retry loop after binding to ena (expected behavior)
+    - **EXPECTED**: Test FAILS because do_unbind() checks is_bound_to_ena() once with no retry loop
+    - Document counterexample: "do_unbind() has no polling loop — returns immediately after single is_bound_to_ena() check"
+    - _Requirements: 2.1, 2.6_
+  - [ ] 1.5 Verify tier1 sender does not pass --bind-ip to test-client (Bug 2 extension)
+    - Inspect `scripts/integration-tests/tier1-dpdk-echo.sh` run_sender function
+    - Assert all `$TEST_CLIENT_BINARY` invocations include `--bind-ip` (expected behavior)
+    - **EXPECTED**: Test FAILS because test-client invocations have no `--bind-ip` argument
+    - Document counterexample: "tier1-dpdk-echo.sh sender invokes test-client without --bind-ip, traffic routes through management interface"
+    - _Requirements: 2.4_
+  - Mark task complete when all exploration tests are written, run, and failures are documented
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
+
+- [ ] 2. Write preservation property tests (BEFORE implementing fix)
+  - **Property 2: Preservation** - Existing Behavior Baseline
+  - **IMPORTANT**: Follow observation-first methodology
+  - Observe behavior on UNFIXED code for non-buggy inputs, then write tests capturing observed behavior
+  - [ ] 2.1 Verify test-client default bind address is 0.0.0.0:0
+    - Observe: `apps/test-client/src/main.rs` binds to `"0.0.0.0:0"` when no `--bind-ip` is provided
+    - Write property test: for any invocation without `--bind-ip`, bind address SHALL be `"0.0.0.0:0"`
+    - **EXPECTED**: Test PASSES on unfixed code (this is existing behavior to preserve)
+    - _Requirements: 3.1_
+  - [ ] 2.2 Verify Tier 1 JUnit XML test case structure
+    - Observe: `scripts/integration-tests/tier1-dpdk-echo.sh` produces JUnit XML with classname `tier1.dpdk_echo` and 4 test cases: `arp_resolution`, `udp_send_receive`, `echo_roundtrip`, `payload_integrity`
+    - Write property test: tier1 script SHALL produce XML with exactly these 4 test case names under `tier1.dpdk_echo`
+    - **EXPECTED**: Test PASSES on unfixed code (test structure is unchanged)
+    - _Requirements: 3.3_
+  - [ ] 2.3 Verify orchestrator accepts --tier 1 and --tier 3
+    - Observe: `scripts/run-integration-tests.sh` accepts `--tier 1` and `--tier 3` without error
+    - Write property test: for tier values in {1, 3}, orchestrator SHALL accept the argument
+    - **EXPECTED**: Test PASSES on unfixed code (existing CLI behavior)
+    - _Requirements: 3.4_
+  - [ ] 2.4 Verify local build compatibility with stubs
+    - Observe: `cargo build && cargo test` passes without DPDK installed
+    - Write property test: after adding `dpdk-tokio` dependency to test-client, `cargo build && cargo test` SHALL still pass
+    - **EXPECTED**: Test PASSES on unfixed code (stub system handles this)
+    - _Requirements: 3.5_
+  - [ ] 2.5 Verify echo server behavior is unmodified
+    - Observe: `apps/echo/src/main.rs` is not modified by this bugfix
+    - Write property test: echo server source SHALL remain unchanged (no modifications in this bugfix)
+    - **EXPECTED**: Test PASSES (echo server is out of scope for this fix)
+    - _Requirements: 3.2_
+  - Mark task complete when all preservation tests are written, run, and passing on unfixed code
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
+
+- [ ] 3. Fix test-client socket import and --bind-ip argument
+  - [ ] 3.1 Add dpdk-tokio dependency to test-client Cargo.toml
+    - Add `dpdk-tokio = { path = "../../dpdk-tokio" }` to `[dependencies]` in `apps/test-client/Cargo.toml`
+    - Verify `cargo build -p test-client` succeeds
+    - _Bug_Condition: input.testClient.importPath == "tokio::net::UdpSocket" AND dpdk-tokio not in dependencies_
+    - _Expected_Behavior: dpdk-tokio is a dependency, enabling DPDK-accelerated socket usage_
+    - _Preservation: cargo build && cargo test still passes (stub system)_
+    - _Requirements: 2.2, 3.5_
+  - [ ] 3.2 Change socket import to dpdk_tokio::compat::tokio::UdpSocket
+    - In `apps/test-client/src/main.rs`, replace `use tokio::net::UdpSocket;` with `use dpdk_tokio::compat::tokio::UdpSocket;`
+    - Verify `cargo build -p test-client` succeeds
+    - _Bug_Condition: input.testClient.importPath == "tokio::net::UdpSocket"_
+    - _Expected_Behavior: import is dpdk_tokio::compat::tokio::UdpSocket_
+    - _Preservation: UdpSocket API is compatible (compat layer), cargo test passes_
+    - _Requirements: 2.2_
+  - [ ] 3.3 Add --bind-ip CLI argument to Args struct
+    - Add `bind_ip: Option<String>` field with `#[arg(long)]` to the `Args` struct in `apps/test-client/src/main.rs`
+    - Add doc comment: `/// Local IP address to bind to (default: 0.0.0.0)`
+    - _Bug_Condition: input.testClient.bindAddress == "0.0.0.0:0" AND input.intendedInterface == "dpdk_eni"_
+    - _Expected_Behavior: Args struct has bind_ip: Option<String> field_
+    - _Preservation: When --bind-ip is not provided, bind_ip is None (backward compatible)_
+    - _Requirements: 2.3, 3.1_
+  - [ ] 3.4 Construct bind address from --bind-ip argument
+    - Replace hardcoded `UdpSocket::bind("0.0.0.0:0").await?` with logic that uses `args.bind_ip` when provided
+    - When `--bind-ip` is provided: bind to `"{bind_ip}:0"`
+    - When `--bind-ip` is not provided: bind to `"0.0.0.0:0"` (backward compatible default)
+    - Log the actual bind address for debugging
+    - _Bug_Condition: hardcoded "0.0.0.0:0" ignores DPDK ENI IP_
+    - _Expected_Behavior: bind address respects --bind-ip CLI argument_
+    - _Preservation: No --bind-ip → "0.0.0.0:0" (identical to current behavior)_
+    - _Requirements: 2.3, 2.4, 3.1_
+  - [ ] 3.5 Verify bug condition exploration test (Property 1) now passes for test-client bugs
+    - **Property 1: Expected Behavior** - Test-Client Socket and Bind Address
+    - **IMPORTANT**: Re-run the SAME tests from tasks 1.1, 1.2 — do NOT write new tests
+    - Re-run exploration tests for Bug 1 (wrong import) and Bug 2 (hardcoded bind)
+    - **EXPECTED OUTCOME**: Tests PASS (confirms test-client bugs are fixed)
+    - _Requirements: 2.2, 2.3_
+
+- [ ] 4. Fix ENI state transition race condition
+  - [ ] 4.1 Add polling loop to do_unbind() in configure-eni.sh
+    - In `scripts/integration-tests/configure-eni.sh`, modify `do_unbind()` function
+    - After `echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind`, add a retry loop:
+      - Check `is_bound_to_ena()` up to 10 times with 1-second sleeps
+      - If ENI transitions within timeout, return 0
+      - If ENI does not transition within timeout, log error and return 1
+    - Replace the single `is_bound_to_ena()` check with the polling loop
+    - _Bug_Condition: input.eniTransitionComplete == false after unbind returns_
+    - _Expected_Behavior: do_unbind() polls until ENI is bound_to_ena or timeout_
+    - _Preservation: Idempotency behavior unchanged (already bound_to_ena → no-op)_
+    - _Requirements: 2.1, 2.6_
+  - [ ] 4.2 Verify bug condition exploration test (Property 1) now passes for ENI race
+    - **Property 1: Expected Behavior** - ENI State Polling
+    - **IMPORTANT**: Re-run the SAME test from task 1.4 — do NOT write a new test
+    - Re-run exploration test for Bug 3 (missing polling loop)
+    - **EXPECTED OUTCOME**: Test PASSES (confirms polling loop exists)
+    - _Requirements: 2.1, 2.6_
+
+- [ ] 5. Fix Tier 1 sender to pass --bind-ip to test-client
+  - [ ] 5.1 Add --bind-ip to test-client invocations in tier1-dpdk-echo.sh
+    - In `scripts/integration-tests/tier1-dpdk-echo.sh`, modify `run_sender()` function
+    - Add `--bind-ip "$BIND_IP"` to all `$TEST_CLIENT_BINARY` invocations (4 invocations: arp_resolution, udp_send_receive, echo_roundtrip, payload_integrity)
+    - This ensures the sender binds to the DPDK ENI IP instead of 0.0.0.0:0
+    - _Bug_Condition: tier1 sender invokes test-client without --bind-ip_
+    - _Expected_Behavior: all test-client invocations include --bind-ip $BIND_IP_
+    - _Preservation: Tier 1 JUnit XML test case names unchanged (arp_resolution, udp_send_receive, echo_roundtrip, payload_integrity)_
+    - _Requirements: 2.4, 3.3_
+  - [ ] 5.2 Verify bug condition exploration test (Property 1) now passes for tier1 sender
+    - **Property 1: Expected Behavior** - Tier 1 Sender Bind IP
+    - **IMPORTANT**: Re-run the SAME test from task 1.5 — do NOT write a new test
+    - Re-run exploration test for tier1 sender missing --bind-ip
+    - **EXPECTED OUTCOME**: Test PASSES (confirms --bind-ip is passed)
+    - _Requirements: 2.4_
+
+- [ ] 6. Add Tier 2 test script and orchestrator support
+  - [ ] 6.1 Create tier2-kernel-interop.sh test script
+    - Create `scripts/integration-tests/tier2-kernel-interop.sh` based on `tier1-dpdk-echo.sh` structure
+    - Key differences from tier1:
+      - Sender does NOT pass `--bind-ip` to test-client (uses kernel networking via default `0.0.0.0:0`)
+      - Classname is `tier2.kernel_interop`
+      - Suite name is `tier2-kernel-interop`
+      - Same 4 test cases: `arp_resolution`, `udp_send_receive`, `echo_roundtrip`, `payload_integrity`
+    - `--bind-ip` argument is optional for sender role (only required for listener)
+    - Make file executable (`chmod +x`)
+    - _Bug_Condition: input.requestedTier == 2 AND NOT orchestrator.supportsTier(2)_
+    - _Expected_Behavior: tier2-kernel-interop.sh exists and tests Kernel→DPDK path_
+    - _Requirements: 2.5_
+  - [ ] 6.2 Update orchestrator --tier validation to accept 2
+    - In `scripts/run-integration-tests.sh`, change `--tier` validation from `"$TIER_FILTER" != "1" && "$TIER_FILTER" != "3"` to also accept `"2"`
+    - Update usage text to show `--tier <1|2|3>`
+    - _Bug_Condition: orchestrator rejects --tier 2_
+    - _Expected_Behavior: orchestrator accepts --tier 2 without error_
+    - _Preservation: --tier 1 and --tier 3 continue to work identically_
+    - _Requirements: 2.5, 3.4_
+  - [ ] 6.3 Add run_tier2() function to orchestrator
+    - Add `run_tier2()` function to `scripts/run-integration-tests.sh`
+    - Function should:
+      - Bind receiver ENI only (sender uses kernel networking)
+      - Ensure sender ENI is unbound
+      - Start listener on receiver with `tier2-kernel-interop.sh --role listener`
+      - Run sender on sender with `tier2-kernel-interop.sh --role sender`
+    - _Bug_Condition: no run_tier2() function exists_
+    - _Expected_Behavior: run_tier2() configures ENIs for Kernel→DPDK and executes tier2 script_
+    - _Requirements: 2.5_
+  - [ ] 6.4 Wire Tier 2 into main execution flow
+    - In `scripts/run-integration-tests.sh` main() function, insert `run_tier2` between tier 1 and tier 3
+    - Add `unbind_all_enis` between tier 1 and tier 2, and between tier 2 and tier 3
+    - Handle `--tier 2` filter to run only tier 2
+    - _Bug_Condition: tier 2 not in execution flow_
+    - _Expected_Behavior: full suite runs tier 1 → unbind → tier 2 → unbind → tier 3_
+    - _Preservation: --tier 1 and --tier 3 execution paths unchanged_
+    - _Requirements: 2.5, 3.4, 3.6_
+  - [ ] 6.5 Verify bug condition exploration test (Property 1) now passes for tier 2
+    - **Property 1: Expected Behavior** - Orchestrator Tier 2 Support
+    - **IMPORTANT**: Re-run the SAME test from task 1.3 — do NOT write a new test
+    - Re-run exploration test for orchestrator rejecting --tier 2
+    - **EXPECTED OUTCOME**: Test PASSES (confirms --tier 2 is accepted)
+    - _Requirements: 2.5_
+
+- [ ] 7. Verify preservation tests still pass after all fixes
+  - **Property 2: Preservation** - Post-Fix Regression Check
+  - **IMPORTANT**: Re-run the SAME tests from task 2 — do NOT write new tests
+  - [ ] 7.1 Re-run preservation test: default bind address is 0.0.0.0:0
+    - Re-run test from task 2.1
+    - **EXPECTED OUTCOME**: Test PASSES (backward compatibility preserved)
+    - _Requirements: 3.1_
+  - [ ] 7.2 Re-run preservation test: Tier 1 JUnit XML structure
+    - Re-run test from task 2.2
+    - **EXPECTED OUTCOME**: Test PASSES (test case names unchanged)
+    - _Requirements: 3.3_
+  - [ ] 7.3 Re-run preservation test: --tier 1 and --tier 3 accepted
+    - Re-run test from task 2.3
+    - **EXPECTED OUTCOME**: Test PASSES (existing CLI args still work)
+    - _Requirements: 3.4_
+  - [ ] 7.4 Re-run preservation test: local build compatibility
+    - Run `cargo build && cargo test` to verify all 133+ tests pass with stubs
+    - **EXPECTED OUTCOME**: Test PASSES (stub system handles dpdk-tokio dependency)
+    - _Requirements: 3.5_
+  - [ ] 7.5 Re-run preservation test: echo server unmodified
+    - Re-run test from task 2.5
+    - **EXPECTED OUTCOME**: Test PASSES (echo server not touched)
+    - _Requirements: 3.2_
+
+- [ ] 8. Checkpoint - Ensure all tests pass
+  - Verify all exploration tests (Property 1) now pass after fixes
+  - Verify all preservation tests (Property 2) still pass after fixes
+  - Run `bash -n` syntax check on all modified/new shell scripts
+  - Run `cargo build && cargo test` to verify local build compatibility
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- Tasks 1 and 2 MUST be completed BEFORE any implementation tasks (3-6)
+- Exploration tests (task 1) are expected to FAIL on unfixed code — this confirms the bugs exist
+- Preservation tests (task 2) are expected to PASS on unfixed code — this captures baseline behavior
+- After implementation (tasks 3-6), exploration tests should PASS and preservation tests should still PASS
+- The test-client fix (task 3) is the highest-priority change as it affects the core DPDK→DPDK validation
+- The ENI polling fix (task 4) prevents Tier 3 failures caused by race conditions
+- The Tier 2 addition (task 6) captures the Kernel→DPDK interop path that old Tier 1 accidentally tested
+- Property-based tests reference correctness properties from the design document (Properties 1-7)
