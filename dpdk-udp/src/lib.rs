@@ -827,7 +827,7 @@ impl ReceiveQueue {
 /// - **AF_PACKET+MMAP** - Linux raw sockets with zero-copy ring buffers
 pub struct UdpSocket {
     local_addr: SocketAddr,
-    connected_addr: Option<SocketAddr>,
+    connected_addr: Mutex<Option<SocketAddr>>,
     /// Backend for packet I/O (DPDK or generic)
     socket_backend: SocketBackend,
     /// Legacy DPDK resources (kept for backward-compatible methods)
@@ -840,7 +840,7 @@ pub struct UdpSocket {
     /// ICMP handler for ping responses
     icmp_handler: IcmpHandler,
     /// Connection state tracking (for connected sockets)
-    connection_state: Option<RwLock<ConnectionState>>,
+    connection_state: RwLock<Option<ConnectionState>>,
     /// Receive queue for buffered packets
     recv_queue: Mutex<ReceiveQueue>,
     /// Whether to automatically respond to ARP requests
@@ -887,14 +887,14 @@ impl UdpSocket {
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
-            connected_addr: None,
+            connected_addr: Mutex::new(None),
             socket_backend,
             resources,
             ttl: 64,
             dst_mac: MacAddress::broadcast(),
             arp_handler,
             icmp_handler,
-            connection_state: None,
+            connection_state: RwLock::new(None),
             recv_queue: Mutex::new(ReceiveQueue::new(1024)),
             auto_arp: true,
             auto_icmp: true,
@@ -955,14 +955,14 @@ impl UdpSocket {
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
-            connected_addr: None,
+            connected_addr: Mutex::new(None),
             socket_backend: SocketBackend::Generic(backend),
             resources,
             ttl: 64,
             dst_mac: MacAddress::broadcast(),
             arp_handler,
             icmp_handler,
-            connection_state: None,
+            connection_state: RwLock::new(None),
             recv_queue: Mutex::new(ReceiveQueue::new(1024)),
             auto_arp: true,
             auto_icmp: true,
@@ -1006,8 +1006,14 @@ impl UdpSocket {
         };
 
         // Resolve destination MAC via ARP (or use configured/broadcast MAC)
-        let dst_mac = self.arp_handler.resolve(&dst_ip)
-            .unwrap_or_else(|| self.dst_mac.clone());
+        let dst_mac = match self.arp_handler.resolve(&dst_ip) {
+            Some(mac) => mac,
+            None if self.auto_arp => {
+                // Proactively send ARP request and wait for reply
+                self.resolve_arp(&dst_ip)?
+            }
+            None => self.dst_mac.clone(),
+        };
 
         let src_mac = self.socket_backend.mac_address();
 
@@ -1027,9 +1033,9 @@ impl UdpSocket {
         self.socket_backend.send_frame(&frame)?;
 
         // Update connection state if connected
-        if let Some(ref state) = self.connection_state {
-            if let Ok(mut s) = state.write() {
-                s.record_send(buf.len());
+        if let Ok(mut guard) = self.connection_state.write() {
+            if let Some(ref mut state) = *guard {
+                state.record_send(buf.len());
             }
         }
 
@@ -1130,8 +1136,8 @@ impl UdpSocket {
                         );
 
                         // If connected, only accept packets from the connected address
-                        if let Some(ref connected) = self.connected_addr {
-                            if src_addr != *connected {
+                        if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                            if src_addr != connected {
                                 // Queue for later if not from connected peer
                                 let mut queue = self.recv_queue.lock().unwrap();
                                 queue.push(parsed.payload, src_addr);
@@ -1145,9 +1151,9 @@ impl UdpSocket {
                             buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
 
                             // Update connection state
-                            if let Some(ref state) = self.connection_state {
-                                if let Ok(mut s) = state.write() {
-                                    s.record_recv(copy_len);
+                            if let Ok(mut guard) = self.connection_state.write() {
+                                if let Some(ref mut state) = *guard {
+                                    state.record_recv(copy_len);
                                 }
                             }
 
@@ -1176,7 +1182,7 @@ impl UdpSocket {
 
     /// Returns the socket address of the remote peer this socket was connected to.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.connected_addr.ok_or_else(|| {
+        self.connected_addr.lock().unwrap().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
         })
     }
@@ -1185,17 +1191,17 @@ impl UdpSocket {
     ///
     /// After connecting, `send()` and `recv()` can be used without specifying addresses.
     /// The socket will also track connection statistics.
-    pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let addr = addr.to_socket_addrs()?.next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
 
         // Initialize connection tracking
-        self.connection_state = Some(RwLock::new(ConnectionState::new(
+        *self.connection_state.write().unwrap() = Some(ConnectionState::new(
             self.local_addr,
             addr,
-        )));
+        ));
 
-        self.connected_addr = Some(addr);
+        *self.connected_addr.lock().unwrap() = Some(addr);
         Ok(())
     }
 
@@ -1208,7 +1214,7 @@ impl UdpSocket {
 
     /// Sends data on the socket to the remote address to which it is connected.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let addr = self.connected_addr.ok_or_else(|| {
+        let addr = self.connected_addr.lock().unwrap().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
         })?;
         self.send_to_addr(buf, addr)
@@ -1293,6 +1299,62 @@ impl UdpSocket {
     }
 
     // ========================================================================
+    // ARP Resolution
+    // ========================================================================
+
+    /// Proactively resolve an IP address to a MAC address via ARP.
+    ///
+    /// Sends an ARP request and polls for the reply. Returns the resolved MAC
+    /// or falls back to broadcast MAC if no reply is received.
+    fn resolve_arp(&self, target_ip: &Ipv4Addr) -> io::Result<MacAddress> {
+        // Build and send ARP request
+        if let Some(arp_frame) = self.arp_handler.make_request(*target_ip) {
+            self.socket_backend.send_frame(&arp_frame)?;
+        } else {
+            return Ok(self.dst_mac.clone());
+        }
+
+        // Poll for ARP reply (up to 3 seconds with 100us intervals)
+        for _ in 0..30_000 {
+            let frames = self.socket_backend.recv_frames(32)?;
+            for frame_data in &frames {
+                if frame_data.len() >= 14 {
+                    let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+                    if ethertype == arp::ETH_TYPE_ARP {
+                        // Process ARP (learns from replies, responds to requests)
+                        if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
+                            let _ = self.socket_backend.send_frame(&reply_frame);
+                        }
+                    } else if ethertype == ETH_TYPE_IPV4 {
+                        // Queue any UDP packets we receive while waiting
+                        if let Some(parsed) = parse_udp_packet(frame_data) {
+                            if frame_data.len() >= 12 {
+                                let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
+                                self.arp_handler.cache.insert(parsed.src_ip, MacAddress::new(src_mac));
+                            }
+                            let src_addr = SocketAddr::V4(
+                                SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+                            );
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            queue.push(parsed.payload, src_addr);
+                        }
+                    }
+                }
+            }
+
+            // Check if ARP resolved
+            if let Some(mac) = self.arp_handler.resolve(target_ip) {
+                return Ok(mac);
+            }
+
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+
+        // Fallback to broadcast if ARP didn't resolve
+        Ok(self.dst_mac.clone())
+    }
+
+    // ========================================================================
     // Connection Tracking
     // ========================================================================
 
@@ -1300,14 +1362,14 @@ impl UdpSocket {
     ///
     /// Returns None if the socket is not connected.
     pub fn connection_stats(&self) -> Option<ConnectionState> {
-        self.connection_state.as_ref().and_then(|state| {
-            state.read().ok().map(|s| s.clone())
+        self.connection_state.read().ok().and_then(|guard| {
+            guard.as_ref().map(|s| s.clone())
         })
     }
 
     /// Check if this socket is connected.
     pub fn is_connected(&self) -> bool {
-        self.connected_addr.is_some()
+        self.connected_addr.lock().unwrap().is_some()
     }
 
     /// Get the number of packets in the receive queue.
@@ -1610,13 +1672,11 @@ mod tests {
     /// std signature: pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()>
     #[test]
     fn test_api_connect_signature() {
-        // Note: Our connect takes &mut self while std takes &self
-        // This is an intentional deviation for internal state management
-        fn _connect_with_str(socket: &mut UdpSocket) -> io::Result<()> {
+        fn _connect_with_str(socket: &UdpSocket) -> io::Result<()> {
             socket.connect("127.0.0.1:9000")
         }
 
-        fn _connect_with_socketaddr(socket: &mut UdpSocket) -> io::Result<()> {
+        fn _connect_with_socketaddr(socket: &UdpSocket) -> io::Result<()> {
             let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
             socket.connect(addr)
         }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use tokio::net::UdpSocket;
+use dpdk_tokio::compat::tokio::UdpSocket;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -9,34 +9,44 @@ struct Args {
     /// Target IP address
     #[arg(long, default_value = "10.0.0.2")]
     target: String,
-    
+
     /// Target port
     #[arg(long, default_value_t = 9000)]
     port: u16,
-    
+
     /// Message to send
     #[arg(long, default_value = "hello dpdk")]
     message: String,
-    
+
     /// Number of packets to send
     #[arg(long, default_value_t = 1)]
     count: u32,
-    
+
     /// Delay between packets (ms)
     #[arg(long, default_value_t = 1000)]
     delay: u64,
+
+    /// Local IP address to bind to (default: 0.0.0.0)
+    #[arg(long)]
+    bind_ip: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    
+
+    let bind_addr = args.bind_ip
+        .as_deref()
+        .map(|ip| format!("{}:0", ip))
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+
     println!("UDP Test Client");
     println!("Target: {}:{}", args.target, args.port);
+    println!("Bind address: {}", bind_addr);
     println!("Message: '{}'", args.message);
     println!("Count: {}", args.count);
-    
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+    let socket = UdpSocket::bind(&bind_addr).await?;
     let target_addr = format!("{}:{}", args.target, args.port);
     
     println!("Sending packets...");

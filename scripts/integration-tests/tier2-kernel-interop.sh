@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# tier1-dpdk-echo.sh - Tier 1: DPDK <-> DPDK echo test harness
+# tier2-kernel-interop.sh - Tier 2: Kernel → DPDK interoperability test
 #
-# Tests bidirectional UDP communication between two dpdk-stdlib instances.
-# Verifies: ARP resolution, UDP send/receive, echo roundtrip, payload integrity.
+# Tests kernel socket sender communicating with a DPDK echo server receiver.
+# The sender uses default bind (0.0.0.0:0) which routes through the management
+# interface (kernel networking), while the receiver runs dpdk-stdlib on the DPDK ENI.
+#
+# Verifies: ARP resolution, UDP send/receive, echo roundtrip, payload integrity
+# across the kernel→DPDK boundary.
 #
 # Usage:
-#   # On Instance B (listener):
-#   ./tier1-dpdk-echo.sh --role listener --bind-ip 10.0.1.100 --port 9000
+#   # On Instance B (listener, DPDK bound):
+#   ./tier2-kernel-interop.sh --role listener --bind-ip 10.0.1.100 --port 9000
 #
-#   # On Instance A (sender):
-#   ./tier1-dpdk-echo.sh --role sender --bind-ip 10.0.1.50 --peer-ip 10.0.1.100 \
-#       --port 9000 --output /tmp/test-results/tier1-dpdk-echo.xml
+#   # On Instance A (sender, kernel networking):
+#   ./tier2-kernel-interop.sh --role sender --peer-ip 10.0.1.100 \
+#       --port 9000 --output /tmp/test-results/tier2-kernel-interop.xml
 
 set -euo pipefail
 
@@ -28,7 +32,7 @@ PEER_IP=""
 PORT=9000
 OUTPUT=""
 TEST_TIMEOUT=60  # Per-test timeout in seconds
-CLASSNAME="tier1.dpdk_echo"
+CLASSNAME="tier2.kernel_interop"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -41,14 +45,20 @@ while [[ $# -gt 0 ]]; do
         --output)     OUTPUT="$2";  shift 2 ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --role <listener|sender> --bind-ip <IP> [--peer-ip <IP>] --port <PORT> [--output <PATH>]" >&2
+            echo "Usage: $0 --role <listener|sender> [--bind-ip <IP>] [--peer-ip <IP>] --port <PORT> [--output <PATH>]" >&2
             exit 1
             ;;
     esac
 done
 
-if [[ -z "$ROLE" || -z "$BIND_IP" ]]; then
-    echo "Missing required arguments: --role and --bind-ip are required" >&2
+if [[ -z "$ROLE" ]]; then
+    echo "Missing required argument: --role" >&2
+    exit 1
+fi
+
+# Listener requires --bind-ip (DPDK ENI); sender does not (uses kernel default)
+if [[ "$ROLE" == "listener" && -z "$BIND_IP" ]]; then
+    echo "Listener role requires --bind-ip" >&2
     exit 1
 fi
 
@@ -58,13 +68,13 @@ if [[ "$ROLE" == "sender" && -z "$PEER_IP" ]]; then
 fi
 
 if [[ -z "$OUTPUT" ]]; then
-    OUTPUT=$(result_path "tier1" "dpdk-echo")
+    OUTPUT=$(result_path "tier2" "kernel-interop")
 fi
 
 # ── Listener role ────────────────────────────────────────────────────────────
 
 run_listener() {
-    log_info "Starting Tier 1 listener on ${BIND_IP}:${PORT}"
+    log_info "Starting Tier 2 listener on ${BIND_IP}:${PORT}"
 
     # Enable coredumps for this shell and its children
     ulimit -c unlimited 2>/dev/null || true
@@ -92,7 +102,6 @@ run_listener() {
     log_info "Listener is ready and waiting for traffic"
 
     # Keep running until killed by the orchestrator or sender finishes
-    # The listener stays up for the duration of the test
     local waited=0
     local max_wait=120
     while kill -0 "$echo_pid" 2>/dev/null && [[ $waited -lt $max_wait ]]; do
@@ -114,7 +123,7 @@ run_listener() {
 # ── Sender role ──────────────────────────────────────────────────────────────
 
 run_sender() {
-    log_info "Starting Tier 1 sender: ${BIND_IP} -> ${PEER_IP}:${PORT}"
+    log_info "Starting Tier 2 sender (kernel networking) -> ${PEER_IP}:${PORT}"
     log_info "Output will be written to: $OUTPUT"
 
     # Capture test-client output to a log file
@@ -122,10 +131,14 @@ run_sender() {
     log_info "Test client output will be logged to: $client_log"
     exec > >(tee -a "$client_log") 2>&1
 
-    junit_start_suite "tier1-dpdk-echo" 4
+    junit_start_suite "tier2-kernel-interop" 4
 
     # Give the listener time to start
     sleep 5
+
+    # NOTE: Sender does NOT pass --bind-ip — it uses the default 0.0.0.0:0
+    # which routes through the management interface (kernel networking).
+    # This tests the Kernel→DPDK interoperability path.
 
     # ── Test 1: ARP resolution ───────────────────────────────────────────
     log_info "Test: arp_resolution"
@@ -134,9 +147,8 @@ run_sender() {
     local arp_ok=true
     local arp_err=""
 
-    # Send a single packet to trigger ARP resolution, then check if we get a response
     if run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "arp-probe" --count 1 2>&1; then
+        --target "$PEER_IP" --port "$PORT" --message "arp-probe" --count 1 2>&1; then
         log_info "ARP resolution succeeded (got response from peer)"
     else
         arp_ok=false
@@ -153,9 +165,6 @@ run_sender() {
         junit_add_failure "arp_resolution" "$CLASSNAME" "$elapsed" "$arp_err" "Could not resolve MAC address for $PEER_IP"
     fi
 
-    # Clean up DPDK shared memory so the next process can reinitialize EAL
-    rm -rf /var/run/dpdk/ 2>/dev/null || true
-
     # ── Test 2: UDP send/receive ─────────────────────────────────────────
     log_info "Test: udp_send_receive"
     start=$(_timer_now)
@@ -164,12 +173,11 @@ run_sender() {
     local send_output=""
 
     send_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "hello-dpdk" --count 3 --delay 500 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --message "hello-dpdk" --count 3 --delay 500 2>&1) || {
         send_ok=false
         send_err="UDP send/receive failed"
     }
 
-    # Verify we got responses
     if [[ "$send_ok" == "true" ]]; then
         if echo "$send_output" | grep -q "Received"; then
             log_info "UDP send/receive succeeded"
@@ -188,9 +196,6 @@ run_sender() {
         junit_add_failure "udp_send_receive" "$CLASSNAME" "$elapsed" "$send_err" "$send_output"
     fi
 
-    # Clean up DPDK shared memory so the next process can reinitialize EAL
-    rm -rf /var/run/dpdk/ 2>/dev/null || true
-
     # ── Test 3: Echo roundtrip ───────────────────────────────────────────
     log_info "Test: echo_roundtrip"
     start=$(_timer_now)
@@ -199,12 +204,11 @@ run_sender() {
     local echo_output=""
 
     echo_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "roundtrip-test" --count 5 --delay 200 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --message "roundtrip-test" --count 5 --delay 200 2>&1) || {
         echo_ok=false
         echo_err="Echo roundtrip timed out or failed"
     }
 
-    # Count how many responses came back
     if [[ "$echo_ok" == "true" ]]; then
         local response_count
         response_count=$(echo "$echo_output" | grep -c "Received" || true)
@@ -225,9 +229,6 @@ run_sender() {
         junit_add_failure "echo_roundtrip" "$CLASSNAME" "$elapsed" "$echo_err" "$echo_output"
     fi
 
-    # Clean up DPDK shared memory so the next process can reinitialize EAL
-    rm -rf /var/run/dpdk/ 2>/dev/null || true
-
     # ── Test 4: Payload integrity ────────────────────────────────────────
     log_info "Test: payload_integrity"
     start=$(_timer_now)
@@ -237,17 +238,15 @@ run_sender() {
     local test_payload="Hello DPDK payload integrity check 12345"
 
     payload_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "$test_payload" --count 1 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --message "$test_payload" --count 1 2>&1) || {
         payload_ok=false
         payload_err="Payload integrity test timed out or failed"
     }
 
-    # Verify the echoed payload contains our message
     if [[ "$payload_ok" == "true" ]]; then
         if echo "$payload_output" | grep -q "echo: $test_payload"; then
             log_info "Payload integrity verified"
         elif echo "$payload_output" | grep -q "Received"; then
-            # Got a response but payload may differ - still check
             log_info "Response received, checking payload match..."
             if echo "$payload_output" | grep -q "$test_payload"; then
                 log_info "Payload integrity verified (found in response)"
@@ -274,7 +273,7 @@ run_sender() {
     junit_end_suite
     junit_write "$OUTPUT"
 
-    log_info "Tier 1 sender tests complete. Results: $OUTPUT"
+    log_info "Tier 2 sender tests complete. Results: $OUTPUT"
 }
 
 # ── Main dispatch ────────────────────────────────────────────────────────────

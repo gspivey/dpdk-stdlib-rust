@@ -81,8 +81,8 @@ while [[ $# -gt 0 ]]; do
         --json-summary)  FLAG_JSON_SUMMARY=true;  shift ;;
         --tier)
             TIER_FILTER="$2"
-            if [[ "$TIER_FILTER" != "1" && "$TIER_FILTER" != "3" ]]; then
-                echo "ERROR: --tier must be 1 or 3, got: $TIER_FILTER" >&2
+            if [[ "$TIER_FILTER" != "1" && "$TIER_FILTER" != "2" && "$TIER_FILTER" != "3" ]]; then
+                echo "ERROR: --tier must be 1, 2, or 3, got: $TIER_FILTER" >&2
                 exit 2
             fi
             shift 2
@@ -192,36 +192,37 @@ fetch_stack_outputs() {
     if [[ -f /tmp/cdk-outputs.json ]]; then
         local cdk_outputs
         cdk_outputs=$(cat /tmp/cdk-outputs.json)
+        log_info "CDK outputs file contents: $cdk_outputs"
         SENDER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderInstanceId: $SENDER_INSTANCE_ID"; SENDER_INSTANCE_ID=""; }
         RECEIVER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverInstanceId: $RECEIVER_INSTANCE_ID"; RECEIVER_INSTANCE_ID=""; }
         SENDER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniId: $SENDER_DPDK_ENI_ID"; SENDER_DPDK_ENI_ID=""; }
         RECEIVER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniId: $RECEIVER_DPDK_ENI_ID"; RECEIVER_DPDK_ENI_ID=""; }
         SENDER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniPrivateIp: $SENDER_DPDK_ENI_IP"; SENDER_DPDK_ENI_IP=""; }
         RECEIVER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniPrivateIp: $RECEIVER_DPDK_ENI_IP"; RECEIVER_DPDK_ENI_IP=""; }
 
         if [[ -n "$SENDER_INSTANCE_ID" && -n "$RECEIVER_INSTANCE_ID" \
               && -n "$SENDER_DPDK_ENI_IP" && -n "$RECEIVER_DPDK_ENI_IP" ]]; then
@@ -242,10 +243,18 @@ print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
     # Authoritative source of truth. Used when the CDK outputs file is absent
     # or incomplete (e.g., CDK ran without the deploy role and wrote {}).
     local cf_outputs
+    local cf_error
+    cf_error=$(mktemp)
     cf_outputs=$(aws cloudformation describe-stacks \
         --stack-name "$CDK_STACK_NAME" \
         --query "Stacks[0].Outputs" \
-        --output json 2>/dev/null || true)
+        --output json 2>"$cf_error") || {
+        log_error "CloudFormation describe-stacks failed:"
+        log_error "  $(cat "$cf_error")"
+        rm -f "$cf_error"
+        return 1
+    }
+    rm -f "$cf_error"
 
     if [[ -z "$cf_outputs" || "$cf_outputs" == "null" ]]; then
         log_error "CloudFormation describe-stacks returned no outputs for $CDK_STACK_NAME"
@@ -253,42 +262,44 @@ print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
         return 1
     fi
 
+    log_info "CloudFormation outputs JSON: $cf_outputs"
+
     SENDER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderInstanceId': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderInstanceId: $SENDER_INSTANCE_ID"; SENDER_INSTANCE_ID=""; }
     RECEIVER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverInstanceId': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverInstanceId: $RECEIVER_INSTANCE_ID"; RECEIVER_INSTANCE_ID=""; }
     SENDER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniId': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniId: $SENDER_DPDK_ENI_ID"; SENDER_DPDK_ENI_ID=""; }
     RECEIVER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniId': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniId: $RECEIVER_DPDK_ENI_ID"; RECEIVER_DPDK_ENI_ID=""; }
     SENDER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'SenderDpdkEniPrivateIp': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniPrivateIp: $SENDER_DPDK_ENI_IP"; SENDER_DPDK_ENI_IP=""; }
     RECEIVER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
 import json, sys
 outputs = json.load(sys.stdin)
 for o in outputs:
     if o['OutputKey'] == 'ReceiverDpdkEniPrivateIp': print(o['OutputValue'])
-" 2>/dev/null || true)
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniPrivateIp: $RECEIVER_DPDK_ENI_IP"; RECEIVER_DPDK_ENI_IP=""; }
 
     log_info "Stack outputs (from CloudFormation describe-stacks):"
     log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
@@ -497,6 +508,18 @@ ssm_get_stdout() {
         --output text 2>/dev/null
 }
 
+# Cancel an in-flight SSM command (e.g., a listener that's still running).
+# Usage: ssm_cancel_command <instance_id> <command_id>
+ssm_cancel_command() {
+    local instance_id="$1"
+    local cmd_id="$2"
+
+    log_info "Cancelling SSM command $cmd_id on $instance_id..."
+    aws ssm cancel-command --command-id "$cmd_id" --instance-ids "$instance_id" 2>/dev/null || true
+    # Give SSM agent a moment to process the cancellation
+    sleep 2
+}
+
 # ── ENI configuration ───────────────────────────────────────────────────────
 
 configure_eni() {
@@ -504,8 +527,13 @@ configure_eni() {
     local action="$2"  # bind or unbind
 
     log_info "ENI $action on $instance_id"
-    ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"
+    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" \
+        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"; then
+        log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
+        ssm_run_command "$instance_id" 15 \
+            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+        return 1
+    fi
 }
 
 # ── Tier execution ───────────────────────────────────────────────────────────
@@ -549,10 +577,62 @@ run_tier1() {
         generate_failure_xml "tier1-dpdk-echo" "Sender test execution failed or timed out"
     fi
 
-    # Wait for listener to finish (or time out)
-    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 || true
+    # Wait for listener to finish (or time out), then cancel if still running
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    # Kill any lingering echo server processes on the receiver
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
 
     log_info "Tier 1 execution complete"
+}
+
+run_tier2() {
+    log_section "Tier 2: Kernel -> DPDK interoperability test"
+
+    # Bind ENI on receiver only (sender uses kernel networking)
+    log_info "Configuring ENIs for Tier 2..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    # Ensure sender ENI is unbound (kernel networking)
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" || true
+
+    # Start listener on receiver (DPDK) in background
+    log_info "Starting listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-kernel-interop.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start listener"
+        generate_failure_xml "tier2-kernel-interop" "Failed to start listener on receiver"
+        return 1
+    fi
+
+    # Give listener time to start
+    sleep 10
+
+    # Run sender on sender (kernel networking — no --bind-ip)
+    log_info "Starting sender on sender (kernel networking)..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-kernel-interop.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-kernel-interop.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Sender test execution failed"
+        generate_failure_xml "tier2-kernel-interop" "Sender test execution failed or timed out"
+    fi
+
+    # Wait for listener to finish (or time out), then cancel if still running
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    # Kill any lingering echo server processes on the receiver
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
+
+    log_info "Tier 2 execution complete"
 }
 
 run_tier3() {
@@ -613,8 +693,18 @@ run_tier3() {
 
 unbind_all_enis() {
     log_info "Unbinding all ENIs..."
-    configure_eni "$SENDER_INSTANCE_ID" "unbind" || true
-    configure_eni "$RECEIVER_INSTANCE_ID" "unbind" || true
+    if ! configure_eni "$SENDER_INSTANCE_ID" "unbind"; then
+        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID) — continuing"
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind"; then
+        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID) — continuing"
+    fi
+    # Verify ENI status after unbind to catch incomplete transitions
+    log_info "Verifying ENI status after unbind..."
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 \
+        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 \
+        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
 }
 
 # ── Result collection ────────────────────────────────────────────────────────
@@ -739,10 +829,14 @@ print_summary() {
         [[ -f "$xml_file" ]] || continue
 
         local suite_name tests failures time_val
-        suite_name=$(grep -oP 'name="\K[^"]+' "$xml_file" | head -1 || echo "unknown")
-        tests=$(grep -oP 'tests="\K[^"]+' "$xml_file" | head -1 || echo "0")
-        failures=$(grep -oP 'failures="\K[^"]+' "$xml_file" | head -1 || echo "0")
-        time_val=$(grep -oP 'time="\K[^"]+' "$xml_file" | head -1 || echo "0")
+        suite_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        suite_name="${suite_name:-unknown}"
+        tests=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        tests="${tests:-0}"
+        failures=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        failures="${failures:-0}"
+        time_val=$(sed -n 's/.*time="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        time_val="${time_val:-0}"
 
         printf "%-40s %6s %8s %10s\n" "$suite_name" "$tests" "$failures" "$time_val"
 
@@ -779,7 +873,13 @@ generate_json_summary() {
     local timestamp
     timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     local run_id
-    run_id=$(echo "$commit_hash$timestamp" | md5sum | cut -c1-8 2>/dev/null || echo "unknown")
+    if command -v md5sum >/dev/null 2>&1; then
+        run_id=$(echo "$commit_hash$timestamp" | md5sum | cut -c1-8)
+    elif command -v md5 >/dev/null 2>&1; then
+        run_id=$(echo "$commit_hash$timestamp" | md5 -q | cut -c1-8)
+    else
+        run_id="unknown"
+    fi
 
     # Build JSON using python3 for reliable JSON generation
     python3 - "$RESULTS_DIR" "$run_id" "$commit_hash" "$timestamp" <<'PYEOF'
@@ -1250,7 +1350,16 @@ main() {
         run_tier1 || true
     fi
 
-    # Unbind ENIs between tiers
+    # Unbind ENIs between tier 1 and tier 2
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "2" ]]; then
+        run_tier2 || true
+    fi
+
+    # Unbind ENIs between tier 2 and tier 3
     if [[ -z "$TIER_FILTER" ]]; then
         unbind_all_enis
     fi

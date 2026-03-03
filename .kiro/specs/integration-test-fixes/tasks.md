@@ -2,13 +2,31 @@
 
 ## Overview
 
-Fix three interrelated bugs in the integration test suite: (1) test-client uses kernel sockets instead of DPDK, (2) test-client hardcodes bind address preventing DPDK→DPDK testing, (3) ENI state transitions race between tiers causing Tier 3 failures. Additionally, add missing Tier 2 (Kernel→DPDK) test and wire it into the orchestrator.
+Fix three interrelated bugs in the integration test suite: (1) test-client uses kernel sockets instead of DPDK, (2) test-client hardcodes bind address preventing DPDK→DPDK testing, (3) ENI state transitions race between tiers causing Tier 3 failures. Additionally, add missing Tier 2 (Kernel→DPDK) test and wire it into the orchestrator. Also fix diagnostic visibility issues that make failures silent and hard to debug.
 
 The implementation follows the exploratory bugfix workflow: write exploration tests BEFORE the fix to confirm the bugs exist, write preservation tests to capture baseline behavior, then implement the fix and verify both pass.
 
 ## Tasks
 
-- [ ] 1. Write bug condition exploration tests
+- [x] 0. Add diagnostic visibility to orchestrator (Phase 0 prerequisite)
+  - **Rationale**: The orchestrator suppresses errors with `2>/dev/null || true` throughout stack output parsing and ENI configuration. The `failure-summary.json` shows `fetch_stack_outputs` failing with empty instance IDs — but the actual error is hidden. Without visibility, debugging tier 3 is guesswork.
+  - [x] 0.1 Add error logging to `fetch_stack_outputs()` in `scripts/run-integration-tests.sh`
+    - Remove `2>/dev/null` from AWS CLI calls in the CloudFormation describe-stacks fallback path
+    - Log raw CDK outputs file contents before Python parsing
+    - Log raw CloudFormation describe-stacks response before Python parsing
+    - Log Python parse results (or errors) explicitly so failures produce actionable messages
+    - _Rationale: failure-summary.json shows empty instance IDs with no explanation_
+  - [x] 0.2 Add error logging to `configure_eni()` SSM calls in `scripts/run-integration-tests.sh`
+    - When `configure_eni()` fails, log the SSM command output (not just "ENI bind failed")
+    - Capture stderr from the SSM command so the actual `configure-eni.sh` error is visible
+    - _Rationale: "ENI bind failed on sender instance" gives no root cause info_
+  - [x] 0.3 Add logging to `unbind_all_enis()` in `scripts/run-integration-tests.sh`
+    - Log which instances are being unbound and the result of each unbind
+    - After unbinding, log ENI status on both instances (call `configure-eni.sh --action status` via SSM)
+    - Ensure `|| true` doesn't silently swallow real unbind failures
+    - _Rationale: tier 3 ENI bind may fail because prior unbind didn't complete_
+
+- [x] 1. Write bug condition exploration tests
   - **Property 1: Fault Condition** - Integration Test Bug Conditions
   - **CRITICAL**: These tests MUST FAIL on unfixed code — failure confirms the bugs exist
   - **DO NOT attempt to fix the tests or the code when they fail**
@@ -49,7 +67,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
   - Mark task complete when all exploration tests are written, run, and failures are documented
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
 
-- [ ] 2. Write preservation property tests (BEFORE implementing fix)
+- [x] 2. Write preservation property tests (BEFORE implementing fix)
   - **Property 2: Preservation** - Existing Behavior Baseline
   - **IMPORTANT**: Follow observation-first methodology
   - Observe behavior on UNFIXED code for non-buggy inputs, then write tests capturing observed behavior
@@ -81,7 +99,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
   - Mark task complete when all preservation tests are written, run, and passing on unfixed code
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-- [ ] 3. Fix test-client socket import and --bind-ip argument
+- [x] 3. Fix test-client socket import and --bind-ip argument
   - [ ] 3.1 Add dpdk-tokio dependency to test-client Cargo.toml
     - Add `dpdk-tokio = { path = "../../dpdk-tokio" }` to `[dependencies]` in `apps/test-client/Cargo.toml`
     - Verify `cargo build -p test-client` succeeds
@@ -119,7 +137,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
     - **EXPECTED OUTCOME**: Tests PASS (confirms test-client bugs are fixed)
     - _Requirements: 2.2, 2.3_
 
-- [ ] 4. Fix ENI state transition race condition
+- [x] 4. Fix ENI state transition race condition
   - [ ] 4.1 Add polling loop to do_unbind() in configure-eni.sh
     - In `scripts/integration-tests/configure-eni.sh`, modify `do_unbind()` function
     - After `echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind`, add a retry loop:
@@ -138,7 +156,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
     - **EXPECTED OUTCOME**: Test PASSES (confirms polling loop exists)
     - _Requirements: 2.1, 2.6_
 
-- [ ] 5. Fix Tier 1 sender to pass --bind-ip to test-client
+- [x] 5. Fix Tier 1 sender to pass --bind-ip to test-client
   - [ ] 5.1 Add --bind-ip to test-client invocations in tier1-dpdk-echo.sh
     - In `scripts/integration-tests/tier1-dpdk-echo.sh`, modify `run_sender()` function
     - Add `--bind-ip "$BIND_IP"` to all `$TEST_CLIENT_BINARY` invocations (4 invocations: arp_resolution, udp_send_receive, echo_roundtrip, payload_integrity)
@@ -154,7 +172,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
     - **EXPECTED OUTCOME**: Test PASSES (confirms --bind-ip is passed)
     - _Requirements: 2.4_
 
-- [ ] 6. Add Tier 2 test script and orchestrator support
+- [x] 6. Add Tier 2 test script and orchestrator support
   - [ ] 6.1 Create tier2-kernel-interop.sh test script
     - Create `scripts/integration-tests/tier2-kernel-interop.sh` based on `tier1-dpdk-echo.sh` structure
     - Key differences from tier1:
@@ -199,7 +217,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
     - **EXPECTED OUTCOME**: Test PASSES (confirms --tier 2 is accepted)
     - _Requirements: 2.5_
 
-- [ ] 7. Verify preservation tests still pass after all fixes
+- [x] 7. Verify preservation tests still pass after all fixes
   - **Property 2: Preservation** - Post-Fix Regression Check
   - **IMPORTANT**: Re-run the SAME tests from task 2 — do NOT write new tests
   - [ ] 7.1 Re-run preservation test: default bind address is 0.0.0.0:0
@@ -223,7 +241,7 @@ The implementation follows the exploratory bugfix workflow: write exploration te
     - **EXPECTED OUTCOME**: Test PASSES (echo server not touched)
     - _Requirements: 3.2_
 
-- [ ] 8. Checkpoint - Ensure all tests pass
+- [x] 8. Checkpoint - Ensure all tests pass
   - Verify all exploration tests (Property 1) now pass after fixes
   - Verify all preservation tests (Property 2) still pass after fixes
   - Run `bash -n` syntax check on all modified/new shell scripts

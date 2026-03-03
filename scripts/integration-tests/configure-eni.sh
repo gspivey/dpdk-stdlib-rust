@@ -137,13 +137,21 @@ do_bind() {
     # Bind to vfio-pci
     echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind
 
-    if is_bound_to_vfio "$pci_addr"; then
-        echo "Successfully bound $pci_addr to vfio-pci"
-        return 0
-    else
-        echo "ERROR: Failed to bind $pci_addr to vfio-pci" >&2
-        return 1
-    fi
+    # Poll until ENI is fully bound to vfio-pci
+    local retries=0
+    local max_retries=10
+    while [[ $retries -lt $max_retries ]]; do
+        if is_bound_to_vfio "$pci_addr"; then
+            echo "Successfully bound $pci_addr to vfio-pci (after ${retries}s)"
+            return 0
+        fi
+        retries=$((retries + 1))
+        echo "Waiting for ENI bind to vfio-pci... (${retries}/${max_retries})"
+        sleep 1
+    done
+
+    echo "ERROR: Failed to bind $pci_addr to vfio-pci after ${max_retries}s" >&2
+    return 1
 }
 
 do_unbind() {
@@ -171,13 +179,23 @@ do_unbind() {
     # Bind to kernel ena driver
     echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind 2>/dev/null || true
 
-    if is_bound_to_ena "$pci_addr"; then
-        echo "Successfully bound $pci_addr back to ena driver"
-        return 0
-    else
-        echo "ERROR: Failed to bind $pci_addr to ena driver" >&2
-        return 1
-    fi
+    # Poll until ENI is fully transitioned to ena driver.
+    # The kernel driver re-probe is asynchronous; without polling,
+    # the next tier may attempt to bind before the transition completes.
+    local retries=0
+    local max_retries=10
+    while [[ $retries -lt $max_retries ]]; do
+        if is_bound_to_ena "$pci_addr"; then
+            echo "Successfully bound $pci_addr back to ena driver (after ${retries}s)"
+            return 0
+        fi
+        retries=$((retries + 1))
+        echo "Waiting for ENI transition to ena driver... (${retries}/${max_retries})"
+        sleep 1
+    done
+
+    echo "ERROR: Failed to bind $pci_addr to ena driver after ${max_retries}s" >&2
+    return 1
 }
 
 # ── Main dispatch ────────────────────────────────────────────────────────────
