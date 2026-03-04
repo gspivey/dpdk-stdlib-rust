@@ -754,12 +754,21 @@ run_tier2() {
 run_tier3() {
     log_section "Tier 3: DPDK <-> iperf3 interoperability test"
 
+    # Pre-bind diagnostics: check ENI state on sender before attempting bind
+    log_info "Pre-bind diagnostics for sender..."
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 \
+        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+
     # Bind ENI on Instance A only; Instance B uses kernel networking
     log_info "Configuring ENIs for Tier 3..."
     if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
-        log_error "Failed to bind ENI on sender (tier3 is non-blocking)"
-        generate_skip_xml "tier3-iperf-interop" "ENI bind failed on sender instance - tier3 is experimental"
-        return 0
+        log_error "Failed to bind ENI on sender for Tier 3"
+        # Capture detailed diagnostics instead of silently skipping
+        log_error "Collecting ENI diagnostics from sender..."
+        ssm_run_command "$SENDER_INSTANCE_ID" 15 \
+            "lspci -D; echo '---'; ls -la /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null || echo 'no vfio-pci dir'; echo '---'; lsmod | grep vfio; echo '---'; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; echo '---'; dmesg | tail -20" || true
+        generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance — see instance logs for diagnostics"
+        return 1
     fi
     # Ensure receiver ENI is unbound (kernel networking)
     configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP" || true

@@ -122,6 +122,8 @@ do_bind() {
     pci_addr=$(get_secondary_pci_addr)
     if [[ -z "$pci_addr" ]]; then
         echo "ERROR: No secondary ENA device found" >&2
+        echo "  lspci -D output:"
+        lspci -D 2>&1 || true
         return 1
     fi
 
@@ -132,6 +134,8 @@ do_bind() {
     fi
 
     echo "Binding $pci_addr to vfio-pci..."
+    echo "  Current driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+    echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
 
     # Kill any DPDK processes that might hold the vfio-pci device open
     kill_dpdk_processes
@@ -146,28 +150,52 @@ do_bind() {
     if [[ -f /sys/module/vfio/parameters/enable_unsafe_noiommu_mode ]]; then
         echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
         echo "Enabled vfio noiommu mode"
+    else
+        echo "WARNING: noiommu mode sysfs file not found"
     fi
 
     # Unbind from current driver (may already be unbound — that's fine)
     if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
-        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+        local current_driver
+        current_driver=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver)" 2>/dev/null || echo "unknown")
+        echo "Unbinding from current driver: $current_driver"
+        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || {
+            echo "WARNING: unbind from $current_driver failed (exit $?)"
+        }
         sleep 1
+    else
+        echo "Device has no current driver binding"
     fi
 
     # Use driver_override to tell the kernel which driver to use for this device.
     # This is more reliable than new_id because it doesn't depend on matching
     # vendor/device IDs (ENA uses 1d0f:ec20 on c5n instances).
-    echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override"
+    if ! echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>&1; then
+        echo "ERROR: Failed to set driver_override to vfio-pci" >&2
+        echo "  Attempting recovery: clear override and retry..."
+        echo "" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>/dev/null || true
+        sleep 1
+        echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>&1 || {
+            echo "ERROR: driver_override still fails" >&2
+            ls -la "/sys/bus/pci/devices/$pci_addr/" 2>&1 || true
+            return 1
+        }
+    fi
+    echo "  driver_override set to: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null)"
 
     # Bind to vfio-pci (retry up to 3 times if device is transiently busy)
     local bind_attempts=0
     local max_bind_attempts=3
     while [[ $bind_attempts -lt $max_bind_attempts ]]; do
-        if echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+        if echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/vfio-bind-err.log; then
+            echo "Bind write succeeded on attempt $((bind_attempts + 1))"
             break
         fi
         bind_attempts=$((bind_attempts + 1))
-        echo "Bind attempt $bind_attempts failed, retrying in 2s..."
+        echo "Bind attempt $bind_attempts/$max_bind_attempts failed:"
+        echo "  Error: $(cat /tmp/vfio-bind-err.log 2>/dev/null || echo 'unknown')"
+        echo "  Device state: driver=$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+        echo "  vfio modules: $(lsmod | grep vfio 2>/dev/null | tr '\n' '; ')"
         sleep 2
     done
 
@@ -185,6 +213,12 @@ do_bind() {
     done
 
     echo "ERROR: Failed to bind $pci_addr to vfio-pci after ${max_retries}s" >&2
+    echo "  Final driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+    echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
+    echo "  vfio module loaded: $(lsmod | grep vfio 2>/dev/null || echo 'no vfio modules')"
+    echo "  noiommu mode: $(cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A')"
+    echo "  dmesg last 10 lines:"
+    dmesg | tail -10 2>/dev/null || true
     return 1
 }
 

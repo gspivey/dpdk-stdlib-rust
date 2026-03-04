@@ -178,14 +178,85 @@ jobs:
           # Output to step log
           cat "$REPORT"
 
-          # Post as PR comment so diagnostics are readable via gh api
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # Post as PR comment — use resolved PR number (works for both PR and workflow_dispatch)
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
           if [ -n "$PR_NUMBER" ]; then
             gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
               || echo "::warning::Could not post PR comment (missing permission)"
           else
-            echo "::warning::No PR number available (workflow_dispatch?), skipping PR comment"
+            echo "::warning::No PR number available, skipping PR comment"
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post instance logs to PR
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping log posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/instance-logs-report.md"
+          OUTCOME="${{ steps.tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ Integration Tests Passed (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ Integration Tests Failed (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            # Extract pass/fail/skip counts from JUnit XML
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+
+            # Show failure/skip details
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+            if grep -q '<skipped' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<skipped[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  SKIP: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+
+          # Include instance log excerpts (last 50 lines of key files)
+          echo "<details><summary>Instance Logs</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            echo "### $(basename "$log") (${LOGSIZE} bytes, last 50 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -50 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Post to PR
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post instance logs PR comment"
         env:
           GH_TOKEN: ${{ github.token }}
 
