@@ -493,10 +493,12 @@ ssm_run_command() {
         return 1
     fi
 
-    # Poll for completion
+    # Poll for completion — poll longer than the SSM timeout to avoid a race
+    # where the command finishes just as we stop polling.
+    local poll_limit=$((timeout_secs + 30))
     local elapsed=0
     local status=""
-    while [[ $elapsed -lt $timeout_secs ]]; do
+    while [[ $elapsed -lt $poll_limit ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
 
@@ -530,7 +532,7 @@ ssm_run_command() {
         esac
     done
 
-    log_error "SSM command timed out on $instance_id after ${timeout_secs}s"
+    log_error "SSM command timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s)"
     return 1
 }
 

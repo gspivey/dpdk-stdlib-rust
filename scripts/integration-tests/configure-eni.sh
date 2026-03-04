@@ -148,6 +148,9 @@ do_bind() {
     # Kill any DPDK processes that might hold the vfio-pci device open
     kill_dpdk_processes
 
+    # Clean stale DPDK runtime state that prevents re-initialization
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+
     # Load required kernel modules
     modprobe uio 2>/dev/null || true
     modprobe vfio-pci 2>/dev/null || true
@@ -209,7 +212,7 @@ do_bind() {
 
     # Poll until ENI is fully bound to vfio-pci
     local retries=0
-    local max_retries=10
+    local max_retries=20
     while [[ $retries -lt $max_retries ]]; do
         if is_bound_to_vfio "$pci_addr"; then
             echo "Successfully bound $pci_addr to vfio-pci (after ${retries}s)"
