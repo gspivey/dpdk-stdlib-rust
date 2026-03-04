@@ -15,7 +15,10 @@
 #   0 - Success (or already in desired state)
 #   1 - Failure
 
-set -euo pipefail
+# Note: we intentionally do NOT use set -euo pipefail here.
+# Many operations (sysfs writes, pkill, modprobe) can fail benignly,
+# and set -e would cause the script to exit before the actual operation
+# (bind/unbind) is checked.  Errors are handled explicitly.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
