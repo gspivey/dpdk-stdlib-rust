@@ -617,29 +617,62 @@ configure_eni() {
     fi
 
     # After unbinding, ensure the kernel interface has the correct IP.
-    # NetworkManager/DHCP may not assign it in time (or at all on AL2023
-    # after a vfio-pci round-trip).  We assign it directly as a safety net.
+    # NetworkManager on AL2023 will detect the new interface and may run DHCP
+    # or reconfigure it, removing any manually-assigned IP.  We must tell NM
+    # to leave the interface alone before assigning the IP.
     if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
         log_info "Ensuring IP $expected_ip is configured on $instance_id secondary ENI..."
-        ssm_run_command "$instance_id" 15 "$(cat <<IPCMD
+        if ! ssm_run_command "$instance_id" 30 "$(cat <<IPCMD
+set -euo pipefail
 pci_addr=\$(lspci -D | grep 'Elastic Network Adapter' | tail -1 | cut -d' ' -f1)
-iface=\$(ls /sys/bus/pci/devices/\$pci_addr/net/ 2>/dev/null | head -1)
-if [[ -n "\$iface" ]]; then
-    ip link set "\$iface" up 2>/dev/null || true
-    if ! ip -4 addr show "\$iface" 2>/dev/null | grep -q '$expected_ip'; then
-        echo "Assigning $expected_ip/24 to \$iface"
-        ip addr add '$expected_ip/24' dev "\$iface" 2>/dev/null || true
-    else
-        echo "IP $expected_ip already configured on \$iface"
+echo "PCI address: \$pci_addr"
+
+# Wait for kernel to create the net interface (async after ena bind)
+retries=0
+iface=""
+while [[ \$retries -lt 10 ]]; do
+    iface=\$(ls /sys/bus/pci/devices/\$pci_addr/net/ 2>/dev/null | head -1)
+    if [[ -n "\$iface" ]]; then
+        break
     fi
-    # Add default route via subnet gateway if missing
-    local gw=\$(echo '$expected_ip' | sed 's/\\.[0-9]*\$/.1/')
-    ip route add default via "\$gw" dev "\$iface" metric 200 2>/dev/null || true
-    echo "Interface \$iface state:"
-    ip -4 addr show "\$iface" 2>/dev/null || true
+    retries=\$((retries + 1))
+    echo "Waiting for net interface to appear... (\$retries/10)"
+    sleep 1
+done
+
+if [[ -z "\$iface" ]]; then
+    echo "ERROR: No network interface found for \$pci_addr after 10s"
+    ls -la /sys/bus/pci/devices/\$pci_addr/ 2>/dev/null || true
+    exit 1
 fi
+echo "Interface: \$iface"
+
+# Tell NetworkManager to ignore this interface so it doesn't remove our IP
+if command -v nmcli >/dev/null 2>&1; then
+    nmcli device set "\$iface" managed no 2>/dev/null || true
+    echo "Set \$iface as unmanaged by NetworkManager"
+fi
+
+# Bring up the interface
+ip link set "\$iface" up
+
+# Flush any stale addresses and assign the expected IP
+ip addr flush dev "\$iface" 2>/dev/null || true
+echo "Assigning $expected_ip/24 to \$iface"
+ip addr add '$expected_ip/24' dev "\$iface"
+
+# Add route via subnet gateway
+gw=\$(echo '$expected_ip' | sed 's/\.[0-9]*\$/.1/')
+ip route add default via "\$gw" dev "\$iface" metric 200 2>/dev/null || true
+
+# Verify
+echo "Final interface state:"
+ip -4 addr show "\$iface"
 IPCMD
-)" || true
+)"; then
+            log_error "Failed to assign IP $expected_ip on $instance_id"
+            return 1
+        fi
     fi
 }
 
@@ -770,8 +803,13 @@ run_tier3() {
         generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance — see instance logs for diagnostics"
         return 1
     fi
-    # Ensure receiver ENI is unbound (kernel networking)
-    configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP" || true
+    # Ensure receiver ENI is unbound (kernel networking) with IP assigned
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
+        log_error "Failed to unbind/configure receiver ENI for Tier 3"
+        generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
+        generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
+        return 1
+    fi
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -790,7 +828,7 @@ run_tier3() {
     local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction our-app-sends --local-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-our-app-sends.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
         log_error "our-app-sends test execution failed (tier3 is non-blocking)"
-        generate_skip_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out - tier3 is experimental"
+        generate_failure_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out"
     fi
 
     ssm_wait_command "$RECEIVER_INSTANCE_ID" "$iperf_server_cmd_id" 30 || true
@@ -809,7 +847,7 @@ run_tier3() {
     local iperf_client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction iperf-sends --local-ip $RECEIVER_DPDK_ENI_IP --peer-ip $SENDER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-iperf-sends.xml"
     if ! ssm_run_command "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$iperf_client_cmd"; then
         log_error "iperf-sends test execution failed (tier3 is non-blocking)"
-        generate_skip_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out - tier3 is experimental"
+        generate_failure_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out"
     fi
 
     ssm_wait_command "$SENDER_INSTANCE_ID" "$listener_cmd_id" 30 || true
