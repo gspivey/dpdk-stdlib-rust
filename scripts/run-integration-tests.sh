@@ -512,7 +512,14 @@ ssm_run_command() {
                 ;;
             Failed|TimedOut|Cancelled)
                 log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
-                # Fetch stderr for diagnostics
+                # Fetch stdout and stderr for diagnostics
+                log_error "SSM stdout:"
+                aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardOutputContent" \
+                    --output text 2>/dev/null || true
+                log_error "SSM stderr:"
                 aws ssm get-command-invocation \
                     --command-id "$cmd_id" \
                     --instance-id "$instance_id" \
