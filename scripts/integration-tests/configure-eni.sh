@@ -70,6 +70,25 @@ is_bound_to_ena() {
     return 1
 }
 
+# Kill any DPDK processes that may be holding the vfio-pci device open.
+# A running DPDK process keeps an fd on /dev/vfio/*, which prevents the
+# kernel from unbinding or rebinding the device.
+kill_dpdk_processes() {
+    local killed=false
+    for name in echo test-client tokio-echo; do
+        if pkill -f "target/release/$name" 2>/dev/null; then
+            echo "Killed lingering $name process"
+            killed=true
+        fi
+    done
+    if [[ "$killed" == "true" ]]; then
+        # Give processes time to release vfio-pci file descriptors
+        sleep 2
+    fi
+    # Clean DPDK runtime state so the next process can re-init EAL
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+}
+
 # ── Actions ──────────────────────────────────────────────────────────────────
 
 do_status() {
@@ -114,6 +133,9 @@ do_bind() {
 
     echo "Binding $pci_addr to vfio-pci..."
 
+    # Kill any DPDK processes that might hold the vfio-pci device open
+    kill_dpdk_processes
+
     # Load required kernel modules
     modprobe uio 2>/dev/null || true
     modprobe vfio-pci 2>/dev/null || true
@@ -126,16 +148,28 @@ do_bind() {
         echo "Enabled vfio noiommu mode"
     fi
 
-    # Unbind from current driver
-    echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+    # Unbind from current driver (may already be unbound — that's fine)
+    if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
+        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+        sleep 1
+    fi
 
     # Use driver_override to tell the kernel which driver to use for this device.
     # This is more reliable than new_id because it doesn't depend on matching
     # vendor/device IDs (ENA uses 1d0f:ec20 on c5n instances).
     echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override"
 
-    # Bind to vfio-pci
-    echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind
+    # Bind to vfio-pci (retry up to 3 times if device is transiently busy)
+    local bind_attempts=0
+    local max_bind_attempts=3
+    while [[ $bind_attempts -lt $max_bind_attempts ]]; do
+        if echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+            break
+        fi
+        bind_attempts=$((bind_attempts + 1))
+        echo "Bind attempt $bind_attempts failed, retrying in 2s..."
+        sleep 2
+    done
 
     # Poll until ENI is fully bound to vfio-pci
     local retries=0
@@ -170,20 +204,27 @@ do_unbind() {
 
     echo "Unbinding $pci_addr from vfio-pci and returning to ena driver..."
 
-    # Unbind from vfio-pci
-    echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+    # Kill any DPDK processes that hold the vfio-pci device open.
+    # A running DPDK app keeps /dev/vfio/* open, preventing driver unbind.
+    kill_dpdk_processes
+
+    # Unbind from current driver (vfio-pci or whatever is loaded)
+    if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
+        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+        sleep 1
+    fi
 
     # Clear driver_override so the kernel uses the default (ena) driver
     echo "" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>/dev/null || true
 
-    # Bind to kernel ena driver
+    # Trigger kernel re-scan so ena driver picks up the device
     echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind 2>/dev/null || true
 
     # Poll until ENI is fully transitioned to ena driver.
     # The kernel driver re-probe is asynchronous; without polling,
     # the next tier may attempt to bind before the transition completes.
     local retries=0
-    local max_retries=10
+    local max_retries=15
     while [[ $retries -lt $max_retries ]]; do
         if is_bound_to_ena "$pci_addr"; then
             echo "Successfully bound $pci_addr back to ena driver (after ${retries}s)"

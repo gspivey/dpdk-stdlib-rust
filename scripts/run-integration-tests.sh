@@ -156,7 +156,31 @@ post_pr_comment() {
     fi
 }
 
-# ── Gateway MAC discovery ────────────────────────────────────────────────────
+# ── Process cleanup and ARP warming ──────────────────────────────────────────
+
+# Kill all DPDK processes and clean runtime state on both instances.
+# Must be called between tiers so the next tier starts from a clean slate.
+cleanup_dpdk_state() {
+    log_info "Cleaning DPDK state on both instances..."
+    local cleanup_cmd="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$cleanup_cmd" || true
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$cleanup_cmd" || true
+}
+
+# Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
+# In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
+# dpdk-udp reads /proc/net/arp at bind() time, so we need the kernel to
+# have resolved the gateway and peer IPs before the DPDK binaries start.
+warm_arp_cache() {
+    log_info "Warming kernel ARP cache on both instances..."
+    # Ping both ENI IPs (proxy ARP populates gateway MAC) and the gateway
+    local subnet_prefix
+    subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
+    local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+}
+
 # ── Networking diagnostics ───────────────────────────────────────────────────
 
 run_diagnostics() {
@@ -613,14 +637,8 @@ run_tier1() {
     # Run baseline diagnostics
     run_diagnostics "baseline" || true
 
-    # Warm the kernel ARP cache on both instances so DPDK can seed from /proc/net/arp.
-    # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
-    # dpdk-udp reads /proc/net/arp at bind() time, so we just need the kernel to
-    # have resolved the gateway and peer IPs before the DPDK binaries start.
-    log_info "Warming kernel ARP cache on both instances..."
-    local arp_warm_cmd="ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
 
     # Start listener on receiver (Instance B) in background
     log_info "Starting listener on receiver..."
@@ -669,6 +687,9 @@ run_tier2() {
     # Ensure sender ENI is unbound (kernel networking)
     configure_eni "$SENDER_INSTANCE_ID" "unbind" || true
 
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
+
     # Start listener on receiver (DPDK) in background
     log_info "Starting listener on receiver..."
     local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-kernel-interop.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
@@ -713,8 +734,11 @@ run_tier3() {
         generate_skip_xml "tier3-iperf-interop" "ENI bind failed on sender instance - tier3 is experimental"
         return 0
     fi
-    # Ensure receiver ENI is unbound (kernel networking for iperf3)
+    # Ensure receiver ENI is unbound (kernel networking)
     configure_eni "$RECEIVER_INSTANCE_ID" "unbind" || true
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
 
     # ── Direction 1: our-app-sends ───────────────────────────────────────
     log_info "Direction 1: our-app-sends (dpdk-stdlib -> iperf3)"
@@ -761,6 +785,11 @@ run_tier3() {
 
 unbind_all_enis() {
     log_info "Unbinding all ENIs..."
+
+    # Kill DPDK processes first — they hold vfio-pci file descriptors open
+    # which prevents driver unbind.
+    cleanup_dpdk_state
+
     if ! configure_eni "$SENDER_INSTANCE_ID" "unbind"; then
         log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID) — continuing"
     fi
