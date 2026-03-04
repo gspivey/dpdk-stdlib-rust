@@ -621,73 +621,9 @@ configure_eni() {
     # or reconfigure it, removing any manually-assigned IP.  We must tell NM
     # to leave the interface alone before assigning the IP.
     if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
-        log_info "Ensuring IP $expected_ip is configured on $instance_id secondary ENI..."
-        # Build the IP assignment script — use a quoted heredoc to prevent
-        # premature expansion, then substitute the IP placeholder.
-        local ip_cmd
-        ip_cmd=$(cat <<'IPCMD_OUTER'
-EXPECTED_IP="__EXPECTED_IP__"
-
-# Find secondary ENA PCI address
-pci_addr=$(lspci -D 2>/dev/null | grep 'Elastic Network Adapter' | tail -1 | cut -d' ' -f1 || true)
-echo "PCI address: ${pci_addr:-NONE}"
-
-if [ -z "$pci_addr" ]; then
-    echo "ERROR: No ENA device found"
-    lspci -D 2>/dev/null || true
-    exit 1
-fi
-
-# Wait for kernel to create the net interface (async after ena bind)
-retries=0
-iface=""
-while [ $retries -lt 10 ]; do
-    iface=$(ls /sys/bus/pci/devices/$pci_addr/net/ 2>/dev/null | head -1 || true)
-    if [ -n "$iface" ]; then
-        break
-    fi
-    retries=$((retries + 1))
-    echo "Waiting for net interface to appear... ($retries/10)"
-    sleep 1
-done
-
-if [ -z "$iface" ]; then
-    echo "ERROR: No network interface found for $pci_addr after 10s"
-    ls -la /sys/bus/pci/devices/$pci_addr/ 2>/dev/null || true
-    exit 1
-fi
-echo "Interface: $iface"
-
-# Tell NetworkManager to ignore this interface so it doesn't remove our IP
-if command -v nmcli >/dev/null 2>&1; then
-    nmcli device set "$iface" managed no 2>/dev/null || true
-    echo "Set $iface as unmanaged by NetworkManager"
-fi
-
-# Bring up the interface
-ip link set "$iface" up 2>/dev/null || true
-
-# Assign IP (use 'replace' for idempotency — works whether IP exists or not)
-echo "Assigning ${EXPECTED_IP}/24 to $iface"
-ip addr replace "${EXPECTED_IP}/24" dev "$iface"
-
-# Add route via subnet gateway
-gw=$(echo "$EXPECTED_IP" | sed 's/\.[0-9]*$/.1/')
-ip route replace default via "$gw" dev "$iface" metric 200 2>/dev/null || true
-
-# Verify the IP is actually configured
-if ip -4 addr show "$iface" 2>/dev/null | grep -q "$EXPECTED_IP"; then
-    echo "SUCCESS: $iface has IP $EXPECTED_IP"
-    ip -4 addr show "$iface"
-else
-    echo "ERROR: IP $EXPECTED_IP not found on $iface after assignment"
-    ip addr show "$iface" 2>/dev/null || true
-    exit 1
-fi
-IPCMD_OUTER
-)
-        ip_cmd="${ip_cmd//__EXPECTED_IP__/$expected_ip}"
-        if ! ssm_run_command "$instance_id" 30 "$ip_cmd"; then
+        log_info "Assigning IP $expected_ip on $instance_id secondary ENI..."
+        if ! ssm_run_command "$instance_id" 30 \
+            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"; then
             log_error "Failed to assign IP $expected_ip on $instance_id"
             return 1
         fi

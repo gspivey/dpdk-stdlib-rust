@@ -23,6 +23,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 ACTION=""
+ASSIGN_IP=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,16 +31,20 @@ while [[ $# -gt 0 ]]; do
             ACTION="$2"
             shift 2
             ;;
+        --ip)
+            ASSIGN_IP="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --action <bind|unbind|status>" >&2
+            echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
             exit 1
             ;;
     esac
 done
 
 if [[ -z "$ACTION" ]]; then
-    echo "Usage: $0 --action <bind|unbind|status>" >&2
+    echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
     exit 1
 fi
 
@@ -285,6 +290,76 @@ do_unbind() {
     return 1
 }
 
+# Assign a static IP to the secondary ENI.  Requires --ip <address>.
+# Disables NetworkManager on the interface to prevent it from removing the IP.
+do_assign_ip() {
+    if [[ -z "$ASSIGN_IP" ]]; then
+        echo "ERROR: --ip <address> is required for assign-ip action" >&2
+        return 1
+    fi
+
+    local pci_addr
+    pci_addr=$(get_secondary_pci_addr)
+    if [[ -z "$pci_addr" ]]; then
+        echo "ERROR: No secondary ENA device found" >&2
+        lspci -D 2>/dev/null || true
+        return 1
+    fi
+    echo "PCI address: $pci_addr"
+
+    # Wait for kernel to create the net interface (async after ena bind)
+    local retries=0
+    local iface=""
+    while [[ $retries -lt 10 ]]; do
+        iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
+        if [[ -n "$iface" ]]; then
+            break
+        fi
+        retries=$((retries + 1))
+        echo "Waiting for net interface to appear... ($retries/10)"
+        sleep 1
+    done
+
+    if [[ -z "$iface" ]]; then
+        echo "ERROR: No network interface found for $pci_addr after 10s" >&2
+        ls -la "/sys/bus/pci/devices/$pci_addr/" 2>/dev/null || true
+        return 1
+    fi
+    echo "Interface: $iface"
+
+    # Tell NetworkManager to ignore this interface so it doesn't remove our IP
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device set "$iface" managed no 2>/dev/null || true
+        echo "Set $iface as unmanaged by NetworkManager"
+    fi
+
+    # Bring up the interface
+    ip link set "$iface" up 2>/dev/null || true
+
+    # Assign IP (use 'replace' for idempotency — works whether IP exists or not)
+    echo "Assigning ${ASSIGN_IP}/24 to $iface"
+    ip addr replace "${ASSIGN_IP}/24" dev "$iface" || {
+        echo "ERROR: ip addr replace failed" >&2
+        return 1
+    }
+
+    # Add route via subnet gateway
+    local gw
+    gw=$(echo "$ASSIGN_IP" | sed 's/\.[0-9]*$/.1/')
+    ip route replace default via "$gw" dev "$iface" metric 200 2>/dev/null || true
+
+    # Verify the IP is actually configured
+    if ip -4 addr show "$iface" 2>/dev/null | grep -q "$ASSIGN_IP"; then
+        echo "SUCCESS: $iface has IP $ASSIGN_IP"
+        ip -4 addr show "$iface"
+        return 0
+    else
+        echo "ERROR: IP $ASSIGN_IP not found on $iface after assignment" >&2
+        ip addr show "$iface" 2>/dev/null || true
+        return 1
+    fi
+}
+
 # ── Main dispatch ────────────────────────────────────────────────────────────
 
 case "$ACTION" in
@@ -297,9 +372,12 @@ case "$ACTION" in
     status)
         do_status
         ;;
+    assign-ip)
+        do_assign_ip
+        ;;
     *)
         echo "Unknown action: $ACTION" >&2
-        echo "Usage: $0 --action <bind|unbind|status>" >&2
+        echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
         exit 1
         ;;
 esac
