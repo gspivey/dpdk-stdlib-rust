@@ -70,6 +70,12 @@ fi
 run_our_app_sends_server() {
     log_info "Starting kernel UDP echo server on 0.0.0.0:${PORT} (our-app-sends direction)"
 
+    # Diagnostic: verify kernel interface has the expected IP
+    log_info "Receiver network state:"
+    ip -4 addr show 2>/dev/null || true
+    log_info "Receiver ARP table:"
+    cat /proc/net/arp 2>/dev/null || true
+
     local echo_log="/tmp/iperf3-server.log"
     log_info "Kernel echo server output will be logged to: $echo_log"
 
@@ -132,13 +138,29 @@ run_our_app_sends_client() {
     # Give the kernel echo server time to start
     sleep 5
 
+    # Pre-flight diagnostics: verify DPDK state and ARP cache
+    log_info "Pre-flight: checking DPDK state and ARP cache..."
+    log_info "Local IP: $LOCAL_IP, Peer IP: $PEER_IP, Port: $PORT"
+    log_info "/proc/net/arp contents:"
+    cat /proc/net/arp 2>/dev/null || true
+    log_info "DPDK runtime state:"
+    ls -la /var/run/dpdk/ 2>/dev/null || echo "No /var/run/dpdk/ directory"
+    log_info "vfio-pci bindings:"
+    ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null || echo "No vfio-pci bindings"
+    log_info "Test binary: $TEST_CLIENT_BINARY"
+    ls -la "$TEST_CLIENT_BINARY" 2>/dev/null || echo "Binary not found!"
+
     local start end elapsed
     start=$(_timer_now)
     local test_ok=true
     local test_err=""
     local test_output=""
 
+    # Clean DPDK runtime state so EAL can initialize fresh
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+
     # Use test-client with --bind-ip to force DPDK path
+    log_info "Launching test-client: $TEST_CLIENT_BINARY --target $PEER_IP --port $PORT --bind-ip $LOCAL_IP --count 10 --delay 200"
     test_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
         --target "$PEER_IP" --port "$PORT" --bind-ip "$LOCAL_IP" \
         --message "dpdk-to-kernel-test-payload" \
@@ -146,6 +168,7 @@ run_our_app_sends_client() {
         test_ok=false
         test_err="Failed to send UDP traffic from dpdk-stdlib to kernel echo server"
     }
+    log_info "Test client output: $test_output"
 
     # Verify that packets were sent and responses received
     if [[ "$test_ok" == "true" ]]; then

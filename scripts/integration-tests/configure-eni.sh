@@ -253,20 +253,33 @@ do_unbind() {
                     sleep 3
                 fi
 
-                # Final fallback: configure IP from EC2 IMDS
+                # Final fallback: configure IP from EC2 IMDS (IMDSv2)
                 if ! ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet '; then
-                    echo "DHCP didn't assign IP, trying IMDS..."
+                    echo "DHCP didn't assign IP, trying IMDS (IMDSv2)..."
                     local mac
                     mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null || true)
                     if [[ -n "$mac" ]]; then
+                        # IMDSv2 requires a session token
+                        local imds_token
+                        imds_token=$(curl -sf --max-time 5 -X PUT \
+                            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+                            "http://169.254.169.254/latest/api/token" 2>/dev/null || true)
+                        local imds_header=""
+                        if [[ -n "$imds_token" ]]; then
+                            imds_header="X-aws-ec2-metadata-token: $imds_token"
+                        fi
                         local imds_ip
-                        imds_ip=$(curl -sf --max-time 5 "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/local-ipv4s" 2>/dev/null | head -1 || true)
+                        imds_ip=$(curl -sf --max-time 5 ${imds_header:+-H "$imds_header"} \
+                            "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/local-ipv4s" 2>/dev/null | head -1 || true)
                         local imds_cidr
-                        imds_cidr=$(curl -sf --max-time 5 "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/subnet-ipv4-cidr-block" 2>/dev/null || true)
+                        imds_cidr=$(curl -sf --max-time 5 ${imds_header:+-H "$imds_header"} \
+                            "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/subnet-ipv4-cidr-block" 2>/dev/null || true)
                         if [[ -n "$imds_ip" && -n "$imds_cidr" ]]; then
                             local prefix_len="${imds_cidr##*/}"
                             ip addr add "${imds_ip}/${prefix_len}" dev "$iface" 2>/dev/null || true
                             echo "Configured $iface with $imds_ip/$prefix_len from IMDS"
+                        else
+                            echo "IMDS lookup failed (token=${imds_token:+ok}${imds_token:-empty}, ip=${imds_ip:-empty}, cidr=${imds_cidr:-empty})"
                         fi
                     fi
                 fi

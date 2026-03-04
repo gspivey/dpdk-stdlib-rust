@@ -605,6 +605,7 @@ ssm_cancel_command() {
 configure_eni() {
     local instance_id="$1"
     local action="$2"  # bind or unbind
+    local expected_ip="${3:-}"  # optional: IP to assign after unbind
 
     log_info "ENI $action on $instance_id"
     if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" \
@@ -613,6 +614,32 @@ configure_eni() {
         ssm_run_command "$instance_id" 15 \
             "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
         return 1
+    fi
+
+    # After unbinding, ensure the kernel interface has the correct IP.
+    # NetworkManager/DHCP may not assign it in time (or at all on AL2023
+    # after a vfio-pci round-trip).  We assign it directly as a safety net.
+    if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
+        log_info "Ensuring IP $expected_ip is configured on $instance_id secondary ENI..."
+        ssm_run_command "$instance_id" 15 "$(cat <<IPCMD
+pci_addr=\$(lspci -D | grep 'Elastic Network Adapter' | tail -1 | cut -d' ' -f1)
+iface=\$(ls /sys/bus/pci/devices/\$pci_addr/net/ 2>/dev/null | head -1)
+if [[ -n "\$iface" ]]; then
+    ip link set "\$iface" up 2>/dev/null || true
+    if ! ip -4 addr show "\$iface" 2>/dev/null | grep -q '$expected_ip'; then
+        echo "Assigning $expected_ip/24 to \$iface"
+        ip addr add '$expected_ip/24' dev "\$iface" 2>/dev/null || true
+    else
+        echo "IP $expected_ip already configured on \$iface"
+    fi
+    # Add default route via subnet gateway if missing
+    local gw=\$(echo '$expected_ip' | sed 's/\\.[0-9]*\$/.1/')
+    ip route add default via "\$gw" dev "\$iface" metric 200 2>/dev/null || true
+    echo "Interface \$iface state:"
+    ip -4 addr show "\$iface" 2>/dev/null || true
+fi
+IPCMD
+)" || true
     fi
 }
 
@@ -685,7 +712,7 @@ run_tier2() {
         return 1
     fi
     # Ensure sender ENI is unbound (kernel networking)
-    configure_eni "$SENDER_INSTANCE_ID" "unbind" || true
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -735,7 +762,7 @@ run_tier3() {
         return 0
     fi
     # Ensure receiver ENI is unbound (kernel networking)
-    configure_eni "$RECEIVER_INSTANCE_ID" "unbind" || true
+    configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP" || true
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -790,10 +817,10 @@ unbind_all_enis() {
     # which prevents driver unbind.
     cleanup_dpdk_state
 
-    if ! configure_eni "$SENDER_INSTANCE_ID" "unbind"; then
+    if ! configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP"; then
         log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID) — continuing"
     fi
-    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind"; then
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
         log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID) — continuing"
     fi
     # Verify ENI status after unbind to catch incomplete transitions
