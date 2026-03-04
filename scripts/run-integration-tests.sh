@@ -29,7 +29,7 @@ CDK_DIR="$REPO_ROOT/deploy/cdk"
 
 SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
 TEST_TIMEOUT=120             # 2 minutes per test scenario
-ENI_BIND_TIMEOUT=30          # 30 seconds for ENI bind/unbind
+ENI_BIND_TIMEOUT=45          # 45 seconds for ENI bind/unbind
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"

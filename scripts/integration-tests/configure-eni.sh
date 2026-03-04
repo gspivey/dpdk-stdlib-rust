@@ -263,73 +263,16 @@ do_unbind() {
         if is_bound_to_ena "$pci_addr"; then
             echo "Successfully bound $pci_addr back to ena driver (after ${retries}s)"
 
-            # Bring up the network interface and configure its IP.
-            # After rebinding to ena, the kernel creates the interface but
-            # it may not have an IP assigned. We use multiple strategies:
-            #   1. NetworkManager (AL2023 default)
-            #   2. dhclient (older systems)
-            #   3. EC2 IMDS manual fallback
+            # Bring up the interface but do NOT configure IP here.
+            # IP configuration is handled by the orchestrator (run-integration-tests.sh)
+            # which knows the expected IP and assigns it via a separate SSM command.
+            # Doing IP config here (NM/DHCP/IMDS) takes 10-30s and risks exceeding
+            # the SSM command timeout, causing spurious "bind failed" errors.
             local iface
             iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
             if [[ -n "$iface" ]]; then
                 echo "Bringing up interface $iface..."
                 ip link set "$iface" up 2>/dev/null || true
-
-                # Try NetworkManager first (AL2023)
-                if command -v nmcli >/dev/null 2>&1; then
-                    nmcli device connect "$iface" 2>/dev/null || true
-                    sleep 3
-                fi
-
-                # Try dhclient as fallback
-                if ! ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet '; then
-                    dhclient "$iface" 2>/dev/null || true
-                    sleep 3
-                fi
-
-                # Final fallback: configure IP from EC2 IMDS (IMDSv2)
-                if ! ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet '; then
-                    echo "DHCP didn't assign IP, trying IMDS (IMDSv2)..."
-                    local mac
-                    mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null || true)
-                    if [[ -n "$mac" ]]; then
-                        # IMDSv2 requires a session token
-                        local imds_token
-                        imds_token=$(curl -sf --max-time 5 -X PUT \
-                            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
-                            "http://169.254.169.254/latest/api/token" 2>/dev/null || true)
-                        local imds_header=""
-                        if [[ -n "$imds_token" ]]; then
-                            imds_header="X-aws-ec2-metadata-token: $imds_token"
-                        fi
-                        local imds_ip
-                        imds_ip=$(curl -sf --max-time 5 ${imds_header:+-H "$imds_header"} \
-                            "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/local-ipv4s" 2>/dev/null | head -1 || true)
-                        local imds_cidr
-                        imds_cidr=$(curl -sf --max-time 5 ${imds_header:+-H "$imds_header"} \
-                            "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/subnet-ipv4-cidr-block" 2>/dev/null || true)
-                        if [[ -n "$imds_ip" && -n "$imds_cidr" ]]; then
-                            local prefix_len="${imds_cidr##*/}"
-                            ip addr add "${imds_ip}/${prefix_len}" dev "$iface" 2>/dev/null || true
-                            echo "Configured $iface with $imds_ip/$prefix_len from IMDS"
-                        else
-                            echo "IMDS lookup failed (token=${imds_token:+ok}${imds_token:-empty}, ip=${imds_ip:-empty}, cidr=${imds_cidr:-empty})"
-                        fi
-                    fi
-                fi
-
-                # Poll for IP with short timeout
-                local ip_retries=0
-                while [[ $ip_retries -lt 5 ]]; do
-                    local iface_ip
-                    iface_ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1 || true)
-                    if [[ -n "$iface_ip" ]]; then
-                        echo "Interface $iface configured with IP $iface_ip"
-                        break
-                    fi
-                    ip_retries=$((ip_retries + 1))
-                    sleep 1
-                done
             fi
             return 0
         fi
