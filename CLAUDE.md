@@ -92,6 +92,50 @@ gh api repos/gspivey/dpdk-stdlib-rust/actions/runs/<run-id>/jobs \
   --jq '.jobs[] | {name, conclusion, failed_steps: [.steps[] | select(.conclusion != "success") | .name]}'
 ```
 
+### Diagnosing CI Failures (Step-by-Step)
+
+When integration tests fail, follow this sequence. This works in **Claude Code web** (no AWS
+access needed — only `gh` CLI).
+
+**Quick path — use the diagnostic script:**
+```bash
+./scripts/diagnose-ci-failure.sh                    # Most recent failed run
+./scripts/diagnose-ci-failure.sh <run-id>           # Specific run
+./scripts/diagnose-ci-failure.sh --pr <number>      # Read staged CI comments from PR
+```
+
+**Manual path:**
+
+1. **Get the run ID:**
+   ```bash
+   gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
+   ```
+
+2. **Read staged CI comments on the PR** (fastest — CI posts progress at each stage):
+   ```bash
+   gh pr view <pr-number> --comments --repo gspivey/dpdk-stdlib-rust
+   ```
+   Look for comments with `[CI] Stage:` headers. Each stage posts its own comment:
+   - `[CI] Stage: Deploy` — instance IDs, SSM readiness
+   - `[CI] Stage: Baseline Diagnostics` — networking state before tests
+   - `[CI] Stage: Tier N Results` — test pass/fail summary
+   - `[CI] Stage: Failure Diagnostics` — networking state + log excerpts on failure
+   - `[CI] Stage: Summary` — final pass/fail for all tiers
+
+3. **Cross-reference with domain knowledge:**
+   - Read `docs/aws-vpc-networking.md` for networking failures (ARP, MAC, packets not arriving)
+   - Read `docs/debugging-log.md` for previously encountered issues
+
+4. **If it's a networking issue** (most common):
+   The answer is almost always: **use the gateway MAC, not the peer MAC**.
+   Check that `--gateway-mac` is being discovered and passed correctly in the test harness.
+   See `docs/aws-vpc-networking.md` Known Failure Patterns table.
+
+5. **Fix and re-run:**
+   ```bash
+   ./scripts/ci-validate.sh --skip-local   # Skip local cargo checks, just trigger CI
+   ```
+
 ### Session Start Hook
 
 A session-start hook (`.claude/hooks/session-start.sh`) runs automatically when a Claude Code

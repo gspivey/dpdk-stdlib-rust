@@ -109,6 +109,19 @@ jobs:
             echo "No pre-built AMI found, will use stock AL2023 with full bootstrap"
           fi
 
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch: find PR for this branch
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Run integration tests
         id: tests
         run: |
@@ -117,6 +130,10 @@ jobs:
           ./scripts/run-integration-tests.sh --teardown --json-summary
         env:
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
 
       - name: Print failure diagnostics
         if: failure() && steps.tests.outcome == 'failure'

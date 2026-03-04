@@ -129,6 +129,111 @@ log_section() {
     echo ""
 }
 
+# ── PR comment helper (for staged CI feedback to Claude Code web) ────────────
+# Posts a markdown comment to the PR associated with this CI run.
+# Requires GH_TOKEN and either PR_NUMBER or GITHUB_HEAD_REF to be set.
+# No-op if not running in CI or no PR is found.
+
+post_pr_comment() {
+    local body="$1"
+    local pr_number="${PR_NUMBER:-}"
+
+    # Skip if gh CLI is not available
+    command -v gh >/dev/null 2>&1 || return 0
+
+    # Skip if no GH_TOKEN
+    [[ -n "${GH_TOKEN:-}" ]] || return 0
+
+    # Find PR number if not set
+    if [[ -z "$pr_number" && -n "${GITHUB_HEAD_REF:-}" ]]; then
+        pr_number=$(gh pr list --head "$GITHUB_HEAD_REF" --json number --jq '.[0].number' \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$pr_number" ]]; then
+        gh pr comment "$pr_number" --body "$body" \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || true
+    fi
+}
+
+# ── Gateway MAC discovery ────────────────────────────────────────────────────
+# Discovers the VPC gateway MAC from an EC2 instance via SSM.
+# In AWS VPC, all DPDK outbound frames must use this MAC as dst_mac.
+# See docs/aws-vpc-networking.md for details.
+
+GATEWAY_MAC=""
+
+discover_gateway_mac() {
+    local instance_id="$1"
+
+    log_info "Discovering VPC gateway MAC from $instance_id..."
+
+    local discover_cmd='
+        # Get gateway IP from route table
+        GW_IP=$(ip route show default 2>/dev/null | awk "/default via/ {print \$3}" | head -1)
+        if [ -z "$GW_IP" ]; then
+            # Derive from IMDS
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            PRIMARY_MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
+            SUBNET=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${PRIMARY_MAC}/subnet-ipv4-cidr-block")
+            GW_IP=$(echo "$SUBNET" | sed "s|\.[0-9]*/.*|.1|")
+        fi
+        # Ping gateway to populate ARP table, then read the MAC
+        ping -c 1 -W 2 "$GW_IP" >/dev/null 2>&1 || true
+        ip neigh show "$GW_IP" 2>/dev/null | awk "{print \$5}" | head -1
+    '
+
+    local cmd_id
+    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$discover_cmd")
+    if [[ -z "$cmd_id" ]]; then
+        log_error "Failed to send gateway MAC discovery command"
+        return 1
+    fi
+
+    if ! ssm_wait_command "$instance_id" "$cmd_id" 30; then
+        log_error "Gateway MAC discovery timed out"
+        return 1
+    fi
+
+    GATEWAY_MAC=$(ssm_get_stdout "$instance_id" "$cmd_id" | tr -d '[:space:]')
+
+    if [[ -n "$GATEWAY_MAC" && "$GATEWAY_MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        log_info "Gateway MAC: $GATEWAY_MAC"
+    else
+        log_error "Failed to discover gateway MAC (got: '$GATEWAY_MAC')"
+        GATEWAY_MAC=""
+        return 1
+    fi
+}
+
+# ── Networking diagnostics ───────────────────────────────────────────────────
+
+run_diagnostics() {
+    local label="$1"  # "baseline" or "failure"
+    log_info "Running networking diagnostics ($label)..."
+
+    for entry in "sender:${SENDER_INSTANCE_ID}" "receiver:${RECEIVER_INSTANCE_ID}"; do
+        local role="${entry%%:*}"
+        local instance_id="${entry##*:}"
+        [[ -n "$instance_id" ]] || continue
+
+        local diag_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/diagnose-networking.sh 2>&1"
+        local diag_cmd_id
+        diag_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$diag_cmd")
+        if [[ -n "$diag_cmd_id" ]]; then
+            if ssm_wait_command "$instance_id" "$diag_cmd_id" 30; then
+                local output
+                output=$(ssm_get_stdout "$instance_id" "$diag_cmd_id" 2>/dev/null || echo "")
+                if [[ -n "$output" ]]; then
+                    mkdir -p "$LOGS_DIR"
+                    echo "$output" > "$LOGS_DIR/${role}-networking-diag-${label}.txt"
+                    log_info "Saved ${role} diagnostics to ${role}-networking-diag-${label}.txt"
+                fi
+            fi
+        fi
+    done
+}
+
 # ── Stack output variables (populated after deploy) ──────────────────────────
 
 SENDER_INSTANCE_ID=""
@@ -554,9 +659,29 @@ run_tier1() {
         return 1
     fi
 
+    # Discover gateway MAC for AWS VPC routing (see docs/aws-vpc-networking.md)
+    if [[ -z "$GATEWAY_MAC" ]]; then
+        discover_gateway_mac "$SENDER_INSTANCE_ID" || {
+            log_error "Gateway MAC discovery failed — Tier 1 will likely fail (ARP won't work in VPC)"
+            post_pr_comment "## [CI] Stage: Tier 1 - Gateway MAC Discovery Failed
+Gateway MAC could not be discovered. DPDK packets will use broadcast MAC
+which VPC drops. See \`docs/aws-vpc-networking.md\`."
+        }
+    fi
+
+    # Build gateway-mac flag if available
+    local gw_flag=""
+    if [[ -n "$GATEWAY_MAC" ]]; then
+        gw_flag="--gateway-mac $GATEWAY_MAC"
+        log_info "Using gateway MAC: $GATEWAY_MAC for DPDK routing"
+    fi
+
+    # Run baseline diagnostics
+    run_diagnostics "baseline" || true
+
     # Start listener on receiver (Instance B) in background
     log_info "Starting listener on receiver..."
-    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 ${gw_flag}"
     local listener_cmd_id
     listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
 
@@ -571,7 +696,7 @@ run_tier1() {
 
     # Run sender on sender (Instance A) - this produces the JUnit XML
     log_info "Starting sender on sender..."
-    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml"
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml ${gw_flag}"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
         log_error "Sender test execution failed"
         generate_failure_xml "tier1-dpdk-echo" "Sender test execution failed or timed out"
@@ -1336,6 +1461,13 @@ main() {
         exit 2
     fi
 
+    # Post deploy status to PR
+    post_pr_comment "## [CI] Stage: Deploy
+Infrastructure ready.
+- Sender: \`$SENDER_INSTANCE_ID\` (DPDK ENI: $SENDER_DPDK_ENI_IP)
+- Receiver: \`$RECEIVER_INSTANCE_ID\` (DPDK ENI: $RECEIVER_DPDK_ENI_IP)
+- Both instances SSM-ready."
+
     # Step 4: Verify build
     if ! verify_build; then
         fail_with_logs "verify_build" "Build verification failed — echo binary missing on instance"
@@ -1378,6 +1510,25 @@ main() {
     # Step 8: Collect instance logs + write step summary (always, before teardown)
     collect_instance_logs || true
     write_step_summary || true
+
+    # Post final summary to PR
+    local summary_body="## [CI] Stage: Summary\n"
+    if [[ "$TEST_EXIT_CODE" -eq 0 ]]; then
+        summary_body+="All tests **PASSED**."
+    else
+        summary_body+="Some tests **FAILED** (exit code: $TEST_EXIT_CODE)."
+    fi
+    summary_body+="\n\nGateway MAC: \`${GATEWAY_MAC:-not discovered}\`"
+    # Include JUnit results summary
+    for xml_file in "$RESULTS_DIR"/*.xml; do
+        [[ -f "$xml_file" ]] || continue
+        local suite_name tests failures
+        suite_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        tests=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        failures=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        summary_body+="\n- **${suite_name:-unknown}**: ${tests:-0} tests, ${failures:-0} failures"
+    done
+    post_pr_comment "$(echo -e "$summary_body")"
 
     # Step 9: Teardown
     teardown_infrastructure

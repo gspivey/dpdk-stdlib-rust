@@ -40,29 +40,54 @@ impl UdpSocketTrait for dpdk_udp::UdpSocket {
     }
 }
 
-// Macro for DPDK detection and fallback
-macro_rules! try_dpdk_or_std {
-    ($bind_addr:expr) => {
-        {
-            #[cfg(feature = "dpdk")]
-            {
-                match dpdk_udp::UdpSocket::bind(&$bind_addr) {
-                    Ok(socket) => {
-                        println!("🚀 Using DPDK acceleration");
-                        return run_echo_server(Box::new(socket));
-                    }
-                    Err(_) => {
-                        println!("⚠️  DPDK failed, falling back to standard networking");
-                    }
+/// Parse a MAC address string (xx:xx:xx:xx:xx:xx) into a 6-byte array.
+#[cfg(feature = "dpdk")]
+fn parse_mac(mac_str: &str) -> [u8; 6] {
+    let parts: Vec<u8> = mac_str.split(':')
+        .map(|s| u8::from_str_radix(s, 16).expect("invalid MAC octet"))
+        .collect();
+    assert_eq!(parts.len(), 6, "MAC address must have 6 octets");
+    [parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]]
+}
+
+/// Try DPDK first, then fall back to standard networking.
+/// If gateway_mac is provided, pre-populate the ARP cache for AWS VPC routing.
+fn bind_socket(bind_addr: &str, _gateway_mac: Option<&str>) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "dpdk")]
+    {
+        match dpdk_udp::UdpSocket::bind(bind_addr) {
+            Ok(socket) => {
+                println!("Using DPDK acceleration");
+
+                // Pre-populate ARP cache with gateway MAC for AWS VPC routing
+                if let Some(gw_mac_str) = _gateway_mac {
+                    let mac_bytes = parse_mac(gw_mac_str);
+                    let mac = dpdk_udp::MacAddress::new(mac_bytes);
+                    // Derive gateway IP from bind address (subnet_base + 1)
+                    let bind_ip: std::net::Ipv4Addr = bind_addr.split(':').next()
+                        .unwrap_or("0.0.0.0").parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+                    let octets = bind_ip.octets();
+                    let gateway_ip = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
+                    println!("Pre-populating ARP: gateway {} -> {}", gateway_ip, gw_mac_str);
+                    socket.add_arp_entry(gateway_ip, mac.clone());
+                    // Also map all /24 addresses to gateway MAC (VPC routes everything via gateway)
+                    // We only need the specific peers, but mapping the gateway itself is sufficient
+                    // because send_to_addr resolves via ARP which will send to gateway IP first.
+                    // For direct peer-to-peer, we learn src_mac from inbound packets.
                 }
+
+                return Ok(Box::new(socket));
             }
-            
-            // Standard library fallback
-            println!("📡 Using standard networking");
-            let socket = std::net::UdpSocket::bind(&$bind_addr)?;
-            run_echo_server(Box::new(socket))
+            Err(e) => {
+                println!("DPDK failed ({}), falling back to standard networking", e);
+            }
         }
-    };
+    }
+
+    // Standard library fallback
+    println!("Using standard networking");
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    Ok(Box::new(socket))
 }
 
 #[derive(Parser)]
@@ -72,14 +97,20 @@ struct Args {
     /// IP address to bind to
     #[arg(long, default_value = "127.0.0.1")]
     ip: String,
-    
-    /// Port to bind to  
+
+    /// Port to bind to
     #[arg(long, default_value_t = 9000)]
     port: u16,
-    
+
     /// Use synthetic packet mode (for protocol testing - developer option)
     #[arg(long, hide = true)]
     synthetic: bool,
+
+    /// Gateway MAC address for AWS VPC DPDK routing (format: xx:xx:xx:xx:xx:xx).
+    /// In AWS VPC, all outbound DPDK frames must use the gateway MAC as the
+    /// Ethernet destination. See docs/aws-vpc-networking.md.
+    #[arg(long)]
+    gateway_mac: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,10 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let bind_addr = format!("{}:{}", args.ip, args.port);
-        println!("📡 Binding to {}", bind_addr);
-        
-        // Macro to try DPDK first, fallback to std
-        try_dpdk_or_std!(bind_addr)?;
+        println!("Binding to {}", bind_addr);
+
+        let socket = bind_socket(&bind_addr, args.gateway_mac.as_deref())?;
+        run_echo_server(socket)?;
     }
     
     Ok(())

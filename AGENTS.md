@@ -131,6 +131,20 @@ pub const TOTAL_HEADER_LEN: usize = 42;     // ETH + IPv4 + UDP
 - **Don't assume DPDK is available** - always handle the stub/fallback case
 - **Don't change method signatures on `UdpSocket`** without updating the compat layer in `dpdk-tokio`
 
+## Domain Knowledge
+
+Before debugging networking issues, **READ these documents first**:
+
+| Document | When to Read |
+|----------|-------------|
+| `docs/aws-vpc-networking.md` | Before ANY work on DPDK packet sending, ARP, MAC resolution, or integration test failures |
+| `docs/debugging-log.md` | Before debugging integration test failures — contains history of what was tried |
+| `docs/integration-tests-setup.md` | Before running or modifying integration tests |
+
+**CRITICAL**: In AWS VPC, all DPDK outbound frames must use the **gateway MAC** as the Ethernet
+destination. Do NOT try to ARP for the peer's direct MAC — VPC is L3-routed, not L2-switched.
+See `docs/aws-vpc-networking.md` for the full explanation.
+
 ## Build & Test
 
 ```bash

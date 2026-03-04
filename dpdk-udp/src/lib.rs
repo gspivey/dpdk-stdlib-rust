@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::collections::VecDeque;
 
 use dpdk::{Mbuf, Mempool, Port};
-use dpdk::port::{MacAddress, PortConfig};
+use dpdk::port::PortConfig;
 use dpdk::mbuf::MempoolConfig;
 
-pub use dpdk::port::{RxOffload as HwRxOffload, TxOffload as HwTxOffload};
+pub use dpdk::port::{MacAddress, RxOffload as HwRxOffload, TxOffload as HwTxOffload};
 
 use thiserror::Error;
 
