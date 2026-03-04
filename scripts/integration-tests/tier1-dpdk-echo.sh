@@ -27,7 +27,6 @@ BIND_IP=""
 PEER_IP=""
 PORT=9000
 OUTPUT=""
-GATEWAY_MAC=""
 TEST_TIMEOUT=60  # Per-test timeout in seconds
 CLASSNAME="tier1.dpdk_echo"
 
@@ -40,10 +39,9 @@ while [[ $# -gt 0 ]]; do
         --peer-ip)     PEER_IP="$2";     shift 2 ;;
         --port)        PORT="$2";        shift 2 ;;
         --output)      OUTPUT="$2";      shift 2 ;;
-        --gateway-mac) GATEWAY_MAC="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --role <listener|sender> --bind-ip <IP> [--peer-ip <IP>] --port <PORT> [--output <PATH>] [--gateway-mac <MAC>]" >&2
+            echo "Usage: $0 --role <listener|sender> --bind-ip <IP> [--peer-ip <IP>] --port <PORT> [--output <PATH>]" >&2
             exit 1
             ;;
     esac
@@ -73,11 +71,9 @@ run_listener() {
 
     # Start the echo server in the background, capturing output
     local echo_log="/tmp/echo-server.log"
-    local gw_flag=""
-    [[ -n "$GATEWAY_MAC" ]] && gw_flag="--gateway-mac $GATEWAY_MAC"
-    log_info "Launching echo server: $ECHO_BINARY --ip $BIND_IP --port $PORT $gw_flag"
+    log_info "Launching echo server: $ECHO_BINARY --ip $BIND_IP --port $PORT"
     log_info "Echo server output will be logged to: $echo_log"
-    $ECHO_BINARY --ip "$BIND_IP" --port "$PORT" $gw_flag > "$echo_log" 2>&1 &
+    $ECHO_BINARY --ip "$BIND_IP" --port "$PORT" > "$echo_log" 2>&1 &
     local echo_pid=$!
     log_info "Echo server started with PID $echo_pid"
 
@@ -121,13 +117,6 @@ run_sender() {
     log_info "Starting Tier 1 sender: ${BIND_IP} -> ${PEER_IP}:${PORT}"
     log_info "Output will be written to: $OUTPUT"
 
-    # Build gateway-mac flag for test-client (AWS VPC routing)
-    local gw_flag=""
-    if [[ -n "$GATEWAY_MAC" ]]; then
-        gw_flag="--gateway-mac $GATEWAY_MAC"
-        log_info "Using gateway MAC: $GATEWAY_MAC"
-    fi
-
     # Capture test-client output to a log file
     local client_log="/tmp/test-client.log"
     log_info "Test client output will be logged to: $client_log"
@@ -147,7 +136,7 @@ run_sender() {
 
     # Send a single packet to trigger ARP resolution, then check if we get a response
     if run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" $gw_flag --message "arp-probe" --count 1 2>&1; then
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "arp-probe" --count 1 2>&1; then
         log_info "ARP resolution succeeded (got response from peer)"
     else
         arp_ok=false
@@ -175,7 +164,7 @@ run_sender() {
     local send_output=""
 
     send_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" $gw_flag --message "hello-dpdk" --count 3 --delay 500 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "hello-dpdk" --count 3 --delay 500 2>&1) || {
         send_ok=false
         send_err="UDP send/receive failed"
     }
@@ -210,7 +199,7 @@ run_sender() {
     local echo_output=""
 
     echo_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" $gw_flag --message "roundtrip-test" --count 5 --delay 200 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "roundtrip-test" --count 5 --delay 200 2>&1) || {
         echo_ok=false
         echo_err="Echo roundtrip timed out or failed"
     }
@@ -248,7 +237,7 @@ run_sender() {
     local test_payload="Hello DPDK payload integrity check 12345"
 
     payload_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" $gw_flag --message "$test_payload" --count 1 2>&1) || {
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --message "$test_payload" --count 1 2>&1) || {
         payload_ok=false
         payload_err="Payload integrity test timed out or failed"
     }

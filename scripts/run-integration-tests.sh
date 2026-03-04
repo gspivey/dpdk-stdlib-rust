@@ -157,55 +157,6 @@ post_pr_comment() {
 }
 
 # ── Gateway MAC discovery ────────────────────────────────────────────────────
-# Discovers the VPC gateway MAC from an EC2 instance via SSM.
-# In AWS VPC, all DPDK outbound frames must use this MAC as dst_mac.
-# See docs/aws-vpc-networking.md for details.
-
-GATEWAY_MAC=""
-
-discover_gateway_mac() {
-    local instance_id="$1"
-
-    log_info "Discovering VPC gateway MAC from $instance_id..."
-
-    local discover_cmd='
-        # Get gateway IP from route table
-        GW_IP=$(ip route show default 2>/dev/null | awk "/default via/ {print \$3}" | head -1)
-        if [ -z "$GW_IP" ]; then
-            # Derive from IMDS
-            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-            PRIMARY_MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
-            SUBNET=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${PRIMARY_MAC}/subnet-ipv4-cidr-block")
-            GW_IP=$(echo "$SUBNET" | sed "s|\.[0-9]*/.*|.1|")
-        fi
-        # Ping gateway to populate ARP table, then read the MAC
-        ping -c 1 -W 2 "$GW_IP" >/dev/null 2>&1 || true
-        ip neigh show "$GW_IP" 2>/dev/null | awk "{print \$5}" | head -1
-    '
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$discover_cmd")
-    if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to send gateway MAC discovery command"
-        return 1
-    fi
-
-    if ! ssm_wait_command "$instance_id" "$cmd_id" 30; then
-        log_error "Gateway MAC discovery timed out"
-        return 1
-    fi
-
-    GATEWAY_MAC=$(ssm_get_stdout "$instance_id" "$cmd_id" | tr -d '[:space:]')
-
-    if [[ -n "$GATEWAY_MAC" && "$GATEWAY_MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-        log_info "Gateway MAC: $GATEWAY_MAC"
-    else
-        log_error "Failed to discover gateway MAC (got: '$GATEWAY_MAC')"
-        GATEWAY_MAC=""
-        return 1
-    fi
-}
-
 # ── Networking diagnostics ───────────────────────────────────────────────────
 
 run_diagnostics() {
@@ -659,29 +610,21 @@ run_tier1() {
         return 1
     fi
 
-    # Discover gateway MAC for AWS VPC routing (see docs/aws-vpc-networking.md)
-    if [[ -z "$GATEWAY_MAC" ]]; then
-        discover_gateway_mac "$SENDER_INSTANCE_ID" || {
-            log_error "Gateway MAC discovery failed — Tier 1 will likely fail (ARP won't work in VPC)"
-            post_pr_comment "## [CI] Stage: Tier 1 - Gateway MAC Discovery Failed
-Gateway MAC could not be discovered. DPDK packets will use broadcast MAC
-which VPC drops. See \`docs/aws-vpc-networking.md\`."
-        }
-    fi
-
-    # Build gateway-mac flag if available
-    local gw_flag=""
-    if [[ -n "$GATEWAY_MAC" ]]; then
-        gw_flag="--gateway-mac $GATEWAY_MAC"
-        log_info "Using gateway MAC: $GATEWAY_MAC for DPDK routing"
-    fi
-
     # Run baseline diagnostics
     run_diagnostics "baseline" || true
 
+    # Warm the kernel ARP cache on both instances so DPDK can seed from /proc/net/arp.
+    # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
+    # dpdk-udp reads /proc/net/arp at bind() time, so we just need the kernel to
+    # have resolved the gateway and peer IPs before the DPDK binaries start.
+    log_info "Warming kernel ARP cache on both instances..."
+    local arp_warm_cmd="ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+
     # Start listener on receiver (Instance B) in background
     log_info "Starting listener on receiver..."
-    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 ${gw_flag}"
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
     local listener_cmd_id
     listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
 
@@ -696,7 +639,7 @@ which VPC drops. See \`docs/aws-vpc-networking.md\`."
 
     # Run sender on sender (Instance A) - this produces the JUnit XML
     log_info "Starting sender on sender..."
-    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml ${gw_flag}"
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
         log_error "Sender test execution failed"
         generate_failure_xml "tier1-dpdk-echo" "Sender test execution failed or timed out"
@@ -1518,7 +1461,7 @@ Infrastructure ready.
     else
         summary_body+="Some tests **FAILED** (exit code: $TEST_EXIT_CODE)."
     fi
-    summary_body+="\n\nGateway MAC: \`${GATEWAY_MAC:-not discovered}\`"
+    summary_body+="\n\nARP seeding: kernel /proc/net/arp (automatic)"
     # Include JUnit results summary
     for xml_file in "$RESULTS_DIR"/*.xml; do
         [[ -f "$xml_file" ]] || continue

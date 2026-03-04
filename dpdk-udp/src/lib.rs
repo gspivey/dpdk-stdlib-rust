@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::collections::VecDeque;
 
 use dpdk::{Mbuf, Mempool, Port};
-use dpdk::port::PortConfig;
+use dpdk::port::{MacAddress, PortConfig};
 use dpdk::mbuf::MempoolConfig;
 
-pub use dpdk::port::{MacAddress, RxOffload as HwRxOffload, TxOffload as HwTxOffload};
+pub use dpdk::port::{RxOffload as HwRxOffload, TxOffload as HwTxOffload};
 
 use thiserror::Error;
 
@@ -474,6 +474,59 @@ struct DpdkResources {
 /// Global DPDK resources (initialized once per port)
 static DPDK_RESOURCES: Mutex<Option<Arc<DpdkResources>>> = Mutex::new(None);
 
+/// Seed an ARP cache from the kernel's `/proc/net/arp` table.
+///
+/// On Linux, the kernel maintains ARP entries for interfaces it manages (e.g.
+/// ens5 in AWS). These entries include the VPC gateway MAC, which DPDK needs
+/// for outbound traffic. By reading them at startup we avoid the cold-start
+/// problem where DPDK ARP requests may fail before the port is fully up.
+///
+/// Format of /proc/net/arp:
+/// ```text
+/// IP address       HW type     Flags       HW address            Mask     Device
+/// 10.0.1.1         0x1         0x2         0e:12:ab:cd:ef:01     *        ens5
+/// ```
+fn seed_arp_cache_from_kernel(cache: &ArpCache) {
+    let content = match std::fs::read_to_string("/proc/net/arp") {
+        Ok(c) => c,
+        Err(_) => return, // Not on Linux or no access — skip silently
+    };
+
+    for line in content.lines().skip(1) {
+        // Skip header line
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+
+        // Flags 0x2 = complete entry (0x0 = incomplete)
+        let flags = fields[2];
+        if flags == "0x0" {
+            continue;
+        }
+
+        let ip: Ipv4Addr = match fields[0].parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+
+        let mac_str = fields[3];
+        let mac_parts: Vec<u8> = mac_str
+            .split(':')
+            .filter_map(|s| u8::from_str_radix(s, 16).ok())
+            .collect();
+        if mac_parts.len() != 6 {
+            continue;
+        }
+
+        let mac = MacAddress::new([
+            mac_parts[0], mac_parts[1], mac_parts[2],
+            mac_parts[3], mac_parts[4], mac_parts[5],
+        ]);
+        cache.insert(ip, mac);
+    }
+}
+
 fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let mut guard = DPDK_RESOURCES.lock().unwrap();
 
@@ -519,8 +572,13 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     port.start()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port start failed: {}", e)))?;
 
-    // Create shared ARP cache
+    // Create shared ARP cache, seeded from kernel's ARP table.
+    // On Linux, /proc/net/arp contains entries learned by the kernel stack
+    // (e.g. the VPC gateway MAC on the primary ENI). Seeding these into the
+    // DPDK ARP cache avoids the cold-start problem where the first DPDK ARP
+    // request might time out before the port is fully warmed up.
     let arp_cache = Arc::new(ArpCache::new());
+    seed_arp_cache_from_kernel(&arp_cache);
 
     let resources = Arc::new(DpdkResources {
         _eal: eal,
@@ -1304,54 +1362,65 @@ impl UdpSocket {
 
     /// Proactively resolve an IP address to a MAC address via ARP.
     ///
-    /// Sends an ARP request and polls for the reply. Returns the resolved MAC
-    /// or falls back to broadcast MAC if no reply is received.
+    /// Sends ARP requests (with retries) and polls for the reply. Returns the
+    /// resolved MAC or an error if resolution fails after all attempts.
     fn resolve_arp(&self, target_ip: &Ipv4Addr) -> io::Result<MacAddress> {
-        // Build and send ARP request
-        if let Some(arp_frame) = self.arp_handler.make_request(*target_ip) {
-            self.socket_backend.send_frame(&arp_frame)?;
-        } else {
-            return Ok(self.dst_mac.clone());
-        }
+        let arp_frame = match self.arp_handler.make_request(*target_ip) {
+            Some(f) => f,
+            None => return Ok(self.dst_mac.clone()),
+        };
 
-        // Poll for ARP reply (up to 3 seconds with 100us intervals)
-        for _ in 0..30_000 {
-            let frames = self.socket_backend.recv_frames(32)?;
-            for frame_data in &frames {
-                if frame_data.len() >= 14 {
-                    let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
-                    if ethertype == arp::ETH_TYPE_ARP {
-                        // Process ARP (learns from replies, responds to requests)
-                        if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                            let _ = self.socket_backend.send_frame(&reply_frame);
-                        }
-                    } else if ethertype == ETH_TYPE_IPV4 {
-                        // Queue any UDP packets we receive while waiting
-                        if let Some(parsed) = parse_udp_packet(frame_data) {
-                            if frame_data.len() >= 12 {
-                                let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
-                                self.arp_handler.cache.insert(parsed.src_ip, MacAddress::new(src_mac));
+        // Retry ARP up to 3 times (1 second per attempt, 3 seconds total).
+        // A single attempt can fail if the port hasn't fully warmed up yet.
+        const MAX_ATTEMPTS: u32 = 3;
+        const POLLS_PER_ATTEMPT: u32 = 10_000; // 10k * 100us = 1 second
+
+        for attempt in 0..MAX_ATTEMPTS {
+            self.socket_backend.send_frame(&arp_frame)?;
+
+            for _ in 0..POLLS_PER_ATTEMPT {
+                let frames = self.socket_backend.recv_frames(32)?;
+                for frame_data in &frames {
+                    if frame_data.len() >= 14 {
+                        let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+                        if ethertype == arp::ETH_TYPE_ARP {
+                            if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
+                                let _ = self.socket_backend.send_frame(&reply_frame);
                             }
-                            let src_addr = SocketAddr::V4(
-                                SocketAddrV4::new(parsed.src_ip, parsed.src_port)
-                            );
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            queue.push(parsed.payload, src_addr);
+                        } else if ethertype == ETH_TYPE_IPV4 {
+                            // Queue any UDP packets we receive while waiting
+                            if let Some(parsed) = parse_udp_packet(frame_data) {
+                                if frame_data.len() >= 12 {
+                                    let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
+                                    self.arp_handler.cache.insert(parsed.src_ip, MacAddress::new(src_mac));
+                                }
+                                let src_addr = SocketAddr::V4(
+                                    SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+                                );
+                                let mut queue = self.recv_queue.lock().unwrap();
+                                queue.push(parsed.payload, src_addr);
+                            }
                         }
                     }
                 }
+
+                if let Some(mac) = self.arp_handler.resolve(target_ip) {
+                    return Ok(mac);
+                }
+
+                std::thread::sleep(std::time::Duration::from_micros(100));
             }
 
-            // Check if ARP resolved
-            if let Some(mac) = self.arp_handler.resolve(target_ip) {
-                return Ok(mac);
-            }
-
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            eprintln!(
+                "dpdk-udp: ARP attempt {}/{} for {} timed out",
+                attempt + 1, MAX_ATTEMPTS, target_ip
+            );
         }
 
-        // Fallback to broadcast if ARP didn't resolve
-        Ok(self.dst_mac.clone())
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("ARP resolution failed for {} after {} attempts", target_ip, MAX_ATTEMPTS),
+        ))
     }
 
     // ========================================================================

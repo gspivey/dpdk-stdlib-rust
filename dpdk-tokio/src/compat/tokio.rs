@@ -541,23 +541,6 @@ impl UdpSocket {
         }
     }
 
-    /// Pre-populate an ARP cache entry.
-    ///
-    /// This is an extension method not present in `tokio::net::UdpSocket`.
-    /// For the DPDK backend, this injects a MAC address into the ARP cache
-    /// so that outbound packets to `ip` use `mac` as the Ethernet destination.
-    /// For the Tokio backend, this is a no-op (kernel handles ARP).
-    ///
-    /// In AWS VPC, use this to map target IPs to the gateway MAC address.
-    /// See `docs/aws-vpc-networking.md` for details.
-    pub fn add_arp_entry(&self, _ip: std::net::Ipv4Addr, _mac: [u8; 6]) {
-        #[cfg(feature = "dpdk")]
-        if let UdpSocketInner::Dpdk(ref s) = self.inner {
-            let socket = s.socket.blocking_lock();
-            socket.add_arp_entry(_ip, dpdk_udp::MacAddress::new(_mac));
-        }
-        // Tokio backend: no-op (kernel handles ARP automatically)
-    }
 }
 
 impl std::fmt::Debug for UdpSocket {
