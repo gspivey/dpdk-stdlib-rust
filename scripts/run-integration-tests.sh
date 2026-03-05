@@ -158,27 +158,23 @@ post_pr_comment() {
 
 # ── Process cleanup and ARP warming ──────────────────────────────────────────
 
-# Kill all DPDK processes and clean runtime state on both instances.
-# Must be called between tiers so the next tier starts from a clean slate.
-cleanup_dpdk_state() {
-    log_info "Cleaning DPDK state on both instances..."
-    local cleanup_cmd="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$cleanup_cmd" || true
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$cleanup_cmd" || true
-}
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
 
 # Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
 # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
 # dpdk-udp reads /proc/net/arp at bind() time, so we need the kernel to
 # have resolved the gateway and peer IPs before the DPDK binaries start.
+# Uses async SSM commands to warm both instances in parallel.
 warm_arp_cache() {
-    log_info "Warming kernel ARP cache on both instances..."
-    # Ping both ENI IPs (proxy ARP populates gateway MAC) and the gateway
+    log_info "Warming kernel ARP cache on both instances (parallel)..."
     local subnet_prefix
     subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
     local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd")
+    ssm_wait_command "$SENDER_INSTANCE_ID" "$sender_cmd_id" 30 || true
+    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$receiver_cmd_id" 30 || true
 }
 
 # ── Networking diagnostics ───────────────────────────────────────────────────
@@ -437,23 +433,27 @@ wait_for_ssm_readiness() {
 }
 
 verify_build() {
-    log_info "Verifying project build on instances..."
+    log_info "Verifying project build on instances (parallel)..."
 
-    for instance_id in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
-        log_info "Checking build on $instance_id..."
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
 
-        local cmd_id
-        cmd_id=$(ssm_run_command_async "$instance_id" 30 \
-            "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
+        local label="${entry%%:*}"
+        local rest="${entry#*:}"
+        local instance_id="${rest%%:*}"
+        local cmd_id="${rest##*:}"
 
         if [[ -z "$cmd_id" ]]; then
-            log_error "Failed to send build verification command to $instance_id"
+            log_error "Failed to send build verification command to $label ($instance_id)"
             return 1
         fi
 
-        # Poll for completion rather than fixed sleep
         if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
-            log_error "Build verification command timed out on $instance_id"
+            log_error "Build verification command timed out on $label ($instance_id)"
             return 1
         fi
 
@@ -461,9 +461,9 @@ verify_build() {
         result=$(ssm_get_stdout "$instance_id" "$cmd_id")
 
         if echo "$result" | grep -q "BUILD_OK"; then
-            log_info "Build verified on $instance_id"
+            log_info "Build verified on $label ($instance_id)"
         else
-            log_error "Build not found on $instance_id (output: $result)"
+            log_error "Build not found on $label ($instance_id) (output: $result)"
             return 1
         fi
     done
@@ -672,25 +672,19 @@ configure_eni() {
     local expected_ip="${3:-}"  # optional: IP to assign after unbind
 
     log_info "ENI $action on $instance_id"
-    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"; then
+
+    # Build a single consolidated command to minimize SSM agent load.
+    # For unbind with IP assignment, chain both actions in one SSM call.
+    local cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"
+    if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
+        cmd+=" && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"
+    fi
+
+    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
         log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
         ssm_run_command "$instance_id" 15 \
             "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
         return 1
-    fi
-
-    # After unbinding, ensure the kernel interface has the correct IP.
-    # NetworkManager on AL2023 will detect the new interface and may run DHCP
-    # or reconfigure it, removing any manually-assigned IP.  We must tell NM
-    # to leave the interface alone before assigning the IP.
-    if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
-        log_info "Assigning IP $expected_ip on $instance_id secondary ENI..."
-        if ! ssm_run_command "$instance_id" 30 \
-            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"; then
-            log_error "Failed to assign IP $expected_ip on $instance_id"
-            return 1
-        fi
     fi
 }
 
@@ -746,24 +740,26 @@ run_tier1() {
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
-    # Kill any lingering echo server processes on the receiver
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
-
     log_info "Tier 1 execution complete"
 }
 
 run_tier2() {
     log_section "Tier 2: Kernel -> DPDK interoperability test"
 
-    # Bind ENI on receiver only (sender uses kernel networking)
-    log_info "Configuring ENIs for Tier 2..."
-    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+    # Bind receiver ENI (DPDK) and unbind sender ENI (kernel) in parallel
+    log_info "Configuring ENIs for Tier 2 (parallel)..."
+    local bind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action bind"
+    local unbind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
+    local bind_cmd_id unbind_cmd_id
+    bind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
+    unbind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$bind_cmd_id" 75; then
         log_error "Failed to bind ENI on receiver"
         generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
         return 1
     fi
-    # Ensure sender ENI is unbound (kernel networking)
-    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+    ssm_wait_command "$SENDER_INSTANCE_ID" "$unbind_cmd_id" 75 || true
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -796,33 +792,26 @@ run_tier2() {
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
-    # Kill any lingering echo server processes on the receiver
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
-
     log_info "Tier 2 execution complete"
 }
 
 run_tier3() {
     log_section "Tier 3: DPDK <-> iperf3 interoperability test"
 
-    # Pre-bind diagnostics: check ENI state on sender before attempting bind
-    log_info "Pre-bind diagnostics for sender..."
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+    # Bind sender ENI (DPDK) and unbind receiver ENI (kernel) in parallel
+    log_info "Configuring ENIs for Tier 3 (parallel)..."
+    local bind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action bind"
+    local unbind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
+    local bind_cmd_id unbind_cmd_id
+    bind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
+    unbind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
 
-    # Bind ENI on Instance A only; Instance B uses kernel networking
-    log_info "Configuring ENIs for Tier 3..."
-    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$bind_cmd_id" 75; then
         log_error "Failed to bind ENI on sender for Tier 3"
-        # Capture detailed diagnostics instead of silently skipping
-        log_error "Collecting ENI diagnostics from sender..."
-        ssm_run_command "$SENDER_INSTANCE_ID" 15 \
-            "lspci -D; echo '---'; ls -la /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null || echo 'no vfio-pci dir'; echo '---'; lsmod | grep vfio; echo '---'; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; echo '---'; dmesg | tail -20" || true
-        generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance — see instance logs for diagnostics"
+        generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance"
         return 1
     fi
-    # Ensure receiver ENI is unbound (kernel networking) with IP assigned
-    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$unbind_cmd_id" 75; then
         log_error "Failed to unbind/configure receiver ENI for Tier 3"
         generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
         generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
@@ -876,24 +865,32 @@ run_tier3() {
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
-    log_info "Unbinding all ENIs..."
+    log_info "Unbinding all ENIs (consolidated, parallel)..."
 
-    # Kill DPDK processes first — they hold vfio-pci file descriptors open
-    # which prevents driver unbind.
-    cleanup_dpdk_state
+    # Consolidate cleanup + unbind + IP assignment into ONE command per instance,
+    # and run both instances in parallel. This reduces 8 sequential SSM commands
+    # to 2 parallel ones, preventing SSM agent saturation.
+    local sender_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
+    local receiver_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
 
-    if ! configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP"; then
-        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID) — continuing"
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 60 "$sender_cmd")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 60 "$receiver_cmd")
+
+    # Wait for both
+    local sender_ok=true receiver_ok=true
+    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$sender_cmd_id" 90; then
+        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID)"
+        sender_ok=false
     fi
-    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
-        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID) — continuing"
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$receiver_cmd_id" 90; then
+        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID)"
+        receiver_ok=false
     fi
-    # Verify ENI status after unbind to catch incomplete transitions
-    log_info "Verifying ENI status after unbind..."
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+
+    # Give SSM agent a cooldown period before next tier's commands
+    log_info "SSM cooldown (10s)..."
+    sleep 10
 }
 
 # ── Result collection ────────────────────────────────────────────────────────
@@ -1206,53 +1203,6 @@ teardown_infrastructure() {
 #
 # Logs are written to $LOGS_DIR/ with <role>-<filename> naming.
 
-collect_ssm_file() {
-    local instance_id="$1"
-    local label="$2"
-    local remote_path="$3"
-
-    local filename
-    filename=$(basename "$remote_path")
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 \
-        "test -f $remote_path && cat $remote_path || echo 'FILE_NOT_FOUND'") 2>/dev/null || return 0
-
-    [[ -z "$cmd_id" ]] && return 0
-
-    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
-
-    local content
-    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
-
-    if [[ -n "$content" && "$content" != "FILE_NOT_FOUND" ]]; then
-        echo "$content" > "$LOGS_DIR/${label}-${filename}"
-        log_info "  Saved: ${label}-${filename} ($(echo "$content" | wc -l) lines)"
-    fi
-}
-
-collect_ssm_command() {
-    local instance_id="$1"
-    local label="$2"
-    local name="$3"
-    local command="$4"
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$command") 2>/dev/null || return 0
-
-    [[ -z "$cmd_id" ]] && return 0
-
-    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
-
-    local content
-    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
-
-    if [[ -n "$content" ]]; then
-        echo "$content" > "$LOGS_DIR/${label}-${name}.log"
-        log_info "  Saved: ${label}-${name}.log"
-    fi
-}
-
 collect_instance_logs() {
     log_section "Collecting instance logs"
     mkdir -p "$LOGS_DIR"
@@ -1288,13 +1238,12 @@ collect_instance_logs() {
         return 0
     fi
 
+    # Collect EC2 console output first (no SSM needed, survives termination)
     for entry in "${instances[@]}"; do
         local label="${entry%%:*}"
         local instance_id="${entry##*:}"
 
-        log_info "Collecting logs from ${label} (${instance_id})..."
-
-        # ── EC2 console output (survives termination, no SSM needed) ─────────
+        log_info "Collecting console output from ${label} (${instance_id})..."
         local console_output
         console_output=$(aws ec2 get-console-output \
             --instance-id "$instance_id" \
@@ -1303,8 +1252,40 @@ collect_instance_logs() {
             --output text 2>/dev/null || echo "(console output unavailable)")
         echo "$console_output" > "$LOGS_DIR/${label}-console-output.log"
         log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
+    done
 
-        # ── SSM-based log collection (richer, needs SSM agent) ───────────────
+    # Batch SSM log collection: ONE command per instance collects ALL logs
+    # This prevents SSM agent saturation (was 13 commands per instance, now 1)
+    local log_collect_script='
+OUTDIR=/tmp/collected-logs
+mkdir -p "$OUTDIR"
+
+# Log files
+for f in /var/log/user-data.log /var/log/cloud-init-output.log /var/log/cfn-init.log /var/log/cfn-init-cmd.log /tmp/echo-server.log /tmp/test-client.log /tmp/test-client-iperf.log /tmp/iperf3-server.log; do
+    bn=$(basename "$f")
+    if [ -f "$f" ]; then cp "$f" "$OUTDIR/$bn"; else echo "FILE_NOT_FOUND" > "$OUTDIR/$bn"; fi
+done
+
+# Dynamic commands
+ls -la /opt/dpdk-stdlib/target/release/ > "$OUTDIR/build-listing.log" 2>&1 || echo "no build output directory" > "$OUTDIR/build-listing.log"
+ip addr show > "$OUTDIR/network-interfaces.log" 2>&1 || echo "network info unavailable" > "$OUTDIR/network-interfaces.log"
+journalctl --no-pager -n 500 > "$OUTDIR/journal.log" 2>&1 || tail -500 /var/log/messages > "$OUTDIR/journal.log" 2>&1 || echo "journal unavailable" > "$OUTDIR/journal.log"
+dmesg | grep -iE "segfault|trap|fault|oom|killed|echo|test-client" | tail -50 > "$OUTDIR/dmesg-crashes.log" 2>&1 || echo "no crash-related dmesg entries" > "$OUTDIR/dmesg-crashes.log"
+ls -lh /tmp/coredumps/ > "$OUTDIR/coredump-listing.log" 2>&1 || echo "no coredump directory" > "$OUTDIR/coredump-listing.log"
+cat /tmp/crash-report-*.txt > "$OUTDIR/crash-reports.log" 2>&1 || echo "no crash reports" > "$OUTDIR/crash-reports.log"
+
+# Output a tar of all collected logs (base64 encoded for SSM transport)
+cd "$OUTDIR" && tar czf - . 2>/dev/null | base64
+'
+
+    local -a cmd_ids=()
+    local -a cmd_labels=()
+    local -a cmd_instances=()
+
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
         local ssm_ready
         ssm_ready=$(aws ssm describe-instance-information \
             --filters "Key=InstanceIds,Values=${instance_id}" \
@@ -1312,34 +1293,49 @@ collect_instance_logs() {
             --output text 2>/dev/null || echo "")
 
         if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
-            log_info "  SSM available - collecting log files..."
-            collect_ssm_file  "$instance_id" "$label" "/var/log/user-data.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cloud-init-output.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init-cmd.log"
-            
-            # Application logs from test execution
-            collect_ssm_file  "$instance_id" "$label" "/tmp/echo-server.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client-iperf.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/iperf3-server.log"
-            
-            collect_ssm_command "$instance_id" "$label" "build-listing" \
-                "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
-            collect_ssm_command "$instance_id" "$label" "network-interfaces" \
-                "ip addr show 2>/dev/null || ifconfig -a 2>/dev/null || echo 'network info unavailable'"
-            collect_ssm_command "$instance_id" "$label" "journal" \
-                "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
-
-            # Crash diagnostics: dmesg, coredump listing, and crash reports
-            collect_ssm_command "$instance_id" "$label" "dmesg-crashes" \
-                "dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash-related dmesg entries'"
-            collect_ssm_command "$instance_id" "$label" "coredump-listing" \
-                "ls -lh /tmp/coredumps/ 2>/dev/null || echo 'no coredump directory'"
-            collect_ssm_command "$instance_id" "$label" "crash-reports" \
-                "cat /tmp/crash-report-*.txt 2>/dev/null || echo 'no crash reports'"
+            log_info "  Sending batch log collection to ${label}..."
+            local cmd_id
+            cmd_id=$(ssm_run_command_async "$instance_id" 60 "$log_collect_script") 2>/dev/null || true
+            if [[ -n "$cmd_id" ]]; then
+                cmd_ids+=("$cmd_id")
+                cmd_labels+=("$label")
+                cmd_instances+=("$instance_id")
+            fi
         else
             log_info "  SSM not available for ${label} - relying on console output only"
+        fi
+    done
+
+    # Wait for all batch commands and extract logs
+    for i in "${!cmd_ids[@]}"; do
+        local label="${cmd_labels[$i]}"
+        local instance_id="${cmd_instances[$i]}"
+        local cmd_id="${cmd_ids[$i]}"
+
+        log_info "  Waiting for ${label} log collection..."
+        if ssm_wait_command "$instance_id" "$cmd_id" 90 2>/dev/null; then
+            local b64_content
+            b64_content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
+            if [[ -n "$b64_content" ]]; then
+                # Decode and extract the tar archive
+                local tmpdir
+                tmpdir=$(mktemp -d)
+                echo "$b64_content" | base64 -d 2>/dev/null | tar xzf - -C "$tmpdir" 2>/dev/null || true
+                for logfile in "$tmpdir"/*; do
+                    [[ -f "$logfile" ]] || continue
+                    local bn
+                    bn=$(basename "$logfile")
+                    local content
+                    content=$(cat "$logfile")
+                    if [[ "$content" != "FILE_NOT_FOUND" && -n "$content" ]]; then
+                        cp "$logfile" "$LOGS_DIR/${label}-${bn}"
+                        log_info "  Saved: ${label}-${bn}"
+                    fi
+                done
+                rm -rf "$tmpdir"
+            fi
+        else
+            log_info "  Failed to collect logs from ${label} via SSM"
         fi
     done
 
