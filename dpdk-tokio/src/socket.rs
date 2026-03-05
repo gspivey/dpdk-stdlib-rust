@@ -111,18 +111,31 @@ impl DpdkUdpSocket {
 #[async_trait]
 impl AsyncUdpSocket for DpdkUdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let socket = self.inner.clone();
-        let mut buf_owned = buf.to_vec();
+        loop {
+            let socket = self.inner.clone();
+            let mut buf_owned = buf.to_vec();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned))
-        }).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+            let result = tokio::task::spawn_blocking(move || {
+                let socket = socket.blocking_lock();
+                let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let res = socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned));
+                let _ = socket.set_read_timeout(None);
+                res
+            }).await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let (len, addr, received_buf) = result;
-        buf[..len].copy_from_slice(&received_buf[..len]);
-        Ok((len, addr))
+            match result {
+                Ok((len, addr, received_buf)) => {
+                    buf[..len].copy_from_slice(&received_buf[..len]);
+                    return Ok((len, addr));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
@@ -155,18 +168,31 @@ impl AsyncUdpSocket for DpdkUdpSocket {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let socket = self.inner.clone();
-        let mut buf_owned = buf.to_vec();
+        loop {
+            let socket = self.inner.clone();
+            let mut buf_owned = buf.to_vec();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.recv(&mut buf_owned).map(|len| (len, buf_owned))
-        }).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+            let result = tokio::task::spawn_blocking(move || {
+                let socket = socket.blocking_lock();
+                let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let res = socket.recv(&mut buf_owned).map(|len| (len, buf_owned));
+                let _ = socket.set_read_timeout(None);
+                res
+            }).await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let (len, received_buf) = result;
-        buf[..len].copy_from_slice(&received_buf[..len]);
-        Ok(len)
+            match result {
+                Ok((len, received_buf)) => {
+                    buf[..len].copy_from_slice(&received_buf[..len]);
+                    return Ok(len);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {

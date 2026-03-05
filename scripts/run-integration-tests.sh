@@ -29,7 +29,7 @@ CDK_DIR="$REPO_ROOT/deploy/cdk"
 
 SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
 TEST_TIMEOUT=120             # 2 minutes per test scenario
-ENI_BIND_TIMEOUT=30          # 30 seconds for ENI bind/unbind
+ENI_BIND_TIMEOUT=90          # 90 seconds for ENI bind/unbind (generous for SSM agent recovery)
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"
@@ -156,54 +156,23 @@ post_pr_comment() {
     fi
 }
 
-# ── Gateway MAC discovery ────────────────────────────────────────────────────
-# Discovers the VPC gateway MAC from an EC2 instance via SSM.
-# In AWS VPC, all DPDK outbound frames must use this MAC as dst_mac.
-# See docs/aws-vpc-networking.md for details.
+# ── Process cleanup and ARP warming ──────────────────────────────────────────
 
-GATEWAY_MAC=""
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
 
-discover_gateway_mac() {
-    local instance_id="$1"
-
-    log_info "Discovering VPC gateway MAC from $instance_id..."
-
-    local discover_cmd='
-        # Get gateway IP from route table
-        GW_IP=$(ip route show default 2>/dev/null | awk "/default via/ {print \$3}" | head -1)
-        if [ -z "$GW_IP" ]; then
-            # Derive from IMDS
-            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-            PRIMARY_MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
-            SUBNET=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/${PRIMARY_MAC}/subnet-ipv4-cidr-block")
-            GW_IP=$(echo "$SUBNET" | sed "s|\.[0-9]*/.*|.1|")
-        fi
-        # Ping gateway to populate ARP table, then read the MAC
-        ping -c 1 -W 2 "$GW_IP" >/dev/null 2>&1 || true
-        ip neigh show "$GW_IP" 2>/dev/null | awk "{print \$5}" | head -1
-    '
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$discover_cmd")
-    if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to send gateway MAC discovery command"
-        return 1
-    fi
-
-    if ! ssm_wait_command "$instance_id" "$cmd_id" 30; then
-        log_error "Gateway MAC discovery timed out"
-        return 1
-    fi
-
-    GATEWAY_MAC=$(ssm_get_stdout "$instance_id" "$cmd_id" | tr -d '[:space:]')
-
-    if [[ -n "$GATEWAY_MAC" && "$GATEWAY_MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-        log_info "Gateway MAC: $GATEWAY_MAC"
-    else
-        log_error "Failed to discover gateway MAC (got: '$GATEWAY_MAC')"
-        GATEWAY_MAC=""
-        return 1
-    fi
+# Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
+# In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
+# dpdk-udp reads /proc/net/arp at bind() time, so we need the kernel to
+# have resolved the gateway and peer IPs before the DPDK binaries start.
+# Uses async SSM commands to warm both instances in parallel.
+warm_arp_cache() {
+    log_info "Warming kernel ARP cache on both instances..."
+    local subnet_prefix
+    subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
+    local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    sleep 2
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
 }
 
 # ── Networking diagnostics ───────────────────────────────────────────────────
@@ -462,23 +431,27 @@ wait_for_ssm_readiness() {
 }
 
 verify_build() {
-    log_info "Verifying project build on instances..."
+    log_info "Verifying project build on instances (parallel)..."
 
-    for instance_id in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
-        log_info "Checking build on $instance_id..."
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
 
-        local cmd_id
-        cmd_id=$(ssm_run_command_async "$instance_id" 30 \
-            "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
+        local label="${entry%%:*}"
+        local rest="${entry#*:}"
+        local instance_id="${rest%%:*}"
+        local cmd_id="${rest##*:}"
 
         if [[ -z "$cmd_id" ]]; then
-            log_error "Failed to send build verification command to $instance_id"
+            log_error "Failed to send build verification command to $label ($instance_id)"
             return 1
         fi
 
-        # Poll for completion rather than fixed sleep
         if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
-            log_error "Build verification command timed out on $instance_id"
+            log_error "Build verification command timed out on $label ($instance_id)"
             return 1
         fi
 
@@ -486,9 +459,9 @@ verify_build() {
         result=$(ssm_get_stdout "$instance_id" "$cmd_id")
 
         if echo "$result" | grep -q "BUILD_OK"; then
-            log_info "Build verified on $instance_id"
+            log_info "Build verified on $label ($instance_id)"
         else
-            log_error "Build not found on $instance_id (output: $result)"
+            log_error "Build not found on $label ($instance_id) (output: $result)"
             return 1
         fi
     done
@@ -518,10 +491,12 @@ ssm_run_command() {
         return 1
     fi
 
-    # Poll for completion
+    # Poll for completion — poll longer than the SSM timeout to avoid a race
+    # where the command finishes just as we stop polling.
+    local poll_limit=$((timeout_secs + 30))
     local elapsed=0
     local status=""
-    while [[ $elapsed -lt $timeout_secs ]]; do
+    while [[ $elapsed -lt $poll_limit ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
 
@@ -537,36 +512,55 @@ ssm_run_command() {
                 ;;
             Failed|TimedOut|Cancelled)
                 log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
-                # Fetch stderr for diagnostics
-                aws ssm get-command-invocation \
-                    --command-id "$cmd_id" \
-                    --instance-id "$instance_id" \
-                    --query "StandardErrorContent" \
-                    --output text 2>/dev/null || true
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status (command: $command_str)"
                 return 1
                 ;;
         esac
     done
 
-    log_error "SSM command timed out on $instance_id after ${timeout_secs}s"
+    log_error "SSM command polling timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s, last status: $status)"
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout ${poll_limit}s (SSM timeout: ${timeout_secs}s, command: $command_str)"
     return 1
 }
 
 # Run a command on an instance via SSM in the background (non-blocking).
 # Usage: ssm_run_command_async <instance_id> <timeout_seconds> <command_string>
-# Prints the command ID to stdout.
+# Prints the command ID to stdout. Retries on failure with backoff.
 ssm_run_command_async() {
     local instance_id="$1"
     local timeout_secs="$2"
     local command_str="$3"
 
-    aws ssm send-command \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command_str\"]" \
-        --timeout-seconds "$timeout_secs" \
-        --query "Command.CommandId" \
-        --output text 2>/dev/null
+    local cmd_id=""
+    local attempt=0
+    local max_attempts=3
+    local backoff=2
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        cmd_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"$command_str\"]" \
+            --timeout-seconds "$timeout_secs" \
+            --query "Command.CommandId" \
+            --output text 2>/dev/null || true)
+
+        if [[ -n "$cmd_id" && "$cmd_id" != "None" ]]; then
+            echo "$cmd_id"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            # IMPORTANT: log to stderr, not stdout — stdout is used for the command ID
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] INFO: SSM send-command failed on $instance_id (attempt $attempt/$max_attempts), retrying in ${backoff}s..." >&2
+            sleep "$backoff"
+            backoff=$((backoff * 2))
+        fi
+    done
+
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: SSM send-command failed on $instance_id after $max_attempts attempts" >&2
+    echo ""
 }
 
 # Wait for an async SSM command to complete.
@@ -577,11 +571,11 @@ ssm_wait_command() {
     local timeout_secs="$3"
 
     local elapsed=0
+    local status=""
     while [[ $elapsed -lt $timeout_secs ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
 
-        local status
         status=$(aws ssm get-command-invocation \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
@@ -591,14 +585,60 @@ ssm_wait_command() {
         case "$status" in
             Success)  return 0 ;;
             Failed|TimedOut|Cancelled)
-                log_error "SSM command $status on $instance_id"
+                log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status"
                 return 1
                 ;;
         esac
     done
 
-    log_error "SSM command timed out waiting for $cmd_id on $instance_id"
+    log_error "SSM command polling timed out on $instance_id after ${timeout_secs}s (last status: $status, cmd: $cmd_id)"
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout after ${timeout_secs}s"
     return 1
+}
+
+# Save SSM failure diagnostics to instance-logs for PR visibility
+ssm_save_failure_log() {
+    local instance_id="$1"
+    local cmd_id="$2"
+    local status="$3"
+    local reason="$4"
+
+    local ssm_log_dir="${REPO_ROOT}/instance-logs"
+    mkdir -p "$ssm_log_dir"
+    local role_prefix="unknown"
+    if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
+        role_prefix="sender"
+    elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
+        role_prefix="receiver"
+    fi
+    local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
+    {
+        echo "=== $reason ==="
+        echo "Status: $status"
+        echo "Instance: $instance_id ($role_prefix)"
+        echo "Command ID: ${cmd_id:-(empty)}"
+        echo ""
+        if [[ -n "$cmd_id" ]]; then
+            echo "=== STDOUT ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardOutputContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+            echo ""
+            echo "=== STDERR ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardErrorContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+        else
+            echo "(no command ID — SSM send-command failed)"
+        fi
+        echo ""
+    } >> "$ssm_fail_log"
+    cat "$ssm_fail_log" >&2 || true
 }
 
 # Retrieve stdout from a completed SSM command.
@@ -630,10 +670,18 @@ ssm_cancel_command() {
 configure_eni() {
     local instance_id="$1"
     local action="$2"  # bind or unbind
+    local expected_ip="${3:-}"  # optional: IP to assign after unbind
 
     log_info "ENI $action on $instance_id"
-    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"; then
+
+    # Build a single consolidated command to minimize SSM agent load.
+    # For unbind with IP assignment, chain both actions in one SSM call.
+    local cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"
+    if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
+        cmd+=" && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"
+    fi
+
+    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
         log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
         ssm_run_command "$instance_id" 15 \
             "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
@@ -659,29 +707,15 @@ run_tier1() {
         return 1
     fi
 
-    # Discover gateway MAC for AWS VPC routing (see docs/aws-vpc-networking.md)
-    if [[ -z "$GATEWAY_MAC" ]]; then
-        discover_gateway_mac "$SENDER_INSTANCE_ID" || {
-            log_error "Gateway MAC discovery failed — Tier 1 will likely fail (ARP won't work in VPC)"
-            post_pr_comment "## [CI] Stage: Tier 1 - Gateway MAC Discovery Failed
-Gateway MAC could not be discovered. DPDK packets will use broadcast MAC
-which VPC drops. See \`docs/aws-vpc-networking.md\`."
-        }
-    fi
-
-    # Build gateway-mac flag if available
-    local gw_flag=""
-    if [[ -n "$GATEWAY_MAC" ]]; then
-        gw_flag="--gateway-mac $GATEWAY_MAC"
-        log_info "Using gateway MAC: $GATEWAY_MAC for DPDK routing"
-    fi
-
     # Run baseline diagnostics
     run_diagnostics "baseline" || true
 
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
+
     # Start listener on receiver (Instance B) in background
     log_info "Starting listener on receiver..."
-    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 ${gw_flag}"
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
     local listener_cmd_id
     listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
 
@@ -696,7 +730,7 @@ which VPC drops. See \`docs/aws-vpc-networking.md\`."
 
     # Run sender on sender (Instance A) - this produces the JUnit XML
     log_info "Starting sender on sender..."
-    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml ${gw_flag}"
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
         log_error "Sender test execution failed"
         generate_failure_xml "tier1-dpdk-echo" "Sender test execution failed or timed out"
@@ -707,24 +741,24 @@ which VPC drops. See \`docs/aws-vpc-networking.md\`."
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
-    # Kill any lingering echo server processes on the receiver
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
-
     log_info "Tier 1 execution complete"
 }
 
 run_tier2() {
     log_section "Tier 2: Kernel -> DPDK interoperability test"
 
-    # Bind ENI on receiver only (sender uses kernel networking)
+    # Bind receiver ENI (DPDK), unbind sender ENI (kernel) — sequential to avoid SSM throttling
     log_info "Configuring ENIs for Tier 2..."
     if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
         log_error "Failed to bind ENI on receiver"
         generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
         return 1
     fi
-    # Ensure sender ENI is unbound (kernel networking)
-    configure_eni "$SENDER_INSTANCE_ID" "unbind" || true
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
 
     # Start listener on receiver (DPDK) in background
     log_info "Starting listener on receiver..."
@@ -754,24 +788,29 @@ run_tier2() {
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
-    # Kill any lingering echo server processes on the receiver
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "pkill -f 'target/release/echo' || true" || true
-
     log_info "Tier 2 execution complete"
 }
 
 run_tier3() {
     log_section "Tier 3: DPDK <-> iperf3 interoperability test"
 
-    # Bind ENI on Instance A only; Instance B uses kernel networking
+    # Bind sender ENI (DPDK), unbind receiver ENI (kernel) — sequential to avoid SSM throttling
     log_info "Configuring ENIs for Tier 3..."
     if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
-        log_error "Failed to bind ENI on sender (tier3 is non-blocking)"
-        generate_skip_xml "tier3-iperf-interop" "ENI bind failed on sender instance - tier3 is experimental"
-        return 0
+        log_error "Failed to bind ENI on sender for Tier 3"
+        generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance"
+        return 1
     fi
-    # Ensure receiver ENI is unbound (kernel networking for iperf3)
-    configure_eni "$RECEIVER_INSTANCE_ID" "unbind" || true
+    sleep 3
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
+        log_error "Failed to unbind/configure receiver ENI for Tier 3"
+        generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
+        generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
+        return 1
+    fi
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
 
     # ── Direction 1: our-app-sends ───────────────────────────────────────
     log_info "Direction 1: our-app-sends (dpdk-stdlib -> iperf3)"
@@ -787,7 +826,7 @@ run_tier3() {
     local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction our-app-sends --local-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-our-app-sends.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
         log_error "our-app-sends test execution failed (tier3 is non-blocking)"
-        generate_skip_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out - tier3 is experimental"
+        generate_failure_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out"
     fi
 
     ssm_wait_command "$RECEIVER_INSTANCE_ID" "$iperf_server_cmd_id" 30 || true
@@ -806,7 +845,7 @@ run_tier3() {
     local iperf_client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction iperf-sends --local-ip $RECEIVER_DPDK_ENI_IP --peer-ip $SENDER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-iperf-sends.xml"
     if ! ssm_run_command "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$iperf_client_cmd"; then
         log_error "iperf-sends test execution failed (tier3 is non-blocking)"
-        generate_skip_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out - tier3 is experimental"
+        generate_failure_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out"
     fi
 
     ssm_wait_command "$SENDER_INSTANCE_ID" "$listener_cmd_id" 30 || true
@@ -817,19 +856,25 @@ run_tier3() {
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
-    log_info "Unbinding all ENIs..."
-    if ! configure_eni "$SENDER_INSTANCE_ID" "unbind"; then
-        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID) — continuing"
-    fi
-    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind"; then
-        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID) — continuing"
-    fi
-    # Verify ENI status after unbind to catch incomplete transitions
-    log_info "Verifying ENI status after unbind..."
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 \
-        "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+    log_info "Unbinding all ENIs (consolidated, sequential)..."
+
+    # Consolidate cleanup + unbind + IP assignment into ONE command per instance.
+    # Run sequentially with a pause between to avoid SSM API throttling.
+    local sender_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
+    local receiver_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
+
+    ssm_run_command "$SENDER_INSTANCE_ID" 90 "$sender_cmd" || \
+        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID)"
+
+    # Pause between instances to avoid SSM API throttling
+    sleep 3
+
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 90 "$receiver_cmd" || \
+        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID)"
+
+    # Give SSM agent a longer cooldown period before next tier's commands
+    log_info "SSM cooldown (15s)..."
+    sleep 15
 }
 
 # ── Result collection ────────────────────────────────────────────────────────
@@ -873,69 +918,76 @@ collect_results() {
 
     mkdir -p "$RESULTS_DIR"
 
-    # Collect XML files from sender instance
-    collect_xml_from_instance "$SENDER_INSTANCE_ID" "sender"
+    for entry in "sender:${SENDER_INSTANCE_ID}" "receiver:${RECEIVER_INSTANCE_ID}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
 
-    # Collect XML files from receiver instance
-    collect_xml_from_instance "$RECEIVER_INSTANCE_ID" "receiver"
-}
+        log_info "Collecting results from $label ($instance_id)..."
 
-collect_xml_from_instance() {
-    local instance_id="$1"
-    local label="$2"
+        local list_cmd_id
+        list_cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+            "ls -1 $RESULTS_REMOTE_DIR/*.xml 2>/dev/null || echo NO_FILES")
+        [[ -z "$list_cmd_id" ]] && continue
 
-    log_info "Collecting results from $label ($instance_id)..."
-
-    # List XML files in remote results directory
-    local list_cmd="ls -1 $RESULTS_REMOTE_DIR/*.xml 2>/dev/null || echo 'NO_FILES'"
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$list_cmd")
-
-    if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to list results on $label"
-        return 1
-    fi
-
-    sleep 5
-
-    local file_list
-    file_list=$(ssm_get_stdout "$instance_id" "$cmd_id")
-
-    if [[ "$file_list" == "NO_FILES" || -z "$file_list" ]]; then
-        log_info "No result files on $label"
-        return 0
-    fi
-
-    # Download each XML file
-    while IFS= read -r remote_path; do
-        [[ -z "$remote_path" ]] && continue
-        local filename
-        filename=$(basename "$remote_path")
-
-        log_info "Retrieving $filename from $label..."
-
-        local cat_cmd="cat $remote_path"
-        local cat_cmd_id
-        cat_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$cat_cmd")
-
-        if [[ -z "$cat_cmd_id" ]]; then
-            log_error "Failed to retrieve $filename from $label"
+        if ! ssm_wait_command "$instance_id" "$list_cmd_id" 60; then
+            log_error "Failed to list results on $label"
             continue
         fi
 
-        sleep 5
+        local file_list
+        file_list=$(ssm_get_stdout "$instance_id" "$list_cmd_id")
 
-        local content
-        content=$(ssm_get_stdout "$instance_id" "$cat_cmd_id")
-
-        if [[ -n "$content" ]]; then
-            echo "$content" > "$RESULTS_DIR/$filename"
-            log_info "Saved $filename"
-        else
-            log_error "Empty content for $filename from $label"
-            generate_failure_xml "${filename%.xml}" "Failed to retrieve results from $label"
+        if [[ "$file_list" == "NO_FILES" || -z "$file_list" ]]; then
+            log_info "No result files on $label"
+            continue
         fi
-    done <<< "$file_list"
+
+        # Cat all XML files in a single command with delimiters
+        sleep 2
+        local cat_script="cd $RESULTS_REMOTE_DIR && for f in *.xml; do echo ===FILE:\$f===; cat \$f; done"
+        local cat_cmd_id
+        cat_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$cat_script")
+        [[ -z "$cat_cmd_id" ]] && continue
+
+        if ! ssm_wait_command "$instance_id" "$cat_cmd_id" 60; then
+            log_error "Failed to cat results from $label"
+            continue
+        fi
+
+        local output
+        output=$(ssm_get_stdout "$instance_id" "$cat_cmd_id")
+
+        if [[ -z "$output" ]]; then
+            log_error "Empty results from $label"
+            continue
+        fi
+
+        # Parse: split on ===FILE:name=== delimiters
+        local current_file=""
+        local current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                    echo "$current_content" > "$RESULTS_DIR/$current_file"
+                    log_info "Saved $current_file from $label"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                if [[ -n "$current_content" ]]; then
+                    current_content+=$'\n'"$line"
+                else
+                    current_content="$line"
+                fi
+            fi
+        done <<< "$output"
+        if [[ -n "$current_file" && -n "$current_content" ]]; then
+            echo "$current_content" > "$RESULTS_DIR/$current_file"
+            log_info "Saved $current_file from $label"
+        fi
+
+        sleep 2
+    done
 }
 
 # ── Summary reporting ────────────────────────────────────────────────────────
@@ -1142,53 +1194,6 @@ teardown_infrastructure() {
 #
 # Logs are written to $LOGS_DIR/ with <role>-<filename> naming.
 
-collect_ssm_file() {
-    local instance_id="$1"
-    local label="$2"
-    local remote_path="$3"
-
-    local filename
-    filename=$(basename "$remote_path")
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 \
-        "test -f $remote_path && cat $remote_path || echo 'FILE_NOT_FOUND'") 2>/dev/null || return 0
-
-    [[ -z "$cmd_id" ]] && return 0
-
-    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
-
-    local content
-    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
-
-    if [[ -n "$content" && "$content" != "FILE_NOT_FOUND" ]]; then
-        echo "$content" > "$LOGS_DIR/${label}-${filename}"
-        log_info "  Saved: ${label}-${filename} ($(echo "$content" | wc -l) lines)"
-    fi
-}
-
-collect_ssm_command() {
-    local instance_id="$1"
-    local label="$2"
-    local name="$3"
-    local command="$4"
-
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$command") 2>/dev/null || return 0
-
-    [[ -z "$cmd_id" ]] && return 0
-
-    ssm_wait_command "$instance_id" "$cmd_id" 45 2>/dev/null || true
-
-    local content
-    content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
-
-    if [[ -n "$content" ]]; then
-        echo "$content" > "$LOGS_DIR/${label}-${name}.log"
-        log_info "  Saved: ${label}-${name}.log"
-    fi
-}
-
 collect_instance_logs() {
     log_section "Collecting instance logs"
     mkdir -p "$LOGS_DIR"
@@ -1224,13 +1229,12 @@ collect_instance_logs() {
         return 0
     fi
 
+    # Collect EC2 console output first (no SSM needed, survives termination)
     for entry in "${instances[@]}"; do
         local label="${entry%%:*}"
         local instance_id="${entry##*:}"
 
-        log_info "Collecting logs from ${label} (${instance_id})..."
-
-        # ── EC2 console output (survives termination, no SSM needed) ─────────
+        log_info "Collecting console output from ${label} (${instance_id})..."
         local console_output
         console_output=$(aws ec2 get-console-output \
             --instance-id "$instance_id" \
@@ -1239,8 +1243,13 @@ collect_instance_logs() {
             --output text 2>/dev/null || echo "(console output unavailable)")
         echo "$console_output" > "$LOGS_DIR/${label}-console-output.log"
         log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
+    done
 
-        # ── SSM-based log collection (richer, needs SSM agent) ───────────────
+    # Collect key logs via SSM — use individual commands with delays to avoid throttling
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
         local ssm_ready
         ssm_ready=$(aws ssm describe-instance-information \
             --filters "Key=InstanceIds,Values=${instance_id}" \
@@ -1248,32 +1257,72 @@ collect_instance_logs() {
             --output text 2>/dev/null || echo "")
 
         if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
-            log_info "  SSM available - collecting log files..."
-            collect_ssm_file  "$instance_id" "$label" "/var/log/user-data.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cloud-init-output.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init.log"
-            collect_ssm_file  "$instance_id" "$label" "/var/log/cfn-init-cmd.log"
-            
-            # Application logs from test execution
-            collect_ssm_file  "$instance_id" "$label" "/tmp/echo-server.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/test-client-iperf.log"
-            collect_ssm_file  "$instance_id" "$label" "/tmp/iperf3-server.log"
-            
-            collect_ssm_command "$instance_id" "$label" "build-listing" \
-                "ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build output directory'"
-            collect_ssm_command "$instance_id" "$label" "network-interfaces" \
-                "ip addr show 2>/dev/null || ifconfig -a 2>/dev/null || echo 'network info unavailable'"
-            collect_ssm_command "$instance_id" "$label" "journal" \
-                "journalctl --no-pager -n 500 2>/dev/null || tail -500 /var/log/messages 2>/dev/null || echo 'journal unavailable'"
+            log_info "  SSM available - collecting log files from ${label}..."
 
-            # Crash diagnostics: dmesg, coredump listing, and crash reports
-            collect_ssm_command "$instance_id" "$label" "dmesg-crashes" \
-                "dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash-related dmesg entries'"
-            collect_ssm_command "$instance_id" "$label" "coredump-listing" \
-                "ls -lh /tmp/coredumps/ 2>/dev/null || echo 'no coredump directory'"
-            collect_ssm_command "$instance_id" "$label" "crash-reports" \
-                "cat /tmp/crash-report-*.txt 2>/dev/null || echo 'no crash reports'"
+            # Batch 1: user-data log (most important) + app logs
+            local batch1_cmd="echo '===FILE:user-data.log==='; tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-server.log==='; cat /tmp/echo-server.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client.log==='; cat /tmp/test-client.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client-iperf.log==='; cat /tmp/test-client-iperf.log 2>/dev/null || echo '(not found)'"
+            local batch1_id
+            batch1_id=$(ssm_run_command_async "$instance_id" 30 "$batch1_cmd")
+            if [[ -n "$batch1_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch1_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch1_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        # Parse ===FILE:name=== delimited output
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
+            fi
+
+            sleep 3
+
+            # Batch 2: network state + crash diagnostics
+            local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'"
+            local batch2_id
+            batch2_id=$(ssm_run_command_async "$instance_id" 30 "$batch2_cmd")
+            if [[ -n "$batch2_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch2_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch2_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
+            fi
+
+            sleep 3
         else
             log_info "  SSM not available for ${label} - relying on console output only"
         fi
@@ -1518,7 +1567,7 @@ Infrastructure ready.
     else
         summary_body+="Some tests **FAILED** (exit code: $TEST_EXIT_CODE)."
     fi
-    summary_body+="\n\nGateway MAC: \`${GATEWAY_MAC:-not discovered}\`"
+    summary_body+="\n\nARP seeding: kernel /proc/net/arp (automatic)"
     # Include JUnit results summary
     for xml_file in "$RESULTS_DIR"/*.xml; do
         [[ -f "$xml_file" ]] || continue

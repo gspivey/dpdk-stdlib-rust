@@ -30,11 +30,6 @@ struct Args {
     #[arg(long)]
     bind_ip: Option<String>,
 
-    /// Gateway MAC address for AWS VPC DPDK routing (format: xx:xx:xx:xx:xx:xx).
-    /// Pre-populates the ARP cache so DPDK sends to the VPC gateway MAC.
-    /// See docs/aws-vpc-networking.md.
-    #[arg(long)]
-    gateway_mac: Option<String>,
 }
 
 #[tokio::main]
@@ -54,22 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket = UdpSocket::bind(&bind_addr).await?;
     println!("Backend: {}", socket.backend());
-
-    // Pre-populate ARP cache with gateway MAC for AWS VPC routing.
-    // Maps the TARGET IP to the gateway MAC so DPDK sends frames to the
-    // VPC virtual router, which does L3 forwarding to the actual destination.
-    if let Some(ref gw_mac_str) = args.gateway_mac {
-        let parts: Vec<u8> = gw_mac_str.split(':')
-            .map(|s| u8::from_str_radix(s, 16).expect("invalid MAC octet"))
-            .collect();
-        assert_eq!(parts.len(), 6, "gateway MAC must have 6 octets");
-        let mac = [parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]];
-
-        let target_ip: std::net::Ipv4Addr = args.target.parse()
-            .expect("--target must be a valid IPv4 address when using --gateway-mac");
-        println!("Pre-populating ARP: {} -> {}", target_ip, gw_mac_str);
-        socket.add_arp_entry(target_ip, mac);
-    }
 
     let target_addr = format!("{}:{}", args.target, args.port);
 

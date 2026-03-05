@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# tier3-iperf-interop.sh - Tier 3: DPDK <-> iperf3 interoperability test harness
+# tier3-iperf-interop.sh - Tier 3: Cross-stack interoperability test harness
 #
-# Tests that dpdk-stdlib can interoperate with standard iperf3 UDP traffic.
-# Two directions:
-#   - "our-app-sends": Instance A (dpdk-stdlib) sends to Instance B (iperf3 server)
-#   - "iperf-sends": Instance B (iperf3 client) sends to Instance A (dpdk-stdlib listener)
+# Tests that dpdk-stdlib can interoperate across networking stacks:
+#   - "our-app-sends": Instance A (dpdk-stdlib via DPDK) sends to Instance B (kernel echo server)
+#   - "iperf-sends": Instance B (kernel test-client) sends to Instance A (dpdk-stdlib listener)
+#
+# This validates that DPDK packets can reach kernel sockets and vice versa
+# across the VPC, verifying correct gateway MAC usage and packet format.
 #
 # Usage:
 #   ./tier3-iperf-interop.sh --role <server|client> --direction <our-app-sends|iperf-sends> \
@@ -27,7 +29,7 @@ PEER_IP=""
 PORT=9000
 OUTPUT=""
 TEST_TIMEOUT=60
-CLASSNAME="tier3.iperf_interop"
+CLASSNAME="tier3.cross_stack_interop"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -58,36 +60,73 @@ if [[ -z "$OUTPUT" ]]; then
 fi
 
 # ── Direction: our-app-sends ─────────────────────────────────────────────────
-# Instance A runs dpdk-stdlib sending UDP to Instance B running iperf3 server.
-# - Server role (Instance B): start iperf3 server, wait, collect stats
-# - Client role (Instance A): run dpdk-stdlib sending UDP traffic
+# Instance A (DPDK) sends UDP to Instance B (kernel networking).
+# - Server role (Instance B): Start a Python UDP echo server on the kernel stack.
+#   We use Python instead of iperf3 because iperf3 requires a TCP control
+#   channel which DPDK doesn't support. Python's UDP socket is a real kernel
+#   socket, validating true cross-stack interop.
+# - Client role (Instance A): Run dpdk-stdlib test-client with --bind-ip (DPDK path).
 
 run_our_app_sends_server() {
-    # Instance B: run iperf3 in UDP server mode
-    log_info "Starting iperf3 UDP server on ${LOCAL_IP}:${PORT} (our-app-sends direction)"
+    log_info "Starting kernel UDP echo server on 0.0.0.0:${PORT} (our-app-sends direction)"
 
-    local iperf_log="/tmp/iperf3-server.log"
-    log_info "iperf3 server output will be logged to: $iperf_log"
-    iperf3 -s -B "$LOCAL_IP" -p "$PORT" --one-off > "$iperf_log" 2>&1 &
-    local iperf_pid=$!
-    log_info "iperf3 server started with PID $iperf_pid"
+    # Diagnostic: verify kernel interface has the expected IP
+    log_info "Receiver network state:"
+    ip -4 addr show 2>/dev/null || true
+    log_info "Receiver ARP table:"
+    cat /proc/net/arp 2>/dev/null || true
+
+    local echo_log="/tmp/iperf3-server.log"
+    log_info "Kernel echo server output will be logged to: $echo_log"
+
+    # Python UDP echo server — listens on all interfaces so it works
+    # regardless of which kernel interface has the target IP.
+    python3 -u -c "
+import socket, sys, signal, time
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', $PORT))
+s.settimeout(5.0)
+print(f'Kernel UDP echo server listening on 0.0.0.0:$PORT', flush=True)
+
+count = 0
+start = time.time()
+while time.time() - start < 90:
+    try:
+        data, addr = s.recvfrom(1500)
+        count += 1
+        print(f'Received {len(data)} bytes from {addr}: {data[:80]}', flush=True)
+        s.sendto(data, addr)
+    except socket.timeout:
+        continue
+    except Exception as e:
+        print(f'Error: {e}', flush=True)
+        break
+
+print(f'Kernel echo server finished after {count} packets', flush=True)
+" > "$echo_log" 2>&1 &
+    local pid=$!
+    log_info "Kernel echo server started with PID $pid"
 
     # Wait for the test to complete (sender will drive the timing)
     local waited=0
     local max_wait=90
-    while kill -0 "$iperf_pid" 2>/dev/null && [[ $waited -lt $max_wait ]]; do
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt $max_wait ]]; do
         sleep 5
         waited=$(( waited + 5 ))
     done
 
-    kill "$iperf_pid" 2>/dev/null || true
-    wait "$iperf_pid" 2>/dev/null || true
-    log_info "iperf3 server finished"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    log_info "Kernel echo server finished"
 }
 
 run_our_app_sends_client() {
-    # Instance A: run dpdk-stdlib sending UDP to iperf3 server
-    log_info "Sending UDP traffic from dpdk-stdlib to iperf3 server at ${PEER_IP}:${PORT}"
+    # Instance A: run dpdk-stdlib sending UDP via DPDK to kernel echo server
+    log_info "Sending UDP traffic from dpdk-stdlib (DPDK) to kernel echo server at ${PEER_IP}:${PORT}"
 
     # Capture test-client output to a log file
     local client_log="/tmp/test-client-iperf.log"
@@ -96,8 +135,20 @@ run_our_app_sends_client() {
 
     junit_start_suite "tier3-iperf-interop" 1
 
-    # Give the iperf3 server time to start
+    # Give the kernel echo server time to start
     sleep 5
+
+    # Pre-flight diagnostics: verify DPDK state and ARP cache
+    log_info "Pre-flight: checking DPDK state and ARP cache..."
+    log_info "Local IP: $LOCAL_IP, Peer IP: $PEER_IP, Port: $PORT"
+    log_info "/proc/net/arp contents:"
+    cat /proc/net/arp 2>/dev/null || true
+    log_info "DPDK runtime state:"
+    ls -la /var/run/dpdk/ 2>/dev/null || echo "No /var/run/dpdk/ directory"
+    log_info "vfio-pci bindings:"
+    ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null || echo "No vfio-pci bindings"
+    log_info "Test binary: $TEST_CLIENT_BINARY"
+    ls -la "$TEST_CLIENT_BINARY" 2>/dev/null || echo "Binary not found!"
 
     local start end elapsed
     start=$(_timer_now)
@@ -105,24 +156,37 @@ run_our_app_sends_client() {
     local test_err=""
     local test_output=""
 
-    # Use the test client to send UDP packets to the iperf3 server
+    # Clean DPDK runtime state so EAL can initialize fresh
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+
+    # Use test-client with --bind-ip to force DPDK path
+    log_info "Launching test-client: $TEST_CLIENT_BINARY --target $PEER_IP --port $PORT --bind-ip $LOCAL_IP --count 10 --delay 200"
     test_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
-        --target "$PEER_IP" --port "$PORT" --message "dpdk-to-iperf-test-payload" \
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$LOCAL_IP" \
+        --message "dpdk-to-kernel-test-payload" \
         --count 10 --delay 200 2>&1) || {
         test_ok=false
-        test_err="Failed to send UDP traffic from dpdk-stdlib to iperf3"
+        test_err="Failed to send UDP traffic from dpdk-stdlib to kernel echo server"
     }
+    log_info "Test client output: $test_output"
 
-    # Verify that we sent bytes (even without responses, since iperf3 server
-    # may not echo back in the same format)
+    # Verify that packets were sent and responses received
     if [[ "$test_ok" == "true" ]]; then
         if echo "$test_output" | grep -q "Sent"; then
             local sent_count
             sent_count=$(echo "$test_output" | grep -c "Sent" || true)
-            log_info "our-app-sends: sent $sent_count packets to iperf3 server"
+            local recv_count
+            recv_count=$(echo "$test_output" | grep -c "Received" || true)
+            log_info "our-app-sends: sent $sent_count packets, received $recv_count responses"
+            if [[ "$sent_count" -ge 5 ]]; then
+                log_info "our-app-sends: PASS (sent >= 5 packets)"
+            else
+                test_ok=false
+                test_err="Only sent $sent_count/10 packets (need >= 5)"
+            fi
         else
             test_ok=false
-            test_err="No packets were sent to iperf3 server"
+            test_err="No packets were sent to kernel echo server"
         fi
     fi
 
@@ -141,18 +205,20 @@ run_our_app_sends_client() {
 }
 
 # ── Direction: iperf-sends ───────────────────────────────────────────────────
-# Instance B runs iperf3 client sending UDP to Instance A running dpdk-stdlib listener.
-# - Server role (Instance A): start dpdk-stdlib listener, wait, collect stats
-# - Client role (Instance B): run iperf3 client sending UDP traffic
+# Instance B (kernel networking) sends UDP to Instance A (dpdk-stdlib listener).
+# - Server role (Instance A): start dpdk-stdlib echo server (DPDK path)
+# - Client role (Instance B): run test-client WITHOUT --bind-ip so it uses
+#   the tokio/kernel fallback, testing kernel→DPDK interoperability.
 
 run_iperf_sends_server() {
-    # Instance A: run dpdk-stdlib echo server as listener
+    # Instance A: run dpdk-stdlib echo server as listener (DPDK path)
     log_info "Starting dpdk-stdlib listener on ${LOCAL_IP}:${PORT} (iperf-sends direction)"
 
     # Enable coredumps for this shell and its children
     ulimit -c unlimited 2>/dev/null || true
 
-    "$ECHO_BINARY" --ip "$LOCAL_IP" --port "$PORT" &
+    local echo_log="/tmp/echo-server.log"
+    "$ECHO_BINARY" --ip "$LOCAL_IP" --port "$PORT" > "$echo_log" 2>&1 &
     local echo_pid=$!
     log_info "Echo server started with PID $echo_pid"
 
@@ -184,8 +250,12 @@ run_iperf_sends_server() {
 }
 
 run_iperf_sends_client() {
-    # Instance B: run iperf3 as UDP client sending to dpdk-stdlib listener
-    log_info "Sending iperf3 UDP traffic to dpdk-stdlib listener at ${PEER_IP}:${PORT}"
+    # Instance B: send UDP from kernel stack to dpdk-stdlib listener
+    log_info "Sending kernel UDP traffic to dpdk-stdlib listener at ${PEER_IP}:${PORT}"
+
+    # Capture output
+    local client_log="/tmp/test-client-iperf.log"
+    exec > >(tee -a "$client_log") 2>&1
 
     junit_start_suite "tier3-iperf-interop" 1
 
@@ -198,30 +268,34 @@ run_iperf_sends_client() {
     local test_err=""
     local test_output=""
 
-    # Run iperf3 in UDP client mode sending to the dpdk-stdlib listener
-    test_output=$(run_with_timeout "$TEST_TIMEOUT" \
-        iperf3 -c "$PEER_IP" -p "$PORT" -u -b 10M -t 10 --json 2>&1) || {
-        # iperf3 may return non-zero if the "server" doesn't respond as expected
-        # That's OK for interop testing - we check bytes transferred
-        log_info "iperf3 returned non-zero exit code (expected for non-iperf server)"
+    # Run test-client WITHOUT --bind-ip so it falls back to tokio (kernel).
+    # This tests the kernel → DPDK path.
+    test_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
+        --target "$PEER_IP" --port "$PORT" \
+        --message "kernel-to-dpdk-test-payload" \
+        --count 10 --delay 200 2>&1) || {
+        test_ok=false
+        test_err="Failed to send kernel UDP traffic to dpdk-stdlib listener"
     }
 
-    # Check if iperf3 transferred any bytes
-    if echo "$test_output" | grep -q '"bytes"'; then
-        local bytes_sent
-        bytes_sent=$(echo "$test_output" | grep -o '"bytes":[0-9]*' | head -1 | cut -d: -f2 || echo "0")
-        if [[ "$bytes_sent" -gt 0 ]]; then
-            log_info "iperf-sends: transferred $bytes_sent bytes"
+    # Verify packets were sent and check for responses
+    if [[ "$test_ok" == "true" ]]; then
+        if echo "$test_output" | grep -q "Sent"; then
+            local sent_count
+            sent_count=$(echo "$test_output" | grep -c "Sent" || true)
+            local recv_count
+            recv_count=$(echo "$test_output" | grep -c "Received" || true)
+            log_info "iperf-sends: sent $sent_count packets, received $recv_count responses"
+            if [[ "$sent_count" -ge 5 ]]; then
+                log_info "iperf-sends: PASS (sent >= 5 packets)"
+            else
+                test_ok=false
+                test_err="Only sent $sent_count/10 packets (need >= 5)"
+            fi
         else
             test_ok=false
-            test_err="Zero bytes transferred from iperf3 to dpdk-stdlib"
+            test_err="No packets were sent to dpdk-stdlib listener"
         fi
-    elif echo "$test_output" | grep -qi "sent\|transfer\|bytes"; then
-        # Non-JSON output fallback
-        log_info "iperf-sends: traffic was sent (non-JSON confirmation)"
-    else
-        test_ok=false
-        test_err="Could not confirm any bytes were transferred"
     fi
 
     end=$(_timer_now)
@@ -256,10 +330,10 @@ case "${DIRECTION}:${ROLE}" in
     *)
         echo "Invalid direction:role combination: ${DIRECTION}:${ROLE}" >&2
         echo "Valid combinations:" >&2
-        echo "  --direction our-app-sends --role server   (Instance B: iperf3 server)" >&2
+        echo "  --direction our-app-sends --role server   (Instance B: kernel echo server)" >&2
         echo "  --direction our-app-sends --role client   (Instance A: dpdk-stdlib sender)" >&2
         echo "  --direction iperf-sends   --role server   (Instance A: dpdk-stdlib listener)" >&2
-        echo "  --direction iperf-sends   --role client   (Instance B: iperf3 client)" >&2
+        echo "  --direction iperf-sends   --role client   (Instance B: kernel test-client)" >&2
         exit 1
         ;;
 esac

@@ -178,14 +178,152 @@ jobs:
           # Output to step log
           cat "$REPORT"
 
-          # Post as PR comment so diagnostics are readable via gh api
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # Post as PR comment — use resolved PR number (works for both PR and workflow_dispatch)
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
           if [ -n "$PR_NUMBER" ]; then
             gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
               || echo "::warning::Could not post PR comment (missing permission)"
           else
-            echo "::warning::No PR number available (workflow_dispatch?), skipping PR comment"
+            echo "::warning::No PR number available, skipping PR comment"
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post instance logs to PR
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping log posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/instance-logs-report.md"
+          OUTCOME="${{ steps.tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ Integration Tests Passed (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ Integration Tests Failed (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+            if grep -q '<skipped' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<skipped[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  SKIP: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+
+          # Application logs (most useful for debugging test failures)
+          echo "<details><summary>Application Logs</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log instance-logs/*-test-client-iperf.log instance-logs/*-iperf3-server.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue  # skip near-empty files
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -40 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # SSM failure logs (critical for diagnosing ENI bind/unbind issues)
+          for log in instance-logs/*-ssm-failure.log; do
+            [ -f "$log" ] || continue
+            echo "<details><summary>⚠️ SSM Command Failures ($(basename "$log"))</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # Network and PCI state
+          echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-network-interfaces.log instance-logs/*-networking-diag-*.txt; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Crash diagnostics
+          HAS_CRASHES=false
+          for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+            [ -f "$log" ] || continue
+            if ! grep -qE '^(no crash|no coredump)' "$log" 2>/dev/null; then
+              HAS_CRASHES=true
+              break
+            fi
+          done
+          if [ "$HAS_CRASHES" = "true" ]; then
+            echo "<details><summary>⚠️ Crash Diagnostics</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+              [ -f "$log" ] || continue
+              grep -qE '^(no crash|no coredump)' "$log" 2>/dev/null && continue
+              echo "#### $(basename "$log")" >> "$REPORT"
+              echo '```' >> "$REPORT"
+              cat "$log" >> "$REPORT"
+              echo '```' >> "$REPORT"
+            done
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Console output (kernel dmesg - useful for vfio/ena driver transitions)
+          echo "<details><summary>Kernel Console (dmesg)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log") (PCI/driver events only)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            grep -E '(vfio|ena |pci )' "$log" 2>/dev/null | tail -30 >> "$REPORT" || echo "(no PCI events)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Truncate if too long for GH comment (max 65536 chars)
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-report.md
+            echo "" >> /tmp/truncated-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-report.md
+            mv /tmp/truncated-report.md "$REPORT"
+          fi
+
+          # Post to PR
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post instance logs PR comment"
         env:
           GH_TOKEN: ${{ github.token }}
 

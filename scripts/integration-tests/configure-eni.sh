@@ -15,7 +15,10 @@
 #   0 - Success (or already in desired state)
 #   1 - Failure
 
-set -euo pipefail
+# Note: we intentionally do NOT use set -euo pipefail here.
+# Many operations (sysfs writes, pkill, modprobe) can fail benignly,
+# and set -e would cause the script to exit before the actual operation
+# (bind/unbind) is checked.  Errors are handled explicitly.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -23,6 +26,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 ACTION=""
+ASSIGN_IP=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,16 +34,20 @@ while [[ $# -gt 0 ]]; do
             ACTION="$2"
             shift 2
             ;;
+        --ip)
+            ASSIGN_IP="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --action <bind|unbind|status>" >&2
+            echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
             exit 1
             ;;
     esac
 done
 
 if [[ -z "$ACTION" ]]; then
-    echo "Usage: $0 --action <bind|unbind|status>" >&2
+    echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
     exit 1
 fi
 
@@ -68,6 +76,25 @@ is_bound_to_ena() {
         return 0
     fi
     return 1
+}
+
+# Kill any DPDK processes that may be holding the vfio-pci device open.
+# A running DPDK process keeps an fd on /dev/vfio/*, which prevents the
+# kernel from unbinding or rebinding the device.
+kill_dpdk_processes() {
+    local killed=false
+    for name in echo test-client tokio-echo; do
+        if pkill -f "target/release/$name" 2>/dev/null; then
+            echo "Killed lingering $name process"
+            killed=true
+        fi
+    done
+    if [[ "$killed" == "true" ]]; then
+        # Give processes time to release vfio-pci file descriptors
+        sleep 2
+    fi
+    # Clean DPDK runtime state so the next process can re-init EAL
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
 }
 
 # ── Actions ──────────────────────────────────────────────────────────────────
@@ -103,6 +130,8 @@ do_bind() {
     pci_addr=$(get_secondary_pci_addr)
     if [[ -z "$pci_addr" ]]; then
         echo "ERROR: No secondary ENA device found" >&2
+        echo "  lspci -D output:"
+        lspci -D 2>&1 || true
         return 1
     fi
 
@@ -113,6 +142,14 @@ do_bind() {
     fi
 
     echo "Binding $pci_addr to vfio-pci..."
+    echo "  Current driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+    echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
+
+    # Kill any DPDK processes that might hold the vfio-pci device open
+    kill_dpdk_processes
+
+    # Clean stale DPDK runtime state that prevents re-initialization
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
 
     # Load required kernel modules
     modprobe uio 2>/dev/null || true
@@ -124,22 +161,58 @@ do_bind() {
     if [[ -f /sys/module/vfio/parameters/enable_unsafe_noiommu_mode ]]; then
         echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
         echo "Enabled vfio noiommu mode"
+    else
+        echo "WARNING: noiommu mode sysfs file not found"
     fi
 
-    # Unbind from current driver
-    echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+    # Unbind from current driver (may already be unbound — that's fine)
+    if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
+        local current_driver
+        current_driver=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver)" 2>/dev/null || echo "unknown")
+        echo "Unbinding from current driver: $current_driver"
+        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || {
+            echo "WARNING: unbind from $current_driver failed (exit $?)"
+        }
+        sleep 1
+    else
+        echo "Device has no current driver binding"
+    fi
 
     # Use driver_override to tell the kernel which driver to use for this device.
     # This is more reliable than new_id because it doesn't depend on matching
     # vendor/device IDs (ENA uses 1d0f:ec20 on c5n instances).
-    echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override"
+    if ! echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>&1; then
+        echo "ERROR: Failed to set driver_override to vfio-pci" >&2
+        echo "  Attempting recovery: clear override and retry..."
+        echo "" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>/dev/null || true
+        sleep 1
+        echo "vfio-pci" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>&1 || {
+            echo "ERROR: driver_override still fails" >&2
+            ls -la "/sys/bus/pci/devices/$pci_addr/" 2>&1 || true
+            return 1
+        }
+    fi
+    echo "  driver_override set to: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null)"
 
-    # Bind to vfio-pci
-    echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind
+    # Bind to vfio-pci (retry up to 3 times if device is transiently busy)
+    local bind_attempts=0
+    local max_bind_attempts=3
+    while [[ $bind_attempts -lt $max_bind_attempts ]]; do
+        if echo "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/vfio-bind-err.log; then
+            echo "Bind write succeeded on attempt $((bind_attempts + 1))"
+            break
+        fi
+        bind_attempts=$((bind_attempts + 1))
+        echo "Bind attempt $bind_attempts/$max_bind_attempts failed:"
+        echo "  Error: $(cat /tmp/vfio-bind-err.log 2>/dev/null || echo 'unknown')"
+        echo "  Device state: driver=$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+        echo "  vfio modules: $(lsmod | grep vfio 2>/dev/null | tr '\n' '; ')"
+        sleep 2
+    done
 
     # Poll until ENI is fully bound to vfio-pci
     local retries=0
-    local max_retries=10
+    local max_retries=20
     while [[ $retries -lt $max_retries ]]; do
         if is_bound_to_vfio "$pci_addr"; then
             echo "Successfully bound $pci_addr to vfio-pci (after ${retries}s)"
@@ -151,6 +224,12 @@ do_bind() {
     done
 
     echo "ERROR: Failed to bind $pci_addr to vfio-pci after ${max_retries}s" >&2
+    echo "  Final driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
+    echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
+    echo "  vfio module loaded: $(lsmod | grep vfio 2>/dev/null || echo 'no vfio modules')"
+    echo "  noiommu mode: $(cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A')"
+    echo "  dmesg last 10 lines:"
+    dmesg | tail -10 2>/dev/null || true
     return 1
 }
 
@@ -170,23 +249,42 @@ do_unbind() {
 
     echo "Unbinding $pci_addr from vfio-pci and returning to ena driver..."
 
-    # Unbind from vfio-pci
-    echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+    # Kill any DPDK processes that hold the vfio-pci device open.
+    # A running DPDK app keeps /dev/vfio/* open, preventing driver unbind.
+    kill_dpdk_processes
+
+    # Unbind from current driver (vfio-pci or whatever is loaded)
+    if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
+        echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
+        sleep 1
+    fi
 
     # Clear driver_override so the kernel uses the default (ena) driver
     echo "" > "/sys/bus/pci/devices/$pci_addr/driver_override" 2>/dev/null || true
 
-    # Bind to kernel ena driver
+    # Trigger kernel re-scan so ena driver picks up the device
     echo "$pci_addr" > /sys/bus/pci/drivers/ena/bind 2>/dev/null || true
 
     # Poll until ENI is fully transitioned to ena driver.
     # The kernel driver re-probe is asynchronous; without polling,
     # the next tier may attempt to bind before the transition completes.
     local retries=0
-    local max_retries=10
+    local max_retries=15
     while [[ $retries -lt $max_retries ]]; do
         if is_bound_to_ena "$pci_addr"; then
             echo "Successfully bound $pci_addr back to ena driver (after ${retries}s)"
+
+            # Bring up the interface but do NOT configure IP here.
+            # IP configuration is handled by the orchestrator (run-integration-tests.sh)
+            # which knows the expected IP and assigns it via a separate SSM command.
+            # Doing IP config here (NM/DHCP/IMDS) takes 10-30s and risks exceeding
+            # the SSM command timeout, causing spurious "bind failed" errors.
+            local iface
+            iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
+            if [[ -n "$iface" ]]; then
+                echo "Bringing up interface $iface..."
+                ip link set "$iface" up 2>/dev/null || true
+            fi
             return 0
         fi
         retries=$((retries + 1))
@@ -196,6 +294,76 @@ do_unbind() {
 
     echo "ERROR: Failed to bind $pci_addr to ena driver after ${max_retries}s" >&2
     return 1
+}
+
+# Assign a static IP to the secondary ENI.  Requires --ip <address>.
+# Disables NetworkManager on the interface to prevent it from removing the IP.
+do_assign_ip() {
+    if [[ -z "$ASSIGN_IP" ]]; then
+        echo "ERROR: --ip <address> is required for assign-ip action" >&2
+        return 1
+    fi
+
+    local pci_addr
+    pci_addr=$(get_secondary_pci_addr)
+    if [[ -z "$pci_addr" ]]; then
+        echo "ERROR: No secondary ENA device found" >&2
+        lspci -D 2>/dev/null || true
+        return 1
+    fi
+    echo "PCI address: $pci_addr"
+
+    # Wait for kernel to create the net interface (async after ena bind)
+    local retries=0
+    local iface=""
+    while [[ $retries -lt 10 ]]; do
+        iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
+        if [[ -n "$iface" ]]; then
+            break
+        fi
+        retries=$((retries + 1))
+        echo "Waiting for net interface to appear... ($retries/10)"
+        sleep 1
+    done
+
+    if [[ -z "$iface" ]]; then
+        echo "ERROR: No network interface found for $pci_addr after 10s" >&2
+        ls -la "/sys/bus/pci/devices/$pci_addr/" 2>/dev/null || true
+        return 1
+    fi
+    echo "Interface: $iface"
+
+    # Tell NetworkManager to ignore this interface so it doesn't remove our IP
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device set "$iface" managed no 2>/dev/null || true
+        echo "Set $iface as unmanaged by NetworkManager"
+    fi
+
+    # Bring up the interface
+    ip link set "$iface" up 2>/dev/null || true
+
+    # Assign IP (use 'replace' for idempotency — works whether IP exists or not)
+    echo "Assigning ${ASSIGN_IP}/24 to $iface"
+    ip addr replace "${ASSIGN_IP}/24" dev "$iface" || {
+        echo "ERROR: ip addr replace failed" >&2
+        return 1
+    }
+
+    # Add route via subnet gateway
+    local gw
+    gw=$(echo "$ASSIGN_IP" | sed 's/\.[0-9]*$/.1/')
+    ip route replace default via "$gw" dev "$iface" metric 200 2>/dev/null || true
+
+    # Verify the IP is actually configured
+    if ip -4 addr show "$iface" 2>/dev/null | grep -q "$ASSIGN_IP"; then
+        echo "SUCCESS: $iface has IP $ASSIGN_IP"
+        ip -4 addr show "$iface"
+        return 0
+    else
+        echo "ERROR: IP $ASSIGN_IP not found on $iface after assignment" >&2
+        ip addr show "$iface" 2>/dev/null || true
+        return 1
+    fi
 }
 
 # ── Main dispatch ────────────────────────────────────────────────────────────
@@ -210,9 +378,12 @@ case "$ACTION" in
     status)
         do_status
         ;;
+    assign-ip)
+        do_assign_ip
+        ;;
     *)
         echo "Unknown action: $ACTION" >&2
-        echo "Usage: $0 --action <bind|unbind|status>" >&2
+        echo "Usage: $0 --action <bind|unbind|status|assign-ip> [--ip <address>]" >&2
         exit 1
         ;;
 esac
