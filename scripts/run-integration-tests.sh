@@ -166,15 +166,13 @@ CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'targe
 # have resolved the gateway and peer IPs before the DPDK binaries start.
 # Uses async SSM commands to warm both instances in parallel.
 warm_arp_cache() {
-    log_info "Warming kernel ARP cache on both instances (parallel)..."
+    log_info "Warming kernel ARP cache on both instances..."
     local subnet_prefix
     subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
     local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
-    local sender_cmd_id receiver_cmd_id
-    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd")
-    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd")
-    ssm_wait_command "$SENDER_INSTANCE_ID" "$sender_cmd_id" 30 || true
-    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$receiver_cmd_id" 30 || true
+    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    sleep 2
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
 }
 
 # ── Networking diagnostics ───────────────────────────────────────────────────
@@ -527,19 +525,41 @@ ssm_run_command() {
 
 # Run a command on an instance via SSM in the background (non-blocking).
 # Usage: ssm_run_command_async <instance_id> <timeout_seconds> <command_string>
-# Prints the command ID to stdout.
+# Prints the command ID to stdout. Retries on failure with backoff.
 ssm_run_command_async() {
     local instance_id="$1"
     local timeout_secs="$2"
     local command_str="$3"
 
-    aws ssm send-command \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command_str\"]" \
-        --timeout-seconds "$timeout_secs" \
-        --query "Command.CommandId" \
-        --output text 2>/dev/null
+    local cmd_id=""
+    local attempt=0
+    local max_attempts=3
+    local backoff=2
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        cmd_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"$command_str\"]" \
+            --timeout-seconds "$timeout_secs" \
+            --query "Command.CommandId" \
+            --output text 2>/dev/null || true)
+
+        if [[ -n "$cmd_id" && "$cmd_id" != "None" ]]; then
+            echo "$cmd_id"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            log_info "SSM send-command failed on $instance_id (attempt $attempt/$max_attempts), retrying in ${backoff}s..."
+            sleep "$backoff"
+            backoff=$((backoff * 2))
+        fi
+    done
+
+    log_error "SSM send-command failed on $instance_id after $max_attempts attempts"
+    echo ""
 }
 
 # Wait for an async SSM command to complete.
@@ -596,21 +616,25 @@ ssm_save_failure_log() {
         echo "=== $reason ==="
         echo "Status: $status"
         echo "Instance: $instance_id ($role_prefix)"
-        echo "Command ID: $cmd_id"
+        echo "Command ID: ${cmd_id:-(empty)}"
         echo ""
-        echo "=== STDOUT ==="
-        aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || echo "(unavailable)"
-        echo ""
-        echo "=== STDERR ==="
-        aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardErrorContent" \
-            --output text 2>/dev/null || echo "(unavailable)"
+        if [[ -n "$cmd_id" ]]; then
+            echo "=== STDOUT ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardOutputContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+            echo ""
+            echo "=== STDERR ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardErrorContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+        else
+            echo "(no command ID — SSM send-command failed)"
+        fi
         echo ""
     } >> "$ssm_fail_log"
     cat "$ssm_fail_log" >&2 || true
@@ -722,20 +746,15 @@ run_tier1() {
 run_tier2() {
     log_section "Tier 2: Kernel -> DPDK interoperability test"
 
-    # Bind receiver ENI (DPDK) and unbind sender ENI (kernel) in parallel
-    log_info "Configuring ENIs for Tier 2 (parallel)..."
-    local bind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action bind"
-    local unbind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
-    local bind_cmd_id unbind_cmd_id
-    bind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
-    unbind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
-
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$bind_cmd_id" 120; then
+    # Bind receiver ENI (DPDK), unbind sender ENI (kernel) — sequential to avoid SSM throttling
+    log_info "Configuring ENIs for Tier 2..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
         log_error "Failed to bind ENI on receiver"
         generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
         return 1
     fi
-    ssm_wait_command "$SENDER_INSTANCE_ID" "$unbind_cmd_id" 120 || true
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -774,20 +793,15 @@ run_tier2() {
 run_tier3() {
     log_section "Tier 3: DPDK <-> iperf3 interoperability test"
 
-    # Bind sender ENI (DPDK) and unbind receiver ENI (kernel) in parallel
-    log_info "Configuring ENIs for Tier 3 (parallel)..."
-    local bind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action bind"
-    local unbind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
-    local bind_cmd_id unbind_cmd_id
-    bind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
-    unbind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
-
-    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$bind_cmd_id" 120; then
+    # Bind sender ENI (DPDK), unbind receiver ENI (kernel) — sequential to avoid SSM throttling
+    log_info "Configuring ENIs for Tier 3..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
         log_error "Failed to bind ENI on sender for Tier 3"
         generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance"
         return 1
     fi
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$unbind_cmd_id" 120; then
+    sleep 3
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
         log_error "Failed to unbind/configure receiver ENI for Tier 3"
         generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
         generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
@@ -841,32 +855,25 @@ run_tier3() {
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
-    log_info "Unbinding all ENIs (consolidated, parallel)..."
+    log_info "Unbinding all ENIs (consolidated, sequential)..."
 
-    # Consolidate cleanup + unbind + IP assignment into ONE command per instance,
-    # and run both instances in parallel. This reduces 8 sequential SSM commands
-    # to 2 parallel ones, preventing SSM agent saturation.
+    # Consolidate cleanup + unbind + IP assignment into ONE command per instance.
+    # Run sequentially with a pause between to avoid SSM API throttling.
     local sender_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
     local receiver_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
 
-    local sender_cmd_id receiver_cmd_id
-    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 60 "$sender_cmd")
-    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 60 "$receiver_cmd")
-
-    # Wait for both
-    local sender_ok=true receiver_ok=true
-    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$sender_cmd_id" 90; then
+    ssm_run_command "$SENDER_INSTANCE_ID" 90 "$sender_cmd" || \
         log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID)"
-        sender_ok=false
-    fi
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$receiver_cmd_id" 90; then
-        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID)"
-        receiver_ok=false
-    fi
 
-    # Give SSM agent a cooldown period before next tier's commands
-    log_info "SSM cooldown (10s)..."
-    sleep 10
+    # Pause between instances to avoid SSM API throttling
+    sleep 3
+
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 90 "$receiver_cmd" || \
+        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID)"
+
+    # Give SSM agent a longer cooldown period before next tier's commands
+    log_info "SSM cooldown (15s)..."
+    sleep 15
 }
 
 # ── Result collection ────────────────────────────────────────────────────────
