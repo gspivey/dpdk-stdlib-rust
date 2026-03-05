@@ -552,13 +552,14 @@ ssm_run_command_async() {
 
         attempt=$((attempt + 1))
         if [[ $attempt -lt $max_attempts ]]; then
-            log_info "SSM send-command failed on $instance_id (attempt $attempt/$max_attempts), retrying in ${backoff}s..."
+            # IMPORTANT: log to stderr, not stdout — stdout is used for the command ID
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] INFO: SSM send-command failed on $instance_id (attempt $attempt/$max_attempts), retrying in ${backoff}s..." >&2
             sleep "$backoff"
             backoff=$((backoff * 2))
         fi
     done
 
-    log_error "SSM send-command failed on $instance_id after $max_attempts attempts"
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: SSM send-command failed on $instance_id after $max_attempts attempts" >&2
     echo ""
 }
 
@@ -917,41 +918,55 @@ collect_results() {
 
     mkdir -p "$RESULTS_DIR"
 
-    # Collect all XML files from both instances in parallel using ONE SSM
-    # command per instance (batch cat with delimiters instead of per-file SSM)
-    local collect_script="cd $RESULTS_REMOTE_DIR 2>/dev/null || { echo 'NO_FILES'; exit 0; }; ls -1 *.xml 2>/dev/null | while read -r f; do echo \"===FILE:\$f===\"; cat \"\$f\"; done; [ -z \"\$(ls -1 *.xml 2>/dev/null)\" ] && echo 'NO_FILES'"
-
-    local sender_cmd_id receiver_cmd_id
-    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 "$collect_script")
-    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 "$collect_script")
-
-    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
+    for entry in "sender:${SENDER_INSTANCE_ID}" "receiver:${RECEIVER_INSTANCE_ID}"; do
         local label="${entry%%:*}"
-        local rest="${entry#*:}"
-        local instance_id="${rest%%:*}"
-        local cmd_id="${rest##*:}"
+        local instance_id="${entry##*:}"
 
-        [[ -z "$cmd_id" ]] && continue
+        log_info "Collecting results from $label ($instance_id)..."
 
-        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
-            log_error "Failed to collect results from $label"
+        local list_cmd_id
+        list_cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+            "ls -1 $RESULTS_REMOTE_DIR/*.xml 2>/dev/null || echo NO_FILES")
+        [[ -z "$list_cmd_id" ]] && continue
+
+        if ! ssm_wait_command "$instance_id" "$list_cmd_id" 60; then
+            log_error "Failed to list results on $label"
             continue
         fi
 
-        local output
-        output=$(ssm_get_stdout "$instance_id" "$cmd_id")
+        local file_list
+        file_list=$(ssm_get_stdout "$instance_id" "$list_cmd_id")
 
-        if [[ "$output" == "NO_FILES" || -z "$output" ]]; then
+        if [[ "$file_list" == "NO_FILES" || -z "$file_list" ]]; then
             log_info "No result files on $label"
             continue
         fi
 
-        # Parse the batched output: split on ===FILE:name=== delimiters
+        # Cat all XML files in a single command with delimiters
+        sleep 2
+        local cat_script="cd $RESULTS_REMOTE_DIR && for f in *.xml; do echo ===FILE:\$f===; cat \$f; done"
+        local cat_cmd_id
+        cat_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$cat_script")
+        [[ -z "$cat_cmd_id" ]] && continue
+
+        if ! ssm_wait_command "$instance_id" "$cat_cmd_id" 60; then
+            log_error "Failed to cat results from $label"
+            continue
+        fi
+
+        local output
+        output=$(ssm_get_stdout "$instance_id" "$cat_cmd_id")
+
+        if [[ -z "$output" ]]; then
+            log_error "Empty results from $label"
+            continue
+        fi
+
+        # Parse: split on ===FILE:name=== delimiters
         local current_file=""
         local current_content=""
         while IFS= read -r line; do
             if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
-                # Save previous file if any
                 if [[ -n "$current_file" && -n "$current_content" ]]; then
                     echo "$current_content" > "$RESULTS_DIR/$current_file"
                     log_info "Saved $current_file from $label"
@@ -966,11 +981,12 @@ collect_results() {
                 fi
             fi
         done <<< "$output"
-        # Save last file
         if [[ -n "$current_file" && -n "$current_content" ]]; then
             echo "$current_content" > "$RESULTS_DIR/$current_file"
             log_info "Saved $current_file from $label"
         fi
+
+        sleep 2
     done
 }
 
@@ -1229,34 +1245,7 @@ collect_instance_logs() {
         log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
     done
 
-    # Batch SSM log collection: ONE command per instance collects ALL logs
-    # This prevents SSM agent saturation (was 13 commands per instance, now 1)
-    local log_collect_script='
-OUTDIR=/tmp/collected-logs
-mkdir -p "$OUTDIR"
-
-# Log files
-for f in /var/log/user-data.log /var/log/cloud-init-output.log /var/log/cfn-init.log /var/log/cfn-init-cmd.log /tmp/echo-server.log /tmp/test-client.log /tmp/test-client-iperf.log /tmp/iperf3-server.log; do
-    bn=$(basename "$f")
-    if [ -f "$f" ]; then cp "$f" "$OUTDIR/$bn"; else echo "FILE_NOT_FOUND" > "$OUTDIR/$bn"; fi
-done
-
-# Dynamic commands
-ls -la /opt/dpdk-stdlib/target/release/ > "$OUTDIR/build-listing.log" 2>&1 || echo "no build output directory" > "$OUTDIR/build-listing.log"
-ip addr show > "$OUTDIR/network-interfaces.log" 2>&1 || echo "network info unavailable" > "$OUTDIR/network-interfaces.log"
-journalctl --no-pager -n 500 > "$OUTDIR/journal.log" 2>&1 || tail -500 /var/log/messages > "$OUTDIR/journal.log" 2>&1 || echo "journal unavailable" > "$OUTDIR/journal.log"
-dmesg | grep -iE "segfault|trap|fault|oom|killed|echo|test-client" | tail -50 > "$OUTDIR/dmesg-crashes.log" 2>&1 || echo "no crash-related dmesg entries" > "$OUTDIR/dmesg-crashes.log"
-ls -lh /tmp/coredumps/ > "$OUTDIR/coredump-listing.log" 2>&1 || echo "no coredump directory" > "$OUTDIR/coredump-listing.log"
-cat /tmp/crash-report-*.txt > "$OUTDIR/crash-reports.log" 2>&1 || echo "no crash reports" > "$OUTDIR/crash-reports.log"
-
-# Output a tar of all collected logs (base64 encoded for SSM transport)
-cd "$OUTDIR" && tar czf - . 2>/dev/null | base64
-'
-
-    local -a cmd_ids=()
-    local -a cmd_labels=()
-    local -a cmd_instances=()
-
+    # Collect key logs via SSM — use individual commands with delays to avoid throttling
     for entry in "${instances[@]}"; do
         local label="${entry%%:*}"
         local instance_id="${entry##*:}"
@@ -1268,49 +1257,74 @@ cd "$OUTDIR" && tar czf - . 2>/dev/null | base64
             --output text 2>/dev/null || echo "")
 
         if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
-            log_info "  Sending batch log collection to ${label}..."
-            local cmd_id
-            cmd_id=$(ssm_run_command_async "$instance_id" 60 "$log_collect_script") 2>/dev/null || true
-            if [[ -n "$cmd_id" ]]; then
-                cmd_ids+=("$cmd_id")
-                cmd_labels+=("$label")
-                cmd_instances+=("$instance_id")
+            log_info "  SSM available - collecting log files from ${label}..."
+
+            # Batch 1: user-data log (most important) + app logs
+            local batch1_cmd="echo '===FILE:user-data.log==='; tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-server.log==='; cat /tmp/echo-server.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client.log==='; cat /tmp/test-client.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client-iperf.log==='; cat /tmp/test-client-iperf.log 2>/dev/null || echo '(not found)'"
+            local batch1_id
+            batch1_id=$(ssm_run_command_async "$instance_id" 30 "$batch1_cmd")
+            if [[ -n "$batch1_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch1_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch1_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        # Parse ===FILE:name=== delimited output
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
             fi
+
+            sleep 3
+
+            # Batch 2: network state + crash diagnostics
+            local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'"
+            local batch2_id
+            batch2_id=$(ssm_run_command_async "$instance_id" 30 "$batch2_cmd")
+            if [[ -n "$batch2_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch2_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch2_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
+            fi
+
+            sleep 3
         else
             log_info "  SSM not available for ${label} - relying on console output only"
-        fi
-    done
-
-    # Wait for all batch commands and extract logs
-    for i in "${!cmd_ids[@]}"; do
-        local label="${cmd_labels[$i]}"
-        local instance_id="${cmd_instances[$i]}"
-        local cmd_id="${cmd_ids[$i]}"
-
-        log_info "  Waiting for ${label} log collection..."
-        if ssm_wait_command "$instance_id" "$cmd_id" 90 2>/dev/null; then
-            local b64_content
-            b64_content=$(ssm_get_stdout "$instance_id" "$cmd_id" 2>/dev/null || true)
-            if [[ -n "$b64_content" ]]; then
-                # Decode and extract the tar archive
-                local tmpdir
-                tmpdir=$(mktemp -d)
-                echo "$b64_content" | base64 -d 2>/dev/null | tar xzf - -C "$tmpdir" 2>/dev/null || true
-                for logfile in "$tmpdir"/*; do
-                    [[ -f "$logfile" ]] || continue
-                    local bn
-                    bn=$(basename "$logfile")
-                    local content
-                    content=$(cat "$logfile")
-                    if [[ "$content" != "FILE_NOT_FOUND" && -n "$content" ]]; then
-                        cp "$logfile" "$LOGS_DIR/${label}-${bn}"
-                        log_info "  Saved: ${label}-${bn}"
-                    fi
-                done
-                rm -rf "$tmpdir"
-            fi
-        else
-            log_info "  Failed to collect logs from ${label} via SSM"
         fi
     done
 
