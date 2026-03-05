@@ -553,7 +553,41 @@ ssm_run_command() {
         esac
     done
 
-    log_error "SSM command timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s)"
+    log_error "SSM command polling timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s, last status: $status)"
+    # Save diagnostic output for polling timeout too
+    local ssm_log_dir="${REPO_ROOT}/instance-logs"
+    mkdir -p "$ssm_log_dir"
+    local role_prefix="unknown"
+    if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
+        role_prefix="sender"
+    elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
+        role_prefix="receiver"
+    fi
+    local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
+    {
+        echo "=== SSM Polling Timeout ==="
+        echo "Poll limit: ${poll_limit}s (SSM timeout: ${timeout_secs}s)"
+        echo "Last status: $status"
+        echo "Instance: $instance_id ($role_prefix)"
+        echo "Command ID: $cmd_id"
+        echo "Command: $command_str"
+        echo ""
+        echo "=== STDOUT ==="
+        aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null || echo "(unavailable)"
+        echo ""
+        echo "=== STDERR ==="
+        aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "StandardErrorContent" \
+            --output text 2>/dev/null || echo "(unavailable)"
+    } >> "$ssm_fail_log"
+    log_error "SSM failure output saved to $ssm_fail_log"
+    cat "$ssm_fail_log" >&2 || true
     return 1
 }
 
