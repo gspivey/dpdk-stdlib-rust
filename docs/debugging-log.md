@@ -60,6 +60,32 @@ CloudFormation waited full 20-35 minute timeout before detecting user-data failu
 
 ---
 
+## 2026-03-05: Tier 3 our-app-sends — only 1 packet sent, then deadlock
+
+### Context
+- Tier 3 our-app-sends: DPDK test-client sends to Python kernel echo server
+- Test output: "Sent 30 bytes: 'dpdk-to-kernel-test-payload #1'" then "Timeout waiting for response"
+- Only 1 of 10 packets sent, process killed by 60s `run_with_timeout`
+- Tiers 1, 2, and 3-iperf-sends all passing
+
+### Root Cause 1: Port 0 literal
+- DPDK `bind("ip:0")` used port 0 literally in UDP headers (no ephemeral port allocation)
+- Python echo server received from port 0, tried `sendto(data, (ip, 0))` — port 0 is invalid
+- **Fix**: Added `allocate_ephemeral_port()` using Linux range 32768-60999 with `AtomicU16` counter
+
+### Root Cause 2: Async recv_from deadlock
+- `tokio::time::timeout(5s, socket.recv_from())` fires, dropping the future
+- But `spawn_blocking` thread keeps running holding the socket's `Mutex` lock forever
+- Next `send_to` call deadlocks waiting for the lock — explains why only 1 packet sent
+- **Fix**: Set 1-second `set_read_timeout` in spawn_blocking, loop in async wrapper with `yield_now`
+  between iterations so the lock is always released within 1 second
+
+### Conclusion
+Both fixes needed: ephemeral port ensures responses reach the correct port, and the
+deadlock fix ensures the send/recv cycle can repeat. See `docs/ephemeral-ports.md`.
+
+---
+
 ## 2026-02-27: test-client using kernel networking instead of DPDK
 
 ### Context
