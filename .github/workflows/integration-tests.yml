@@ -252,6 +252,18 @@ jobs:
           echo "</details>" >> "$REPORT"
           echo "" >> "$REPORT"
 
+          # SSM failure logs (critical for diagnosing ENI bind/unbind issues)
+          for log in instance-logs/*-ssm-failure.log; do
+            [ -f "$log" ] || continue
+            echo "<details><summary>⚠️ SSM Command Failures ($(basename "$log"))</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
           # Network and PCI state
           echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
           echo "" >> "$REPORT"
