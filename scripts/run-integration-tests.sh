@@ -934,69 +934,61 @@ collect_results() {
 
     mkdir -p "$RESULTS_DIR"
 
-    # Collect XML files from sender instance
-    collect_xml_from_instance "$SENDER_INSTANCE_ID" "sender"
+    # Collect all XML files from both instances in parallel using ONE SSM
+    # command per instance (batch cat with delimiters instead of per-file SSM)
+    local collect_script="cd $RESULTS_REMOTE_DIR 2>/dev/null || { echo 'NO_FILES'; exit 0; }; ls -1 *.xml 2>/dev/null | while read -r f; do echo \"===FILE:\$f===\"; cat \"\$f\"; done; [ -z \"\$(ls -1 *.xml 2>/dev/null)\" ] && echo 'NO_FILES'"
 
-    # Collect XML files from receiver instance
-    collect_xml_from_instance "$RECEIVER_INSTANCE_ID" "receiver"
-}
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 "$collect_script")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 "$collect_script")
 
-collect_xml_from_instance() {
-    local instance_id="$1"
-    local label="$2"
+    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
+        local label="${entry%%:*}"
+        local rest="${entry#*:}"
+        local instance_id="${rest%%:*}"
+        local cmd_id="${rest##*:}"
 
-    log_info "Collecting results from $label ($instance_id)..."
+        [[ -z "$cmd_id" ]] && continue
 
-    # List XML files in remote results directory
-    local list_cmd="ls -1 $RESULTS_REMOTE_DIR/*.xml 2>/dev/null || echo 'NO_FILES'"
-    local cmd_id
-    cmd_id=$(ssm_run_command_async "$instance_id" 30 "$list_cmd")
-
-    if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to list results on $label"
-        return 1
-    fi
-
-    sleep 5
-
-    local file_list
-    file_list=$(ssm_get_stdout "$instance_id" "$cmd_id")
-
-    if [[ "$file_list" == "NO_FILES" || -z "$file_list" ]]; then
-        log_info "No result files on $label"
-        return 0
-    fi
-
-    # Download each XML file
-    while IFS= read -r remote_path; do
-        [[ -z "$remote_path" ]] && continue
-        local filename
-        filename=$(basename "$remote_path")
-
-        log_info "Retrieving $filename from $label..."
-
-        local cat_cmd="cat $remote_path"
-        local cat_cmd_id
-        cat_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$cat_cmd")
-
-        if [[ -z "$cat_cmd_id" ]]; then
-            log_error "Failed to retrieve $filename from $label"
+        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
+            log_error "Failed to collect results from $label"
             continue
         fi
 
-        sleep 5
+        local output
+        output=$(ssm_get_stdout "$instance_id" "$cmd_id")
 
-        local content
-        content=$(ssm_get_stdout "$instance_id" "$cat_cmd_id")
-
-        if [[ -n "$content" ]]; then
-            echo "$content" > "$RESULTS_DIR/$filename"
-            log_info "Saved $filename"
-        else
-            log_error "Empty content for $filename from $label"
-            generate_failure_xml "${filename%.xml}" "Failed to retrieve results from $label"
+        if [[ "$output" == "NO_FILES" || -z "$output" ]]; then
+            log_info "No result files on $label"
+            continue
         fi
-    done <<< "$file_list"
+
+        # Parse the batched output: split on ===FILE:name=== delimiters
+        local current_file=""
+        local current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                # Save previous file if any
+                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                    echo "$current_content" > "$RESULTS_DIR/$current_file"
+                    log_info "Saved $current_file from $label"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                if [[ -n "$current_content" ]]; then
+                    current_content+=$'\n'"$line"
+                else
+                    current_content="$line"
+                fi
+            fi
+        done <<< "$output"
+        # Save last file
+        if [[ -n "$current_file" && -n "$current_content" ]]; then
+            echo "$current_content" > "$RESULTS_DIR/$current_file"
+            log_info "Saved $current_file from $label"
+        fi
+    done
 }
 
 # ── Summary reporting ────────────────────────────────────────────────────────
