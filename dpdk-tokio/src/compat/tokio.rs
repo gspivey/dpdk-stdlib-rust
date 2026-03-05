@@ -180,16 +180,29 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.recv(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                let socket = s.socket.clone();
-                let mut buf_owned = buf.to_vec();
-                let result = ::tokio::task::spawn_blocking(move || {
-                    let socket = socket.blocking_lock();
-                    socket.recv(&mut buf_owned).map(|len| (len, buf_owned))
-                }).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-                let (len, received_buf) = result;
-                buf[..len].copy_from_slice(&received_buf[..len]);
-                Ok(len)
+                loop {
+                    let socket = s.socket.clone();
+                    let mut buf_owned = buf.to_vec();
+                    let result = ::tokio::task::spawn_blocking(move || {
+                        let socket = socket.blocking_lock();
+                        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                        let res = socket.recv(&mut buf_owned).map(|len| (len, buf_owned));
+                        let _ = socket.set_read_timeout(None);
+                        res
+                    }).await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    match result {
+                        Ok((len, received_buf)) => {
+                            buf[..len].copy_from_slice(&received_buf[..len]);
+                            return Ok(len);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            ::tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
         }
     }
@@ -220,16 +233,34 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.recv_from(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                let socket = s.socket.clone();
-                let mut buf_owned = buf.to_vec();
-                let result = ::tokio::task::spawn_blocking(move || {
-                    let socket = socket.blocking_lock();
-                    socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned))
-                }).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-                let (len, addr, received_buf) = result;
-                buf[..len].copy_from_slice(&received_buf[..len]);
-                Ok((len, addr))
+                // Loop with a short read timeout so spawn_blocking always returns,
+                // allowing tokio::time::timeout and cancellation to work correctly.
+                loop {
+                    let socket = s.socket.clone();
+                    let mut buf_owned = buf.to_vec();
+                    let result = ::tokio::task::spawn_blocking(move || {
+                        let socket = socket.blocking_lock();
+                        // Set a 1-second read timeout so this thread releases the lock
+                        // promptly, allowing the async runtime to handle cancellation.
+                        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                        let res = socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned));
+                        let _ = socket.set_read_timeout(None);
+                        res
+                    }).await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    match result {
+                        Ok((len, addr, received_buf)) => {
+                            buf[..len].copy_from_slice(&received_buf[..len]);
+                            return Ok((len, addr));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            // Timeout expired, yield to async runtime and retry
+                            ::tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
         }
     }

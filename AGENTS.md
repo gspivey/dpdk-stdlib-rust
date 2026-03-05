@@ -140,6 +140,7 @@ Before debugging networking issues, **READ these documents first**:
 | `docs/aws-vpc-networking.md` | Before ANY work on DPDK packet sending, ARP, MAC resolution, or integration test failures |
 | `docs/debugging-log.md` | Before debugging integration test failures — contains history of what was tried |
 | `docs/integration-tests-setup.md` | Before running or modifying integration tests |
+| `docs/ephemeral-ports.md` | Before working on port allocation, bind(port 0), or async recv_from deadlocks |
 
 **CRITICAL**: In AWS VPC, all DPDK outbound frames must use the **gateway MAC** as the Ethernet
 destination. Do NOT try to ARP for the peer's direct MAC — VPC is L3-routed, not L2-switched.

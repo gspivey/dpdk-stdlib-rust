@@ -14,7 +14,9 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use dpdk::{Mbuf, Mempool, Port};
 use dpdk::port::{MacAddress, PortConfig};
@@ -883,6 +885,22 @@ impl ReceiveQueue {
 /// - **DPDK** (default) - High-performance userspace networking
 /// - **AF_PACKET** - Linux raw sockets (fallback when DPDK is unavailable)
 /// - **AF_PACKET+MMAP** - Linux raw sockets with zero-copy ring buffers
+/// Global ephemeral port counter for DPDK sockets (range: 32768-60999, matching Linux)
+static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(32768);
+
+/// Allocate an ephemeral port from the Linux-style range (32768-60999).
+fn allocate_ephemeral_port() -> u16 {
+    loop {
+        let port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+        if port >= 32768 && port <= 60999 {
+            return port;
+        }
+        // Wrapped past 60999; reset to start of range
+        NEXT_EPHEMERAL_PORT.store(32769, Ordering::Relaxed);
+        return 32768;
+    }
+}
+
 pub struct UdpSocket {
     local_addr: SocketAddr,
     connected_addr: Mutex<Option<SocketAddr>>,
@@ -905,6 +923,10 @@ pub struct UdpSocket {
     auto_arp: bool,
     /// Whether to automatically respond to ICMP echo requests
     auto_icmp: bool,
+    /// Read timeout for recv operations (None = block forever)
+    read_timeout: Mutex<Option<Duration>>,
+    /// Write timeout for send operations (None = block forever)
+    write_timeout: Mutex<Option<Duration>>,
 }
 
 impl UdpSocket {
@@ -924,6 +946,14 @@ impl UdpSocket {
             }
         };
 
+        // Allocate an ephemeral port if port 0 was requested
+        let local_v4 = if local_v4.port() == 0 {
+            let ephemeral = allocate_ephemeral_port();
+            SocketAddrV4::new(*local_v4.ip(), ephemeral)
+        } else {
+            local_v4
+        };
+
         // Get or initialize DPDK resources
         let resources = get_or_init_dpdk(0)?;
 
@@ -939,7 +969,7 @@ impl UdpSocket {
 
         let icmp_handler = IcmpHandler::new(local_mac, local_ip);
 
-        println!("✅ DPDK UDP socket bound to {} (MAC: {})", addr, resources.src_mac);
+        println!("✅ DPDK UDP socket bound to {} (MAC: {})", SocketAddr::V4(local_v4), resources.src_mac);
 
         let socket_backend = SocketBackend::Dpdk(Arc::clone(&resources));
 
@@ -956,6 +986,8 @@ impl UdpSocket {
             recv_queue: Mutex::new(ReceiveQueue::new(1024)),
             auto_arp: true,
             auto_icmp: true,
+            read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
         })
     }
 
@@ -988,6 +1020,14 @@ impl UdpSocket {
             }
         };
 
+        // Allocate an ephemeral port if port 0 was requested
+        let local_v4 = if local_v4.port() == 0 {
+            let ephemeral = allocate_ephemeral_port();
+            SocketAddrV4::new(*local_v4.ip(), ephemeral)
+        } else {
+            local_v4
+        };
+
         let local_mac = backend.mac_address();
         let local_ip = *local_v4.ip();
         let arp_cache = Arc::new(ArpCache::new());
@@ -1007,7 +1047,7 @@ impl UdpSocket {
         let resources = get_or_init_dpdk(0)?;
 
         println!("✅ {} UDP socket bound to {} (MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-            backend_name, addr,
+            backend_name, SocketAddr::V4(local_v4),
             local_mac[0], local_mac[1], local_mac[2],
             local_mac[3], local_mac[4], local_mac[5]);
 
@@ -1024,12 +1064,50 @@ impl UdpSocket {
             recv_queue: Mutex::new(ReceiveQueue::new(1024)),
             auto_arp: true,
             auto_icmp: true,
+            read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
         })
     }
 
     /// Get the name of the active packet I/O backend.
     pub fn active_backend(&self) -> &'static str {
         self.socket_backend.backend_name()
+    }
+
+    /// Sets the read timeout for `recv`, `recv_from`, and `peek` operations.
+    ///
+    /// If `dur` is `None`, reads will block indefinitely. If `dur` is `Some(duration)`,
+    /// reads will return `io::ErrorKind::WouldBlock` / `TimedOut` after the duration.
+    /// Matches `std::net::UdpSocket::set_read_timeout`.
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        if let Some(d) = dur {
+            if d.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero duration not supported"));
+            }
+        }
+        *self.read_timeout.lock().unwrap() = dur;
+        Ok(())
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        Ok(*self.read_timeout.lock().unwrap())
+    }
+
+    /// Sets the write timeout for `send` and `send_to` operations.
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        if let Some(d) = dur {
+            if d.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero duration not supported"));
+            }
+        }
+        *self.write_timeout.lock().unwrap() = dur;
+        Ok(())
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        Ok(*self.write_timeout.lock().unwrap())
     }
 
     /// Sends data on the socket to the given address.
@@ -1120,10 +1198,18 @@ impl UdpSocket {
             }
         };
 
+        let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
+
         // Block until we receive a matching packet (std::net::UdpSocket behavior).
         // DPDK rx_burst is non-blocking, so we poll in a loop with a short sleep
         // to avoid burning 100% CPU while still achieving low latency.
         loop {
+            // Check read timeout
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"));
+                }
+            }
             // First check if we have buffered packets
             {
                 let mut queue = self.recv_queue.lock().unwrap();
