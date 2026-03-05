@@ -29,7 +29,7 @@ CDK_DIR="$REPO_ROOT/deploy/cdk"
 
 SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
 TEST_TIMEOUT=120             # 2 minutes per test scenario
-ENI_BIND_TIMEOUT=45          # 45 seconds for ENI bind/unbind
+ENI_BIND_TIMEOUT=90          # 90 seconds for ENI bind/unbind (generous for SSM agent recovery)
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="DpdkTestStack"
@@ -514,80 +514,14 @@ ssm_run_command() {
                 ;;
             Failed|TimedOut|Cancelled)
                 log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
-                # Save stdout and stderr to instance-logs for PR comment visibility
-                local ssm_log_dir="${REPO_ROOT}/instance-logs"
-                mkdir -p "$ssm_log_dir"
-                local role_prefix="unknown"
-                if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
-                    role_prefix="sender"
-                elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
-                    role_prefix="receiver"
-                fi
-                local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
-                {
-                    echo "=== SSM Command Failed ==="
-                    echo "Status: $status"
-                    echo "Instance: $instance_id ($role_prefix)"
-                    echo "Command ID: $cmd_id"
-                    echo "Command: $command_str"
-                    echo ""
-                    echo "=== STDOUT ==="
-                    aws ssm get-command-invocation \
-                        --command-id "$cmd_id" \
-                        --instance-id "$instance_id" \
-                        --query "StandardOutputContent" \
-                        --output text 2>/dev/null || echo "(unavailable)"
-                    echo ""
-                    echo "=== STDERR ==="
-                    aws ssm get-command-invocation \
-                        --command-id "$cmd_id" \
-                        --instance-id "$instance_id" \
-                        --query "StandardErrorContent" \
-                        --output text 2>/dev/null || echo "(unavailable)"
-                } >> "$ssm_fail_log"
-                log_error "SSM failure output saved to $ssm_fail_log"
-                # Also print to CI log
-                cat "$ssm_fail_log" >&2 || true
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status (command: $command_str)"
                 return 1
                 ;;
         esac
     done
 
     log_error "SSM command polling timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s, last status: $status)"
-    # Save diagnostic output for polling timeout too
-    local ssm_log_dir="${REPO_ROOT}/instance-logs"
-    mkdir -p "$ssm_log_dir"
-    local role_prefix="unknown"
-    if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
-        role_prefix="sender"
-    elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
-        role_prefix="receiver"
-    fi
-    local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
-    {
-        echo "=== SSM Polling Timeout ==="
-        echo "Poll limit: ${poll_limit}s (SSM timeout: ${timeout_secs}s)"
-        echo "Last status: $status"
-        echo "Instance: $instance_id ($role_prefix)"
-        echo "Command ID: $cmd_id"
-        echo "Command: $command_str"
-        echo ""
-        echo "=== STDOUT ==="
-        aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || echo "(unavailable)"
-        echo ""
-        echo "=== STDERR ==="
-        aws ssm get-command-invocation \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query "StandardErrorContent" \
-            --output text 2>/dev/null || echo "(unavailable)"
-    } >> "$ssm_fail_log"
-    log_error "SSM failure output saved to $ssm_fail_log"
-    cat "$ssm_fail_log" >&2 || true
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout ${poll_limit}s (SSM timeout: ${timeout_secs}s, command: $command_str)"
     return 1
 }
 
@@ -616,11 +550,11 @@ ssm_wait_command() {
     local timeout_secs="$3"
 
     local elapsed=0
+    local status=""
     while [[ $elapsed -lt $timeout_secs ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
 
-        local status
         status=$(aws ssm get-command-invocation \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
@@ -630,14 +564,56 @@ ssm_wait_command() {
         case "$status" in
             Success)  return 0 ;;
             Failed|TimedOut|Cancelled)
-                log_error "SSM command $status on $instance_id"
+                log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status"
                 return 1
                 ;;
         esac
     done
 
-    log_error "SSM command timed out waiting for $cmd_id on $instance_id"
+    log_error "SSM command polling timed out on $instance_id after ${timeout_secs}s (last status: $status, cmd: $cmd_id)"
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout after ${timeout_secs}s"
     return 1
+}
+
+# Save SSM failure diagnostics to instance-logs for PR visibility
+ssm_save_failure_log() {
+    local instance_id="$1"
+    local cmd_id="$2"
+    local status="$3"
+    local reason="$4"
+
+    local ssm_log_dir="${REPO_ROOT}/instance-logs"
+    mkdir -p "$ssm_log_dir"
+    local role_prefix="unknown"
+    if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
+        role_prefix="sender"
+    elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
+        role_prefix="receiver"
+    fi
+    local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
+    {
+        echo "=== $reason ==="
+        echo "Status: $status"
+        echo "Instance: $instance_id ($role_prefix)"
+        echo "Command ID: $cmd_id"
+        echo ""
+        echo "=== STDOUT ==="
+        aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null || echo "(unavailable)"
+        echo ""
+        echo "=== STDERR ==="
+        aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "StandardErrorContent" \
+            --output text 2>/dev/null || echo "(unavailable)"
+        echo ""
+    } >> "$ssm_fail_log"
+    cat "$ssm_fail_log" >&2 || true
 }
 
 # Retrieve stdout from a completed SSM command.
@@ -754,12 +730,12 @@ run_tier2() {
     bind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
     unbind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$bind_cmd_id" 75; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$bind_cmd_id" 120; then
         log_error "Failed to bind ENI on receiver"
         generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
         return 1
     fi
-    ssm_wait_command "$SENDER_INSTANCE_ID" "$unbind_cmd_id" 75 || true
+    ssm_wait_command "$SENDER_INSTANCE_ID" "$unbind_cmd_id" 120 || true
 
     # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
     warm_arp_cache
@@ -806,12 +782,12 @@ run_tier3() {
     bind_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd")
     unbind_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$unbind_cmd")
 
-    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$bind_cmd_id" 75; then
+    if ! ssm_wait_command "$SENDER_INSTANCE_ID" "$bind_cmd_id" 120; then
         log_error "Failed to bind ENI on sender for Tier 3"
         generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance"
         return 1
     fi
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$unbind_cmd_id" 75; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$unbind_cmd_id" 120; then
         log_error "Failed to unbind/configure receiver ENI for Tier 3"
         generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
         generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
