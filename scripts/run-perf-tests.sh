@@ -46,10 +46,12 @@ BENCHMARK_TIMEOUT=600
 
 TREX_INSTANCE_ID=""
 DUT_INSTANCE_ID=""
-TREX_DATA_ENI_IP=""
+TREX_DATA_ENI_IP=""       # TX ENI (device-number 1, PCI 0000:00:06.0)
+TREX_DATA_RX_ENI_IP=""    # RX ENI (device-number 2, PCI 0000:00:07.0)
 DUT_DATA_ENI_IP=""
 TREX_GATEWAY_MAC=""
-TREX_DATA_MAC=""
+TREX_DATA_MAC=""          # TX ENI MAC
+TREX_DATA_RX_MAC=""       # RX ENI MAC
 
 # ── CLI Parsing ───────────────────────────────────────────────────────────────
 
@@ -415,64 +417,62 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # PCI address for secondary ENI on c5n instances
-    TREX_PCI_ADDR="0000:00:06.0"
-    TREX_PCI_BDF="00:06.0"
+    # TRex has 3 ENIs on c5n.2xlarge:
+    #   device 0 = ens5 (0000:00:05.0) — Management (kernel, SSM)
+    #   device 1 = ens6 (0000:00:06.0) — Data TX (DPDK)
+    #   device 2 = ens7 (0000:00:07.0) — Data RX (DPDK)
+    local TX_PCI="0000:00:06.0"
+    local RX_PCI="0000:00:07.0"
+    local TX_BDF="00:06.0"
+    local RX_BDF="00:07.0"
+    TREX_PCI_ADDR="$TX_PCI"
+    TREX_PCI_BDF="$TX_BDF"
 
-    # Discover the interface name for this PCI device
-    local trex_iface
-    trex_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1 || echo ens6" 2>/dev/null || echo "ens6")
-    trex_iface=$(echo "$trex_iface" | tr -d '[:space:]')
-    if [[ -z "$trex_iface" ]]; then trex_iface="ens6"; fi
-    log_info "Secondary ENI: PCI=$TREX_PCI_ADDR interface=$trex_iface"
-
-    # Step 1: Discover TRex data ENI source MAC via IMDS (most reliable)
-    # IMDS is authoritative and doesn't depend on sysfs timing or interface naming.
-    # We query all MACs, find the one with device-number=1 (secondary ENI).
-    log_info "Step 1: Discovering TRex data ENI MAC via IMDS..."
+    # Step 1: Discover TX and RX ENI MACs via IMDS
+    # device-number 1 = TX ENI, device-number 2 = RX ENI
+    log_info "Step 1: Discovering TRex data ENI MACs via IMDS..."
     TREX_DATA_MAC=""
+    TREX_DATA_RX_MAC=""
 
-    # Single SSM command: get token, list MACs, find device-number 1, return its MAC
     local imds_result
     imds_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"FOUND_MAC: \${mac}\"; fi; done" 2>/dev/null || echo "SSM_FAILED")
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"TX_MAC: \${mac}\"; fi; if [ \"\$dn\" = \"2\" ]; then echo \"RX_MAC: \${mac}\"; fi; done" 2>/dev/null || echo "SSM_FAILED")
     log_info "IMDS MAC discovery output: $(echo "$imds_result" | head -10)"
 
-    # Extract the MAC from the FOUND_MAC line
-    TREX_DATA_MAC=$(echo "$imds_result" | grep "^FOUND_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
-
-    # Fallback: try sysfs if IMDS didn't work
-    if [[ -z "$TREX_DATA_MAC" ]]; then
-        log_warn "IMDS discovery failed, falling back to sysfs..."
-        local sysfs_result
-        sysfs_result=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "for iface in ${trex_iface:-ens6} ens6 eth1; do if [ -f /sys/class/net/\$iface/address ]; then echo \"SYSFS_MAC: \$(cat /sys/class/net/\$iface/address)\"; break; fi; done" 2>/dev/null || echo "")
-        TREX_DATA_MAC=$(echo "$sysfs_result" | grep "^SYSFS_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
-    fi
+    TREX_DATA_MAC=$(echo "$imds_result" | grep "^TX_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+    TREX_DATA_RX_MAC=$(echo "$imds_result" | grep "^RX_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
 
     if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
-        log_error "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC')"
+        log_error "Could not discover TRex TX ENI MAC (got: '$TREX_DATA_MAC')"
         log_error "IMDS output was: $(echo "$imds_result" | head -10)"
         return 1
     fi
-    log_info "TRex data ENI MAC: $TREX_DATA_MAC"
+    if [[ -z "$TREX_DATA_RX_MAC" || ! "$TREX_DATA_RX_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        log_error "Could not discover TRex RX ENI MAC (got: '$TREX_DATA_RX_MAC')"
+        log_error "IMDS output was: $(echo "$imds_result" | head -10)"
+        return 1
+    fi
+    log_info "TRex TX MAC: $TREX_DATA_MAC, RX MAC: $TREX_DATA_RX_MAC"
 
-    # Step 2: Discover gateway MAC while ENI is still in kernel mode
+    # Step 2: Discover gateway MAC while TX ENI is still in kernel mode
     # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
     local subnet_gw
     subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
-    local gw_iface="${trex_iface:-ens6}"
-    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw, iface: $gw_iface)..."
+    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw)..."
+
+    # Discover interface names for both data ENIs
+    local tx_iface rx_iface
+    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+        "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" 2>/dev/null || echo "ens6")
+    tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
+    if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
 
     local gw_raw
     gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set $gw_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $gw_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $gw_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $gw_iface 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+        "ip link set $tx_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
     log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -8)"
 
-    # Extract gateway MAC specifically from the GW_ENTRY line (targeted at subnet .1)
     TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
-    # Fallback: any MAC from the neighbor table
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
         TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
     fi
@@ -483,33 +483,26 @@ generate_trex_config() {
     fi
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
-    # Step 3: Unbind secondary ENI from kernel driver so TRex can bind it via vfio-pci
+    # Step 3: Bind BOTH data ENIs to vfio-pci
     # Use sysfs driver_override — works without any DPDK tools installed.
-    log_info "Step 3: Binding $TREX_PCI_ADDR to vfio-pci..."
+    log_info "Step 3: Binding both data ENIs to vfio-pci..."
     local bind_result
-    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "set -x; PCI=$TREX_PCI_ADDR; ip link set ${gw_iface} down 2>/dev/null || true; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/\$PCI 2>/dev/null && echo VERIFIED || echo NOT_VERIFIED" 2>/dev/null || echo "SSM_FAILED")
-    log_info "NIC bind result: $(echo "$bind_result" | grep -E 'BIND_|VERIFIED|FAIL' | head -5)"
-    if [[ "$bind_result" != *"BIND_OK"* && "$bind_result" != *"VERIFIED"* ]]; then
-        log_warn "vfio-pci binding may have failed — TRex might not start"
-    fi
+    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 45 \
+        "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; for PCI in $TX_PCI $RX_PCI; do IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null || true; fi; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK_\$PCI || echo BIND_FAIL_\$PCI; done; ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep -E '00:0[67]'" 2>/dev/null || echo "SSM_FAILED")
+    log_info "NIC bind result: $(echo "$bind_result" | grep -E 'BIND_|FAIL' | head -5)"
 
     # Step 4: Write /etc/trex_cfg.yaml via SSM
-    # Use base64 encoding to avoid all quoting/heredoc issues through SSM JSON layer
-    log_info "Step 4: Writing TRex config (PCI BDF: $TREX_PCI_BDF)..."
-    # TRex requires an even number of interfaces (TX/RX pairs).
-    # We only use port 0 for benchmarking, so list the same NIC twice.
-    # Port 1 is a dummy that won't carry test traffic.
+    log_info "Step 4: Writing TRex config (TX: $TX_BDF, RX: $RX_BDF)..."
     local yaml_content
     yaml_content=$(cat <<YAMLEOF
 - port_limit: 2
   version: 2
-  interfaces: ['${TREX_PCI_BDF}', 'dummy']
+  interfaces: ['${TX_BDF}', '${RX_BDF}']
   port_info:
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_MAC}'
     - dest_mac: '${TREX_GATEWAY_MAC}'
-      src_mac:  '${TREX_DATA_MAC}'
+      src_mac:  '${TREX_DATA_RX_MAC}'
 YAMLEOF
 )
     local yaml_b64
@@ -533,19 +526,14 @@ YAMLEOF
 
 start_trex_server() {
     log_info "Starting TRex server..."
-    local pci="${TREX_PCI_ADDR:-0000:00:06.0}"
+    local TX_PCI="0000:00:06.0"
+    local RX_PCI="0000:00:07.0"
 
-    # Verify NIC is bound to vfio-pci before starting TRex
+    # Verify both NICs are bound to vfio-pci before starting TRex
     local nic_state
     nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo NIC_STATE:; ls -la /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo VFIO_OK || echo VFIO_NOT_BOUND; readlink /sys/bus/pci/devices/$pci/driver 2>/dev/null || echo NO_DRIVER; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep -i huge /proc/meminfo 2>/dev/null | head -3; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" 2>/dev/null || echo "SSM_FAILED")
-    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'VFIO|DRIVER|BINARY|port_limit|src_mac|dest_mac|Huge|NO_VFIO' | head -10)"
-
-    if [[ "$nic_state" == *"VFIO_NOT_BOUND"* ]]; then
-        log_warn "NIC $pci not bound to vfio-pci — attempting fallback bind"
-        ssm_run_command "$TREX_INSTANCE_ID" 30 \
-            "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo $pci > /sys/bus/pci/devices/$pci/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/$pci/driver_override; echo $pci > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo VERIFIED || echo STILL_NOT_BOUND" 2>/dev/null || true
-    fi
+        "echo NIC_STATE:; for p in $TX_PCI $RX_PCI; do readlink /sys/bus/pci/devices/\$p/driver 2>/dev/null | xargs -I{} echo \$p: {}; done; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep HugePages /proc/meminfo 2>/dev/null; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" 2>/dev/null || echo "SSM_FAILED")
+    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'vfio|BINARY|port_limit|src_mac|dest_mac|Huge|NO_VFIO' | head -10)"
 
     # Ensure hugepages are allocated and mounted (TRex/DPDK requires them)
     log_info "Ensuring hugepages are allocated..."
@@ -946,12 +934,16 @@ Packet sizes: \`$PACKET_SIZES\`"
         --stack-name "$CDK_STACK_NAME" \
         --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniPrivateIp'].OutputValue" \
         --output text)
+    TREX_DATA_RX_ENI_IP=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniRxPrivateIp'].OutputValue" \
+        --output text)
     DUT_DATA_ENI_IP=$(aws cloudformation describe-stacks \
         --stack-name "$CDK_STACK_NAME" \
         --query "Stacks[0].Outputs[?OutputKey=='DutDataEniPrivateIp'].OutputValue" \
         --output text)
 
-    log_info "TRex: $TREX_INSTANCE_ID (data IP: $TREX_DATA_ENI_IP)"
+    log_info "TRex: $TREX_INSTANCE_ID (TX: $TREX_DATA_ENI_IP, RX: $TREX_DATA_RX_ENI_IP)"
     log_info "DUT:  $DUT_INSTANCE_ID (data IP: $DUT_DATA_ENI_IP)"
 
     # Wait for both instances
@@ -1005,8 +997,8 @@ Starting TRex configuration (MAC discovery + NIC binding)..."
     fi
 
     post_pr_comment "## [Perf] Stage: TRex Config OK
-- PCI: \`${TREX_PCI_ADDR}\` (BDF: \`${TREX_PCI_BDF}\`)
-- Data MAC: \`$TREX_DATA_MAC\`
+- TX: \`0000:00:06.0\` MAC: \`$TREX_DATA_MAC\`
+- RX: \`0000:00:07.0\` MAC: \`${TREX_DATA_RX_MAC:-unset}\`
 - Gateway MAC: \`$TREX_GATEWAY_MAC\`
 Starting TRex server..."
 

@@ -371,10 +371,18 @@ export class PerfTestStack extends cdk.Stack {
 
     // ── Secondary ENIs (data plane) ──────────────────────────────────────────
 
-    const trexDataEni = new ec2.CfnNetworkInterface(this, 'TrexDataEni', {
+    // TRex needs 2 data ENIs: one for TX, one for RX (TRex requires port pairs).
+    // Device index 1 = TX (ens6 / 0000:00:06.0), device index 2 = RX (ens7 / 0000:00:07.0).
+    const trexDataEniTx = new ec2.CfnNetworkInterface(this, 'TrexDataEni', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
-      description: 'TRex data plane interface',
+      description: 'TRex data plane TX interface',
+    });
+
+    const trexDataEniRx = new ec2.CfnNetworkInterface(this, 'TrexDataEniRx', {
+      subnetId: vpc.privateSubnets[0].subnetId,
+      groupSet: [dataSecurityGroup.securityGroupId],
+      description: 'TRex data plane RX interface',
     });
 
     const dutDataEni = new ec2.CfnNetworkInterface(this, 'DutDataEni', {
@@ -385,8 +393,14 @@ export class PerfTestStack extends cdk.Stack {
 
     new ec2.CfnNetworkInterfaceAttachment(this, 'TrexDataAttachment', {
       instanceId: trexInstance.instanceId,
-      networkInterfaceId: trexDataEni.ref,
+      networkInterfaceId: trexDataEniTx.ref,
       deviceIndex: '1',
+    });
+
+    new ec2.CfnNetworkInterfaceAttachment(this, 'TrexDataRxAttachment', {
+      instanceId: trexInstance.instanceId,
+      networkInterfaceId: trexDataEniRx.ref,
+      deviceIndex: '2',
     });
 
     new ec2.CfnNetworkInterfaceAttachment(this, 'DutDataAttachment', {
@@ -416,8 +430,13 @@ export class PerfTestStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'TrexDataEniId', {
-      value: trexDataEni.ref,
-      description: 'TRex data plane ENI ID',
+      value: trexDataEniTx.ref,
+      description: 'TRex data plane TX ENI ID',
+    });
+
+    new cdk.CfnOutput(this, 'TrexDataEniRxId', {
+      value: trexDataEniRx.ref,
+      description: 'TRex data plane RX ENI ID',
     });
 
     new cdk.CfnOutput(this, 'DutDataEniId', {
@@ -426,8 +445,13 @@ export class PerfTestStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'TrexDataEniPrivateIp', {
-      value: trexDataEni.attrPrimaryPrivateIpAddress,
-      description: 'TRex data plane ENI private IP',
+      value: trexDataEniTx.attrPrimaryPrivateIpAddress,
+      description: 'TRex data plane TX ENI private IP',
+    });
+
+    new cdk.CfnOutput(this, 'TrexDataEniRxPrivateIp', {
+      value: trexDataEniRx.attrPrimaryPrivateIpAddress,
+      description: 'TRex data plane RX ENI private IP',
     });
 
     new cdk.CfnOutput(this, 'DutDataEniPrivateIp', {
