@@ -540,48 +540,45 @@ start_trex_server() {
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
         "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" 2>/dev/null || true
 
-    # Start TRex via SSM with nohup.
-    # Use absolute path to avoid cwd issues. Keep the process alive by
-    # redirecting stdin and using nohup + disown.
+    # Start TRex via fire-and-forget SSM command.
+    # We don't wait for SSM completion because SSM timeouts are too short for
+    # TRex DPDK initialization (~20s). Instead we fire the command and then
+    # verify TRex is running after a fixed wait.
     log_info "Starting TRex server..."
-    local start_result
-    start_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & TPID=\$!; disown \$TPID 2>/dev/null; sleep 5; if kill -0 \$TPID 2>/dev/null; then echo TREX_ALIVE pid=\$TPID; else echo TREX_DIED; tail -20 /var/log/trex-server.log 2>/dev/null; fi" 2>/dev/null || echo "SSM_FAILED")
-    log_info "TRex start result: $start_result"
+    local start_cmd_id
+    start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+    log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
-    if [[ "$start_result" == *"TREX_DIED"* ]]; then
-        log_error "TRex process died immediately after start"
-        log_error "Startup output: $start_result"
-        return 1
-    fi
+    # Wait for TRex to initialize DPDK and start its API server.
+    # TRex takes ~15-20s to probe ENA NICs via DPDK on c5n instances.
+    log_info "Waiting 45s for TRex to initialize..."
+    sleep 45
 
-    # If the start command confirmed TRex is alive, trust it.
-    # SSM rate limiting makes subsequent poll commands unreliable.
-    if [[ "$start_result" == *"TREX_ALIVE"* ]]; then
-        log_info "TRex confirmed alive by start command. Waiting 30s for API to initialize..."
-        sleep 30
+    # Single verification check
+    local check
+    check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -5 /var/log/trex-server.log 2>/dev/null" 2>/dev/null || echo "SSM_CHECK_FAILED")
+    log_info "TRex check: $(echo "$check" | tr '\n' ' ' | head -c 300)"
+
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+        log_info "TRex server is running"
         return 0
     fi
 
-    # Fallback: poll if start command didn't clearly confirm (e.g. SSM timeout).
-    log_info "Start command didn't confirm TREX_ALIVE, polling..."
-    local elapsed=0
-    while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
-        local check
-        check=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -x t-rex-64 >/dev/null 2>&1 && echo PGREP_X; pgrep -f t-rex >/dev/null 2>&1 && echo PGREP_F; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi" 2>/dev/null || echo "SSM_ERROR")
+    # Retry once after 30s more
+    log_info "TRex not yet detected, waiting 30s more..."
+    sleep 30
+    check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -5 /var/log/trex-server.log 2>/dev/null" 2>/dev/null || echo "SSM_CHECK_FAILED")
+    log_info "TRex retry check: $(echo "$check" | tr '\n' ' ' | head -c 300)"
 
-        if [[ "$check" == *"PGREP_X"* || "$check" == *"PGREP_F"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
-            log_info "TRex server is running (${elapsed}s): $(echo "$check" | tr '\n' ' ')"
-            sleep 5
-            return 0
-        fi
-        log_info "TRex not yet detected (${elapsed}s): $(echo "$check" | tr '\n' ' ' | head -c 200)"
-        sleep 15
-        elapsed=$((elapsed + 15))
-    done
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+        log_info "TRex server is running (after retry)"
+        return 0
+    fi
 
-    log_error "TRex server failed to start within ${TREX_START_TIMEOUT}s"
+    log_error "TRex server failed to start — check: $(echo "$check" | tr '\n' ' ')"
     return 1
 }
 
