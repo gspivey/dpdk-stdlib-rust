@@ -415,40 +415,17 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Step 0: Dynamically discover PCI address and interface name for the secondary ENI.
-    # The PCI address varies across instance types (e.g., 0000:00:06.0 on c5n, different on others).
-    # We use lspci to find the last ENA device (same approach as configure-eni.sh).
-    log_info "Step 0: Discovering secondary ENI PCI address on $TREX_INSTANCE_ID..."
-    local pci_discovery
-    pci_discovery=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "export PATH=/usr/sbin:/usr/bin:/sbin:/bin:\$PATH; PCI=\$(lspci -D 2>&1 | grep -i Elastic | tail -1 | awk '{print \$1}'); echo PCI_ADDR: \$PCI; IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; echo LSPCI_ALL:; lspci -D 2>&1 | head -10" 2>&1)
-    local ssm_rc=$?
-    log_info "PCI discovery (rc=$ssm_rc): $(echo "$pci_discovery" | head -8)"
+    # PCI address for secondary ENI on c5n instances
+    TREX_PCI_ADDR="0000:00:06.0"
+    TREX_PCI_BDF="00:06.0"
 
-    TREX_PCI_ADDR=$(echo "$pci_discovery" | grep "^PCI_ADDR:" | head -1 | awk '{print $2}')
+    # Discover the interface name for this PCI device
     local trex_iface
-    trex_iface=$(echo "$pci_discovery" | grep "^IFACE:" | head -1 | awk '{print $2}')
-    # Derive BDF (bus:device.function without domain) for TRex config
-    TREX_PCI_BDF=$(echo "$TREX_PCI_ADDR" | sed 's/^0000://')
-
-    if [[ -z "$TREX_PCI_ADDR" || "$TREX_PCI_ADDR" == "" ]]; then
-        # Fallback: try well-known PCI address for c5n secondary ENI
-        log_warn "lspci discovery failed, trying fallback PCI 0000:00:06.0..."
-        local fallback_check
-        fallback_check=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "ls /sys/bus/pci/devices/0000:00:06.0/ 2>/dev/null && echo PCI_EXISTS || echo PCI_MISSING; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE" 2>&1)
-        log_info "Fallback check: $fallback_check"
-        if [[ "$fallback_check" == *"PCI_EXISTS"* ]]; then
-            TREX_PCI_ADDR="0000:00:06.0"
-            TREX_PCI_BDF="00:06.0"
-            trex_iface=$(echo "$fallback_check" | grep "^IFACE:" | head -1 | awk '{print $2}')
-        else
-            log_error "Could not discover secondary ENI PCI address"
-            log_error "SSM output: $(echo "$pci_discovery" | tail -8)"
-            return 1
-        fi
-    fi
-    log_info "Secondary ENI PCI: $TREX_PCI_ADDR (BDF: $TREX_PCI_BDF, interface: ${trex_iface:-unknown})"
+    trex_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1 || echo ens6" 2>/dev/null || echo "ens6")
+    trex_iface=$(echo "$trex_iface" | tr -d '[:space:]')
+    if [[ -z "$trex_iface" ]]; then trex_iface="ens6"; fi
+    log_info "Secondary ENI: PCI=$TREX_PCI_ADDR interface=$trex_iface"
 
     # Step 1: Discover TRex data ENI source MAC via IMDS (most reliable)
     # IMDS is authoritative and doesn't depend on sysfs timing or interface naming.
@@ -569,34 +546,74 @@ start_trex_server() {
     ssm_run_command "$TREX_INSTANCE_ID" 10 \
         "mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; echo \$(grep HugePages_Free /proc/meminfo)" 2>/dev/null || true
 
-    # Start TRex via systemd-run so it survives SSM session cleanup.
-    # SSM can kill background processes (nohup ... &) when its cgroup is reaped.
-    # systemd-run creates an independent scope that persists.
-    log_info "Starting TRex via systemd-run..."
+    # Write a startup script to the instance, then execute it.
+    # Using a script file avoids quoting issues and makes the process
+    # independent of the SSM session lifecycle.
+    log_info "Writing TRex startup script..."
+    local startup_script_b64
+    startup_script_b64=$(base64 -w0 <<'TREX_SCRIPT'
+#!/bin/bash
+# TRex startup script — runs as independent process
+LOG=/var/log/trex-server.log
+cd /opt/trex
+
+# Kill any previous TRex instance
+pkill -f t-rex-64 2>/dev/null || true
+sleep 1
+
+# Start TRex using setsid so it's fully detached from any parent session
+setsid ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >"$LOG" 2>&1 &
+TREX_PID=$!
+disown $TREX_PID 2>/dev/null || true
+
+echo "TRex PID: $TREX_PID"
+
+# Wait briefly and check if it's still alive
+sleep 3
+if kill -0 $TREX_PID 2>/dev/null; then
+    echo "TREX_ALIVE"
+else
+    echo "TREX_DIED"
+    echo "=== Log ==="
+    tail -30 "$LOG" 2>/dev/null || echo "(no log)"
+fi
+TREX_SCRIPT
+)
+    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "echo $startup_script_b64 | base64 -d > /tmp/start-trex.sh && chmod +x /tmp/start-trex.sh && echo SCRIPT_OK" 2>/dev/null || true
+
+    # Execute the startup script
+    log_info "Executing TRex startup script..."
     local start_result
     start_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "cd /opt/trex && systemd-run --unit=trex-server --remain-after-exit -- bash -c './t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1' && echo STARTED || echo START_FAILED; sleep 3; systemctl is-active trex-server.service 2>/dev/null || echo INACTIVE; pgrep -f t-rex-64 >/dev/null && echo PROCESS_FOUND || echo NO_PROCESS; ls -la /var/log/trex-server.log 2>/dev/null || echo NO_LOG" 2>&1)
+        "/tmp/start-trex.sh" 2>/dev/null || echo "SSM_FAILED")
     log_info "TRex start result: $start_result"
 
-    # Wait for TRex to be ready
+    if [[ "$start_result" == *"TREX_DIED"* ]]; then
+        log_error "TRex process died immediately after start"
+        log_error "Startup output: $start_result"
+        return 1
+    fi
+
+    # Wait for TRex to be ready (poll process existence)
     local elapsed=0
     while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
         local status
         status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "pgrep -f t-rex-64 >/dev/null && echo running || echo not_running; wc -l < /var/log/trex-server.log 2>/dev/null || echo 0" 2>/dev/null || echo "ssm_error")
+            "pgrep -f t-rex-64 >/dev/null && echo running || echo not_running" 2>/dev/null || echo "ssm_error")
 
         if [[ "$status" == *"running"* ]]; then
             log_info "TRex server is running (${elapsed}s)"
             sleep 5
             return 0
         fi
-        # Check log for errors after 10s
-        if [[ $elapsed -ge 10 && $((elapsed % 15)) -eq 0 ]]; then
+        # Check log for errors periodically
+        if [[ $elapsed -ge 10 && $((elapsed % 20)) -eq 0 ]]; then
             local early_log
             early_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "tail -20 /var/log/trex-server.log 2>/dev/null || echo no_log_yet" 2>/dev/null || echo "")
-            if [[ -n "$early_log" && "$early_log" != *"no_log_yet"* ]]; then
-                log_info "TRex log (${elapsed}s): $(echo "$early_log" | tail -5)"
+                "tail -20 /var/log/trex-server.log 2>/dev/null || echo no_log" 2>/dev/null || echo "")
+            if [[ -n "$early_log" && "$early_log" != *"no_log"* ]]; then
+                log_info "TRex log (${elapsed}s): $(echo "$early_log" | tail -3)"
                 if echo "$early_log" | grep -qiE 'error|failed|abort|could not|Traceback'; then
                     log_error "TRex appears to have crashed"
                     break
@@ -614,7 +631,7 @@ start_trex_server() {
 stop_trex_server() {
     log_info "Stopping TRex server..."
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "systemctl stop trex-server.service 2>/dev/null || true; pkill -f t-rex-64 2>/dev/null || true; sleep 2; echo 'TRex stopped'" 2>/dev/null || true
+        "pkill -9 -f t-rex-64 2>/dev/null || true; sleep 2; pgrep -f t-rex-64 >/dev/null && echo 'WARNING: TRex still running' || echo 'TRex stopped'" 2>/dev/null || true
 }
 
 # ── Benchmark Runner ──────────────────────────────────────────────────────────
@@ -1024,7 +1041,7 @@ Starting TRex server..."
         local trex_log
         local diag_pci="${TREX_PCI_ADDR:-0000:00:06.0}"
         trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-            "echo '=== TRex Log (trex-server.log) ==='; cat /var/log/trex-server.log 2>/dev/null | tail -80 || echo '(no log file)'; echo; echo '=== systemd unit status ==='; systemctl status trex-server.service 2>/dev/null || echo 'no unit'; echo; echo '=== journalctl trex ==='; journalctl -u trex-server.service --no-pager -n 30 2>/dev/null || echo 'none'; echo; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>&1)
+            "echo '=== TRex Log ==='; cat /var/log/trex-server.log 2>/dev/null | tail -80 || echo '(no log file)'; echo; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>/dev/null || echo "(SSM failed)")
         post_pr_comment "## [Perf] Stage: TRex Start FAILED
 TRex server failed to start within ${TREX_START_TIMEOUT}s.
 <details><summary>TRex server log + NIC diagnostics</summary>
