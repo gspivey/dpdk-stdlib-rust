@@ -312,7 +312,7 @@ collect_instance_logs() {
     sleep 2
 
     # Batch 2: network state + crash diagnostics + build listing
-    local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|trap|fault|panic|oom|killed|echo|t-rex|testpmd|plain-echo' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'; echo '===FILE:crash-reports.log==='; find /var/crash /var/lib/systemd/coredump -type f -newer /proc/1/fd/0 2>/dev/null | head -20 || echo 'no crash reports'; echo '===FILE:coredump-listing.log==='; coredumpctl list 2>/dev/null | tail -10 || echo 'no coredumps'"
+    local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|page.fault|general.protection|trap |panic|oom|killed process|echo-server|t-rex|testpmd|plain-echo' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'; echo '===FILE:crash-reports.log==='; find /var/crash /var/lib/systemd/coredump -type f -newer /proc/1/fd/0 2>/dev/null | head -20 || echo 'no crash reports'; echo '===FILE:coredump-listing.log==='; coredumpctl list 2>/dev/null | tail -10 || echo 'no coredumps'"
 
     local batch2_output
     batch2_output=$(ssm_run_command "$instance_id" 30 "$batch2_cmd" 2>/dev/null || echo "(failed)")
