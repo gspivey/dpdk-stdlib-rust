@@ -555,8 +555,16 @@ start_trex_server() {
         return 1
     fi
 
-    # Wait for TRex to be ready.
-    # Single SSM command checks process, log file, and TRex API port.
+    # If the start command confirmed TRex is alive, trust it.
+    # SSM rate limiting makes subsequent poll commands unreliable.
+    if [[ "$start_result" == *"TREX_ALIVE"* ]]; then
+        log_info "TRex confirmed alive by start command. Waiting 30s for API to initialize..."
+        sleep 30
+        return 0
+    fi
+
+    # Fallback: poll if start command didn't clearly confirm (e.g. SSM timeout).
+    log_info "Start command didn't confirm TREX_ALIVE, polling..."
     local elapsed=0
     while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
         local check
