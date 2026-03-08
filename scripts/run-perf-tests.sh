@@ -48,6 +48,8 @@ TREX_INSTANCE_ID=""
 DUT_INSTANCE_ID=""
 TREX_DATA_ENI_IP=""
 DUT_DATA_ENI_IP=""
+TREX_GATEWAY_MAC=""
+TREX_DATA_MAC=""
 
 # ── CLI Parsing ───────────────────────────────────────────────────────────────
 
@@ -327,27 +329,44 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Get gateway MAC for the TRex data ENI subnet
-    # In AWS VPC, all frames must use gateway MAC
-    local gateway_mac
-    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ip neigh show dev ens6 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1 || echo ''" 2>/dev/null || echo "")
+    # Discover TRex data ENI source MAC via IMDS (ens6 is bound to vfio-pci, not visible as kernel iface)
+    TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"\${mac%/}\"; break; fi; done" 2>/dev/null || echo "")
 
-    if [[ -z "$gateway_mac" ]]; then
-        # Warm ARP cache and retry
-        log_info "Warming ARP cache on TRex..."
-        ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "ping -c 1 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 1; ip neigh show" 2>/dev/null || true
+    # IMDS returns MAC with trailing slash, clean it up
+    TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]/')
+
+    if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), falling back to 00:00:00:00:00:00"
+        TREX_DATA_MAC="00:00:00:00:00:00"
     fi
+    log_info "TRex data ENI MAC: $TREX_DATA_MAC"
+
+    # Get gateway MAC for the TRex data ENI subnet
+    # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
+    # Since ens6 is bound to vfio-pci, we need to temporarily unbind, get the gateway MAC, then rebind
+    log_info "Temporarily unbinding TRex data ENI to discover gateway MAC..."
+    TREX_GATEWAY_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "/usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 2; ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/') 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; ip neigh show dev ens6 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1; ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || true" 2>/dev/null || echo "")
+
+    # Clean whitespace
+    TREX_GATEWAY_MAC=$(echo "$TREX_GATEWAY_MAC" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+
+    if [[ -z "$TREX_GATEWAY_MAC" ]]; then
+        log_error "Could not discover gateway MAC on TRex data ENI — packets will be dropped by VPC"
+        return 1
+    fi
+    log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
     # Generate /etc/trex_cfg.yaml via SSM
-    local trex_cfg_cmd="cat > /etc/trex_cfg.yaml << 'TREXCFG'
+    # Use unquoted heredoc delimiter so local variables are expanded before sending to remote
+    local trex_cfg_cmd="cat > /etc/trex_cfg.yaml << TREXCFG
 - port_limit: 1
   version: 2
   interfaces: ['00:06.0']
   port_info:
-    - dest_mac: '${GATEWAY_MAC:-ff:ff:ff:ff:ff:ff}'
-      src_mac:  '${TREX_DATA_MAC:-00:00:00:00:00:00}'
+    - dest_mac: '${TREX_GATEWAY_MAC}'
+      src_mac:  '${TREX_DATA_MAC}'
 TREXCFG
 echo 'TRex config written to /etc/trex_cfg.yaml'
 cat /etc/trex_cfg.yaml"
@@ -415,12 +434,8 @@ chmod +x /opt/perf-tests/run_benchmark.py" || {
         return 1
     }
 
-    # Discover gateway MAC from TRex's perspective
-    local gateway_mac
-    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-        "ip neigh show 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1" 2>/dev/null || echo "")
-
-    log_info "Using gateway MAC: ${gateway_mac:-unknown}"
+    # Use the gateway MAC discovered during generate_trex_config
+    log_info "Using gateway MAC: ${TREX_GATEWAY_MAC:-unknown}"
 
     # Run benchmark via SSM
     local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_benchmark.py \
@@ -428,7 +443,7 @@ chmod +x /opt/perf-tests/run_benchmark.py" || {
         --config-name '$config_name' \
         --src-ip '$TREX_DATA_ENI_IP' \
         --dst-ip '$DUT_DATA_ENI_IP' \
-        --dst-mac '${gateway_mac:-ff:ff:ff:ff:ff:ff}' \
+        --dst-mac '${TREX_GATEWAY_MAC}' \
         --dst-port $dst_port \
         --packet-sizes '$PACKET_SIZES' \
         --rate-steps '$RATE_STEPS' \
