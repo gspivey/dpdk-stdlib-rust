@@ -415,40 +415,34 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Step 1: Discover TRex data ENI source MAC from kernel interface
-    # ENI is in kernel mode (ena) at this point — wait_and_bind_eni ensured it's attached
-    log_info "Step 1: Discovering TRex data ENI MAC..."
-    local mac_raw
-    mac_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo IFACES:; ip -o link show 2>/dev/null | head -5; echo MAC:; cat /sys/class/net/ens6/address 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
-    log_info "MAC discovery raw output: $(echo "$mac_raw" | head -8)"
+    # Step 1: Discover TRex data ENI source MAC via IMDS (most reliable)
+    # IMDS is authoritative and doesn't depend on sysfs timing or interface naming.
+    # We query all MACs, find the one with device-number=1 (secondary ENI).
+    log_info "Step 1: Discovering TRex data ENI MAC via IMDS..."
+    TREX_DATA_MAC=""
 
-    # Extract MAC from /sys/class/net/ens6/address (most reliable)
-    TREX_DATA_MAC=$(echo "$mac_raw" | grep -A1 "^MAC:" | tail -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+    # Single SSM command: get token, list MACs, find device-number 1, return its MAC
+    local imds_result
+    imds_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"FOUND_MAC: \${mac}\"; fi; done" 2>/dev/null || echo "SSM_FAILED")
+    log_info "IMDS MAC discovery output: $(echo "$imds_result" | head -10)"
 
+    # Extract the MAC from the FOUND_MAC line
+    TREX_DATA_MAC=$(echo "$imds_result" | grep "^FOUND_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+
+    # Fallback: try sysfs if IMDS didn't work
     if [[ -z "$TREX_DATA_MAC" ]]; then
-        log_warn "Could not discover TRex data ENI MAC from sysfs, trying IMDS..."
-        local imds_raw
-        imds_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
-            "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/" 2>/dev/null || echo "")
-        log_info "IMDS MACs: $imds_raw"
-
-        # Get the second MAC (device-number 1)
-        for mac in $imds_raw; do
-            mac="${mac%/}"
-            local dn
-            dn=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/device-number" 2>/dev/null || echo "")
-            if [[ "$dn" == "1" ]]; then
-                TREX_DATA_MAC="$mac"
-                break
-            fi
-        done
+        log_warn "IMDS discovery failed, falling back to sysfs..."
+        local sysfs_result
+        sysfs_result=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+            "for iface in ens6 eth1; do if [ -f /sys/class/net/\$iface/address ]; then echo \"SYSFS_MAC: \$(cat /sys/class/net/\$iface/address)\"; break; fi; done" 2>/dev/null || echo "")
+        TREX_DATA_MAC=$(echo "$sysfs_result" | grep "^SYSFS_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
     fi
 
     if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
-        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), using 00:00:00:00:00:00"
-        TREX_DATA_MAC="00:00:00:00:00:00"
+        log_error "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC')"
+        log_error "IMDS output was: $(echo "$imds_result" | head -10)"
+        return 1
     fi
     log_info "TRex data ENI MAC: $TREX_DATA_MAC"
 
@@ -460,10 +454,15 @@ generate_trex_config() {
 
     local gw_raw
     gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev ens6 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
-    log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -5)"
+        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev ens6 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev ens6 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+    log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -8)"
 
-    TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+    # Extract gateway MAC specifically from the GW_ENTRY line (targeted at subnet .1)
+    TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+    # Fallback: any MAC from the neighbor table
+    if [[ -z "$TREX_GATEWAY_MAC" ]]; then
+        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+    fi
 
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
         log_error "Could not discover gateway MAC on TRex data ENI — packets will be dropped by VPC"
