@@ -542,51 +542,18 @@ start_trex_server() {
             "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo $pci > /sys/bus/pci/devices/$pci/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/$pci/driver_override; echo $pci > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo VERIFIED || echo STILL_NOT_BOUND" 2>/dev/null || true
     fi
 
-    # Ensure hugepages are mounted (TRex/DPDK requires them)
-    ssm_run_command "$TREX_INSTANCE_ID" 10 \
-        "mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; echo \$(grep HugePages_Free /proc/meminfo)" 2>/dev/null || true
-
-    # Write a startup script to the instance, then execute it.
-    # Using a script file avoids quoting issues and makes the process
-    # independent of the SSM session lifecycle.
-    log_info "Writing TRex startup script..."
-    local startup_script_b64
-    startup_script_b64=$(base64 -w0 <<'TREX_SCRIPT'
-#!/bin/bash
-# TRex startup script — runs as independent process
-LOG=/var/log/trex-server.log
-cd /opt/trex
-
-# Kill any previous TRex instance
-pkill -f t-rex-64 2>/dev/null || true
-sleep 1
-
-# Start TRex using setsid so it's fully detached from any parent session
-setsid ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >"$LOG" 2>&1 &
-TREX_PID=$!
-disown $TREX_PID 2>/dev/null || true
-
-echo "TRex PID: $TREX_PID"
-
-# Wait briefly and check if it's still alive
-sleep 3
-if kill -0 $TREX_PID 2>/dev/null; then
-    echo "TREX_ALIVE"
-else
-    echo "TREX_DIED"
-    echo "=== Log ==="
-    tail -30 "$LOG" 2>/dev/null || echo "(no log)"
-fi
-TREX_SCRIPT
-)
+    # Ensure hugepages are allocated and mounted (TRex/DPDK requires them)
+    log_info "Ensuring hugepages are allocated..."
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo $startup_script_b64 | base64 -d > /tmp/start-trex.sh && chmod +x /tmp/start-trex.sh && echo SCRIPT_OK" 2>/dev/null || true
+        "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" 2>/dev/null || true
 
-    # Execute the startup script
-    log_info "Executing TRex startup script..."
+    # Start TRex via SSM with nohup.
+    # Use absolute path to avoid cwd issues. Keep the process alive by
+    # redirecting stdin and using nohup + disown.
+    log_info "Starting TRex server..."
     local start_result
     start_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "/tmp/start-trex.sh" 2>/dev/null || echo "SSM_FAILED")
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & TPID=\$!; disown \$TPID 2>/dev/null; sleep 5; if kill -0 \$TPID 2>/dev/null; then echo TREX_ALIVE pid=\$TPID; else echo TREX_DIED; tail -20 /var/log/trex-server.log 2>/dev/null; fi" 2>/dev/null || echo "SSM_FAILED")
     log_info "TRex start result: $start_result"
 
     if [[ "$start_result" == *"TREX_DIED"* ]]; then
