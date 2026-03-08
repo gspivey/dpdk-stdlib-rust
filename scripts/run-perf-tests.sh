@@ -569,54 +569,52 @@ start_trex_server() {
     ssm_run_command "$TREX_INSTANCE_ID" 10 \
         "mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; echo \$(grep HugePages_Free /proc/meminfo)" 2>/dev/null || true
 
-    # Start in background via nohup
-    ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 300 \
-        "cd /opt/trex && nohup ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1 &"
+    # Start TRex via systemd-run so it survives SSM session cleanup.
+    # SSM can kill background processes (nohup ... &) when its cgroup is reaped.
+    # systemd-run creates an independent scope that persists.
+    log_info "Starting TRex via systemd-run..."
+    local start_result
+    start_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "cd /opt/trex && systemd-run --unit=trex-server --remain-after-exit -- bash -c './t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1' && echo STARTED || echo START_FAILED; sleep 3; systemctl is-active trex-server.service 2>/dev/null || echo INACTIVE; pgrep -f t-rex-64 >/dev/null && echo PROCESS_FOUND || echo NO_PROCESS; ls -la /var/log/trex-server.log 2>/dev/null || echo NO_LOG" 2>&1)
+    log_info "TRex start result: $start_result"
 
-    # Wait for TRex to be ready (check both process and log for ready marker)
+    # Wait for TRex to be ready
     local elapsed=0
     while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
         local status
         status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "pgrep -f t-rex-64 >/dev/null && echo 'running' || echo 'not running'; wc -l < /var/log/trex-server.log 2>/dev/null || echo '0 lines'" 2>/dev/null || echo "unknown")
+            "pgrep -f t-rex-64 >/dev/null && echo running || echo not_running; wc -l < /var/log/trex-server.log 2>/dev/null || echo 0" 2>/dev/null || echo "ssm_error")
 
         if [[ "$status" == *"running"* ]]; then
             log_info "TRex server is running (${elapsed}s)"
-            # Give it a few more seconds to initialize
             sleep 5
             return 0
         fi
-        # If TRex exited early, check log immediately to understand why
-        if [[ $elapsed -ge 10 ]]; then
+        # Check log for errors after 10s
+        if [[ $elapsed -ge 10 && $((elapsed % 15)) -eq 0 ]]; then
             local early_log
             early_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "tail -20 /var/log/trex-server.log 2>/dev/null || echo '(no log yet)'" 2>/dev/null || echo "")
-            if [[ -n "$early_log" && "$early_log" != *"(no log yet)"* ]]; then
+                "tail -20 /var/log/trex-server.log 2>/dev/null || echo no_log_yet" 2>/dev/null || echo "")
+            if [[ -n "$early_log" && "$early_log" != *"no_log_yet"* ]]; then
                 log_info "TRex log (${elapsed}s): $(echo "$early_log" | tail -5)"
-                # If log contains a fatal error, bail early
-                if echo "$early_log" | grep -qiE 'error|failed|abort|exception|could not'; then
-                    log_error "TRex appears to have crashed — see log above"
+                if echo "$early_log" | grep -qiE 'error|failed|abort|could not|Traceback'; then
+                    log_error "TRex appears to have crashed"
                     break
                 fi
             fi
         fi
-        sleep 5
-        elapsed=$((elapsed + 5))
+        sleep 10
+        elapsed=$((elapsed + 10))
     done
 
     log_error "TRex server failed to start within ${TREX_START_TIMEOUT}s"
-    # Collect TRex log for diagnostics
-    local final_log
-    final_log=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo '=== trex-server.log ==='; tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== vfio state ==='; ls /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo 'vfio: bound' || echo 'vfio: NOT bound'; readlink /sys/bus/pci/devices/$pci/driver 2>/dev/null || echo 'no driver'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== dmesg vfio ==='; dmesg 2>/dev/null | grep -i vfio | tail -5 || echo 'none'" 2>/dev/null || echo "(SSM failed)")
-    log_info "TRex failure diagnostics: $final_log"
     return 1
 }
 
 stop_trex_server() {
     log_info "Stopping TRex server..."
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; echo 'TRex stopped'" 2>/dev/null || true
+        "systemctl stop trex-server.service 2>/dev/null || true; pkill -f t-rex-64 2>/dev/null || true; sleep 2; echo 'TRex stopped'" 2>/dev/null || true
 }
 
 # ── Benchmark Runner ──────────────────────────────────────────────────────────
@@ -1025,8 +1023,8 @@ Starting TRex server..."
         # Grab TRex log and NIC state for diagnostics
         local trex_log
         local diag_pci="${TREX_PCI_ADDR:-0000:00:06.0}"
-        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "echo '=== TRex Log ==='; tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>/dev/null || echo "(SSM failed)")
+        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "echo '=== TRex Log (trex-server.log) ==='; cat /var/log/trex-server.log 2>/dev/null | tail -80 || echo '(no log file)'; echo; echo '=== systemd unit status ==='; systemctl status trex-server.service 2>/dev/null || echo 'no unit'; echo; echo '=== journalctl trex ==='; journalctl -u trex-server.service --no-pager -n 30 2>/dev/null || echo 'none'; echo; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>&1)
         post_pr_comment "## [Perf] Stage: TRex Start FAILED
 TRex server failed to start within ${TREX_START_TIMEOUT}s.
 <details><summary>TRex server log + NIC diagnostics</summary>
