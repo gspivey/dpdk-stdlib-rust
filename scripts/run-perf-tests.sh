@@ -912,6 +912,11 @@ Packet sizes: \`$PACKET_SIZES\`"
             log_info "Using pre-built TRex AMI: $trex_ami"
         fi
 
+        # Destroy any leftover stack first (from a previous failed run)
+        log_info "Cleaning up any leftover stack..."
+        npx cdk destroy "$CDK_STACK_NAME" --force 2>/dev/null || true
+        sleep 5
+
         npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
             || { log_error "CDK deploy failed"; exit 2; }
 
