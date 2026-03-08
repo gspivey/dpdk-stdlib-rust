@@ -265,22 +265,78 @@ collect_instance_logs() {
     log_info "Collecting logs from $label..."
     mkdir -p "$LOGS_DIR"
 
-    # User-data log
-    local ud_output
-    ud_output=$(ssm_run_command "$instance_id" 30 "tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'" 2>/dev/null || echo "(failed)")
-    echo "$ud_output" > "$LOGS_DIR/${label}-user-data.log"
-
-    # Console output (survives instance issues)
+    # Console output first (no SSM needed, survives instance termination)
     aws ec2 get-console-output \
         --instance-id "$instance_id" \
         --latest \
         --query "Output" \
         --output text > "$LOGS_DIR/${label}-console-output.log" 2>/dev/null || true
 
-    # dmesg crashes
-    local dmesg_output
-    dmesg_output=$(ssm_run_command "$instance_id" 15 "dmesg | grep -iE '(segfault|panic|oom|kill)' | tail -20 2>/dev/null || echo 'no crashes'" 2>/dev/null || echo "(failed)")
-    echo "$dmesg_output" > "$LOGS_DIR/${label}-dmesg-crashes.log"
+    # Check SSM availability
+    local ssm_ready
+    ssm_ready=$(aws ssm describe-instance-information \
+        --filters "Key=InstanceIds,Values=${instance_id}" \
+        --query "InstanceInformationList[0].InstanceId" \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -z "$ssm_ready" || "$ssm_ready" == "None" ]]; then
+        log_info "  SSM not available for ${label} — relying on console output only"
+        return 0
+    fi
+
+    # Batch 1: user-data log + app logs
+    local batch1_cmd="echo '===FILE:user-data.log==='; tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'; echo '===FILE:trex-server.log==='; tail -100 /var/log/trex-server.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-rust-dpdk.log==='; tail -80 /var/log/echo-rust-dpdk.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-rust-stdlib.log==='; tail -80 /var/log/echo-rust-stdlib.log 2>/dev/null || echo '(not found)'; echo '===FILE:testpmd.log==='; tail -80 /var/log/testpmd.log 2>/dev/null || echo '(not found)'; echo '===FILE:plain-echo.log==='; tail -80 /var/log/plain-echo.log 2>/dev/null || echo '(not found)'"
+
+    local batch1_output
+    batch1_output=$(ssm_run_command "$instance_id" 30 "$batch1_cmd" 2>/dev/null || echo "(failed)")
+    if [[ -n "$batch1_output" && "$batch1_output" != "(failed)" ]]; then
+        local current_file="" current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                    log_info "  Saved: ${label}-${current_file}"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+            fi
+        done <<< "$batch1_output"
+        if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+            log_info "  Saved: ${label}-${current_file}"
+        fi
+    fi
+
+    sleep 2
+
+    # Batch 2: network state + crash diagnostics + build listing
+    local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|trap|fault|panic|oom|killed|echo|t-rex|testpmd|plain-echo' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'; echo '===FILE:crash-reports.log==='; find /var/crash /var/lib/systemd/coredump -type f -newer /proc/1/fd/0 2>/dev/null | head -20 || echo 'no crash reports'; echo '===FILE:coredump-listing.log==='; coredumpctl list 2>/dev/null | tail -10 || echo 'no coredumps'"
+
+    local batch2_output
+    batch2_output=$(ssm_run_command "$instance_id" 30 "$batch2_cmd" 2>/dev/null || echo "(failed)")
+    if [[ -n "$batch2_output" && "$batch2_output" != "(failed)" ]]; then
+        local current_file="" current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                    log_info "  Saved: ${label}-${current_file}"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+            fi
+        done <<< "$batch2_output"
+        if [[ -n "$current_file" && -n "$current_content" ]]; then
+            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+            log_info "  Saved: ${label}-${current_file}"
+        fi
+    fi
+
+    log_info "Instance logs collected for ${label}"
 }
 
 collect_networking_diagnostics() {
@@ -744,10 +800,6 @@ cleanup() {
         if [[ -n "$TREX_INSTANCE_ID" ]]; then
             collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
             collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure" || true
-            # TRex server log
-            ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "tail -100 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null \
-                > "$LOGS_DIR/trex-server.log" || true
         fi
 
         write_failure_json "perf-test" "Script exited with code $exit_code"
