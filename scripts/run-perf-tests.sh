@@ -1,0 +1,887 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run-perf-tests.sh — Performance test orchestrator for dpdk-stdlib-rust
+#
+# Deploys a TRex generator + DUT instance, runs UDP echo benchmarks across
+# 4 configurations (rust-dpdk, native-dpdk, rust-stdlib, plain-rust),
+# collects structured JSON results, and posts a summary to the PR.
+#
+# Usage:
+#   ./scripts/run-perf-tests.sh [OPTIONS]
+#
+# Options:
+#   --teardown          Destroy CDK stack when done (default: true)
+#   --skip-deploy       Skip CDK deploy (reuse existing stack)
+#   --packet-sizes      Comma-separated sizes (default: 64,512,1400)
+#   --duration          Seconds per rate step (default: 30)
+#   --rate-steps        Comma-separated rate percentages (default: 10,25,50,75,100)
+#   --configs           Comma-separated DUT configs (default: rust-dpdk,native-dpdk,rust-stdlib,plain-rust)
+#   --json-summary      Write JSON summary file
+#   -h, --help          Show help
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+
+TEARDOWN=true
+SKIP_DEPLOY=false
+PACKET_SIZES="64,512,1400"
+DURATION=30
+RATE_STEPS="10,25,50,75,100"
+CONFIGS="rust-dpdk,native-dpdk,rust-stdlib,plain-rust"
+JSON_SUMMARY=false
+
+CDK_STACK_NAME="PerfTestStack"
+CDK_DIR="$REPO_ROOT/deploy/cdk"
+RESULTS_DIR="$REPO_ROOT/perf-results"
+LOGS_DIR="$REPO_ROOT/instance-logs"
+
+SSM_READINESS_TIMEOUT=600
+TREX_START_TIMEOUT=60
+BENCHMARK_TIMEOUT=600
+
+TREX_INSTANCE_ID=""
+DUT_INSTANCE_ID=""
+TREX_DATA_ENI_IP=""
+DUT_DATA_ENI_IP=""
+
+# ── CLI Parsing ───────────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --teardown)       TEARDOWN=true; shift ;;
+        --no-teardown)    TEARDOWN=false; shift ;;
+        --skip-deploy)    SKIP_DEPLOY=true; shift ;;
+        --packet-sizes)   PACKET_SIZES="$2"; shift 2 ;;
+        --duration)       DURATION="$2"; shift 2 ;;
+        --rate-steps)     RATE_STEPS="$2"; shift 2 ;;
+        --configs)        CONFIGS="$2"; shift 2 ;;
+        --json-summary)   JSON_SUMMARY=true; shift ;;
+        -h|--help)
+            head -25 "$0" | grep -E '^#' | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log_info()  { echo "[$(date -u +%H:%M:%S)] INFO  $*"; }
+log_warn()  { echo "[$(date -u +%H:%M:%S)] WARN  $*" >&2; }
+log_error() { echo "[$(date -u +%H:%M:%S)] ERROR $*" >&2; }
+
+# ── PR Comment Helper ─────────────────────────────────────────────────────────
+
+post_pr_comment() {
+    local body="$1"
+    local pr_number="${PR_NUMBER:-}"
+
+    command -v gh >/dev/null 2>&1 || return 0
+    [[ -n "${GH_TOKEN:-}" ]] || return 0
+
+    if [[ -z "$pr_number" && -n "${GITHUB_HEAD_REF:-}" ]]; then
+        pr_number=$(gh pr list --head "$GITHUB_HEAD_REF" --json number --jq '.[0].number' \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$pr_number" ]]; then
+        gh pr comment "$pr_number" --body "$body" \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || true
+    fi
+}
+
+# ── SSM Helpers ───────────────────────────────────────────────────────────────
+
+ssm_run_command() {
+    local instance_id="$1"
+    local timeout_sec="$2"
+    shift 2
+    local command="$*"
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$command\"]" \
+        --timeout-seconds "$timeout_sec" \
+        --query "Command.CommandId" \
+        --output text 2>/dev/null)
+
+    if [[ -z "$cmd_id" ]]; then
+        log_error "Failed to send SSM command to $instance_id"
+        return 1
+    fi
+
+    # Wait for completion
+    local elapsed=0
+    while [[ $elapsed -lt $timeout_sec ]]; do
+        local status
+        status=$(aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" \
+            --output text 2>/dev/null || echo "Pending")
+
+        case "$status" in
+            Success) break ;;
+            Failed|Cancelled|TimedOut)
+                log_error "SSM command $cmd_id on $instance_id: $status"
+                # Save stderr for diagnostics
+                aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardErrorContent" \
+                    --output text 2>/dev/null || true
+                return 1
+                ;;
+        esac
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    # Return stdout
+    aws ssm get-command-invocation \
+        --command-id "$cmd_id" \
+        --instance-id "$instance_id" \
+        --query "StandardOutputContent" \
+        --output text 2>/dev/null
+}
+
+ssm_run_command_fire_and_forget() {
+    local instance_id="$1"
+    local timeout_sec="$2"
+    shift 2
+    local command="$*"
+
+    aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$command\"]" \
+        --timeout-seconds "$timeout_sec" \
+        --query "Command.CommandId" \
+        --output text 2>/dev/null
+}
+
+wait_ssm_ready() {
+    local instance_id="$1"
+    local label="$2"
+    local elapsed=0
+
+    log_info "Waiting for $label ($instance_id) SSM readiness..."
+    while [[ $elapsed -lt $SSM_READINESS_TIMEOUT ]]; do
+        local status
+        status=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=$instance_id" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text 2>/dev/null || echo "None")
+
+        if [[ "$status" == "Online" ]]; then
+            log_info "$label SSM ready (${elapsed}s)"
+            return 0
+        fi
+        sleep 15
+        elapsed=$((elapsed + 15))
+    done
+
+    log_error "$label SSM not ready after ${SSM_READINESS_TIMEOUT}s"
+    return 1
+}
+
+# ── Failure JSON ──────────────────────────────────────────────────────────────
+
+write_failure_json() {
+    local step="$1"
+    local message="$2"
+    mkdir -p "$LOGS_DIR"
+
+    python3 - <<PYEOF
+import json, datetime
+data = {
+    "failed_step": """$step""",
+    "error": """$message""",
+    "exit_code": 2,
+    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "trex_instance_id": """${TREX_INSTANCE_ID:-}""",
+    "dut_instance_id": """${DUT_INSTANCE_ID:-}""",
+    "commit": """${GITHUB_SHA:-unknown}""",
+    "run_url": "${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}",
+}
+with open("$LOGS_DIR/failure-summary.json", "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+}
+
+# ── Environment & Diagnostics Collection ──────────────────────────────────────
+
+collect_environment_info() {
+    local instance_id="$1"
+    local label="$2"
+
+    log_info "Collecting environment info from $label..."
+    local env_cmd="echo '=== System Info ===';
+echo \"Hostname: \$(hostname)\";
+echo \"Instance type: \$(curl -s -H \"X-aws-ec2-metadata-token: \$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)\" http://169.254.169.254/latest/meta-data/instance-type)\";
+echo \"AZ: \$(curl -s -H \"X-aws-ec2-metadata-token: \$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)\" http://169.254.169.254/latest/meta-data/placement/availability-zone)\";
+echo \"Kernel: \$(uname -r)\";
+echo \"CPUs: \$(nproc)\";
+echo \"Memory: \$(free -h | grep Mem | awk '{print \$2}')\";
+echo \"Hugepages: \$(cat /proc/meminfo | grep HugePages_Total)\";
+echo '=== PCI Devices ===';
+lspci | grep -i eth 2>/dev/null || echo 'none';
+echo '=== DPDK Bind Status ===';
+/usr/local/bin/dpdk-devbind.py --status 2>/dev/null || echo 'devbind not available';
+echo '=== Network Interfaces ===';
+ip addr show 2>/dev/null || echo 'unavailable';
+echo '=== Loaded Modules ===';
+lsmod | grep -E '(vfio|uio|ena)' 2>/dev/null || echo 'none';
+echo '=== NUMA Info ===';
+numactl --hardware 2>/dev/null || echo 'numactl not available'"
+
+    local output
+    output=$(ssm_run_command "$instance_id" 30 "$env_cmd" 2>/dev/null || echo "(failed to collect)")
+    mkdir -p "$LOGS_DIR"
+    echo "$output" > "$LOGS_DIR/${label}-environment.txt"
+    log_info "Saved $label environment info"
+}
+
+collect_instance_logs() {
+    local instance_id="$1"
+    local label="$2"
+
+    log_info "Collecting logs from $label..."
+    mkdir -p "$LOGS_DIR"
+
+    # User-data log
+    local ud_output
+    ud_output=$(ssm_run_command "$instance_id" 30 "tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'" 2>/dev/null || echo "(failed)")
+    echo "$ud_output" > "$LOGS_DIR/${label}-user-data.log"
+
+    # Console output (survives instance issues)
+    aws ec2 get-console-output \
+        --instance-id "$instance_id" \
+        --latest \
+        --query "Output" \
+        --output text > "$LOGS_DIR/${label}-console-output.log" 2>/dev/null || true
+
+    # dmesg crashes
+    local dmesg_output
+    dmesg_output=$(ssm_run_command "$instance_id" 15 "dmesg | grep -iE '(segfault|panic|oom|kill)' | tail -20 2>/dev/null || echo 'no crashes'" 2>/dev/null || echo "(failed)")
+    echo "$dmesg_output" > "$LOGS_DIR/${label}-dmesg-crashes.log"
+}
+
+collect_networking_diagnostics() {
+    local instance_id="$1"
+    local label="$2"
+    local phase="$3"  # "baseline" or "failure"
+
+    log_info "Collecting $phase networking diagnostics from $label..."
+    local diag_cmd="echo '=== Interface State ===';
+ip addr show 2>/dev/null;
+echo '=== ARP Table ===';
+ip neigh show 2>/dev/null;
+echo '=== Routes ===';
+ip route show 2>/dev/null;
+echo '=== DPDK Bind ===';
+/usr/local/bin/dpdk-devbind.py --status 2>/dev/null || echo 'unavailable';
+echo '=== Ethtool Stats (ens6) ===';
+ethtool -S ens6 2>/dev/null | head -30 || echo 'unavailable';
+echo '=== Processes ===';
+ps aux | grep -E '(echo|testpmd|t-rex|plain-echo)' | grep -v grep || echo 'none'"
+
+    local output
+    output=$(ssm_run_command "$instance_id" 30 "$diag_cmd" 2>/dev/null || echo "(failed)")
+    mkdir -p "$LOGS_DIR"
+    echo "$output" > "$LOGS_DIR/${label}-networking-diag-${phase}.txt"
+}
+
+# ── DUT NIC Management ────────────────────────────────────────────────────────
+
+dut_bind_dpdk() {
+    log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 && echo 'Bound to vfio-pci'" \
+        || { log_error "Failed to bind DUT ENI to vfio-pci"; return 1; }
+}
+
+dut_bind_kernel() {
+    log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "/usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 2; ip link set ens6 up 2>/dev/null || true; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; echo 'Bound to kernel (ena)'" \
+        || { log_error "Failed to bind DUT ENI to kernel"; return 1; }
+}
+
+dut_stop_all_apps() {
+    log_info "Stopping all DUT applications..."
+    ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/plain-echo' 2>/dev/null || true; pkill -f testpmd 2>/dev/null || true; rm -rf /var/run/dpdk/ 2>/dev/null || true; sleep 2; echo 'All apps stopped'" \
+        2>/dev/null || true
+}
+
+# ── TRex Management ──────────────────────────────────────────────────────────
+
+generate_trex_config() {
+    log_info "Generating TRex configuration..."
+
+    # Get gateway MAC for the TRex data ENI subnet
+    # In AWS VPC, all frames must use gateway MAC
+    local gateway_mac
+    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "ip neigh show dev ens6 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1 || echo ''" 2>/dev/null || echo "")
+
+    if [[ -z "$gateway_mac" ]]; then
+        # Warm ARP cache and retry
+        log_info "Warming ARP cache on TRex..."
+        ssm_run_command "$TREX_INSTANCE_ID" 15 \
+            "ping -c 1 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 1; ip neigh show" 2>/dev/null || true
+    fi
+
+    # Generate /etc/trex_cfg.yaml via SSM
+    local trex_cfg_cmd="cat > /etc/trex_cfg.yaml << 'TREXCFG'
+- port_limit: 1
+  version: 2
+  interfaces: ['00:06.0']
+  port_info:
+    - dest_mac: '${GATEWAY_MAC:-ff:ff:ff:ff:ff:ff}'
+      src_mac:  '${TREX_DATA_MAC:-00:00:00:00:00:00}'
+TREXCFG
+echo 'TRex config written to /etc/trex_cfg.yaml'
+cat /etc/trex_cfg.yaml"
+
+    ssm_run_command "$TREX_INSTANCE_ID" 15 "$trex_cfg_cmd" || {
+        log_error "Failed to write TRex config"
+        return 1
+    }
+}
+
+start_trex_server() {
+    log_info "Starting TRex server..."
+
+    # Start in background via nohup
+    ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 300 \
+        "cd /opt/trex && nohup ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1 &"
+
+    # Wait for TRex to be ready
+    local elapsed=0
+    while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
+        local status
+        status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+            "pgrep -f t-rex-64 >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null || echo "unknown")
+
+        if [[ "$status" == *"running"* ]]; then
+            log_info "TRex server is running (${elapsed}s)"
+            # Give it a few more seconds to initialize
+            sleep 5
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    log_error "TRex server failed to start within ${TREX_START_TIMEOUT}s"
+    # Collect TRex log for diagnostics
+    ssm_run_command "$TREX_INSTANCE_ID" 10 "tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null || true
+    return 1
+}
+
+stop_trex_server() {
+    log_info "Stopping TRex server..."
+    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; echo 'TRex stopped'" 2>/dev/null || true
+}
+
+# ── Benchmark Runner ──────────────────────────────────────────────────────────
+
+run_benchmark_for_config() {
+    local config_name="$1"
+    local dst_port="${2:-9000}"
+
+    log_info "Running TRex benchmark for config: $config_name"
+
+    # Copy benchmark script to TRex instance
+    local benchmark_script
+    benchmark_script=$(cat "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
+
+    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "mkdir -p /opt/perf-tests && cat > /opt/perf-tests/run_benchmark.py << 'PYSCRIPT'
+${benchmark_script}
+PYSCRIPT
+chmod +x /opt/perf-tests/run_benchmark.py" || {
+        log_error "Failed to copy benchmark script to TRex"
+        return 1
+    }
+
+    # Discover gateway MAC from TRex's perspective
+    local gateway_mac
+    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+        "ip neigh show 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1" 2>/dev/null || echo "")
+
+    log_info "Using gateway MAC: ${gateway_mac:-unknown}"
+
+    # Run benchmark via SSM
+    local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_benchmark.py \
+        --server localhost \
+        --config-name '$config_name' \
+        --src-ip '$TREX_DATA_ENI_IP' \
+        --dst-ip '$DUT_DATA_ENI_IP' \
+        --dst-mac '${gateway_mac:-ff:ff:ff:ff:ff:ff}' \
+        --dst-port $dst_port \
+        --packet-sizes '$PACKET_SIZES' \
+        --rate-steps '$RATE_STEPS' \
+        --duration $DURATION \
+        --output '/tmp/perf-results/${config_name}.json'"
+
+    local output
+    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd" 2>/dev/null)
+    local exit_code=$?
+
+    echo "$output"
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Benchmark failed for $config_name"
+        mkdir -p "$LOGS_DIR"
+        echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+        return 1
+    fi
+
+    # Download results from TRex instance
+    local results_json
+    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo '{}'" 2>/dev/null)
+
+    mkdir -p "$RESULTS_DIR"
+    echo "$results_json" > "$RESULTS_DIR/${config_name}.json"
+    log_info "Results saved to $RESULTS_DIR/${config_name}.json"
+}
+
+# ── DUT Config Runners ────────────────────────────────────────────────────────
+
+start_dut_rust_dpdk() {
+    log_info "Starting DUT: rust-dpdk (echo server with DPDK backend)"
+    dut_bind_dpdk || return 1
+
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
+    sleep 5
+
+    # Verify it's running
+    local status
+    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    if [[ "$status" != *"running"* ]]; then
+        log_error "rust-dpdk echo server failed to start"
+        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-dpdk.log 2>/dev/null" 2>/dev/null || true
+        return 1
+    fi
+    log_info "rust-dpdk echo server running"
+}
+
+start_dut_native_dpdk() {
+    log_info "Starting DUT: native-dpdk (testpmd macswap)"
+    dut_bind_dpdk || return 1
+
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --vdev=net_vfio0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+    sleep 5
+
+    local status
+    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+        "pgrep -f testpmd >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    if [[ "$status" != *"running"* ]]; then
+        log_error "testpmd failed to start"
+        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/testpmd.log 2>/dev/null" 2>/dev/null || true
+        return 1
+    fi
+    log_info "testpmd macswap running"
+}
+
+start_dut_rust_stdlib() {
+    log_info "Starting DUT: rust-stdlib (echo server with kernel backend)"
+    dut_bind_kernel || return 1
+
+    # The echo binary without DPDK feature falls back to std::net
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-stdlib.log 2>&1 &"
+    sleep 3
+
+    local status
+    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    if [[ "$status" != *"running"* ]]; then
+        log_error "rust-stdlib echo server failed to start"
+        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-stdlib.log 2>/dev/null" 2>/dev/null || true
+        return 1
+    fi
+    log_info "rust-stdlib echo server running"
+}
+
+start_dut_plain_rust() {
+    log_info "Starting DUT: plain-rust (minimal std::net echo server)"
+    dut_bind_kernel || return 1
+
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/plain-echo.log 2>&1 &"
+    sleep 3
+
+    local status
+    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+        "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    if [[ "$status" != *"running"* ]]; then
+        log_error "plain-rust echo server failed to start"
+        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/plain-echo.log 2>/dev/null" 2>/dev/null || true
+        return 1
+    fi
+    log_info "plain-rust echo server running"
+}
+
+# ── Results Aggregation ───────────────────────────────────────────────────────
+
+aggregate_results() {
+    log_info "Aggregating performance results..."
+    mkdir -p "$RESULTS_DIR"
+
+    python3 - <<'PYEOF'
+import json, glob, os, sys
+from datetime import datetime, timezone
+
+results_dir = os.environ.get("RESULTS_DIR", "perf-results")
+output_file = os.path.join(results_dir, "perf-report.json")
+
+configs = {}
+for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
+    if os.path.basename(f) == "perf-report.json":
+        continue
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+            name = data.get("config_name", os.path.basename(f).replace(".json", ""))
+            configs[name] = data
+    except Exception as e:
+        print(f"Warning: failed to read {f}: {e}", file=sys.stderr)
+
+report = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "commit": os.environ.get("GITHUB_SHA", "unknown"),
+    "instance_type": "c5n.2xlarge",
+    "configs": configs,
+}
+
+with open(output_file, "w") as f:
+    json.dump(report, f, indent=2)
+print(f"Aggregated report written to {output_file}")
+PYEOF
+}
+
+generate_markdown_summary() {
+    log_info "Generating markdown summary..."
+
+    python3 - <<'PYEOF'
+import json, os, sys
+
+results_dir = os.environ.get("RESULTS_DIR", "perf-results")
+report_file = os.path.join(results_dir, "perf-report.json")
+md_file = os.path.join(results_dir, "perf-summary.md")
+
+if not os.path.exists(report_file):
+    print("No report file found, skipping summary generation", file=sys.stderr)
+    sys.exit(0)
+
+with open(report_file) as f:
+    report = json.load(f)
+
+lines = []
+lines.append(f"## Performance Test Results — {report.get('instance_type', 'unknown')}")
+lines.append("")
+lines.append(f"Commit: `{report.get('commit', 'unknown')[:8]}`")
+lines.append(f"Timestamp: {report.get('timestamp', 'unknown')}")
+lines.append("")
+
+configs = report.get("configs", {})
+if not configs:
+    lines.append("*No results collected*")
+else:
+    # Collect all packet sizes across configs
+    all_sizes = set()
+    for cfg_data in configs.values():
+        for size_key in cfg_data.get("results", {}).keys():
+            all_sizes.add(size_key)
+
+    for pkt_size in sorted(all_sizes):
+        lines.append(f"### {pkt_size} packets")
+        lines.append("")
+        lines.append("| Config | Rate | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps |")
+        lines.append("|--------|------|--------|--------|--------|-------------|-------------|---------|")
+
+        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-stdlib", "plain-rust"]:
+            cfg_data = configs.get(cfg_name, {})
+            size_results = cfg_data.get("results", {}).get(pkt_size, [])
+
+            for r in size_results:
+                tx_pps = f"{r.get('tx_pps', 0):,}"
+                rx_pps = f"{r.get('rx_pps', 0):,}"
+                drop = f"{r.get('drop_pct', 0):.2f}%"
+                lat_avg = r.get('lat_avg_us', -1)
+                lat_max = r.get('lat_max_us', -1)
+                lat_avg_s = f"{lat_avg:.1f}" if lat_avg >= 0 else "N/A"
+                lat_max_s = f"{lat_max:.1f}" if lat_max >= 0 else "N/A"
+                tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
+                rate = f"{r.get('offered_pct', 0)}%"
+
+                lines.append(f"| {cfg_name} | {rate} | {tx_pps} | {rx_pps} | {drop} | {lat_avg_s} | {lat_max_s} | {tx_mbps} |")
+
+        lines.append("")
+
+md_content = "\n".join(lines)
+with open(md_file, "w") as f:
+    f.write(md_content)
+
+# Also print for step summary
+print(md_content)
+PYEOF
+}
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+
+cleanup() {
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Script exiting with code $exit_code, collecting failure diagnostics..."
+
+        if [[ -n "$DUT_INSTANCE_ID" ]]; then
+            collect_instance_logs "$DUT_INSTANCE_ID" "dut" || true
+            collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure" || true
+        fi
+        if [[ -n "$TREX_INSTANCE_ID" ]]; then
+            collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
+            collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure" || true
+            # TRex server log
+            ssm_run_command "$TREX_INSTANCE_ID" 10 \
+                "tail -100 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null \
+                > "$LOGS_DIR/trex-server.log" || true
+        fi
+
+        write_failure_json "perf-test" "Script exited with code $exit_code"
+    fi
+
+    if [[ "$TEARDOWN" == "true" && "$SKIP_DEPLOY" == "false" ]]; then
+        log_info "Tearing down PerfTestStack..."
+        cd "$CDK_DIR"
+        npx cdk destroy "$CDK_STACK_NAME" --force 2>/dev/null || log_warn "Teardown failed"
+    fi
+}
+
+trap cleanup EXIT
+
+# ── Main Flow ─────────────────────────────────────────────────────────────────
+
+main() {
+    log_info "=== Performance Test Suite ==="
+    log_info "Configs: $CONFIGS"
+    log_info "Packet sizes: $PACKET_SIZES"
+    log_info "Rate steps: $RATE_STEPS"
+    log_info "Duration per step: ${DURATION}s"
+
+    mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
+
+    # ── Phase 1: Deploy ──────────────────────────────────────────────────────
+
+    if [[ "$SKIP_DEPLOY" == "false" ]]; then
+        log_info "Phase 1: Deploying PerfTestStack..."
+        post_pr_comment "## [Perf] Stage: Deploy
+Deploying \`PerfTestStack\` (TRex + DUT on c5n.2xlarge)...
+Configs: \`$CONFIGS\`
+Packet sizes: \`$PACKET_SIZES\`"
+
+        cd "$CDK_DIR"
+
+        # Fetch AMI IDs from SSM if available
+        local dpdk_ami trex_ami context_args=""
+        dpdk_ami=$(aws ssm get-parameter --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+        trex_ami=$(aws ssm get-parameter --name /dpdk-stdlib-rust/ami/trex-latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+        if [[ -n "${DPDK_AMI_ID:-}" ]]; then dpdk_ami="$DPDK_AMI_ID"; fi
+        if [[ -n "${TREX_AMI_ID:-}" ]]; then trex_ami="$TREX_AMI_ID"; fi
+
+        if [[ -n "$dpdk_ami" ]]; then
+            context_args="$context_args -c dpdkAmiId=$dpdk_ami"
+            log_info "Using pre-built DPDK AMI: $dpdk_ami"
+        fi
+        if [[ -n "$trex_ami" ]]; then
+            context_args="$context_args -c trexAmiId=$trex_ami"
+            log_info "Using pre-built TRex AMI: $trex_ami"
+        fi
+
+        npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
+            || { log_error "CDK deploy failed"; exit 2; }
+
+        cd "$REPO_ROOT"
+    fi
+
+    # ── Phase 2: Get stack outputs & wait for SSM ────────────────────────────
+
+    log_info "Phase 2: Resolving stack outputs..."
+
+    TREX_INSTANCE_ID=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='TrexInstanceId'].OutputValue" \
+        --output text)
+    DUT_INSTANCE_ID=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='DutInstanceId'].OutputValue" \
+        --output text)
+    TREX_DATA_ENI_IP=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniPrivateIp'].OutputValue" \
+        --output text)
+    DUT_DATA_ENI_IP=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='DutDataEniPrivateIp'].OutputValue" \
+        --output text)
+
+    log_info "TRex: $TREX_INSTANCE_ID (data IP: $TREX_DATA_ENI_IP)"
+    log_info "DUT:  $DUT_INSTANCE_ID (data IP: $DUT_DATA_ENI_IP)"
+
+    # Wait for both instances
+    wait_ssm_ready "$TREX_INSTANCE_ID" "TRex" &
+    local trex_wait_pid=$!
+    wait_ssm_ready "$DUT_INSTANCE_ID" "DUT" &
+    local dut_wait_pid=$!
+
+    wait "$trex_wait_pid" || { log_error "TRex SSM not ready"; exit 2; }
+    wait "$dut_wait_pid"  || { log_error "DUT SSM not ready"; exit 2; }
+
+    post_pr_comment "## [Perf] Stage: Instances Ready
+- TRex: \`$TREX_INSTANCE_ID\` (${TREX_DATA_ENI_IP})
+- DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})"
+
+    # ── Phase 3: Collect baseline environment info ───────────────────────────
+
+    log_info "Phase 3: Collecting baseline environment info..."
+    collect_environment_info "$TREX_INSTANCE_ID" "trex"
+    collect_environment_info "$DUT_INSTANCE_ID" "dut"
+    collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "baseline"
+    collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "baseline"
+
+    # ── Phase 4: Configure and start TRex ────────────────────────────────────
+
+    log_info "Phase 4: Configuring TRex..."
+    generate_trex_config || { log_error "TRex config failed"; exit 2; }
+    start_trex_server || { log_error "TRex start failed"; exit 2; }
+
+    # ── Phase 5: Run benchmarks for each config ─────────────────────────────
+
+    log_info "Phase 5: Running benchmarks..."
+    IFS=',' read -ra CONFIG_LIST <<< "$CONFIGS"
+    local total_configs=${#CONFIG_LIST[@]}
+    local config_idx=0
+    local failed_configs=()
+
+    for config in "${CONFIG_LIST[@]}"; do
+        config_idx=$((config_idx + 1))
+        log_info "=== Config $config_idx/$total_configs: $config ==="
+
+        post_pr_comment "## [Perf] Stage: Benchmark ($config_idx/$total_configs)
+Running \`$config\` benchmark...
+Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_STEPS\`%"
+
+        # Stop any running DUT apps
+        dut_stop_all_apps
+
+        # Start the appropriate DUT config
+        local start_ok=true
+        case "$config" in
+            rust-dpdk)    start_dut_rust_dpdk   || start_ok=false ;;
+            native-dpdk)  start_dut_native_dpdk || start_ok=false ;;
+            rust-stdlib)  start_dut_rust_stdlib  || start_ok=false ;;
+            plain-rust)   start_dut_plain_rust   || start_ok=false ;;
+            *)
+                log_error "Unknown config: $config"
+                failed_configs+=("$config")
+                continue
+                ;;
+        esac
+
+        if [[ "$start_ok" == "false" ]]; then
+            log_error "Failed to start DUT for config: $config"
+            failed_configs+=("$config")
+            # Collect diagnostics for this failure
+            collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
+            continue
+        fi
+
+        # Run the benchmark
+        if ! run_benchmark_for_config "$config"; then
+            log_error "Benchmark failed for config: $config"
+            failed_configs+=("$config")
+            collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
+            collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure-${config}"
+        fi
+
+        # Collect DUT app log for this config
+        local log_file
+        case "$config" in
+            rust-dpdk)    log_file="/var/log/echo-rust-dpdk.log" ;;
+            native-dpdk)  log_file="/var/log/testpmd.log" ;;
+            rust-stdlib)  log_file="/var/log/echo-rust-stdlib.log" ;;
+            plain-rust)   log_file="/var/log/plain-echo.log" ;;
+        esac
+        if [[ -n "${log_file:-}" ]]; then
+            local app_log
+            app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+                "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
+            echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
+        fi
+    done
+
+    # Stop TRex and DUT
+    dut_stop_all_apps
+    stop_trex_server
+
+    # ── Phase 6: Aggregate results and post summary ──────────────────────────
+
+    log_info "Phase 6: Aggregating results..."
+    aggregate_results
+    local summary
+    summary=$(generate_markdown_summary)
+
+    # Add failure info if any
+    if [[ ${#failed_configs[@]} -gt 0 ]]; then
+        summary="$summary
+
+### Failed Configs
+$(printf '- `%s`\n' "${failed_configs[@]}")"
+    fi
+
+    # Post to PR
+    post_pr_comment "## [Perf] Stage: Results
+
+$summary
+
+[Full results artifact](${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-})"
+
+    # Write to GitHub Actions step summary
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+    fi
+
+    # Collect final logs
+    collect_instance_logs "$DUT_INSTANCE_ID" "dut"
+    collect_instance_logs "$TREX_INSTANCE_ID" "trex"
+
+    # Exit with failure if any configs failed
+    if [[ ${#failed_configs[@]} -gt 0 ]]; then
+        log_error "${#failed_configs[@]} config(s) failed: ${failed_configs[*]}"
+        exit 1
+    fi
+
+    log_info "=== All performance tests completed successfully ==="
+}
+
+main "$@"
