@@ -41,7 +41,7 @@ RESULTS_DIR="$REPO_ROOT/perf-results"
 LOGS_DIR="$REPO_ROOT/instance-logs"
 
 SSM_READINESS_TIMEOUT=600
-TREX_START_TIMEOUT=60
+TREX_START_TIMEOUT=120
 BENCHMARK_TIMEOUT=600
 
 TREX_INSTANCE_ID=""
@@ -389,9 +389,11 @@ generate_trex_config() {
     fi
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
-    # Take down ens6 so TRex can bind it via DPDK internally
-    ssm_run_command "$TREX_INSTANCE_ID" 10 \
-        "ip link set ens6 down 2>/dev/null || true" 2>/dev/null || true
+    # Unbind ens6 from kernel driver so TRex can bind it via vfio-pci
+    # Use TRex's bundled dpdk_nic_bind.py (no system dpdk-devbind.py on TRex AMI)
+    log_info "Unbinding TRex data ENI from kernel driver..."
+    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "ip link set ens6 down 2>/dev/null || true; python3 /opt/trex/dpdk_nic_bind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || /opt/trex/dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>/dev/null || echo 'NIC unbind skipped — TRex will bind internally'; python3 /opt/trex/dpdk_nic_bind.py --status 2>/dev/null | head -10 || true" 2>/dev/null || true
 
     # Generate /etc/trex_cfg.yaml via SSM
     # Use unquoted heredoc delimiter so local variables are expanded before sending to remote
