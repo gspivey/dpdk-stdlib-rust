@@ -471,9 +471,15 @@ generate_trex_config() {
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
     # Step 3: Unbind ens6 from kernel driver so TRex can bind it via vfio-pci
+    # Use sysfs driver_override — works without any DPDK tools installed.
     log_info "Step 3: Unbinding TRex data ENI from kernel driver..."
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ip link set ens6 down 2>/dev/null || true; python3 /opt/trex/dpdk_nic_bind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || /opt/trex/dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>/dev/null || echo NIC_UNBIND_SKIP; python3 /opt/trex/dpdk_nic_bind.py --status 2>/dev/null | head -10 || true" 2>/dev/null || true
+    local bind_result
+    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "set -x; PCI=0000:00:06.0; ip link set ens6 down 2>/dev/null || true; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/\$PCI 2>/dev/null && echo VERIFIED || echo NOT_VERIFIED" 2>/dev/null || echo "SSM_FAILED")
+    log_info "NIC bind result: $(echo "$bind_result" | grep -E 'BIND_|VERIFIED|FAIL' | head -5)"
+    if [[ "$bind_result" != *"BIND_OK"* ]]; then
+        log_warn "vfio-pci binding may have failed — TRex might not start"
+    fi
 
     # Step 4: Write /etc/trex_cfg.yaml via SSM
     # Use base64 encoding to avoid all quoting/heredoc issues through SSM JSON layer
@@ -492,12 +498,17 @@ YAMLEOF
     yaml_b64=$(echo "$yaml_content" | base64 -w0)
 
     local write_result
-    write_result=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml; echo WROTE; cat /etc/trex_cfg.yaml" 2>/dev/null || echo "WRITE_FAILED")
+    write_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml && echo WROTE || echo WRITE_ERR; cat /etc/trex_cfg.yaml 2>/dev/null || true" 2>/dev/null || echo "SSM_WRITE_FAILED")
     log_info "Config write result: $(echo "$write_result" | head -10)"
 
-    if [[ "$write_result" == *"WRITE_FAILED"* ]]; then
-        log_error "Failed to write TRex config via SSM"
+    if [[ "$write_result" == *"SSM_WRITE_FAILED"* ]]; then
+        log_error "SSM command to write TRex config failed"
+        return 1
+    fi
+    if [[ "$write_result" != *"WROTE"* ]]; then
+        log_error "TRex config write did not succeed (no WROTE marker in output)"
+        log_error "Write output: $(echo "$write_result" | head -5)"
         return 1
     fi
 }
