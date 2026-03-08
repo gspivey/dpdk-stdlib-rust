@@ -516,6 +516,18 @@ YAMLEOF
 start_trex_server() {
     log_info "Starting TRex server..."
 
+    # Verify NIC is bound to vfio-pci before starting TRex
+    local nic_state
+    nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "echo NIC_STATE:; ls -la /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo VFIO_OK || echo VFIO_NOT_BOUND; ls /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null && readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null || echo NO_DRIVER; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING" 2>/dev/null || echo "SSM_FAILED")
+    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'VFIO|DRIVER|BINARY|port_limit|src_mac|dest_mac' | head -8)"
+
+    if [[ "$nic_state" == *"VFIO_NOT_BOUND"* ]]; then
+        log_warn "NIC not bound to vfio-pci — attempting fallback with TRex dpdk_setup_ports.py"
+        ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "cd /opt/trex && python3 dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>&1 || echo SETUP_PORTS_FAILED; ls /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo VFIO_OK || echo STILL_NOT_BOUND" 2>/dev/null || true
+    fi
+
     # Start in background via nohup
     ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 300 \
         "cd /opt/trex && nohup ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1 &"
@@ -532,6 +544,15 @@ start_trex_server() {
             # Give it a few more seconds to initialize
             sleep 5
             return 0
+        fi
+        # If TRex exited early, check log immediately
+        if [[ $elapsed -ge 15 ]]; then
+            local early_log
+            early_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+                "cat /var/log/trex-server.log 2>/dev/null | tail -20 || echo '(no log yet)'" 2>/dev/null || echo "")
+            if [[ -n "$early_log" && "$early_log" != *"(no log yet)"* ]]; then
+                log_info "TRex log (early check): $(echo "$early_log" | tail -5)"
+            fi
         fi
         sleep 5
         elapsed=$((elapsed + 5))
@@ -950,13 +971,13 @@ Starting TRex configuration (MAC discovery + NIC binding)..."
 Starting TRex server..."
 
     if ! start_trex_server; then
-        # Grab TRex log
+        # Grab TRex log and NIC state for diagnostics
         local trex_log
-        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "tail -30 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
+        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+            "echo '=== TRex Log ==='; tail -30 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'" 2>/dev/null || echo "(SSM failed)")
         post_pr_comment "## [Perf] Stage: TRex Start FAILED
 TRex server failed to start within ${TREX_START_TIMEOUT}s.
-<details><summary>TRex server log (last 30 lines)</summary>
+<details><summary>TRex server log + NIC diagnostics</summary>
 
 \`\`\`
 ${trex_log}
