@@ -31,6 +31,22 @@ gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --l
 gh run view <run-id> --repo gspivey/dpdk-stdlib-rust
 ```
 
+**⚠ `gh run watch` does NOT work in this repo.** The `GH_TOKEN` is a fine-grained PAT, which
+does not support the `checks:read` permission required by `gh run watch`. It will silently fail
+or error. **Always poll with `gh run view --json status,conclusion` instead:**
+```bash
+# Poll until a run completes
+while true; do
+  json=$(gh run view <run-id> --repo gspivey/dpdk-stdlib-rust --json status,conclusion)
+  status=$(echo "$json" | jq -r '.status')
+  if [ "$status" = "completed" ]; then
+    echo "Conclusion: $(echo "$json" | jq -r '.conclusion')"
+    break
+  fi
+  sleep 30
+done
+```
+
 **Get only failed step logs (fastest path to root cause):**
 ```bash
 gh run view <run-id> --log-failed --repo gspivey/dpdk-stdlib-rust
@@ -163,7 +179,7 @@ Do NOT push a PR and hope CI catches problems — close the feedback loop in-ses
    - Runs `cargo build` + `cargo test` locally
    - Pushes the current branch
    - Triggers the `integration-tests.yml` workflow via `gh workflow run`
-   - Polls with `gh run watch --exit-status` until CI finishes
+   - Polls with `gh run view --json status,conclusion` until CI finishes
    - Exits 0 only if everything passes
 
 3. **If integration tests fail**, `ci-validate.sh` will automatically download and print
