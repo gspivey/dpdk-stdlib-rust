@@ -415,6 +415,28 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
+    # Step 0: Dynamically discover PCI address and interface name for the secondary ENI.
+    # The PCI address varies across instance types (e.g., 0000:00:06.0 on c5n, different on others).
+    # We use lspci to find the last ENA device (same approach as configure-eni.sh).
+    log_info "Step 0: Discovering secondary ENI PCI address..."
+    local pci_discovery
+    pci_discovery=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "PCI=\$(lspci -D | grep 'Elastic Network Adapter' | tail -1 | cut -d' ' -f1); echo \"PCI_ADDR: \$PCI\"; if [ -n \"\$PCI\" ] && [ -d /sys/bus/pci/devices/\$PCI/net ]; then IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); echo \"IFACE: \$IFACE\"; fi; lspci -D | grep 'Elastic Network Adapter'" 2>/dev/null || echo "SSM_FAILED")
+    log_info "PCI discovery: $(echo "$pci_discovery" | head -5)"
+
+    TREX_PCI_ADDR=$(echo "$pci_discovery" | grep "^PCI_ADDR:" | head -1 | awk '{print $2}')
+    local trex_iface
+    trex_iface=$(echo "$pci_discovery" | grep "^IFACE:" | head -1 | awk '{print $2}')
+    # Derive BDF (bus:device.function without domain) for TRex config
+    TREX_PCI_BDF=$(echo "$TREX_PCI_ADDR" | sed 's/^0000://')
+
+    if [[ -z "$TREX_PCI_ADDR" || "$TREX_PCI_ADDR" == "" ]]; then
+        log_error "Could not discover secondary ENI PCI address via lspci"
+        log_error "lspci output: $(echo "$pci_discovery" | tail -5)"
+        return 1
+    fi
+    log_info "Secondary ENI PCI: $TREX_PCI_ADDR (BDF: $TREX_PCI_BDF, interface: ${trex_iface:-unknown})"
+
     # Step 1: Discover TRex data ENI source MAC via IMDS (most reliable)
     # IMDS is authoritative and doesn't depend on sysfs timing or interface naming.
     # We query all MACs, find the one with device-number=1 (secondary ENI).
@@ -435,7 +457,7 @@ generate_trex_config() {
         log_warn "IMDS discovery failed, falling back to sysfs..."
         local sysfs_result
         sysfs_result=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "for iface in ens6 eth1; do if [ -f /sys/class/net/\$iface/address ]; then echo \"SYSFS_MAC: \$(cat /sys/class/net/\$iface/address)\"; break; fi; done" 2>/dev/null || echo "")
+            "for iface in ${trex_iface:-ens6} ens6 eth1; do if [ -f /sys/class/net/\$iface/address ]; then echo \"SYSFS_MAC: \$(cat /sys/class/net/\$iface/address)\"; break; fi; done" 2>/dev/null || echo "")
         TREX_DATA_MAC=$(echo "$sysfs_result" | grep "^SYSFS_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
     fi
 
@@ -450,11 +472,12 @@ generate_trex_config() {
     # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
     local subnet_gw
     subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
-    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw)..."
+    local gw_iface="${trex_iface:-ens6}"
+    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw, iface: $gw_iface)..."
 
     local gw_raw
     gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev ens6 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev ens6 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+        "ip link set $gw_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $gw_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $gw_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $gw_iface 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
     log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -8)"
 
     # Extract gateway MAC specifically from the GW_ENTRY line (targeted at subnet .1)
@@ -470,25 +493,25 @@ generate_trex_config() {
     fi
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
-    # Step 3: Unbind ens6 from kernel driver so TRex can bind it via vfio-pci
+    # Step 3: Unbind secondary ENI from kernel driver so TRex can bind it via vfio-pci
     # Use sysfs driver_override — works without any DPDK tools installed.
-    log_info "Step 3: Unbinding TRex data ENI from kernel driver..."
+    log_info "Step 3: Binding $TREX_PCI_ADDR to vfio-pci..."
     local bind_result
     bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "set -x; PCI=0000:00:06.0; ip link set ens6 down 2>/dev/null || true; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/\$PCI 2>/dev/null && echo VERIFIED || echo NOT_VERIFIED" 2>/dev/null || echo "SSM_FAILED")
+        "set -x; PCI=$TREX_PCI_ADDR; ip link set ${gw_iface} down 2>/dev/null || true; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/\$PCI 2>/dev/null && echo VERIFIED || echo NOT_VERIFIED" 2>/dev/null || echo "SSM_FAILED")
     log_info "NIC bind result: $(echo "$bind_result" | grep -E 'BIND_|VERIFIED|FAIL' | head -5)"
-    if [[ "$bind_result" != *"BIND_OK"* ]]; then
+    if [[ "$bind_result" != *"BIND_OK"* && "$bind_result" != *"VERIFIED"* ]]; then
         log_warn "vfio-pci binding may have failed — TRex might not start"
     fi
 
     # Step 4: Write /etc/trex_cfg.yaml via SSM
     # Use base64 encoding to avoid all quoting/heredoc issues through SSM JSON layer
-    log_info "Step 4: Writing TRex config..."
+    log_info "Step 4: Writing TRex config (PCI BDF: $TREX_PCI_BDF)..."
     local yaml_content
     yaml_content=$(cat <<YAMLEOF
 - port_limit: 1
   version: 2
-  interfaces: ['00:06.0']
+  interfaces: ['${TREX_PCI_BDF}']
   port_info:
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_MAC}'
@@ -515,29 +538,34 @@ YAMLEOF
 
 start_trex_server() {
     log_info "Starting TRex server..."
+    local pci="${TREX_PCI_ADDR:-0000:00:06.0}"
 
     # Verify NIC is bound to vfio-pci before starting TRex
     local nic_state
     nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo NIC_STATE:; ls -la /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo VFIO_OK || echo VFIO_NOT_BOUND; ls /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null && readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null || echo NO_DRIVER; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING" 2>/dev/null || echo "SSM_FAILED")
-    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'VFIO|DRIVER|BINARY|port_limit|src_mac|dest_mac' | head -8)"
+        "echo NIC_STATE:; ls -la /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo VFIO_OK || echo VFIO_NOT_BOUND; readlink /sys/bus/pci/devices/$pci/driver 2>/dev/null || echo NO_DRIVER; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep -i huge /proc/meminfo 2>/dev/null | head -3; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" 2>/dev/null || echo "SSM_FAILED")
+    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'VFIO|DRIVER|BINARY|port_limit|src_mac|dest_mac|Huge|NO_VFIO' | head -10)"
 
     if [[ "$nic_state" == *"VFIO_NOT_BOUND"* ]]; then
-        log_warn "NIC not bound to vfio-pci — attempting fallback with TRex dpdk_setup_ports.py"
+        log_warn "NIC $pci not bound to vfio-pci — attempting fallback bind"
         ssm_run_command "$TREX_INSTANCE_ID" 30 \
-            "cd /opt/trex && python3 dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>&1 || echo SETUP_PORTS_FAILED; ls /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo VFIO_OK || echo STILL_NOT_BOUND" 2>/dev/null || true
+            "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; echo $pci > /sys/bus/pci/devices/$pci/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/$pci/driver_override; echo $pci > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK || echo BIND_FAIL; ls /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo VERIFIED || echo STILL_NOT_BOUND" 2>/dev/null || true
     fi
+
+    # Ensure hugepages are mounted (TRex/DPDK requires them)
+    ssm_run_command "$TREX_INSTANCE_ID" 10 \
+        "mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; echo \$(grep HugePages_Free /proc/meminfo)" 2>/dev/null || true
 
     # Start in background via nohup
     ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 300 \
         "cd /opt/trex && nohup ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1 &"
 
-    # Wait for TRex to be ready
+    # Wait for TRex to be ready (check both process and log for ready marker)
     local elapsed=0
     while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
         local status
         status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "pgrep -f t-rex-64 >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null || echo "unknown")
+            "pgrep -f t-rex-64 >/dev/null && echo 'running' || echo 'not running'; wc -l < /var/log/trex-server.log 2>/dev/null || echo '0 lines'" 2>/dev/null || echo "unknown")
 
         if [[ "$status" == *"running"* ]]; then
             log_info "TRex server is running (${elapsed}s)"
@@ -545,13 +573,18 @@ start_trex_server() {
             sleep 5
             return 0
         fi
-        # If TRex exited early, check log immediately
-        if [[ $elapsed -ge 15 ]]; then
+        # If TRex exited early, check log immediately to understand why
+        if [[ $elapsed -ge 10 ]]; then
             local early_log
             early_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "cat /var/log/trex-server.log 2>/dev/null | tail -20 || echo '(no log yet)'" 2>/dev/null || echo "")
+                "tail -20 /var/log/trex-server.log 2>/dev/null || echo '(no log yet)'" 2>/dev/null || echo "")
             if [[ -n "$early_log" && "$early_log" != *"(no log yet)"* ]]; then
-                log_info "TRex log (early check): $(echo "$early_log" | tail -5)"
+                log_info "TRex log (${elapsed}s): $(echo "$early_log" | tail -5)"
+                # If log contains a fatal error, bail early
+                if echo "$early_log" | grep -qiE 'error|failed|abort|exception|could not'; then
+                    log_error "TRex appears to have crashed — see log above"
+                    break
+                fi
             fi
         fi
         sleep 5
@@ -560,7 +593,10 @@ start_trex_server() {
 
     log_error "TRex server failed to start within ${TREX_START_TIMEOUT}s"
     # Collect TRex log for diagnostics
-    ssm_run_command "$TREX_INSTANCE_ID" 10 "tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null || true
+    local final_log
+    final_log=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "echo '=== trex-server.log ==='; tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== vfio state ==='; ls /sys/bus/pci/drivers/vfio-pci/$pci 2>/dev/null && echo 'vfio: bound' || echo 'vfio: NOT bound'; readlink /sys/bus/pci/devices/$pci/driver 2>/dev/null || echo 'no driver'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== dmesg vfio ==='; dmesg 2>/dev/null | grep -i vfio | tail -5 || echo 'none'" 2>/dev/null || echo "(SSM failed)")
+    log_info "TRex failure diagnostics: $final_log"
     return 1
 }
 
@@ -966,6 +1002,7 @@ Starting TRex configuration (MAC discovery + NIC binding)..."
     fi
 
     post_pr_comment "## [Perf] Stage: TRex Config OK
+- PCI: \`${TREX_PCI_ADDR}\` (BDF: \`${TREX_PCI_BDF}\`)
 - Data MAC: \`$TREX_DATA_MAC\`
 - Gateway MAC: \`$TREX_GATEWAY_MAC\`
 Starting TRex server..."
@@ -973,8 +1010,9 @@ Starting TRex server..."
     if ! start_trex_server; then
         # Grab TRex log and NIC state for diagnostics
         local trex_log
+        local diag_pci="${TREX_PCI_ADDR:-0000:00:06.0}"
         trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "echo '=== TRex Log ==='; tail -30 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/0000:00:06.0 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'" 2>/dev/null || echo "(SSM failed)")
+            "echo '=== TRex Log ==='; tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>/dev/null || echo "(SSM failed)")
         post_pr_comment "## [Perf] Stage: TRex Start FAILED
 TRex server failed to start within ${TREX_START_TIMEOUT}s.
 <details><summary>TRex server log + NIC diagnostics</summary>
