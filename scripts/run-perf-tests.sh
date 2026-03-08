@@ -359,36 +359,55 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Discover TRex data ENI source MAC from kernel interface
+    # Step 1: Discover TRex data ENI source MAC from kernel interface
     # ENI is in kernel mode (ena) at this point — wait_and_bind_eni ensured it's attached
-    TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ip link show ens6 2>/dev/null | grep -oE 'link/ether [0-9a-f:]+' | awk '{print \$2}'" 2>/dev/null || echo "")
-    TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]')
+    log_info "Step 1: Discovering TRex data ENI MAC..."
+    local mac_raw
+    mac_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "echo IFACES:; ip -o link show 2>/dev/null | head -5; echo MAC:; cat /sys/class/net/ens6/address 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+    log_info "MAC discovery raw output: $(echo "$mac_raw" | head -8)"
 
-    if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
-        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), falling back to IMDS..."
-        TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
-            "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"\${mac%/}\"; break; fi; done" 2>/dev/null || echo "")
-        TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]/')
+    # Extract MAC from /sys/class/net/ens6/address (most reliable)
+    TREX_DATA_MAC=$(echo "$mac_raw" | grep -A1 "^MAC:" | tail -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+
+    if [[ -z "$TREX_DATA_MAC" ]]; then
+        log_warn "Could not discover TRex data ENI MAC from sysfs, trying IMDS..."
+        local imds_raw
+        imds_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
+            "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/" 2>/dev/null || echo "")
+        log_info "IMDS MACs: $imds_raw"
+
+        # Get the second MAC (device-number 1)
+        for mac in $imds_raw; do
+            mac="${mac%/}"
+            local dn
+            dn=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+                "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}/device-number" 2>/dev/null || echo "")
+            if [[ "$dn" == "1" ]]; then
+                TREX_DATA_MAC="$mac"
+                break
+            fi
+        done
     fi
 
     if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
-        log_warn "Could not discover TRex data ENI MAC, using 00:00:00:00:00:00"
+        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), using 00:00:00:00:00:00"
         TREX_DATA_MAC="00:00:00:00:00:00"
     fi
     log_info "TRex data ENI MAC: $TREX_DATA_MAC"
 
-    # Discover gateway MAC while ENI is still in kernel mode
+    # Step 2: Discover gateway MAC while ENI is still in kernel mode
     # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
     local subnet_gw
     subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
-    log_info "Discovering gateway MAC (subnet gateway: $subnet_gw)..."
+    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw)..."
 
-    TREX_GATEWAY_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; ip neigh show dev ens6 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1" 2>/dev/null || echo "")
+    local gw_raw
+    gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev ens6 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+    log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -5)"
 
-    # Clean whitespace and extract MAC
-    TREX_GATEWAY_MAC=$(echo "$TREX_GATEWAY_MAC" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+    TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
 
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
         log_error "Could not discover gateway MAC on TRex data ENI — packets will be dropped by VPC"
@@ -396,29 +415,36 @@ generate_trex_config() {
     fi
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
 
-    # Unbind ens6 from kernel driver so TRex can bind it via vfio-pci
-    # Use TRex's bundled dpdk_nic_bind.py (no system dpdk-devbind.py on TRex AMI)
-    log_info "Unbinding TRex data ENI from kernel driver..."
+    # Step 3: Unbind ens6 from kernel driver so TRex can bind it via vfio-pci
+    log_info "Step 3: Unbinding TRex data ENI from kernel driver..."
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ip link set ens6 down 2>/dev/null || true; python3 /opt/trex/dpdk_nic_bind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || /opt/trex/dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>/dev/null || echo 'NIC unbind skipped — TRex will bind internally'; python3 /opt/trex/dpdk_nic_bind.py --status 2>/dev/null | head -10 || true" 2>/dev/null || true
+        "ip link set ens6 down 2>/dev/null || true; python3 /opt/trex/dpdk_nic_bind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || /opt/trex/dpdk_setup_ports.py -b vfio-pci 0000:00:06.0 2>/dev/null || echo NIC_UNBIND_SKIP; python3 /opt/trex/dpdk_nic_bind.py --status 2>/dev/null | head -10 || true" 2>/dev/null || true
 
-    # Generate /etc/trex_cfg.yaml via SSM
-    # Use unquoted heredoc delimiter so local variables are expanded before sending to remote
-    local trex_cfg_cmd="cat > /etc/trex_cfg.yaml << TREXCFG
+    # Step 4: Write /etc/trex_cfg.yaml via SSM
+    # Use base64 encoding to avoid all quoting/heredoc issues through SSM JSON layer
+    log_info "Step 4: Writing TRex config..."
+    local yaml_content
+    yaml_content=$(cat <<YAMLEOF
 - port_limit: 1
   version: 2
   interfaces: ['00:06.0']
   port_info:
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_MAC}'
-TREXCFG
-echo 'TRex config written to /etc/trex_cfg.yaml'
-cat /etc/trex_cfg.yaml"
+YAMLEOF
+)
+    local yaml_b64
+    yaml_b64=$(echo "$yaml_content" | base64 -w0)
 
-    ssm_run_command "$TREX_INSTANCE_ID" 15 "$trex_cfg_cmd" || {
-        log_error "Failed to write TRex config"
+    local write_result
+    write_result=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml; echo WROTE; cat /etc/trex_cfg.yaml" 2>/dev/null || echo "WRITE_FAILED")
+    log_info "Config write result: $(echo "$write_result" | head -10)"
+
+    if [[ "$write_result" == *"WRITE_FAILED"* ]]; then
+        log_error "Failed to write TRex config via SSM"
         return 1
-    }
+    fi
 }
 
 start_trex_server() {
