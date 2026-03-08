@@ -654,6 +654,10 @@ start_dut_rust_dpdk() {
     log_info "Starting DUT: rust-dpdk (echo server with DPDK backend)"
     dut_bind_dpdk || return 1
 
+    # Ensure clean DPDK state and hugepages
+    ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" 2>/dev/null || true
+
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
     sleep 5
@@ -674,8 +678,12 @@ start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd macswap)"
     dut_bind_dpdk || return 1
 
+    # Ensure clean DPDK state and hugepages
+    ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" 2>/dev/null || true
+
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --vdev=net_vfio0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
     sleep 5
 
     local status
@@ -1087,9 +1095,9 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
     # ── Phase 6: Aggregate results and post summary ──────────────────────────
 
     log_info "Phase 6: Aggregating results..."
-    aggregate_results
+    aggregate_results || true
     local summary
-    summary=$(generate_markdown_summary)
+    summary=$(generate_markdown_summary) || summary="*No results to display*"
 
     # Add failure info if any
     if [[ ${#failed_configs[@]} -gt 0 ]]; then
@@ -1111,9 +1119,9 @@ $summary
         echo "$summary" >> "$GITHUB_STEP_SUMMARY"
     fi
 
-    # Collect final logs
-    collect_instance_logs "$DUT_INSTANCE_ID" "dut"
-    collect_instance_logs "$TREX_INSTANCE_ID" "trex"
+    # Collect final logs (|| true to prevent set -e from killing the script)
+    collect_instance_logs "$DUT_INSTANCE_ID" "dut" || true
+    collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
 
     # Exit with failure if any configs failed
     if [[ ${#failed_configs[@]} -gt 0 ]]; then
