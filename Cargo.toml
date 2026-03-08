@@ -8,6 +8,7 @@ members = [
   "apps/echo",
   "apps/test-client",
   "apps/tokio-echo",
+  "apps/plain-echo",
 ]
 
 [workspace.dependencies]

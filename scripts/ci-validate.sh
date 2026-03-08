@@ -118,8 +118,22 @@ if [[ "$FLAG_SKIP_INTEGRATION" != "true" ]]; then
         exit 3
     fi
 
-    log "Watching run $RUN_ID (this may take 20-30 minutes)..."
-    if gh run watch "$RUN_ID" --exit-status 2>&1; then
+    log "Polling run $RUN_ID (this may take 20-30 minutes)..."
+    # NOTE: We cannot use `gh run watch` because the GH_TOKEN is a fine-grained PAT,
+    # which does not support the checks:read permission required by `gh run watch`.
+    # Instead, poll with `gh run view --json status,conclusion`.
+    while true; do
+        RUN_JSON=$(gh run view "$RUN_ID" --json status,conclusion 2>/dev/null || echo '{}')
+        RUN_STATUS=$(echo "$RUN_JSON" | jq -r '.status // "unknown"')
+        RUN_CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion // ""')
+        if [[ "$RUN_STATUS" == "completed" ]]; then
+            break
+        fi
+        log "  Status: $RUN_STATUS — waiting 30s..."
+        sleep 30
+    done
+
+    if [[ "$RUN_CONCLUSION" == "success" ]]; then
         log "Integration tests PASSED"
     else
         log "Integration tests FAILED — downloading failure data..."
