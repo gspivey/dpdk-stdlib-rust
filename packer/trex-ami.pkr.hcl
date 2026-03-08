@@ -86,7 +86,7 @@ build {
       "echo '=== Installing TRex ${var.trex_version} ==='",
       "cd /opt",
       "TREX_VERSION='${var.trex_version}'",
-      "sudo curl -kL \"https://trex-tgn.cisco.com/trex/release/$${TREX_VERSION}.tar.gz\" -o trex.tar.gz",
+      "sudo curl -fL \"https://trex-tgn.cisco.com/trex/release/$${TREX_VERSION}.tar.gz\" -o trex.tar.gz",
       "sudo tar -xzf trex.tar.gz",
       "sudo mv $${TREX_VERSION} trex",
       "sudo rm -f trex.tar.gz",
