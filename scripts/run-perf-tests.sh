@@ -105,11 +105,15 @@ ssm_run_command() {
     shift 2
     local command="$*"
 
+    # JSON-escape the command string (handle double quotes and backslashes)
+    local escaped_command
+    escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
+
     local cmd_id
     cmd_id=$(aws ssm send-command \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command\"]" \
+        --parameters "{\"commands\":[${escaped_command}]}" \
         --timeout-seconds "$timeout_sec" \
         --query "Command.CommandId" \
         --output text 2>/dev/null)
@@ -160,10 +164,13 @@ ssm_run_command_fire_and_forget() {
     shift 2
     local command="$*"
 
+    local escaped_command
+    escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
+
     aws ssm send-command \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command\"]" \
+        --parameters "{\"commands\":[${escaped_command}]}" \
         --timeout-seconds "$timeout_sec" \
         --query "Command.CommandId" \
         --output text 2>/dev/null
