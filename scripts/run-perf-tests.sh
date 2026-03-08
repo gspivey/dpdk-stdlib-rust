@@ -418,11 +418,12 @@ generate_trex_config() {
     # Step 0: Dynamically discover PCI address and interface name for the secondary ENI.
     # The PCI address varies across instance types (e.g., 0000:00:06.0 on c5n, different on others).
     # We use lspci to find the last ENA device (same approach as configure-eni.sh).
-    log_info "Step 0: Discovering secondary ENI PCI address..."
+    log_info "Step 0: Discovering secondary ENI PCI address on $TREX_INSTANCE_ID..."
     local pci_discovery
-    pci_discovery=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "PCI=\$(lspci -D | grep 'Elastic Network Adapter' | tail -1 | cut -d' ' -f1); echo \"PCI_ADDR: \$PCI\"; if [ -n \"\$PCI\" ] && [ -d /sys/bus/pci/devices/\$PCI/net ]; then IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); echo \"IFACE: \$IFACE\"; fi; lspci -D | grep 'Elastic Network Adapter'" 2>/dev/null || echo "SSM_FAILED")
-    log_info "PCI discovery: $(echo "$pci_discovery" | head -5)"
+    pci_discovery=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "export PATH=/usr/sbin:/usr/bin:/sbin:/bin:\$PATH; PCI=\$(lspci -D 2>&1 | grep -i Elastic | tail -1 | awk '{print \$1}'); echo PCI_ADDR: \$PCI; IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; echo LSPCI_ALL:; lspci -D 2>&1 | head -10" 2>&1)
+    local ssm_rc=$?
+    log_info "PCI discovery (rc=$ssm_rc): $(echo "$pci_discovery" | head -8)"
 
     TREX_PCI_ADDR=$(echo "$pci_discovery" | grep "^PCI_ADDR:" | head -1 | awk '{print $2}')
     local trex_iface
@@ -431,9 +432,21 @@ generate_trex_config() {
     TREX_PCI_BDF=$(echo "$TREX_PCI_ADDR" | sed 's/^0000://')
 
     if [[ -z "$TREX_PCI_ADDR" || "$TREX_PCI_ADDR" == "" ]]; then
-        log_error "Could not discover secondary ENI PCI address via lspci"
-        log_error "lspci output: $(echo "$pci_discovery" | tail -5)"
-        return 1
+        # Fallback: try well-known PCI address for c5n secondary ENI
+        log_warn "lspci discovery failed, trying fallback PCI 0000:00:06.0..."
+        local fallback_check
+        fallback_check=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+            "ls /sys/bus/pci/devices/0000:00:06.0/ 2>/dev/null && echo PCI_EXISTS || echo PCI_MISSING; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE" 2>&1)
+        log_info "Fallback check: $fallback_check"
+        if [[ "$fallback_check" == *"PCI_EXISTS"* ]]; then
+            TREX_PCI_ADDR="0000:00:06.0"
+            TREX_PCI_BDF="00:06.0"
+            trex_iface=$(echo "$fallback_check" | grep "^IFACE:" | head -1 | awk '{print $2}')
+        else
+            log_error "Could not discover secondary ENI PCI address"
+            log_error "SSM output: $(echo "$pci_discovery" | tail -8)"
+            return 1
+        fi
     fi
     log_info "Secondary ENI PCI: $TREX_PCI_ADDR (BDF: $TREX_PCI_BDF, interface: ${trex_iface:-unknown})"
 
@@ -995,6 +1008,7 @@ Starting TRex configuration (MAC discovery + NIC binding)..."
     if ! generate_trex_config; then
         post_pr_comment "## [Perf] Stage: TRex Config FAILED
 \`generate_trex_config\` returned non-zero.
+- TREX_PCI_ADDR: \`${TREX_PCI_ADDR:-unset}\`
 - TREX_DATA_MAC: \`${TREX_DATA_MAC:-unset}\`
 - TREX_GATEWAY_MAC: \`${TREX_GATEWAY_MAC:-unset}\`"
         log_error "TRex config failed"
