@@ -837,8 +837,42 @@ Packet sizes: \`$PACKET_SIZES\`"
     # ── Phase 4: Configure and start TRex ────────────────────────────────────
 
     log_info "Phase 4: Configuring TRex..."
-    generate_trex_config || { log_error "TRex config failed"; exit 2; }
-    start_trex_server || { log_error "TRex start failed"; exit 2; }
+    post_pr_comment "## [Perf] Stage: TRex Config
+Starting TRex configuration (MAC discovery + NIC binding)..."
+
+    if ! generate_trex_config; then
+        post_pr_comment "## [Perf] Stage: TRex Config FAILED
+\`generate_trex_config\` returned non-zero.
+- TREX_DATA_MAC: \`${TREX_DATA_MAC:-unset}\`
+- TREX_GATEWAY_MAC: \`${TREX_GATEWAY_MAC:-unset}\`"
+        log_error "TRex config failed"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] Stage: TRex Config OK
+- Data MAC: \`$TREX_DATA_MAC\`
+- Gateway MAC: \`$TREX_GATEWAY_MAC\`
+Starting TRex server..."
+
+    if ! start_trex_server; then
+        # Grab TRex log
+        local trex_log
+        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+            "tail -30 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
+        post_pr_comment "## [Perf] Stage: TRex Start FAILED
+TRex server failed to start within ${TREX_START_TIMEOUT}s.
+<details><summary>TRex server log (last 30 lines)</summary>
+
+\`\`\`
+${trex_log}
+\`\`\`
+</details>"
+        log_error "TRex start failed"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] Stage: TRex Started
+TRex server running. Beginning benchmarks..."
 
     # ── Phase 5: Run benchmarks for each config ─────────────────────────────
 
