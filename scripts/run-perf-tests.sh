@@ -497,12 +497,17 @@ generate_trex_config() {
     # Step 4: Write /etc/trex_cfg.yaml via SSM
     # Use base64 encoding to avoid all quoting/heredoc issues through SSM JSON layer
     log_info "Step 4: Writing TRex config (PCI BDF: $TREX_PCI_BDF)..."
+    # TRex requires an even number of interfaces (TX/RX pairs).
+    # We only use port 0 for benchmarking, so list the same NIC twice.
+    # Port 1 is a dummy that won't carry test traffic.
     local yaml_content
     yaml_content=$(cat <<YAMLEOF
-- port_limit: 1
+- port_limit: 2
   version: 2
-  interfaces: ['${TREX_PCI_BDF}']
+  interfaces: ['${TREX_PCI_BDF}', 'dummy']
   port_info:
+    - dest_mac: '${TREX_GATEWAY_MAC}'
+      src_mac:  '${TREX_DATA_MAC}'
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_MAC}'
 YAMLEOF
