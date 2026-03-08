@@ -301,6 +301,29 @@ ps aux | grep -E '(echo|testpmd|t-rex|plain-echo)' | grep -v grep || echo 'none'
     echo "$output" > "$LOGS_DIR/${label}-networking-diag-${phase}.txt"
 }
 
+# ── ENI Binding (post-SSM) ────────────────────────────────────────────────────
+
+wait_and_bind_eni() {
+    local instance_id="$1"
+    local label="$2"
+    local driver="$3"  # "vfio-pci" or "ena"
+
+    log_info "Ensuring secondary ENI is attached and bound to $driver on $label..."
+    local output
+    output=$(ssm_run_command "$instance_id" 120 \
+        "for i in \$(seq 1 60); do TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"ENI_FOUND mac=\${mac%/}\"; if [ \"$driver\" = \"vfio-pci\" ]; then ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || echo BIND_SKIP; else /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 1; ip link set ens6 up 2>/dev/null || true; fi; echo DONE; exit 0; fi; done; sleep 2; done; echo ENI_TIMEOUT" 2>/dev/null || echo "SSM_FAILED")
+
+    if [[ "$output" == *"ENI_TIMEOUT"* ]]; then
+        log_error "$label secondary ENI not found after 120s"
+        return 1
+    fi
+    if [[ "$output" == *"SSM_FAILED"* ]]; then
+        log_error "SSM command failed on $label"
+        return 1
+    fi
+    log_info "$label ENI binding result: $(echo "$output" | head -3)"
+}
+
 # ── DUT NIC Management ────────────────────────────────────────────────────────
 
 dut_bind_dpdk() {
@@ -329,27 +352,35 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Discover TRex data ENI source MAC via IMDS (ens6 is bound to vfio-pci, not visible as kernel iface)
-    TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
-        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"\${mac%/}\"; break; fi; done" 2>/dev/null || echo "")
-
-    # IMDS returns MAC with trailing slash, clean it up
-    TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]/')
+    # Discover TRex data ENI source MAC from kernel interface
+    # ENI is in kernel mode (ena) at this point — wait_and_bind_eni ensured it's attached
+    TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+        "ip link show ens6 2>/dev/null | grep -oE 'link/ether [0-9a-f:]+' | awk '{print \$2}'" 2>/dev/null || echo "")
+    TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]')
 
     if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
-        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), falling back to 00:00:00:00:00:00"
+        log_warn "Could not discover TRex data ENI MAC (got: '$TREX_DATA_MAC'), falling back to IMDS..."
+        TREX_DATA_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 20 \
+            "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"\${mac%/}\"; break; fi; done" 2>/dev/null || echo "")
+        TREX_DATA_MAC=$(echo "$TREX_DATA_MAC" | tr -d '[:space:]/')
+    fi
+
+    if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        log_warn "Could not discover TRex data ENI MAC, using 00:00:00:00:00:00"
         TREX_DATA_MAC="00:00:00:00:00:00"
     fi
     log_info "TRex data ENI MAC: $TREX_DATA_MAC"
 
-    # Get gateway MAC for the TRex data ENI subnet
+    # Discover gateway MAC while ENI is still in kernel mode
     # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
-    # Since ens6 is bound to vfio-pci, we need to temporarily unbind, get the gateway MAC, then rebind
-    log_info "Temporarily unbinding TRex data ENI to discover gateway MAC..."
-    TREX_GATEWAY_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "/usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 2; ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/') 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; ip neigh show dev ens6 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1; ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || true" 2>/dev/null || echo "")
+    local subnet_gw
+    subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
+    log_info "Discovering gateway MAC (subnet gateway: $subnet_gw)..."
 
-    # Clean whitespace
+    TREX_GATEWAY_MAC=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ip link set ens6 up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; ip neigh show dev ens6 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1" 2>/dev/null || echo "")
+
+    # Clean whitespace and extract MAC
     TREX_GATEWAY_MAC=$(echo "$TREX_GATEWAY_MAC" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
 
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
@@ -357,6 +388,10 @@ generate_trex_config() {
         return 1
     fi
     log_info "Gateway MAC: $TREX_GATEWAY_MAC"
+
+    # Take down ens6 so TRex can bind it via DPDK internally
+    ssm_run_command "$TREX_INSTANCE_ID" 10 \
+        "ip link set ens6 down 2>/dev/null || true" 2>/dev/null || true
 
     # Generate /etc/trex_cfg.yaml via SSM
     # Use unquoted heredoc delimiter so local variables are expanded before sending to remote
@@ -775,6 +810,19 @@ Packet sizes: \`$PACKET_SIZES\`"
     post_pr_comment "## [Perf] Stage: Instances Ready
 - TRex: \`$TREX_INSTANCE_ID\` (${TREX_DATA_ENI_IP})
 - DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})"
+
+    # ── Phase 2b: Ensure secondary ENIs are attached and bound ────────────────
+    # The ENI attachments are separate CloudFormation resources that may complete
+    # after the instance boots. Wait for them and bind via SSM.
+
+    log_info "Phase 2b: Ensuring secondary ENIs are attached..."
+    # TRex ENI stays in kernel mode for now — we need it for gateway MAC discovery.
+    # TRex will bind it to DPDK internally when started.
+    wait_and_bind_eni "$TREX_INSTANCE_ID" "TRex" "ena" \
+        || { log_error "TRex ENI attachment failed"; exit 2; }
+    # DUT ENI starts in kernel mode — orchestrator binds as needed per config.
+    wait_and_bind_eni "$DUT_INSTANCE_ID" "DUT" "ena" \
+        || { log_error "DUT ENI attachment failed"; exit 2; }
 
     # ── Phase 3: Collect baseline environment info ───────────────────────────
 

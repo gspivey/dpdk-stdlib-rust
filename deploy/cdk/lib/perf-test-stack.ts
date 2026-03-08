@@ -168,23 +168,27 @@ export class PerfTestStack extends cdk.Stack {
       'echo 1024 > /proc/sys/vm/nr_hugepages',
       'mkdir -p /mnt/huge',
       'mount -t hugetlbfs nodev /mnt/huge || echo "hugepages already mounted"',
-      // Wait for secondary ENI, bind to vfio-pci
-      'echo "=== Binding secondary ENI to vfio-pci for TRex ==="',
-      'for i in {1..60}; do',
+      // Wait for secondary ENI — attachment is a separate CloudFormation resource,
+      // so it may not be ready during instance boot. Make this non-fatal; the test
+      // orchestrator configures and starts TRex via SSM after CFN deploy completes.
+      // Note: TRex AMI does NOT have dpdk-devbind.py — TRex binds the NIC itself.
+      'echo "=== Waiting for secondary ENI (best-effort) ==="',
+      'ENI_FOUND=false',
+      'for i in {1..180}; do',
       '  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
       '  MACS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/)',
       '  for mac in $MACS; do',
       '    DEVICE_NUM=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/${mac}device-number)',
       '    if [ "$DEVICE_NUM" = "1" ]; then',
       '      echo "Found secondary ENI at device-number 1 (MAC: ${mac})"',
-      '      ip link set ens6 down 2>/dev/null || true',
-      '      dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || echo "devbind not available, TRex will bind itself"',
+      '      ENI_FOUND=true',
       '      break 2',
       '    fi',
       '  done',
-      '  echo "Attempt $i: waiting for secondary ENI..."',
+      '  if [ $((i % 30)) -eq 0 ]; then echo "Attempt $i: waiting for secondary ENI..."; fi',
       '  sleep 1',
       'done',
+      'if [ "$ENI_FOUND" = "false" ]; then echo "WARNING: Secondary ENI not found during boot — orchestrator will handle via SSM"; fi',
       // Collect environment info
       'echo "=== TRex Environment ==="',
       'echo "Instance type: $(curl -s -H \"X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)\" http://169.254.169.254/latest/meta-data/instance-type)"',
@@ -281,9 +285,12 @@ export class PerfTestStack extends cdk.Stack {
       'ulimit -c unlimited',
       'mkdir -p /tmp/coredumps',
       'echo "/tmp/coredumps/core.%e.%p.%t" > /proc/sys/kernel/core_pattern',
-      // Wait for secondary ENI, bind to vfio-pci (initial state for DPDK tests)
-      'echo "=== Binding secondary ENI to vfio-pci ==="',
-      'for i in {1..60}; do',
+      // Wait for secondary ENI — attachment is a separate CloudFormation resource,
+      // so it may not be ready during instance boot. Make this non-fatal; the test
+      // orchestrator handles binding via SSM after CFN deploy completes.
+      'echo "=== Waiting for secondary ENI (best-effort, orchestrator handles binding) ==="',
+      'ENI_FOUND=false',
+      'for i in {1..180}; do',
       '  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
       '  MACS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/)',
       '  for mac in $MACS; do',
@@ -291,14 +298,16 @@ export class PerfTestStack extends cdk.Stack {
       '    if [ "$DEVICE_NUM" = "1" ]; then',
       '      echo "Found secondary ENI at device-number 1"',
       '      ip link set ens6 down 2>/dev/null || true',
-      '      /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0',
-      '      /usr/local/bin/dpdk-devbind.py --status | head -10',
+      '      /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || echo "devbind failed, orchestrator will handle"',
+      '      /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -10 || true',
+      '      ENI_FOUND=true',
       '      break 2',
       '    fi',
       '  done',
-      '  echo "Attempt $i: waiting for secondary ENI..."',
+      '  if [ $((i % 30)) -eq 0 ]; then echo "Attempt $i: waiting for secondary ENI..."; fi',
       '  sleep 1',
       'done',
+      'if [ "$ENI_FOUND" = "false" ]; then echo "WARNING: Secondary ENI not found during boot — orchestrator will bind via SSM"; fi',
     ];
 
     const dutProjectSetup = [
