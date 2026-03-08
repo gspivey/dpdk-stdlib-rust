@@ -6,7 +6,7 @@ on:
       trex_version:
         description: 'TRex version to build'
         required: false
-        default: 'v3.06'
+        default: 'v3.08'
 
 permissions:
   id-token: write
@@ -51,7 +51,7 @@ jobs:
         id: build
         run: |
           cd packer
-          TREX_VERSION="${{ github.event.inputs.trex_version || 'v3.06' }}"
+          TREX_VERSION="${{ github.event.inputs.trex_version || 'v3.08' }}"
 
           set +e
           packer build \
