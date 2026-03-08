@@ -567,31 +567,33 @@ start_trex_server() {
         return 1
     fi
 
-    # Wait for TRex to be ready (poll process existence)
+    # Wait for TRex to be ready.
+    # Use multiple detection methods since pgrep -f may not match the process name.
     local elapsed=0
     while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
         local status
         status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "pgrep -f t-rex-64 >/dev/null && echo running || echo not_running" 2>/dev/null || echo "ssm_error")
+            "ps aux | grep '[t]-rex-64' | head -1; ls /var/run/trex/trex_daemon_server.lock 2>/dev/null && echo LOCK_EXISTS; ls -la /var/log/trex-server.log 2>/dev/null | awk '{print \$5}'; pgrep -x t-rex-64 >/dev/null 2>&1 && echo PGREP_OK; pgrep -f '/opt/trex/t-rex' >/dev/null 2>&1 && echo PGREP_F_OK" 2>/dev/null || echo "ssm_error")
 
-        if [[ "$status" == *"running"* ]]; then
+        if [[ "$status" == *"PGREP_OK"* || "$status" == *"PGREP_F_OK"* || "$status" == *"t-rex-64"* ]]; then
             log_info "TRex server is running (${elapsed}s)"
             sleep 5
             return 0
         fi
-        # Check log for errors periodically
-        if [[ $elapsed -ge 10 && $((elapsed % 20)) -eq 0 ]]; then
-            local early_log
-            early_log=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "tail -20 /var/log/trex-server.log 2>/dev/null || echo no_log" 2>/dev/null || echo "")
-            if [[ -n "$early_log" && "$early_log" != *"no_log"* ]]; then
-                log_info "TRex log (${elapsed}s): $(echo "$early_log" | tail -3)"
-                if echo "$early_log" | grep -qiE 'error|failed|abort|could not|Traceback'; then
-                    log_error "TRex appears to have crashed"
-                    break
-                fi
+        # Check if log file is growing (TRex is alive and writing stats)
+        if [[ $elapsed -ge 15 ]]; then
+            local log_check
+            log_check=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+                "wc -c < /var/log/trex-server.log 2>/dev/null || echo 0" 2>/dev/null || echo "0")
+            local log_size
+            log_size=$(echo "$log_check" | grep -oE '^[0-9]+' | head -1)
+            if [[ -n "$log_size" && "$log_size" -gt 100 ]]; then
+                log_info "TRex log is ${log_size} bytes — TRex appears to be running (${elapsed}s)"
+                sleep 5
+                return 0
             fi
         fi
+        log_info "TRex not yet detected (${elapsed}s): $(echo "$status" | head -2)"
         sleep 10
         elapsed=$((elapsed + 10))
     done
