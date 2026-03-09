@@ -434,12 +434,17 @@ wait_for_trex_rx_eni() {
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
+    # Clean up any DPDK state first — if a previous process left the lock file,
+    # dpdk-devbind.py may refuse to rebind the device.
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null || true" || true
+
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>&1 && echo 'Bound to vfio-pci'" 2>&1)
+        "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; ip link set ens6 down 2>/dev/null || true; CURRENT=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo none); echo CURRENT_DRIVER: \$CURRENT; if [ \"\$CURRENT\" = 'vfio-pci' ]; then echo 'Already bound to vfio-pci'; else /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>&1; fi; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null | grep -q vfio-pci && echo 'BIND_OK' || echo 'BIND_FAILED'" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_dpdk result (exit=$bind_exit): $bind_out"
-    if [[ $bind_exit -ne 0 ]]; then
+    if [[ "$bind_out" != *"BIND_OK"* ]]; then
         log_error "Failed to bind DUT ENI to vfio-pci: $bind_out"
         return 1
     fi
@@ -447,9 +452,18 @@ dut_bind_dpdk() {
 
 dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
-    ssm_run_command "$DUT_INSTANCE_ID" 45 \
-        "rm -rf /var/run/dpdk/ 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 3; ip link set ens6 up 2>/dev/null || true; dhclient ens6 2>/dev/null || true; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; ip addr show ens6 2>/dev/null; echo 'Bound to kernel (ena)'" \
-        || { log_error "Failed to bind DUT ENI to kernel"; return 1; }
+    # Clean up DPDK state first
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null || true" || true
+
+    local bind_out
+    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "CURRENT=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo none); echo CURRENT_DRIVER: \$CURRENT; if [ \"\$CURRENT\" = 'vfio-pci' ]; then echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null || true; sleep 1; echo ena > /sys/bus/pci/devices/0000:00:06.0/driver_override; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>/dev/null || /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>&1 || true; fi; sleep 3; ip link set ens6 up 2>/dev/null || true; dhclient ens6 2>/dev/null || true; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; ip addr show ens6 2>/dev/null; echo 'Bound to kernel (ena)'" 2>&1)
+    log_info "dut_bind_kernel result: $bind_out"
+    if [[ "$bind_out" == *"SSM_FAILED"* ]]; then
+        log_error "Failed to bind DUT ENI to kernel: $bind_out"
+        return 1
+    fi
 }
 
 dut_stop_all_apps() {
