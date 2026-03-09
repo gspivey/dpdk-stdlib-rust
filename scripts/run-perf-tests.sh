@@ -454,9 +454,12 @@ dut_bind_kernel() {
 
 dut_stop_all_apps() {
     log_info "Stopping all DUT applications..."
-    ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f 'target/release/plain-echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; rm -rf /var/run/dpdk 2>/dev/null || true; echo 'All apps stopped'" \
-        2>/dev/null || true
+    local stop_result
+    stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f 'target/release/plain-echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; rm -rf /var/run/dpdk 2>/dev/null || true; echo 'All apps stopped'") || true
+    log_info "Stop result: $stop_result"
+    # Give SSM agent a breather between operations
+    sleep 5
 }
 
 # ── TRex Management ──────────────────────────────────────────────────────────
@@ -839,8 +842,8 @@ start_dut_rust_dpdk() {
 
     # Ensure clean DPDK state and hugepages. Kill any lingering DPDK processes
     # and wait for them to die before removing the lock file.
-    ssm_run_command "$DUT_INSTANCE_ID" 20 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" 2>/dev/null || true
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
@@ -871,8 +874,8 @@ start_dut_native_dpdk() {
     dut_bind_dpdk || return 1
 
     # Ensure clean DPDK state and hugepages
-    ssm_run_command "$DUT_INSTANCE_ID" 20 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" 2>/dev/null || true
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
@@ -1300,8 +1303,12 @@ DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 Running \`$config\` benchmark...
 Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_STEPS\`%"
 
-        # Stop any running DUT apps
+        # Stop any running DUT apps and give SSM agent a breather
         dut_stop_all_apps
+        if [[ $config_idx -gt 1 ]]; then
+            log_info "Waiting 10s between configs for SSM agent recovery..."
+            sleep 10
+        fi
 
         # Start the appropriate DUT config
         local start_ok=true
