@@ -1131,10 +1131,28 @@ Packet sizes: \`$PACKET_SIZES\`"
             log_info "Using pre-built TRex AMI: $trex_ami"
         fi
 
-        # Destroy any leftover stack first (from a previous failed run)
+        # Destroy any leftover stack first (from a previous failed run).
+        # Wait for deletion to complete — CloudFormation DELETE_IN_PROGRESS
+        # blocks new deploys, and ENI detachment can take 10+ minutes.
         log_info "Cleaning up any leftover stack..."
-        npx cdk destroy "$CDK_STACK_NAME" --force 2>/dev/null || true
-        sleep 5
+        npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+
+        # Wait for stack to fully delete (DELETE_IN_PROGRESS → DELETE_COMPLETE/gone)
+        local stack_wait=0
+        while [[ $stack_wait -lt 600 ]]; do
+            local stack_status
+            stack_status=$(aws cloudformation describe-stacks \
+                --stack-name "$CDK_STACK_NAME" \
+                --query "Stacks[0].StackStatus" \
+                --output text 2>/dev/null || echo "GONE")
+            if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
+                log_info "Stack fully cleaned up (status: $stack_status)"
+                break
+            fi
+            log_info "Waiting for stack deletion (status: $stack_status, ${stack_wait}s elapsed)..."
+            sleep 15
+            stack_wait=$((stack_wait + 15))
+        done
 
         npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
             || { log_error "CDK deploy failed"; exit 2; }
