@@ -639,10 +639,18 @@ for i, p in enumerate(ports):
     print('  Port %d: %s' % (i, p.get('hw_mac', 'unknown')))
 c.disconnect()
 print('PREFLIGHT_OK')
-\"" 2>&1) || true
+\" 2>&1" 2>&1) || true
     log_info "TRex preflight check: $preflight"
+
+    # Post preflight results to PR for visibility (we can't access CI runner logs)
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` preflight
+\`\`\`
+$preflight
+\`\`\`"
+
     if [[ "$preflight" != *"PREFLIGHT_OK"* ]]; then
         log_error "TRex API preflight failed — benchmark will likely fail"
+        return 1
     fi
 
     # Run benchmark via SSM — capture both stdout and stderr
@@ -666,8 +674,18 @@ print('PREFLIGHT_OK')
     mkdir -p "$LOGS_DIR"
     echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
     log_info "Benchmark SSM exit code: $ssm_exit_code"
-    log_info "Benchmark output (last 20 lines):"
-    echo "$output" | tail -20
+
+    # Post benchmark output to PR for visibility
+    local output_tail
+    output_tail=$(echo "$output" | tail -30)
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` result
+SSM exit: $ssm_exit_code
+<details><summary>Output (last 30 lines)</summary>
+
+\`\`\`
+${output_tail}
+\`\`\`
+</details>"
 
     if [[ $ssm_exit_code -ne 0 ]]; then
         log_error "Benchmark SSM command failed for $config_name (exit=$ssm_exit_code)"
@@ -675,8 +693,10 @@ print('PREFLIGHT_OK')
     fi
 
     # Check the Python script's exit code from the captured output
+    # Use sed instead of grep -P for portability
     local py_exit
-    py_exit=$(echo "$output" | grep -oP 'EXIT_CODE=\K[0-9]+' | tail -1)
+    py_exit=$(echo "$output" | sed -n 's/.*EXIT_CODE=\([0-9]*\).*/\1/p' | tail -1)
+    log_info "Python exit code for $config_name: '${py_exit:-not found}'"
     if [[ -n "$py_exit" && "$py_exit" != "0" ]]; then
         log_error "Benchmark Python script failed for $config_name (exit=$py_exit)"
         return 1
@@ -686,28 +706,58 @@ print('PREFLIGHT_OK')
     log_info "Downloading results for $config_name..."
     local results_json
     results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
+        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---JSON_START---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
     local dl_exit=$?
 
     log_info "Results download SSM exit: $dl_exit"
 
-    if [[ $dl_exit -ne 0 || "$results_json" == *"FILE_NOT_FOUND"* ]]; then
-        log_error "Failed to download results for $config_name (dl_exit=$dl_exit)"
-        echo "$results_json" > "$LOGS_DIR/trex-results-download-${config_name}.log"
+    if [[ $dl_exit -ne 0 ]]; then
+        log_error "SSM download command failed for $config_name (dl_exit=$dl_exit)"
         return 1
     fi
 
-    # Extract just the JSON part (after the directory listing)
+    if [[ "$results_json" == *"FILE_NOT_FOUND"* ]]; then
+        log_error "Results file not found on TRex for $config_name"
+        post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` download
+Results file NOT FOUND on TRex instance.
+\`\`\`
+$(echo "$results_json" | head -10)
+\`\`\`"
+        return 1
+    fi
+
+    # Extract just the JSON part (after the directory listing separator)
     local json_content
-    json_content=$(echo "$results_json" | sed -n '/^---$/,$ p' | tail -n +2)
+    json_content=$(echo "$results_json" | sed -n '/^---JSON_START---$/,$ p' | tail -n +2)
 
     mkdir -p "$RESULTS_DIR"
     echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
 
-    # Verify the JSON is valid
-    if ! python3 -c "import json; d=json.load(open('$RESULTS_DIR/${config_name}.json')); print('Valid JSON:', len(d.get('results',{})), 'packet sizes')" 2>&1; then
-        log_error "Invalid JSON in results for $config_name"
-        cat "$RESULTS_DIR/${config_name}.json" | head -5
+    # Verify the JSON is valid and has results
+    local json_check
+    json_check=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$RESULTS_DIR/${config_name}.json'))
+    n = len(d.get('results', {}))
+    print(f'Valid JSON: {n} packet sizes, config={d.get(\"config_name\", \"missing\")}')
+    if n == 0:
+        print('WARNING: No results in JSON')
+        sys.exit(1)
+except Exception as e:
+    print(f'JSON error: {e}')
+    sys.exit(1)
+" 2>&1)
+    local json_valid=$?
+    log_info "JSON validation for $config_name: $json_check (exit=$json_valid)"
+
+    if [[ $json_valid -ne 0 ]]; then
+        log_error "Invalid/empty JSON results for $config_name"
+        post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` JSON validation
+**FAILED**: $json_check
+\`\`\`
+$(head -5 "$RESULTS_DIR/${config_name}.json")
+\`\`\`"
         return 1
     fi
 
