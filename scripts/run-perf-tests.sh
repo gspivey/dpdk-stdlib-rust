@@ -410,6 +410,26 @@ wait_and_bind_eni() {
     log_info "$label ENI binding result: $(echo "$output" | head -3)"
 }
 
+wait_for_trex_rx_eni() {
+    # Wait for TRex RX ENI (device-number 2, PCI 0000:00:07.0) to be attached.
+    # This is a separate CloudFormation resource and may attach after the TX ENI.
+    local instance_id="$1"
+    log_info "Waiting for TRex RX ENI (device-number 2) to attach..."
+    local output
+    output=$(ssm_run_command "$instance_id" 120 \
+        "for i in \$(seq 1 60); do TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"2\" ]; then echo \"RX_ENI_FOUND mac=\${mac%/}\"; echo DONE; exit 0; fi; done; if [ \$((i % 10)) -eq 0 ]; then echo \"Attempt \$i: waiting for RX ENI (device-number 2)...\"; fi; sleep 2; done; echo RX_ENI_TIMEOUT") || echo "SSM_FAILED"
+
+    if [[ "$output" == *"RX_ENI_TIMEOUT"* ]]; then
+        log_error "TRex RX ENI (device-number 2) not found after 120s"
+        return 1
+    fi
+    if [[ "$output" == *"SSM_FAILED"* ]]; then
+        log_error "SSM command failed waiting for TRex RX ENI"
+        return 1
+    fi
+    log_info "TRex RX ENI found: $(echo "$output" | grep RX_ENI_FOUND | head -1)"
+}
+
 # ── DUT NIC Management ────────────────────────────────────────────────────────
 
 dut_bind_dpdk() {
@@ -463,7 +483,7 @@ generate_trex_config() {
 
     local imds_result
     imds_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"TX_MAC: \${mac}\"; fi; if [ \"\$dn\" = \"2\" ]; then echo \"RX_MAC: \${mac}\"; fi; done" 2>/dev/null || echo "SSM_FAILED")
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"TX_MAC: \${mac}\"; fi; if [ \"\$dn\" = \"2\" ]; then echo \"RX_MAC: \${mac}\"; fi; done" || echo "SSM_FAILED")
     log_info "IMDS MAC discovery output: $(echo "$imds_result" | head -10)"
 
     TREX_DATA_MAC=$(echo "$imds_result" | grep "^TX_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
@@ -489,14 +509,14 @@ generate_trex_config() {
 
     # Discover interface names for both data ENIs
     local tx_iface rx_iface
-    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-        "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" 2>/dev/null || echo "ens6")
+    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" || echo "ens6")
     tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
     if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
 
     local gw_raw
     gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set $tx_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" 2>/dev/null || echo "SSM_FAILED")
+        "ip link set $tx_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" || echo "SSM_FAILED")
     log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -8)"
 
     TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
@@ -512,11 +532,27 @@ generate_trex_config() {
 
     # Step 3: Bind BOTH data ENIs to vfio-pci
     # Use sysfs driver_override — works without any DPDK tools installed.
+    # First verify both PCI devices exist (ENIs must be attached).
     log_info "Step 3: Binding both data ENIs to vfio-pci..."
     local bind_result
-    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 45 \
-        "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; for PCI in $TX_PCI $RX_PCI; do IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null || true; fi; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK_\$PCI || echo BIND_FAIL_\$PCI; done; ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep -E '00:0[67]'" 2>/dev/null || echo "SSM_FAILED")
-    log_info "NIC bind result: $(echo "$bind_result" | grep -E 'BIND_|FAIL' | head -5)"
+    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 60 \
+        "echo '=== Pre-bind PCI check ==='; ls /sys/bus/pci/devices/$TX_PCI 2>/dev/null && echo PCI_TX_EXISTS || echo PCI_TX_MISSING; ls /sys/bus/pci/devices/$RX_PCI 2>/dev/null && echo PCI_RX_EXISTS || echo PCI_RX_MISSING; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; for PCI in $TX_PCI $RX_PCI; do IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null || true; fi; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK_\$PCI || echo BIND_FAIL_\$PCI; done; echo '=== Post-bind vfio-pci devices ==='; ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep -E '00:0[67]' || echo 'NO_VFIO_DEVICES'" || echo "SSM_FAILED")
+    log_info "NIC bind result: $bind_result"
+
+    # Verify both ENIs bound successfully
+    if [[ "$bind_result" == *"PCI_RX_MISSING"* ]]; then
+        log_error "TRex RX ENI PCI device $RX_PCI not found — ENI may not be attached"
+        return 1
+    fi
+    if [[ "$bind_result" != *"BIND_OK_${TX_PCI}"* ]]; then
+        log_error "Failed to bind TX ENI $TX_PCI to vfio-pci"
+        return 1
+    fi
+    if [[ "$bind_result" != *"BIND_OK_${RX_PCI}"* ]]; then
+        log_error "Failed to bind RX ENI $RX_PCI to vfio-pci"
+        return 1
+    fi
+    log_info "Both ENIs bound to vfio-pci successfully"
 
     # Step 4: Write /etc/trex_cfg.yaml via SSM
     log_info "Step 4: Writing TRex config (TX: $TX_BDF, RX: $RX_BDF)..."
@@ -537,7 +573,7 @@ YAMLEOF
 
     local write_result
     write_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml && echo WROTE || echo WRITE_ERR; cat /etc/trex_cfg.yaml 2>/dev/null || true" 2>/dev/null || echo "SSM_WRITE_FAILED")
+        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml && echo WROTE || echo WRITE_ERR; cat /etc/trex_cfg.yaml 2>/dev/null || true" || echo "SSM_WRITE_FAILED")
     log_info "Config write result: $(echo "$write_result" | head -10)"
 
     if [[ "$write_result" == *"SSM_WRITE_FAILED"* ]]; then
@@ -558,14 +594,27 @@ start_trex_server() {
 
     # Verify both NICs are bound to vfio-pci before starting TRex
     local nic_state
-    nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo NIC_STATE:; for p in $TX_PCI $RX_PCI; do readlink /sys/bus/pci/devices/\$p/driver 2>/dev/null | xargs -I{} echo \$p: {}; done; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep HugePages /proc/meminfo 2>/dev/null; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" 2>/dev/null || echo "SSM_FAILED")
+    nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo NIC_STATE:; for p in $TX_PCI $RX_PCI; do readlink /sys/bus/pci/devices/\$p/driver 2>/dev/null | xargs -I{} echo \$p: {}; done; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep HugePages /proc/meminfo 2>/dev/null; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" || echo "SSM_FAILED")
     log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'vfio|BINARY|port_limit|src_mac|dest_mac|Huge|NO_VFIO' | head -10)"
+
+    # Verify both NICs are actually on vfio-pci before starting TRex
+    if ! echo "$nic_state" | grep -q "$TX_PCI.*vfio-pci"; then
+        log_error "TX NIC $TX_PCI is NOT bound to vfio-pci — TRex will fail"
+        log_error "Full NIC state: $nic_state"
+        return 1
+    fi
+    if ! echo "$nic_state" | grep -q "$RX_PCI.*vfio-pci"; then
+        log_error "RX NIC $RX_PCI is NOT bound to vfio-pci — TRex will fail"
+        log_error "Full NIC state: $nic_state"
+        return 1
+    fi
+    log_info "Both NICs confirmed bound to vfio-pci"
 
     # Ensure hugepages are allocated and mounted (TRex/DPDK requires them)
     log_info "Ensuring hugepages are allocated..."
     ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" 2>/dev/null || true
+        "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" || true
 
     # Start TRex via fire-and-forget SSM command.
     # We don't wait for SSM completion because SSM timeouts are too short for
@@ -585,8 +634,8 @@ start_trex_server() {
     # Single verification check
     local check
     check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -5 /var/log/trex-server.log 2>/dev/null" 2>/dev/null || echo "SSM_CHECK_FAILED")
-    log_info "TRex check: $(echo "$check" | tr '\n' ' ' | head -c 300)"
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
+    log_info "TRex check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
 
     if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
         log_info "TRex server is running"
@@ -597,8 +646,8 @@ start_trex_server() {
     log_info "TRex not yet detected, waiting 30s more..."
     sleep 30
     check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -5 /var/log/trex-server.log 2>/dev/null" 2>/dev/null || echo "SSM_CHECK_FAILED")
-    log_info "TRex retry check: $(echo "$check" | tr '\n' ' ' | head -c 300)"
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
+    log_info "TRex retry check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
 
     if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
         log_info "TRex server is running (after retry)"
@@ -1136,10 +1185,13 @@ Packet sizes: \`$PACKET_SIZES\`"
     # after the instance boots. Wait for them and bind via SSM.
 
     log_info "Phase 2b: Ensuring secondary ENIs are attached..."
-    # TRex ENI stays in kernel mode for now — we need it for gateway MAC discovery.
-    # TRex will bind it to DPDK internally when started.
+    # TRex has 2 data ENIs: device-number 1 (TX) and device-number 2 (RX).
+    # Wait for BOTH before proceeding. They stay in kernel mode for now —
+    # trex_configure_and_bind() will bind them to vfio-pci after gateway MAC discovery.
     wait_and_bind_eni "$TREX_INSTANCE_ID" "TRex" "ena" \
-        || { log_error "TRex ENI attachment failed"; exit 2; }
+        || { log_error "TRex TX ENI attachment failed"; exit 2; }
+    wait_for_trex_rx_eni "$TREX_INSTANCE_ID" \
+        || { log_error "TRex RX ENI attachment failed"; exit 2; }
     # DUT ENI starts in kernel mode — orchestrator binds as needed per config.
     wait_and_bind_eni "$DUT_INSTANCE_ID" "DUT" "ena" \
         || { log_error "DUT ENI attachment failed"; exit 2; }
