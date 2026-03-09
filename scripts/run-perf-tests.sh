@@ -1148,6 +1148,43 @@ TRex server running. Beginning benchmarks..."
     # ── Phase 5: Run benchmarks for each config ─────────────────────────────
 
     log_info "Phase 5: Running benchmarks..."
+    log_info "DUT_INSTANCE_ID=$DUT_INSTANCE_ID TREX_INSTANCE_ID=$TREX_INSTANCE_ID"
+
+    # Verify DUT SSM connectivity before starting benchmarks.
+    # The DUT may still be building from user-data. Wait up to 120s for the build to finish.
+    log_info "Verifying DUT SSM connectivity and build completion..."
+    local dut_ready=false
+    for attempt in $(seq 1 12); do
+        local dut_check
+        dut_check=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "echo DUT_SSM_OK; ls /opt/dpdk-stdlib/target/release/echo 2>/dev/null && echo BUILD_DONE || echo BUILD_PENDING" 2>&1) || true
+        log_info "DUT check attempt $attempt: $dut_check"
+        if [[ "$dut_check" == *"DUT_SSM_OK"* && "$dut_check" == *"BUILD_DONE"* ]]; then
+            dut_ready=true
+            break
+        elif [[ "$dut_check" == *"DUT_SSM_OK"* ]]; then
+            log_info "DUT SSM works but build not done yet, waiting 10s..."
+            sleep 10
+        else
+            log_warn "DUT SSM failed (attempt $attempt), waiting 10s..."
+            sleep 10
+        fi
+    done
+
+    if [[ "$dut_ready" != "true" ]]; then
+        post_pr_comment "## [Perf] DUT Not Ready
+DUT instance \`$DUT_INSTANCE_ID\` SSM connectivity or build not ready after 120s.
+Last check output:
+\`\`\`
+${dut_check:-empty}
+\`\`\`"
+        log_error "DUT not ready, aborting benchmarks"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] DUT Ready
+DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
+
     IFS=',' read -ra CONFIG_LIST <<< "$CONFIGS"
     local total_configs=${#CONFIG_LIST[@]}
     local config_idx=0
