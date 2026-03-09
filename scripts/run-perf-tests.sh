@@ -1181,6 +1181,17 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         if [[ "$start_ok" == "false" ]]; then
             log_error "Failed to start DUT for config: $config"
             failed_configs+=("$config")
+            # Post diagnostic info about the DUT start failure
+            local dut_diag
+            dut_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 15 \
+                "echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -10 || echo 'N/A'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -5 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'" 2>/dev/null || echo "(SSM failed)")
+            post_pr_comment "## [Perf] DUT Start Failed: \`$config\`
+<details><summary>DUT diagnostics</summary>
+
+\`\`\`
+${dut_diag}
+\`\`\`
+</details>"
             # Collect diagnostics for this failure
             collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
             continue
@@ -1229,7 +1240,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         summary="$summary
 
 ### Failed Configs
-$(printf '- `%s`\n' "${failed_configs[@]}")"
+$(printf -- '- `%s`\n' "${failed_configs[@]}")"
     fi
 
     # Post to PR
