@@ -70,11 +70,14 @@ def run_single_benchmark(client, port, streams, rate_pct, duration_sec):
     # Clear stats before starting
     client.clear_stats()
 
-    # Start traffic
+    # Start traffic with duration — TRex will stop TX after duration_sec.
     client.start(ports=[port], mult=f'{rate_pct}%', duration=duration_sec)
 
-    # Wait for traffic to finish + 2 second drain
-    client.wait_on_traffic(ports=[port], timeout=duration_sec + 10)
+    # Sleep for the duration + drain time, then explicitly stop.
+    # We avoid wait_on_traffic() because it can timeout on some setups
+    # when the internal state machine doesn't transition cleanly.
+    time.sleep(duration_sec + 2)
+    client.stop(ports=[port])
     time.sleep(2)
 
     # Collect stats
