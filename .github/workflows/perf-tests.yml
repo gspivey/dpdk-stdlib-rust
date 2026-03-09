@@ -18,7 +18,7 @@ on:
       configs:
         description: 'DUT configs to benchmark'
         required: false
-        default: 'rust-dpdk,native-dpdk,rust-stdlib,plain-rust'
+        default: 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk'
       teardown:
         description: 'Destroy stack after tests'
         required: false
@@ -151,7 +151,7 @@ jobs:
             --packet-sizes "${{ inputs.packet_sizes || '64,512,1400' }}" \
             --duration "${{ inputs.duration || '30' }}" \
             --rate-steps "${{ inputs.rate_steps || '10,25,50,75,100' }}" \
-            --configs "${{ inputs.configs || 'rust-dpdk,native-dpdk,rust-stdlib,plain-rust' }}" \
+            --configs "${{ inputs.configs || 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk' }}" \
             --json-summary
         env:
           DPDK_AMI_ID: ${{ steps.amis.outputs.dpdk_ami }}

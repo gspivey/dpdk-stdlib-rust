@@ -157,12 +157,22 @@ ssm_run_command() {
                 ;;
             Failed|Cancelled|TimedOut)
                 log_error "SSM command $cmd_id on $instance_id: $status"
-                # Output stderr for diagnostics
-                aws ssm get-command-invocation \
+                # Output both stdout and stderr for diagnostics
+                local ssm_stdout ssm_stderr
+                ssm_stdout=$(aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardOutputContent" \
+                    --output text 2>/dev/null || echo "(no stdout)")
+                ssm_stderr=$(aws ssm get-command-invocation \
                     --command-id "$cmd_id" \
                     --instance-id "$instance_id" \
                     --query "StandardErrorContent" \
-                    --output text 2>/dev/null || true
+                    --output text 2>/dev/null || echo "(no stderr)")
+                log_error "SSM stdout: $ssm_stdout"
+                log_error "SSM stderr: $ssm_stderr"
+                # Also output stdout so callers in $() can see it
+                echo "$ssm_stdout"
                 return 1
                 ;;
         esac
