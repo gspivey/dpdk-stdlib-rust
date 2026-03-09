@@ -517,15 +517,26 @@ generate_trex_config() {
     tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
     if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
 
-    local gw_raw
-    gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ip link set $tx_iface up 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 1; ping -c 2 -W 2 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" || echo "SSM_FAILED")
-    log_info "Gateway discovery raw: $(echo "$gw_raw" | tail -8)"
+    # Retry gateway discovery up to 3 times — the interface may need time to get an IP via DHCP
+    TREX_GATEWAY_MAC=""
+    local gw_attempt
+    for gw_attempt in 1 2 3; do
+        local gw_raw
+        gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 45 \
+            "ip link set $tx_iface up 2>/dev/null || true; dhclient $tx_iface 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 2; ip addr show $tx_iface 2>/dev/null; ping -c 3 -W 3 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" || echo "SSM_FAILED")
+        log_info "Gateway discovery attempt $gw_attempt raw: $(echo "$gw_raw" | tail -10)"
 
-    TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
-    if [[ -z "$TREX_GATEWAY_MAC" ]]; then
-        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
-    fi
+        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+        if [[ -z "$TREX_GATEWAY_MAC" ]]; then
+            TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+        fi
+
+        if [[ -n "$TREX_GATEWAY_MAC" ]]; then
+            break
+        fi
+        log_warn "Gateway MAC not found on attempt $gw_attempt, retrying in 10s..."
+        sleep 10
+    done
 
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
         log_error "Could not discover gateway MAC on TRex data ENI — packets will be dropped by VPC"
