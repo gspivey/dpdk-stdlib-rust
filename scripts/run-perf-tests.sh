@@ -32,7 +32,9 @@ SKIP_DEPLOY=false
 PACKET_SIZES="64,512,1400"
 DURATION=30
 RATE_STEPS="10,25,50,75,100"
-CONFIGS="rust-dpdk,native-dpdk,rust-stdlib,plain-rust"
+# Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
+# This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
+CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
