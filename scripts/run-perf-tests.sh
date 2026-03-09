@@ -434,17 +434,18 @@ wait_for_trex_rx_eni() {
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
-    # Clean up any DPDK state first — if a previous process left the lock file,
-    # dpdk-devbind.py may refuse to rebind the device.
+    # Clean up any DPDK state first
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null || true" || true
+        "pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null; true" || true
 
+    # Use sysfs driver_override — same method that works for TRex binding.
+    # This avoids dpdk-devbind.py which can fail in edge cases.
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; ip link set ens6 down 2>/dev/null || true; CURRENT=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo none); echo CURRENT_DRIVER: \$CURRENT; if [ \"\$CURRENT\" = 'vfio-pci' ]; then echo 'Already bound to vfio-pci'; else /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>&1; fi; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null | grep -q vfio-pci && echo 'BIND_OK' || echo 'BIND_FAILED'" 2>&1)
+        "set +e; modprobe vfio-pci 2>/dev/null; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null; fi; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null; sleep 1; echo vfio-pci > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; echo 0000:00:06.0 > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'vfio-pci' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_dpdk result (exit=$bind_exit): $bind_out"
-    if [[ "$bind_out" != *"BIND_OK"* ]]; then
+    if [[ $bind_exit -ne 0 ]]; then
         log_error "Failed to bind DUT ENI to vfio-pci: $bind_out"
         return 1
     fi
@@ -454,13 +455,14 @@ dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
     # Clean up DPDK state first
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null || true" || true
+        "pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null; true" || true
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
-        "CURRENT=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo none); echo CURRENT_DRIVER: \$CURRENT; if [ \"\$CURRENT\" = 'vfio-pci' ]; then echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null || true; sleep 1; echo ena > /sys/bus/pci/devices/0000:00:06.0/driver_override; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>/dev/null || /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>&1 || true; fi; sleep 3; ip link set ens6 up 2>/dev/null || true; dhclient ens6 2>/dev/null || true; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; ip addr show ens6 2>/dev/null; echo 'Bound to kernel (ena)'" 2>&1)
-    log_info "dut_bind_kernel result: $bind_out"
-    if [[ "$bind_out" == *"SSM_FAILED"* ]]; then
+        "set +e; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null; sleep 1; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>/dev/null; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; ip link set \$IFACE up 2>/dev/null; dhclient \$IFACE 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+    local bind_exit=$?
+    log_info "dut_bind_kernel result (exit=$bind_exit): $bind_out"
+    if [[ $bind_exit -ne 0 ]]; then
         log_error "Failed to bind DUT ENI to kernel: $bind_out"
         return 1
     fi
