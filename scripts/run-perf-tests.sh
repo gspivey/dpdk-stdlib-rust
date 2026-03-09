@@ -400,15 +400,15 @@ dut_bind_dpdk() {
 
 dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
-    ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "/usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 2; ip link set ens6 up 2>/dev/null || true; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; echo 'Bound to kernel (ena)'" \
+    ssm_run_command "$DUT_INSTANCE_ID" 45 \
+        "rm -rf /var/run/dpdk/ 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 3; ip link set ens6 up 2>/dev/null || true; dhclient ens6 2>/dev/null || true; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; ip addr show ens6 2>/dev/null; echo 'Bound to kernel (ena)'" \
         || { log_error "Failed to bind DUT ENI to kernel"; return 1; }
 }
 
 dut_stop_all_apps() {
     log_info "Stopping all DUT applications..."
-    ssm_run_command "$DUT_INSTANCE_ID" 20 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f 'target/release/plain-echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 3; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 'All apps stopped'" \
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f 'target/release/plain-echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; rm -rf /var/run/dpdk 2>/dev/null || true; echo 'All apps stopped'" \
         2>/dev/null || true
 }
 
