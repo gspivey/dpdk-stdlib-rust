@@ -795,15 +795,23 @@ start_dut_rust_dpdk() {
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
-    sleep 10
+    sleep 15
 
-    # Verify it's running
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    # Verify it's running (retry up to 3 times — SSM can be slow)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "rust-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "rust-dpdk echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-dpdk.log 2>/dev/null" 2>/dev/null || true
+        log_error "rust-dpdk echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-rust-dpdk.log 2>/dev/null" || true
         return 1
     fi
     log_info "rust-dpdk echo server running"
@@ -819,14 +827,22 @@ start_dut_native_dpdk() {
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
-    sleep 10
+    sleep 15
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f testpmd >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f testpmd >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "native-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "testpmd failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/testpmd.log 2>/dev/null" 2>/dev/null || true
+        log_error "testpmd failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/testpmd.log 2>/dev/null" || true
         return 1
     fi
     log_info "testpmd macswap running"
@@ -839,14 +855,22 @@ start_dut_rust_stdlib() {
     # The echo binary without DPDK feature falls back to std::net
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-stdlib.log 2>&1 &"
-    sleep 3
+    sleep 10
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "rust-stdlib verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "rust-stdlib echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-stdlib.log 2>/dev/null" 2>/dev/null || true
+        log_error "rust-stdlib echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-rust-stdlib.log 2>/dev/null" || true
         return 1
     fi
     log_info "rust-stdlib echo server running"
@@ -858,14 +882,22 @@ start_dut_plain_rust() {
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/plain-echo.log 2>&1 &"
-    sleep 3
+    sleep 10
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "plain-rust verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "plain-rust echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/plain-echo.log 2>/dev/null" 2>/dev/null || true
+        log_error "plain-rust echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/plain-echo.log 2>/dev/null" || true
         return 1
     fi
     log_info "plain-rust echo server running"
