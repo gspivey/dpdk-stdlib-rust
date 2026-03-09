@@ -127,6 +127,7 @@ ssm_run_command() {
 
     # Wait for completion
     local elapsed=0
+    local completed=false
     while [[ $elapsed -lt $timeout_sec ]]; do
         local status
         status=$(aws ssm get-command-invocation \
@@ -136,10 +137,13 @@ ssm_run_command() {
             --output text 2>/dev/null || echo "Pending")
 
         case "$status" in
-            Success) break ;;
+            Success)
+                completed=true
+                break
+                ;;
             Failed|Cancelled|TimedOut)
                 log_error "SSM command $cmd_id on $instance_id: $status"
-                # Save stderr for diagnostics
+                # Output stderr for diagnostics
                 aws ssm get-command-invocation \
                     --command-id "$cmd_id" \
                     --instance-id "$instance_id" \
@@ -151,6 +155,11 @@ ssm_run_command() {
         sleep 5
         elapsed=$((elapsed + 5))
     done
+
+    if [[ "$completed" != "true" ]]; then
+        log_error "SSM command $cmd_id timed out after ${timeout_sec}s (polling)"
+        return 1
+    fi
 
     # Return stdout
     aws ssm get-command-invocation \
@@ -600,19 +609,43 @@ run_benchmark_for_config() {
     local benchmark_script
     benchmark_script=$(cat "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
 
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
         "mkdir -p /opt/perf-tests && cat > /opt/perf-tests/run_benchmark.py << 'PYSCRIPT'
 ${benchmark_script}
 PYSCRIPT
-chmod +x /opt/perf-tests/run_benchmark.py" || {
+chmod +x /opt/perf-tests/run_benchmark.py
+echo 'Script deployed, size:' \$(wc -c < /opt/perf-tests/run_benchmark.py)" || {
         log_error "Failed to copy benchmark script to TRex"
         return 1
     }
 
     # Use the gateway MAC discovered during generate_trex_config
     log_info "Using gateway MAC: ${TREX_GATEWAY_MAC:-unknown}"
+    log_info "Benchmark params: src=${TREX_DATA_ENI_IP} dst=${DUT_DATA_ENI_IP} port=${dst_port} sizes=${PACKET_SIZES} rates=${RATE_STEPS} duration=${DURATION}"
 
-    # Run benchmark via SSM
+    # Pre-flight: verify TRex API is accessible and benchmark script can import dependencies
+    local preflight
+    preflight=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "cd /opt/trex && python3 -c \"
+import sys
+sys.path.insert(0, '/opt/trex/automation/trex_control_plane/interactive')
+from trex.stl.api import STLClient
+c = STLClient(server='localhost')
+c.connect()
+info = c.get_server_system_info()
+ports = c.get_port_info()
+print('TRex API OK: %d ports' % len(ports))
+for i, p in enumerate(ports):
+    print('  Port %d: %s' % (i, p.get('hw_mac', 'unknown')))
+c.disconnect()
+print('PREFLIGHT_OK')
+\"" 2>&1) || true
+    log_info "TRex preflight check: $preflight"
+    if [[ "$preflight" != *"PREFLIGHT_OK"* ]]; then
+        log_error "TRex API preflight failed — benchmark will likely fail"
+    fi
+
+    # Run benchmark via SSM — capture both stdout and stderr
     local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_benchmark.py \
         --server localhost \
         --config-name '$config_name' \
@@ -623,28 +656,61 @@ chmod +x /opt/perf-tests/run_benchmark.py" || {
         --packet-sizes '$PACKET_SIZES' \
         --rate-steps '$RATE_STEPS' \
         --duration $DURATION \
-        --output '/tmp/perf-results/${config_name}.json'"
+        --output '/tmp/perf-results/${config_name}.json' 2>&1; echo EXIT_CODE=\$?"
 
+    log_info "Starting benchmark SSM command (timeout=${BENCHMARK_TIMEOUT}s)..."
     local output
-    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd" 2>/dev/null)
-    local exit_code=$?
+    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd")
+    local ssm_exit_code=$?
 
-    echo "$output"
+    mkdir -p "$LOGS_DIR"
+    echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    log_info "Benchmark SSM exit code: $ssm_exit_code"
+    log_info "Benchmark output (last 20 lines):"
+    echo "$output" | tail -20
 
-    if [[ $exit_code -ne 0 ]]; then
-        log_error "Benchmark failed for $config_name"
-        mkdir -p "$LOGS_DIR"
-        echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    if [[ $ssm_exit_code -ne 0 ]]; then
+        log_error "Benchmark SSM command failed for $config_name (exit=$ssm_exit_code)"
+        return 1
+    fi
+
+    # Check the Python script's exit code from the captured output
+    local py_exit
+    py_exit=$(echo "$output" | grep -oP 'EXIT_CODE=\K[0-9]+' | tail -1)
+    if [[ -n "$py_exit" && "$py_exit" != "0" ]]; then
+        log_error "Benchmark Python script failed for $config_name (exit=$py_exit)"
         return 1
     fi
 
     # Download results from TRex instance
+    log_info "Downloading results for $config_name..."
     local results_json
-    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo '{}'" 2>/dev/null)
+    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
+    local dl_exit=$?
+
+    log_info "Results download SSM exit: $dl_exit"
+
+    if [[ $dl_exit -ne 0 || "$results_json" == *"FILE_NOT_FOUND"* ]]; then
+        log_error "Failed to download results for $config_name (dl_exit=$dl_exit)"
+        echo "$results_json" > "$LOGS_DIR/trex-results-download-${config_name}.log"
+        return 1
+    fi
+
+    # Extract just the JSON part (after the directory listing)
+    local json_content
+    json_content=$(echo "$results_json" | sed -n '/^---$/,$ p' | tail -n +2)
 
     mkdir -p "$RESULTS_DIR"
-    echo "$results_json" > "$RESULTS_DIR/${config_name}.json"
+    echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
+
+    # Verify the JSON is valid
+    if ! python3 -c "import json; d=json.load(open('$RESULTS_DIR/${config_name}.json')); print('Valid JSON:', len(d.get('results',{})), 'packet sizes')" 2>&1; then
+        log_error "Invalid JSON in results for $config_name"
+        cat "$RESULTS_DIR/${config_name}.json" | head -5
+        return 1
+    fi
+
     log_info "Results saved to $RESULTS_DIR/${config_name}.json"
 }
 
