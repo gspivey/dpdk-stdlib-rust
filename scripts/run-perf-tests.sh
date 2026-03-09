@@ -111,17 +111,29 @@ ssm_run_command() {
     local escaped_command
     escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
 
-    local cmd_id
-    cmd_id=$(aws ssm send-command \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "{\"commands\":[${escaped_command}]}" \
-        --timeout-seconds "$timeout_sec" \
-        --query "Command.CommandId" \
-        --output text 2>/dev/null)
+    # Retry send-command up to 3 times with backoff (handles SSM throttling)
+    local cmd_id=""
+    local send_err=""
+    local retry
+    for retry in 1 2 3; do
+        send_err=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[${escaped_command}]}" \
+            --timeout-seconds "$timeout_sec" \
+            --query "Command.CommandId" \
+            --output text 2>&1)
+        local send_exit=$?
+        if [[ $send_exit -eq 0 && -n "$send_err" && "$send_err" != *"error"* && "$send_err" != *"Error"* ]]; then
+            cmd_id="$send_err"
+            break
+        fi
+        log_warn "SSM send-command attempt $retry failed for $instance_id: $send_err"
+        sleep $((retry * 3))
+    done
 
     if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to send SSM command to $instance_id"
+        log_error "Failed to send SSM command to $instance_id after 3 attempts: $send_err"
         return 1
     fi
 
@@ -402,9 +414,15 @@ wait_and_bind_eni() {
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
-    ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 && echo 'Bound to vfio-pci'" \
-        || { log_error "Failed to bind DUT ENI to vfio-pci"; return 1; }
+    local bind_out
+    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>&1 && echo 'Bound to vfio-pci'" 2>&1)
+    local bind_exit=$?
+    log_info "dut_bind_dpdk result (exit=$bind_exit): $bind_out"
+    if [[ $bind_exit -ne 0 ]]; then
+        log_error "Failed to bind DUT ENI to vfio-pci: $bind_out"
+        return 1
+    fi
 }
 
 dut_bind_kernel() {
@@ -1220,9 +1238,10 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
             failed_configs+=("$config")
             # Post diagnostic info about the DUT start failure
             local dut_diag
-            dut_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 15 \
-                "echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -10 || echo 'N/A'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -5 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'" 2>/dev/null || echo "(SSM failed)")
+            dut_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                "echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -10 || echo 'N/A'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -5 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'" 2>&1 || echo "(SSM failed)")
             post_pr_comment "## [Perf] DUT Start Failed: \`$config\`
+DUT instance: \`$DUT_INSTANCE_ID\`
 <details><summary>DUT diagnostics</summary>
 
 \`\`\`
