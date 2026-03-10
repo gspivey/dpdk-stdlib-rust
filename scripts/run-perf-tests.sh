@@ -490,6 +490,11 @@ dut_stop_all_apps() {
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
         "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
+    # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
+    # the shared memory files persist and can cause the next DPDK app to fail
+    # or silently malfunction (e.g., attach as secondary process).
+    ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "rm -rf /var/run/dpdk/ 2>/dev/null; echo DPDK_STATE_CLEANED" || true
     # Give the system time to finish DPDK cleanup after process exit
     sleep 5
 }
@@ -930,7 +935,7 @@ start_dut_native_dpdk() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start > /var/log/testpmd.log 2>&1 &"
     sleep 15
 
     local status=""
@@ -1501,6 +1506,19 @@ ${dut_diag}
             app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
+            # Post testpmd log to PR for visibility (stats-period output shows RX/TX counters)
+            if [[ "$config" == "native-dpdk" ]]; then
+                local testpmd_diag
+                testpmd_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                    "echo '=== testpmd stats (last 30 lines) ==='; tail -30 /var/log/testpmd.log 2>/dev/null || echo '(no log)'; echo '=== ENA port stats ==='; cat /sys/bus/pci/devices/0000:00:06.0/net/*/statistics/rx_packets 2>/dev/null || echo 'N/A (vfio-pci)'" 2>/dev/null || echo "(failed)")
+                post_pr_comment "## [Perf] Diag: testpmd log
+<details><summary>testpmd output (last 30 lines)</summary>
+
+\`\`\`
+${testpmd_diag}
+\`\`\`
+</details>"
+            fi
         fi
     done
 
