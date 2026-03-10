@@ -446,15 +446,16 @@ wait_for_trex_rx_eni() {
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
-    # Clean up any DPDK state first
+    # Clean up any DPDK state first — must use set +e because pkill returns 1
+    # when no matching process exists, and SSM RunShellScript uses set -e by default.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null; true" || true
+        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
 
     # Use sysfs driver_override — same method that works for TRex binding.
     # This avoids dpdk-devbind.py which can fail in edge cases.
     local bind_out
-    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; modprobe vfio-pci 2>/dev/null; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null; fi; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null; sleep 1; echo vfio-pci > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; echo 0000:00:06.0 > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'vfio-pci' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "set +e; echo PRE_STATE:; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo no_driver; ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null || echo no_net_iface; modprobe vfio-pci 2>/dev/null; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then echo BRINGING_DOWN: \$IFACE; ip link set \$IFACE down 2>/dev/null; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo SETTING_OVERRIDE...; echo vfio-pci > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING...; echo 0000:00:06.0 > /sys/bus/pci/drivers/vfio-pci/bind 2>&1 || echo BIND_RESULT: \$?; sleep 1; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'vfio-pci' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; ls -la /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null; cat /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; exit 1; fi" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_dpdk result (exit=$bind_exit): $bind_out"
     if [[ $bind_exit -ne 0 ]]; then
@@ -465,13 +466,14 @@ dut_bind_dpdk() {
 
 dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
-    # Clean up DPDK state first
+    # Clean up DPDK state first — must use set +e because pkill returns 1
+    # when no matching process exists, and SSM RunShellScript uses set -e by default.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; sleep 1; rm -rf /var/run/dpdk/ 2>/dev/null; true" || true
+        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
-        "set +e; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>/dev/null; sleep 1; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>/dev/null; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; ip link set \$IFACE up 2>/dev/null; dhclient \$IFACE 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+        "set +e; echo PRE_STATE:; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo no_driver; ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null || echo no_net_iface; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; dhclient \$IFACE 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; ls -la /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null; cat /sys/bus/pci/devices/0000:00:06.0/driver_override 2>/dev/null; exit 1; fi" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_kernel result (exit=$bind_exit): $bind_out"
     if [[ $bind_exit -ne 0 ]]; then
@@ -714,19 +716,19 @@ run_benchmark_for_config() {
 
     log_info "Running TRex benchmark for config: $config_name"
 
-    # Copy benchmark script to TRex instance
-    local benchmark_script
-    benchmark_script=$(cat "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
+    # Copy benchmark script to TRex instance using base64 encoding.
+    # Heredoc deployment was silently deploying stale content; base64
+    # avoids shell quoting/escaping issues entirely.
+    local benchmark_b64
+    benchmark_b64=$(base64 -w0 "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
 
-    ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "mkdir -p /opt/perf-tests && cat > /opt/perf-tests/run_benchmark.py << 'PYSCRIPT'
-${benchmark_script}
-PYSCRIPT
-chmod +x /opt/perf-tests/run_benchmark.py
-echo 'Script deployed, size:' \$(wc -c < /opt/perf-tests/run_benchmark.py)" || {
+    local deploy_out
+    deploy_out=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "set +e; mkdir -p /opt/perf-tests; echo '$benchmark_b64' | base64 -d > /opt/perf-tests/run_benchmark.py; chmod +x /opt/perf-tests/run_benchmark.py; echo DEPLOYED_SIZE=\$(wc -c < /opt/perf-tests/run_benchmark.py) LINES=\$(wc -l < /opt/perf-tests/run_benchmark.py); echo WAIT_ON_TRAFFIC_COUNT=\$(grep -c 'wait_on_traffic' /opt/perf-tests/run_benchmark.py); echo LINE77=\$(sed -n '77p' /opt/perf-tests/run_benchmark.py); echo DEPLOY_OK") || {
         log_error "Failed to copy benchmark script to TRex"
         return 1
     }
+    log_info "Script deploy result: $deploy_out"
 
     # Use the gateway MAC discovered during generate_trex_config
     log_info "Using gateway MAC: ${TREX_GATEWAY_MAC:-unknown}"
@@ -879,10 +881,9 @@ start_dut_rust_dpdk() {
     log_info "Starting DUT: rust-dpdk (echo server with DPDK backend)"
     dut_bind_dpdk || return 1
 
-    # Ensure clean DPDK state and hugepages. Kill any lingering DPDK processes
-    # and wait for them to die before removing the lock file.
+    # Ensure clean DPDK state and hugepages
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" || true
+        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
@@ -914,7 +915,7 @@ start_dut_native_dpdk() {
 
     # Ensure clean DPDK state and hugepages
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true" || true
+        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
@@ -1384,10 +1385,11 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         if [[ "$start_ok" == "false" ]]; then
             log_error "Failed to start DUT for config: $config"
             failed_configs+=("$config")
-            # Post diagnostic info about the DUT start failure
+            # Post diagnostic info about the DUT start failure — use set +e to
+            # ensure the diagnostic command itself doesn't fail due to set -e.
             local dut_diag
             dut_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-                "echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -10 || echo 'N/A'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -5 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'" 2>&1 || echo "(SSM failed)")
+                "set +e; echo '=== PCI State ==='; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null || echo 'no net iface'; echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -15 || echo 'N/A'; echo '=== DPDK state ==='; ls -la /var/run/dpdk/ 2>/dev/null || echo 'no /var/run/dpdk'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -10 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'; echo '=== vfio ==='; ls /dev/vfio/ 2>/dev/null || echo 'no /dev/vfio'; echo DIAG_DONE" 2>&1 || echo "(SSM failed)")
             post_pr_comment "## [Perf] DUT Start Failed: \`$config\`
 DUT instance: \`$DUT_INSTANCE_ID\`
 <details><summary>DUT diagnostics</summary>
