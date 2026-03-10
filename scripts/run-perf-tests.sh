@@ -1371,11 +1371,31 @@ DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 Running \`$config\` benchmark...
 Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_STEPS\`%"
 
-        # Stop any running DUT apps and give SSM agent a breather
+        # Stop any running DUT apps
         dut_stop_all_apps
         if [[ $config_idx -gt 1 ]]; then
-            log_info "Waiting 10s between configs for SSM agent recovery..."
-            sleep 10
+            # After a heavy benchmark, the DUT may need time to recover.
+            # Wait for SSM agent to become responsive before proceeding.
+            log_info "Waiting for DUT SSM agent to recover between configs..."
+            sleep 15
+            local ssm_ok=false
+            local ssm_retry
+            for ssm_retry in 1 2 3 4 5; do
+                local ssm_check
+                ssm_check=$(ssm_run_command "$DUT_INSTANCE_ID" 15 "echo SSM_OK" 2>/dev/null) || true
+                if [[ "$ssm_check" == *"SSM_OK"* ]]; then
+                    ssm_ok=true
+                    break
+                fi
+                log_warn "DUT SSM not responsive (attempt $ssm_retry), waiting 10s..."
+                sleep 10
+            done
+            if [[ "$ssm_ok" == "false" ]]; then
+                log_error "DUT SSM agent not responding after 5 attempts — skipping remaining configs"
+                failed_configs+=("$config")
+                break
+            fi
+            log_info "DUT SSM agent responsive, proceeding with $config"
         fi
 
         # Start the appropriate DUT config
