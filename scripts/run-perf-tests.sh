@@ -490,6 +490,11 @@ dut_stop_all_apps() {
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
         "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
+    # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
+    # the shared memory files persist and can cause the next DPDK app to fail
+    # or silently malfunction (e.g., attach as secondary process).
+    ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "rm -rf /var/run/dpdk/ 2>/dev/null; echo DPDK_STATE_CLEANED" || true
     # Give the system time to finish DPDK cleanup after process exit
     sleep 5
 }
@@ -922,7 +927,7 @@ start_dut_rust_dpdk() {
 }
 
 start_dut_native_dpdk() {
-    log_info "Starting DUT: native-dpdk (testpmd macswap)"
+    log_info "Starting DUT: native-dpdk (testpmd 5tswap)"
     dut_bind_dpdk || return 1
 
     # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
@@ -930,7 +935,7 @@ start_dut_native_dpdk() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start > /var/log/testpmd.log 2>&1 &"
     sleep 15
 
     local status=""
@@ -949,7 +954,7 @@ start_dut_native_dpdk() {
         ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/testpmd.log 2>/dev/null" || true
         return 1
     fi
-    log_info "testpmd macswap running"
+    log_info "testpmd 5tswap running"
 }
 
 start_dut_rust_stdlib() {
@@ -1136,8 +1141,9 @@ cleanup() {
 
     if [[ "$TEARDOWN" == "true" && "$SKIP_DEPLOY" == "false" ]]; then
         log_info "Tearing down PerfTestStack..."
-        cd "$CDK_DIR"
-        npx cdk destroy "$CDK_STACK_NAME" --force 2>/dev/null || log_warn "Teardown failed"
+        # Use non-blocking delete to avoid consuming OIDC token time.
+        # The safety-net teardown step in the workflow will also attempt cleanup.
+        aws cloudformation delete-stack --stack-name "$CDK_STACK_NAME" 2>/dev/null || log_warn "Teardown failed"
     fi
 }
 
@@ -1185,18 +1191,27 @@ Packet sizes: \`$PACKET_SIZES\`"
         fi
 
         # Destroy any leftover stack first (from a previous failed run).
-        # Wait for deletion to complete — CloudFormation DELETE_IN_PROGRESS
-        # blocks new deploys, and ENI detachment can take 10+ minutes.
-        # If the stack lands in DELETE_FAILED (e.g. ENI detachment timeout),
-        # retry the destroy — CloudFormation will skip already-deleted resources.
+        # IMPORTANT: Do NOT use `npx cdk destroy --force` here — it blocks
+        # and monitors CloudFormation events, which can consume the entire
+        # 1-hour OIDC token if a previous stack is stuck in DELETE_IN_PROGRESS.
+        # Use non-blocking `aws cloudformation delete-stack` + polling instead.
         log_info "Cleaning up any leftover stack..."
-        npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+        local stack_status
+        stack_status=$(aws cloudformation describe-stacks \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "Stacks[0].StackStatus" \
+            --output text 2>/dev/null || echo "GONE")
+        log_info "Current stack status: $stack_status"
+
+        if [[ "$stack_status" != "GONE" && "$stack_status" != "DELETE_COMPLETE" && "$stack_status" != "DELETE_IN_PROGRESS" ]]; then
+            log_info "Requesting stack deletion..."
+            aws cloudformation delete-stack --stack-name "$CDK_STACK_NAME" 2>&1 || true
+        fi
 
         # Wait for stack to fully delete, retrying on DELETE_FAILED
         local stack_wait=0
         local destroy_retries=0
         while [[ $stack_wait -lt 900 ]]; do
-            local stack_status
             stack_status=$(aws cloudformation describe-stacks \
                 --stack-name "$CDK_STACK_NAME" \
                 --query "Stacks[0].StackStatus" \
@@ -1208,9 +1223,9 @@ Packet sizes: \`$PACKET_SIZES\`"
             if [[ "$stack_status" == "DELETE_FAILED" && $destroy_retries -lt 3 ]]; then
                 destroy_retries=$((destroy_retries + 1))
                 log_warn "Stack in DELETE_FAILED — retrying destroy (attempt $destroy_retries/3)..."
-                # Use aws CLI directly to delete with retain on stuck resources as last resort
                 if [[ $destroy_retries -le 2 ]]; then
-                    npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+                    aws cloudformation delete-stack \
+                        --stack-name "$CDK_STACK_NAME" 2>&1 || true
                 else
                     # Final attempt: delete stack retaining the stuck ENI attachments
                     # (they'll be cleaned up when the instances terminate)
@@ -1491,6 +1506,19 @@ ${dut_diag}
             app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
+            # Post testpmd log to PR for visibility (stats-period output shows RX/TX counters)
+            if [[ "$config" == "native-dpdk" ]]; then
+                local testpmd_diag
+                testpmd_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                    "echo '=== testpmd stats (last 30 lines) ==='; tail -30 /var/log/testpmd.log 2>/dev/null || echo '(no log)'; echo '=== ENA port stats ==='; cat /sys/bus/pci/devices/0000:00:06.0/net/*/statistics/rx_packets 2>/dev/null || echo 'N/A (vfio-pci)'" 2>/dev/null || echo "(failed)")
+                post_pr_comment "## [Perf] Diag: testpmd log
+<details><summary>testpmd output (last 30 lines)</summary>
+
+\`\`\`
+${testpmd_diag}
+\`\`\`
+</details>"
+            fi
         fi
     done
 

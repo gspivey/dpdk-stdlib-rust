@@ -154,7 +154,7 @@ export class PerfTestStack extends cdk.Stack {
       'systemctl enable amazon-ssm-agent',
       'cd /opt',
       'TREX_VERSION="v3.08"',
-      'curl -fL "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz" -o trex.tar.gz',
+      'curl -fL --retry 3 --retry-delay 10 "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz" -o trex.tar.gz || curl -fLk --retry 3 --retry-delay 10 "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz" -o trex.tar.gz',
       'tar -xzf trex.tar.gz',
       'mv ${TREX_VERSION} trex',
       'rm -f trex.tar.gz',
