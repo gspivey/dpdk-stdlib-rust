@@ -1,12 +1,22 @@
 use clap::Parser;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Global shutdown flag — set by signal handler on SIGTERM/SIGINT.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
 
 // Trait that both std::net::UdpSocket and dpdk_udp::UdpSocket implement
 trait UdpSocketTrait {
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
 }
 
 // Implement trait for std::net::UdpSocket
@@ -14,13 +24,17 @@ impl UdpSocketTrait for std::net::UdpSocket {
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.recv_from(buf)
     }
-    
+
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, addr)
     }
-    
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.local_addr()
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(dur)
     }
 }
 
@@ -30,13 +44,17 @@ impl UdpSocketTrait for dpdk_udp::UdpSocket {
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.recv_from(buf)
     }
-    
+
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, addr)
     }
-    
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.local_addr()
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(dur)
     }
 }
 
@@ -61,6 +79,14 @@ fn bind_socket(bind_addr: &str) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::
     Ok(Box::new(socket))
 }
 
+/// Install signal handlers for graceful shutdown.
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "echo")]
 #[command(about = "UDP Echo Server - auto-detects DPDK or uses standard networking")]
@@ -79,10 +105,11 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_signal_handlers();
     let args = Args::parse();
-    
+
     println!("🚀 DPDK-STDLIB Echo Server");
-    
+
     if args.synthetic {
         #[cfg(feature = "dpdk")]
         {
@@ -100,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let socket = bind_socket(&bind_addr)?;
         run_echo_server(socket)?;
     }
-    
+
     Ok(())
 }
 
@@ -109,28 +136,35 @@ fn run_echo_server(socket: Box<dyn UdpSocketTrait>) -> Result<(), Box<dyn std::e
     println!("✅ Socket created successfully!");
     println!("📡 Local address: {}", socket.local_addr()?);
     println!("🔄 Echo server running... (Ctrl+C to stop)");
-    
-    let mut buf = [0u8; 1024];
-    loop {
+
+    // Set a read timeout so recv_from doesn't block forever — this allows
+    // the loop to check the SHUTDOWN flag periodically.
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let mut buf = [0u8; 1500];
+    while !SHUTDOWN.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((size, from)) => {
-                let msg = String::from_utf8_lossy(&buf[..size]);
-                println!("📨 Received from {}: {}", from, msg);
-                
-                // Echo back
-                let response = format!("echo: {}", msg);
-                match socket.send_to(response.as_bytes(), from) {
-                    Ok(sent) => println!("📤 Sent {} bytes back to {}", sent, from),
-                    Err(e) => eprintln!("❌ Send error: {}", e),
+                // Echo back the raw payload (no prefix — perf tests need exact echo)
+                match socket.send_to(&buf[..size], from) {
+                    Ok(_sent) => {}
+                    Err(e) => eprintln!("Send error: {}", e),
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut => {
+                // Read timeout — just loop back and check SHUTDOWN flag
+                continue;
+            }
             Err(e) => {
-                eprintln!("❌ Receive error: {}", e);
+                eprintln!("Receive error: {}", e);
                 break;
             }
         }
     }
-    
+
+    println!("Shutting down gracefully...");
+    // socket dropped here → DpdkResources::drop → Port::drop → Eal::drop → rte_eal_cleanup()
     Ok(())
 }
 
@@ -160,7 +194,7 @@ fn parse_ip(ip_str: &str) -> [u8; 4] {
     }
     [
         parts[0].parse().expect("Invalid IP octet"),
-        parts[1].parse().expect("Invalid IP octet"), 
+        parts[1].parse().expect("Invalid IP octet"),
         parts[2].parse().expect("Invalid IP octet"),
         parts[3].parse().expect("Invalid IP octet"),
     ]
@@ -170,30 +204,30 @@ fn parse_ip(ip_str: &str) -> [u8; 4] {
 fn run_synthetic_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("📡 Synthetic packet mode - testing protocol parsing without real networking");
     println!("💡 This tests our UDP parsing logic with fake packets");
-    
+
     let ip = parse_ip(&args.ip);
     let socket = SyntheticUdpSocket::new(ip, args.port, Box::new(Echo));
 
     // Create a synthetic UDP packet for testing
     let payload = b"hello synthetic";
     let mut frame = vec![0u8; 14 + 20 + 8 + payload.len()];
-    
+
     // Ethernet header (dummy)
     frame[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
-    
+
     // IP header
     frame[14] = 0x45; // Version + IHL
     frame[14+2..14+4].copy_from_slice(&((20+8+payload.len()) as u16).to_be_bytes()); // Total length
     frame[14+9] = 17; // Protocol (UDP)
     frame[14+12..14+16].copy_from_slice(&[10,0,0,1]); // Source IP
     frame[14+16..14+20].copy_from_slice(&ip); // Dest IP
-    
+
     // UDP header
     frame[14+20..14+22].copy_from_slice(&12345u16.to_be_bytes()); // Source port
     frame[14+20+2..14+20+4].copy_from_slice(&args.port.to_be_bytes()); // Dest port
     frame[14+20+4..14+20+6].copy_from_slice(&((8+payload.len()) as u16).to_be_bytes()); // UDP length
     // Checksum = 0 (skip)
-    
+
     // Payload
     frame[14+20+8..].copy_from_slice(payload);
 
@@ -208,6 +242,6 @@ fn run_synthetic_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Ok(None) => println!("❌ Packet not for this socket"),
         Err(e) => eprintln!("❌ Error: {e:?}"),
     }
-    
+
     Ok(())
 }

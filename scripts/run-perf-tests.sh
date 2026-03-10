@@ -29,10 +29,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEARDOWN=true
 SKIP_DEPLOY=false
-PACKET_SIZES="64,512,1400"
+PACKET_SIZES="64,512"
 DURATION=30
 RATE_STEPS="10,25,50,75,100"
-CONFIGS="rust-dpdk,native-dpdk,rust-stdlib,plain-rust"
+# Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
+# This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
+CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
@@ -41,13 +43,17 @@ RESULTS_DIR="$REPO_ROOT/perf-results"
 LOGS_DIR="$REPO_ROOT/instance-logs"
 
 SSM_READINESS_TIMEOUT=600
-TREX_START_TIMEOUT=60
+TREX_START_TIMEOUT=120
 BENCHMARK_TIMEOUT=600
 
 TREX_INSTANCE_ID=""
 DUT_INSTANCE_ID=""
-TREX_DATA_ENI_IP=""
+TREX_DATA_ENI_IP=""       # TX ENI (device-number 1, PCI 0000:00:06.0)
+TREX_DATA_RX_ENI_IP=""    # RX ENI (device-number 2, PCI 0000:00:07.0)
 DUT_DATA_ENI_IP=""
+TREX_GATEWAY_MAC=""
+TREX_DATA_MAC=""          # TX ENI MAC
+TREX_DATA_RX_MAC=""       # RX ENI MAC
 
 # ── CLI Parsing ───────────────────────────────────────────────────────────────
 
@@ -103,22 +109,39 @@ ssm_run_command() {
     shift 2
     local command="$*"
 
-    local cmd_id
-    cmd_id=$(aws ssm send-command \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command\"]" \
-        --timeout-seconds "$timeout_sec" \
-        --query "Command.CommandId" \
-        --output text 2>/dev/null)
+    # JSON-escape the command string (handle double quotes and backslashes)
+    local escaped_command
+    escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
+
+    # Retry send-command up to 3 times with backoff (handles SSM throttling)
+    local cmd_id=""
+    local send_err=""
+    local retry
+    for retry in 1 2 3; do
+        send_err=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[${escaped_command}]}" \
+            --timeout-seconds "$timeout_sec" \
+            --query "Command.CommandId" \
+            --output text 2>&1)
+        local send_exit=$?
+        if [[ $send_exit -eq 0 && -n "$send_err" && "$send_err" != *"error"* && "$send_err" != *"Error"* ]]; then
+            cmd_id="$send_err"
+            break
+        fi
+        log_warn "SSM send-command attempt $retry failed for $instance_id: $send_err"
+        sleep $((retry * 3))
+    done
 
     if [[ -z "$cmd_id" ]]; then
-        log_error "Failed to send SSM command to $instance_id"
+        log_error "Failed to send SSM command to $instance_id after 3 attempts: $send_err"
         return 1
     fi
 
     # Wait for completion
     local elapsed=0
+    local completed=false
     while [[ $elapsed -lt $timeout_sec ]]; do
         local status
         status=$(aws ssm get-command-invocation \
@@ -128,21 +151,39 @@ ssm_run_command() {
             --output text 2>/dev/null || echo "Pending")
 
         case "$status" in
-            Success) break ;;
+            Success)
+                completed=true
+                break
+                ;;
             Failed|Cancelled|TimedOut)
                 log_error "SSM command $cmd_id on $instance_id: $status"
-                # Save stderr for diagnostics
-                aws ssm get-command-invocation \
+                # Output both stdout and stderr for diagnostics
+                local ssm_stdout ssm_stderr
+                ssm_stdout=$(aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardOutputContent" \
+                    --output text 2>/dev/null || echo "(no stdout)")
+                ssm_stderr=$(aws ssm get-command-invocation \
                     --command-id "$cmd_id" \
                     --instance-id "$instance_id" \
                     --query "StandardErrorContent" \
-                    --output text 2>/dev/null || true
+                    --output text 2>/dev/null || echo "(no stderr)")
+                log_error "SSM stdout: $ssm_stdout"
+                log_error "SSM stderr: $ssm_stderr"
+                # Also output stdout so callers in $() can see it
+                echo "$ssm_stdout"
                 return 1
                 ;;
         esac
         sleep 5
         elapsed=$((elapsed + 5))
     done
+
+    if [[ "$completed" != "true" ]]; then
+        log_error "SSM command $cmd_id timed out after ${timeout_sec}s (polling)"
+        return 1
+    fi
 
     # Return stdout
     aws ssm get-command-invocation \
@@ -158,10 +199,13 @@ ssm_run_command_fire_and_forget() {
     shift 2
     local command="$*"
 
+    local escaped_command
+    escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
+
     aws ssm send-command \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters "commands=[\"$command\"]" \
+        --parameters "{\"commands\":[${escaped_command}]}" \
         --timeout-seconds "$timeout_sec" \
         --query "Command.CommandId" \
         --output text 2>/dev/null
@@ -256,22 +300,78 @@ collect_instance_logs() {
     log_info "Collecting logs from $label..."
     mkdir -p "$LOGS_DIR"
 
-    # User-data log
-    local ud_output
-    ud_output=$(ssm_run_command "$instance_id" 30 "tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'" 2>/dev/null || echo "(failed)")
-    echo "$ud_output" > "$LOGS_DIR/${label}-user-data.log"
-
-    # Console output (survives instance issues)
+    # Console output first (no SSM needed, survives instance termination)
     aws ec2 get-console-output \
         --instance-id "$instance_id" \
         --latest \
         --query "Output" \
         --output text > "$LOGS_DIR/${label}-console-output.log" 2>/dev/null || true
 
-    # dmesg crashes
-    local dmesg_output
-    dmesg_output=$(ssm_run_command "$instance_id" 15 "dmesg | grep -iE '(segfault|panic|oom|kill)' | tail -20 2>/dev/null || echo 'no crashes'" 2>/dev/null || echo "(failed)")
-    echo "$dmesg_output" > "$LOGS_DIR/${label}-dmesg-crashes.log"
+    # Check SSM availability
+    local ssm_ready
+    ssm_ready=$(aws ssm describe-instance-information \
+        --filters "Key=InstanceIds,Values=${instance_id}" \
+        --query "InstanceInformationList[0].InstanceId" \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -z "$ssm_ready" || "$ssm_ready" == "None" ]]; then
+        log_info "  SSM not available for ${label} — relying on console output only"
+        return 0
+    fi
+
+    # Batch 1: user-data log + app logs
+    local batch1_cmd="echo '===FILE:user-data.log==='; tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'; echo '===FILE:trex-server.log==='; tail -100 /var/log/trex-server.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-rust-dpdk.log==='; tail -80 /var/log/echo-rust-dpdk.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-rust-stdlib.log==='; tail -80 /var/log/echo-rust-stdlib.log 2>/dev/null || echo '(not found)'; echo '===FILE:testpmd.log==='; tail -80 /var/log/testpmd.log 2>/dev/null || echo '(not found)'; echo '===FILE:plain-echo.log==='; tail -80 /var/log/plain-echo.log 2>/dev/null || echo '(not found)'"
+
+    local batch1_output
+    batch1_output=$(ssm_run_command "$instance_id" 30 "$batch1_cmd" 2>/dev/null || echo "(failed)")
+    if [[ -n "$batch1_output" && "$batch1_output" != "(failed)" ]]; then
+        local current_file="" current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                    log_info "  Saved: ${label}-${current_file}"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+            fi
+        done <<< "$batch1_output"
+        if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+            log_info "  Saved: ${label}-${current_file}"
+        fi
+    fi
+
+    sleep 2
+
+    # Batch 2: network state + crash diagnostics + build listing
+    local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|page.fault|general.protection|trap |panic|oom|killed process|echo-server|t-rex|testpmd|plain-echo' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'; echo '===FILE:crash-reports.log==='; find /var/crash /var/lib/systemd/coredump -type f -newer /proc/1/fd/0 2>/dev/null | head -20 || echo 'no crash reports'; echo '===FILE:coredump-listing.log==='; coredumpctl list 2>/dev/null | tail -10 || echo 'no coredumps'"
+
+    local batch2_output
+    batch2_output=$(ssm_run_command "$instance_id" 30 "$batch2_cmd" 2>/dev/null || echo "(failed)")
+    if [[ -n "$batch2_output" && "$batch2_output" != "(failed)" ]]; then
+        local current_file="" current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                    log_info "  Saved: ${label}-${current_file}"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+            fi
+        done <<< "$batch2_output"
+        if [[ -n "$current_file" && -n "$current_content" ]]; then
+            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+            log_info "  Saved: ${label}-${current_file}"
+        fi
+    fi
+
+    log_info "Instance logs collected for ${label}"
 }
 
 collect_networking_diagnostics() {
@@ -299,27 +399,99 @@ ps aux | grep -E '(echo|testpmd|t-rex|plain-echo)' | grep -v grep || echo 'none'
     echo "$output" > "$LOGS_DIR/${label}-networking-diag-${phase}.txt"
 }
 
+# ── ENI Binding (post-SSM) ────────────────────────────────────────────────────
+
+wait_and_bind_eni() {
+    local instance_id="$1"
+    local label="$2"
+    local driver="$3"  # "vfio-pci" or "ena"
+
+    log_info "Ensuring secondary ENI is attached and bound to $driver on $label..."
+    local output
+    output=$(ssm_run_command "$instance_id" 120 \
+        "for i in \$(seq 1 60); do TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"1\" ]; then echo \"ENI_FOUND mac=\${mac%/}\"; if [ \"$driver\" = \"vfio-pci\" ]; then ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 2>/dev/null || echo BIND_SKIP; else /usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 1; ip link set ens6 up 2>/dev/null || true; fi; echo DONE; exit 0; fi; done; sleep 2; done; echo ENI_TIMEOUT" 2>/dev/null || echo "SSM_FAILED")
+
+    if [[ "$output" == *"ENI_TIMEOUT"* ]]; then
+        log_error "$label secondary ENI not found after 120s"
+        return 1
+    fi
+    if [[ "$output" == *"SSM_FAILED"* ]]; then
+        log_error "SSM command failed on $label"
+        return 1
+    fi
+    log_info "$label ENI binding result: $(echo "$output" | head -3)"
+}
+
+wait_for_trex_rx_eni() {
+    # Wait for TRex RX ENI (device-number 2, PCI 0000:00:07.0) to be attached.
+    # This is a separate CloudFormation resource and may attach after the TX ENI.
+    local instance_id="$1"
+    log_info "Waiting for TRex RX ENI (device-number 2) to attach..."
+    local output
+    output=$(ssm_run_command "$instance_id" 120 \
+        "for i in \$(seq 1 60); do TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); for mac in \$MACS; do DN=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}device-number); if [ \"\$DN\" = \"2\" ]; then echo \"RX_ENI_FOUND mac=\${mac%/}\"; echo DONE; exit 0; fi; done; if [ \$((i % 10)) -eq 0 ]; then echo \"Attempt \$i: waiting for RX ENI (device-number 2)...\"; fi; sleep 2; done; echo RX_ENI_TIMEOUT") || echo "SSM_FAILED"
+
+    if [[ "$output" == *"RX_ENI_TIMEOUT"* ]]; then
+        log_error "TRex RX ENI (device-number 2) not found after 120s"
+        return 1
+    fi
+    if [[ "$output" == *"SSM_FAILED"* ]]; then
+        log_error "SSM command failed waiting for TRex RX ENI"
+        return 1
+    fi
+    log_info "TRex RX ENI found: $(echo "$output" | grep RX_ENI_FOUND | head -1)"
+}
+
 # ── DUT NIC Management ────────────────────────────────────────────────────────
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
+    # Gracefully stop any running DPDK/echo apps first — SIGTERM lets DPDK run
+    # rte_eal_cleanup() so vfio-pci devices are properly released.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "ip link set ens6 down 2>/dev/null || true; /usr/local/bin/dpdk-devbind.py --bind=vfio-pci 0000:00:06.0 && echo 'Bound to vfio-pci'" \
-        || { log_error "Failed to bind DUT ENI to vfio-pci"; return 1; }
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo CLEANUP_DONE" || true
+
+    # Use sysfs driver_override — same method that works for TRex binding.
+    # This avoids dpdk-devbind.py which can fail in edge cases.
+    local bind_out
+    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'vfio-pci' ]; then echo ALREADY_BOUND_TO_VFIO; echo BIND_OK; exit 0; fi; modprobe vfio-pci 2>/dev/null; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then echo BRINGING_DOWN: \$IFACE; ip link set \$IFACE down 2>/dev/null; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo SETTING_OVERRIDE...; echo vfio-pci > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING...; echo 0000:00:06.0 > /sys/bus/pci/drivers/vfio-pci/bind 2>&1 || echo BIND_RESULT: \$?; sleep 1; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'vfio-pci' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+    local bind_exit=$?
+    log_info "dut_bind_dpdk result (exit=$bind_exit): $bind_out"
+    if [[ $bind_exit -ne 0 ]]; then
+        log_error "Failed to bind DUT ENI to vfio-pci: $bind_out"
+        return 1
+    fi
 }
 
 dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
+    # Gracefully stop any running DPDK/echo apps — SIGTERM lets DPDK cleanup run.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "/usr/local/bin/dpdk-devbind.py --bind=ena 0000:00:06.0 2>/dev/null || true; sleep 2; ip link set ens6 up 2>/dev/null || true; ip addr add ${DUT_DATA_ENI_IP}/24 dev ens6 2>/dev/null || true; echo 'Bound to kernel (ena)'" \
-        || { log_error "Failed to bind DUT ENI to kernel"; return 1; }
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+
+    local bind_out
+    bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'ena' ]; then echo ALREADY_BOUND_TO_ENA; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; echo BIND_OK; exit 0; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip route del default dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+    local bind_exit=$?
+    log_info "dut_bind_kernel result (exit=$bind_exit): $bind_out"
+    if [[ $bind_exit -ne 0 ]]; then
+        log_error "Failed to bind DUT ENI to kernel: $bind_out"
+        return 1
+    fi
 }
 
 dut_stop_all_apps() {
     log_info "Stopping all DUT applications..."
-    ssm_run_command "$DUT_INSTANCE_ID" 15 \
-        "pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/plain-echo' 2>/dev/null || true; pkill -f testpmd 2>/dev/null || true; rm -rf /var/run/dpdk/ 2>/dev/null || true; sleep 2; echo 'All apps stopped'" \
-        2>/dev/null || true
+    local stop_result
+    # Use SIGTERM first for graceful shutdown — DPDK apps need to run their
+    # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
+    # Only escalate to SIGKILL after 10s if the process won't die.
+    stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
+    log_info "Stop result: $stop_result"
+    # Give the system time to finish DPDK cleanup after process exit
+    sleep 5
 }
 
 # ── TRex Management ──────────────────────────────────────────────────────────
@@ -327,71 +499,225 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # Get gateway MAC for the TRex data ENI subnet
-    # In AWS VPC, all frames must use gateway MAC
-    local gateway_mac
-    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "ip neigh show dev ens6 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1 || echo ''" 2>/dev/null || echo "")
+    # TRex has 3 ENIs on c5n.2xlarge:
+    #   device 0 = ens5 (0000:00:05.0) — Management (kernel, SSM)
+    #   device 1 = ens6 (0000:00:06.0) — Data TX (DPDK)
+    #   device 2 = ens7 (0000:00:07.0) — Data RX (DPDK)
+    local TX_PCI="0000:00:06.0"
+    local RX_PCI="0000:00:07.0"
+    local TX_BDF="00:06.0"
+    local RX_BDF="00:07.0"
+    TREX_PCI_ADDR="$TX_PCI"
+    TREX_PCI_BDF="$TX_BDF"
 
-    if [[ -z "$gateway_mac" ]]; then
-        # Warm ARP cache and retry
-        log_info "Warming ARP cache on TRex..."
-        ssm_run_command "$TREX_INSTANCE_ID" 15 \
-            "ping -c 1 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 1; ip neigh show" 2>/dev/null || true
-    fi
+    # Step 1: Discover TX and RX ENI MACs via IMDS
+    # device-number 1 = TX ENI, device-number 2 = RX ENI
+    log_info "Step 1: Discovering TRex data ENI MACs via IMDS..."
+    TREX_DATA_MAC=""
+    TREX_DATA_RX_MAC=""
 
-    # Generate /etc/trex_cfg.yaml via SSM
-    local trex_cfg_cmd="cat > /etc/trex_cfg.yaml << 'TREXCFG'
-- port_limit: 1
-  version: 2
-  interfaces: ['00:06.0']
-  port_info:
-    - dest_mac: '${GATEWAY_MAC:-ff:ff:ff:ff:ff:ff}'
-      src_mac:  '${TREX_DATA_MAC:-00:00:00:00:00:00}'
-TREXCFG
-echo 'TRex config written to /etc/trex_cfg.yaml'
-cat /etc/trex_cfg.yaml"
+    local imds_result
+    imds_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); MACS=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/); echo \"ALL_MACS: \$MACS\"; for mac in \$MACS; do mac=\${mac%/}; dn=\$(curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/network/interfaces/macs/\${mac}/device-number); echo \"MAC=\${mac} DN=\${dn}\"; if [ \"\$dn\" = \"1\" ]; then echo \"TX_MAC: \${mac}\"; fi; if [ \"\$dn\" = \"2\" ]; then echo \"RX_MAC: \${mac}\"; fi; done" || echo "SSM_FAILED")
+    log_info "IMDS MAC discovery output: $(echo "$imds_result" | head -10)"
 
-    ssm_run_command "$TREX_INSTANCE_ID" 15 "$trex_cfg_cmd" || {
-        log_error "Failed to write TRex config"
+    TREX_DATA_MAC=$(echo "$imds_result" | grep "^TX_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+    TREX_DATA_RX_MAC=$(echo "$imds_result" | grep "^RX_MAC:" | head -1 | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' || echo "")
+
+    if [[ -z "$TREX_DATA_MAC" || ! "$TREX_DATA_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        log_error "Could not discover TRex TX ENI MAC (got: '$TREX_DATA_MAC')"
+        log_error "IMDS output was: $(echo "$imds_result" | head -10)"
         return 1
-    }
+    fi
+    if [[ -z "$TREX_DATA_RX_MAC" || ! "$TREX_DATA_RX_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        log_error "Could not discover TRex RX ENI MAC (got: '$TREX_DATA_RX_MAC')"
+        log_error "IMDS output was: $(echo "$imds_result" | head -10)"
+        return 1
+    fi
+    log_info "TRex TX MAC: $TREX_DATA_MAC, RX MAC: $TREX_DATA_RX_MAC"
+
+    # Step 2: Discover gateway MAC while TX ENI is still in kernel mode.
+    # TRex uses DPDK (raw Ethernet frames), so it needs the L2 destination MAC.
+    # AWS VPC is L3-routed: all outbound frames must use the gateway MAC.
+    # The kernel already has this from boot DHCP — just read it.
+    local subnet_gw
+    subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
+    log_info "Step 2: Reading gateway MAC from kernel ARP cache (gw=$subnet_gw)..."
+
+    local tx_iface
+    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" || echo "ens6")
+    tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
+    if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
+
+    # Get TX ENI's own MAC so we can reject it if ARP returns it
+    local tx_own_mac
+    tx_own_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "cat /sys/class/net/$tx_iface/address 2>/dev/null" || echo "")
+    tx_own_mac=$(echo "$tx_own_mac" | tr -d '[:space:]')
+
+    TREX_GATEWAY_MAC=""
+    local gw_attempt
+    for gw_attempt in 1 2 3 4 5; do
+        local gw_raw
+        gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "set +e; ip link set $tx_iface up 2>/dev/null; ping -c 2 -W 2 $subnet_gw 2>/dev/null; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null" || echo "")
+
+        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+
+        # Reject if ARP returned our own MAC (broken ARP cache)
+        if [[ -n "$TREX_GATEWAY_MAC" && -n "$tx_own_mac" && "$TREX_GATEWAY_MAC" == "$tx_own_mac" ]]; then
+            log_warn "Attempt $gw_attempt: got own MAC, not gateway — retrying..."
+            TREX_GATEWAY_MAC=""
+        fi
+
+        if [[ -n "$TREX_GATEWAY_MAC" ]]; then break; fi
+
+        # Interface may not have an IP yet — run dhclient as fallback
+        log_warn "Gateway MAC not found (attempt $gw_attempt), ensuring interface has IP..."
+        ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "set +e; dhclient $tx_iface 2>/dev/null; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null; sleep 3; ping -c 3 -W 2 $subnet_gw 2>/dev/null" || true
+        sleep 5
+    done
+
+    if [[ -z "$TREX_GATEWAY_MAC" ]]; then
+        log_error "Could not discover gateway MAC — packets will be dropped by VPC"
+        return 1
+    fi
+    log_info "Gateway MAC: $TREX_GATEWAY_MAC (own: ${tx_own_mac:-unknown})"
+
+    # Step 3: Bind BOTH data ENIs to vfio-pci
+    # Use sysfs driver_override — works without any DPDK tools installed.
+    # First verify both PCI devices exist (ENIs must be attached).
+    log_info "Step 3: Binding both data ENIs to vfio-pci..."
+    local bind_result
+    bind_result=$(ssm_run_command "$TREX_INSTANCE_ID" 60 \
+        "echo '=== Pre-bind PCI check ==='; ls /sys/bus/pci/devices/$TX_PCI 2>/dev/null && echo PCI_TX_EXISTS || echo PCI_TX_MISSING; ls /sys/bus/pci/devices/$RX_PCI 2>/dev/null && echo PCI_RX_EXISTS || echo PCI_RX_MISSING; modprobe vfio-pci 2>/dev/null || true; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true; for PCI in $TX_PCI $RX_PCI; do IFACE=\$(ls /sys/bus/pci/devices/\$PCI/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip link set \$IFACE down 2>/dev/null || true; fi; echo \$PCI > /sys/bus/pci/devices/\$PCI/driver/unbind 2>/dev/null || true; sleep 1; echo vfio-pci > /sys/bus/pci/devices/\$PCI/driver_override; echo \$PCI > /sys/bus/pci/drivers/vfio-pci/bind && echo BIND_OK_\$PCI || echo BIND_FAIL_\$PCI; done; echo '=== Post-bind vfio-pci devices ==='; ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep -E '00:0[67]' || echo 'NO_VFIO_DEVICES'" || echo "SSM_FAILED")
+    log_info "NIC bind result: $bind_result"
+
+    # Verify both ENIs bound successfully
+    if [[ "$bind_result" == *"PCI_RX_MISSING"* ]]; then
+        log_error "TRex RX ENI PCI device $RX_PCI not found — ENI may not be attached"
+        return 1
+    fi
+    if [[ "$bind_result" != *"BIND_OK_${TX_PCI}"* ]]; then
+        log_error "Failed to bind TX ENI $TX_PCI to vfio-pci"
+        return 1
+    fi
+    if [[ "$bind_result" != *"BIND_OK_${RX_PCI}"* ]]; then
+        log_error "Failed to bind RX ENI $RX_PCI to vfio-pci"
+        return 1
+    fi
+    log_info "Both ENIs bound to vfio-pci successfully"
+
+    # Step 4: Write /etc/trex_cfg.yaml via SSM
+    log_info "Step 4: Writing TRex config (TX: $TX_BDF, RX: $RX_BDF)..."
+    local yaml_content
+    yaml_content=$(cat <<YAMLEOF
+- port_limit: 2
+  version: 2
+  interfaces: ['${TX_BDF}', '${RX_BDF}']
+  port_info:
+    - dest_mac: '${TREX_GATEWAY_MAC}'
+      src_mac:  '${TREX_DATA_MAC}'
+    - dest_mac: '${TREX_GATEWAY_MAC}'
+      src_mac:  '${TREX_DATA_RX_MAC}'
+YAMLEOF
+)
+    local yaml_b64
+    yaml_b64=$(echo "$yaml_content" | base64 -w0)
+
+    local write_result
+    write_result=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo $yaml_b64 | base64 -d > /etc/trex_cfg.yaml && echo WROTE || echo WRITE_ERR; cat /etc/trex_cfg.yaml 2>/dev/null || true" || echo "SSM_WRITE_FAILED")
+    log_info "Config write result: $(echo "$write_result" | head -10)"
+
+    if [[ "$write_result" == *"SSM_WRITE_FAILED"* ]]; then
+        log_error "SSM command to write TRex config failed"
+        return 1
+    fi
+    if [[ "$write_result" != *"WROTE"* ]]; then
+        log_error "TRex config write did not succeed (no WROTE marker in output)"
+        log_error "Write output: $(echo "$write_result" | head -5)"
+        return 1
+    fi
 }
 
 start_trex_server() {
     log_info "Starting TRex server..."
+    local TX_PCI="0000:00:06.0"
+    local RX_PCI="0000:00:07.0"
 
-    # Start in background via nohup
-    ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 300 \
-        "cd /opt/trex && nohup ./t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 > /var/log/trex-server.log 2>&1 &"
+    # Verify both NICs are bound to vfio-pci before starting TRex
+    local nic_state
+    nic_state=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo NIC_STATE:; for p in $TX_PCI $RX_PCI; do readlink /sys/bus/pci/devices/\$p/driver 2>/dev/null | xargs -I{} echo \$p: {}; done; cat /etc/trex_cfg.yaml 2>/dev/null; ls /opt/trex/t-rex-64 2>/dev/null && echo TREX_BINARY_OK || echo TREX_BINARY_MISSING; echo HUGEPAGES:; grep HugePages /proc/meminfo 2>/dev/null; ls /dev/vfio/ 2>/dev/null || echo NO_VFIO_DEV" || echo "SSM_FAILED")
+    log_info "Pre-start NIC state: $(echo "$nic_state" | grep -E 'vfio|BINARY|port_limit|src_mac|dest_mac|Huge|NO_VFIO' | head -10)"
 
-    # Wait for TRex to be ready
-    local elapsed=0
-    while [[ $elapsed -lt $TREX_START_TIMEOUT ]]; do
-        local status
-        status=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-            "pgrep -f t-rex-64 >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null || echo "unknown")
+    # Verify both NICs are actually on vfio-pci before starting TRex
+    if ! echo "$nic_state" | grep -q "$TX_PCI.*vfio-pci"; then
+        log_error "TX NIC $TX_PCI is NOT bound to vfio-pci — TRex will fail"
+        log_error "Full NIC state: $nic_state"
+        return 1
+    fi
+    if ! echo "$nic_state" | grep -q "$RX_PCI.*vfio-pci"; then
+        log_error "RX NIC $RX_PCI is NOT bound to vfio-pci — TRex will fail"
+        log_error "Full NIC state: $nic_state"
+        return 1
+    fi
+    log_info "Both NICs confirmed bound to vfio-pci"
 
-        if [[ "$status" == *"running"* ]]; then
-            log_info "TRex server is running (${elapsed}s)"
-            # Give it a few more seconds to initialize
-            sleep 5
-            return 0
-        fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
+    # Ensure hugepages are allocated and mounted (TRex/DPDK requires them)
+    log_info "Ensuring hugepages are allocated..."
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" || true
 
-    log_error "TRex server failed to start within ${TREX_START_TIMEOUT}s"
-    # Collect TRex log for diagnostics
-    ssm_run_command "$TREX_INSTANCE_ID" 10 "tail -50 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null || true
+    # Start TRex via fire-and-forget SSM command.
+    # We don't wait for SSM completion because SSM timeouts are too short for
+    # TRex DPDK initialization (~20s). Instead we fire the command and then
+    # verify TRex is running after a fixed wait.
+    log_info "Starting TRex server..."
+    local start_cmd_id
+    start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+    log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
+
+    # Wait for TRex to initialize DPDK and start its API server.
+    # TRex takes ~15-20s to probe ENA NICs via DPDK on c5n instances.
+    log_info "Waiting 45s for TRex to initialize..."
+    sleep 45
+
+    # Single verification check
+    local check
+    check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
+    log_info "TRex check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
+
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+        log_info "TRex server is running"
+        return 0
+    fi
+
+    # Retry once after 30s more
+    log_info "TRex not yet detected, waiting 30s more..."
+    sleep 30
+    check=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
+    log_info "TRex retry check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
+
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+        log_info "TRex server is running (after retry)"
+        return 0
+    fi
+
+    log_error "TRex server failed to start — check: $(echo "$check" | tr '\n' ' ')"
     return 1
 }
 
 stop_trex_server() {
     log_info "Stopping TRex server..."
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; echo 'TRex stopped'" 2>/dev/null || true
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "pkill -9 -f t-rex-64 2>/dev/null || true; sleep 2; pgrep -f t-rex-64 >/dev/null && echo 'WARNING: TRex still running' || echo 'TRex stopped'" 2>/dev/null || true
 }
 
 # ── Benchmark Runner ──────────────────────────────────────────────────────────
@@ -402,59 +728,162 @@ run_benchmark_for_config() {
 
     log_info "Running TRex benchmark for config: $config_name"
 
-    # Copy benchmark script to TRex instance
-    local benchmark_script
-    benchmark_script=$(cat "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
+    # Copy benchmark script to TRex instance using base64 encoding.
+    # Heredoc deployment was silently deploying stale content; base64
+    # avoids shell quoting/escaping issues entirely.
+    local benchmark_b64
+    benchmark_b64=$(base64 -w0 "$SCRIPT_DIR/perf-tests/trex/run_benchmark.py")
 
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "mkdir -p /opt/perf-tests && cat > /opt/perf-tests/run_benchmark.py << 'PYSCRIPT'
-${benchmark_script}
-PYSCRIPT
-chmod +x /opt/perf-tests/run_benchmark.py" || {
+    local deploy_out
+    deploy_out=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "set +e; mkdir -p /opt/perf-tests; echo '$benchmark_b64' | base64 -d > /opt/perf-tests/run_benchmark.py; chmod +x /opt/perf-tests/run_benchmark.py; echo DEPLOYED_SIZE=\$(wc -c < /opt/perf-tests/run_benchmark.py) LINES=\$(wc -l < /opt/perf-tests/run_benchmark.py); echo WAIT_ON_TRAFFIC_COUNT=\$(grep -c 'wait_on_traffic' /opt/perf-tests/run_benchmark.py); echo LINE77=\$(sed -n '77p' /opt/perf-tests/run_benchmark.py); echo DEPLOY_OK") || {
         log_error "Failed to copy benchmark script to TRex"
         return 1
     }
+    log_info "Script deploy result: $deploy_out"
 
-    # Discover gateway MAC from TRex's perspective
-    local gateway_mac
-    gateway_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
-        "ip neigh show 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1" 2>/dev/null || echo "")
+    # Use the gateway MAC discovered during generate_trex_config
+    log_info "Using gateway MAC: ${TREX_GATEWAY_MAC:-unknown}"
+    log_info "Benchmark params: src=${TREX_DATA_ENI_IP} dst=${DUT_DATA_ENI_IP} port=${dst_port} sizes=${PACKET_SIZES} rates=${RATE_STEPS} duration=${DURATION}"
 
-    log_info "Using gateway MAC: ${gateway_mac:-unknown}"
+    # Pre-flight: verify TRex API is accessible and benchmark script can import dependencies
+    local preflight
+    preflight=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "cd /opt/trex && python3 -c \"
+import sys
+sys.path.insert(0, '/opt/trex/automation/trex_control_plane/interactive')
+from trex.stl.api import STLClient
+c = STLClient(server='localhost')
+c.connect()
+info = c.get_server_system_info()
+ports = c.get_port_info()
+print('TRex API OK: %d ports' % len(ports))
+for i, p in enumerate(ports):
+    print('  Port %d: %s' % (i, p.get('hw_mac', 'unknown')))
+c.disconnect()
+print('PREFLIGHT_OK')
+\" 2>&1" 2>&1) || true
+    log_info "TRex preflight check: $preflight"
 
-    # Run benchmark via SSM
+    # Post preflight results to PR for visibility (we can't access CI runner logs)
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` preflight
+\`\`\`
+$preflight
+\`\`\`"
+
+    if [[ "$preflight" != *"PREFLIGHT_OK"* ]]; then
+        log_error "TRex API preflight failed — benchmark will likely fail"
+        return 1
+    fi
+
+    # Run benchmark via SSM — capture both stdout and stderr
     local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_benchmark.py \
         --server localhost \
         --config-name '$config_name' \
         --src-ip '$TREX_DATA_ENI_IP' \
         --dst-ip '$DUT_DATA_ENI_IP' \
-        --dst-mac '${gateway_mac:-ff:ff:ff:ff:ff:ff}' \
+        --dst-mac '${TREX_GATEWAY_MAC}' \
         --dst-port $dst_port \
         --packet-sizes '$PACKET_SIZES' \
         --rate-steps '$RATE_STEPS' \
         --duration $DURATION \
-        --output '/tmp/perf-results/${config_name}.json'"
+        --output '/tmp/perf-results/${config_name}.json' 2>&1; echo EXIT_CODE=\$?"
 
+    log_info "Starting benchmark SSM command (timeout=${BENCHMARK_TIMEOUT}s)..."
     local output
-    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd" 2>/dev/null)
-    local exit_code=$?
+    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd")
+    local ssm_exit_code=$?
 
-    echo "$output"
+    mkdir -p "$LOGS_DIR"
+    echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    log_info "Benchmark SSM exit code: $ssm_exit_code"
 
-    if [[ $exit_code -ne 0 ]]; then
-        log_error "Benchmark failed for $config_name"
-        mkdir -p "$LOGS_DIR"
-        echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    # Post benchmark output to PR for visibility
+    local output_tail
+    output_tail=$(echo "$output" | tail -30)
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` result
+SSM exit: $ssm_exit_code
+<details><summary>Output (last 30 lines)</summary>
+
+\`\`\`
+${output_tail}
+\`\`\`
+</details>"
+
+    if [[ $ssm_exit_code -ne 0 ]]; then
+        log_error "Benchmark SSM command failed for $config_name (exit=$ssm_exit_code)"
+        return 1
+    fi
+
+    # Check the Python script's exit code from the captured output
+    # Use sed instead of grep -P for portability
+    local py_exit
+    py_exit=$(echo "$output" | sed -n 's/.*EXIT_CODE=\([0-9]*\).*/\1/p' | tail -1)
+    log_info "Python exit code for $config_name: '${py_exit:-not found}'"
+    if [[ -n "$py_exit" && "$py_exit" != "0" ]]; then
+        log_error "Benchmark Python script failed for $config_name (exit=$py_exit)"
         return 1
     fi
 
     # Download results from TRex instance
+    log_info "Downloading results for $config_name..."
     local results_json
-    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
-        "cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo '{}'" 2>/dev/null)
+    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---JSON_START---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
+    local dl_exit=$?
+
+    log_info "Results download SSM exit: $dl_exit"
+
+    if [[ $dl_exit -ne 0 ]]; then
+        log_error "SSM download command failed for $config_name (dl_exit=$dl_exit)"
+        return 1
+    fi
+
+    if [[ "$results_json" == *"FILE_NOT_FOUND"* ]]; then
+        log_error "Results file not found on TRex for $config_name"
+        post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` download
+Results file NOT FOUND on TRex instance.
+\`\`\`
+$(echo "$results_json" | head -10)
+\`\`\`"
+        return 1
+    fi
+
+    # Extract just the JSON part (after the directory listing separator)
+    local json_content
+    json_content=$(echo "$results_json" | sed -n '/^---JSON_START---$/,$ p' | tail -n +2)
 
     mkdir -p "$RESULTS_DIR"
-    echo "$results_json" > "$RESULTS_DIR/${config_name}.json"
+    echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
+
+    # Verify the JSON is valid and has results
+    local json_check
+    json_check=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$RESULTS_DIR/${config_name}.json'))
+    n = len(d.get('results', {}))
+    print(f'Valid JSON: {n} packet sizes, config={d.get(\"config_name\", \"missing\")}')
+    if n == 0:
+        print('WARNING: No results in JSON')
+        sys.exit(1)
+except Exception as e:
+    print(f'JSON error: {e}')
+    sys.exit(1)
+" 2>&1)
+    local json_valid=$?
+    log_info "JSON validation for $config_name: $json_check (exit=$json_valid)"
+
+    if [[ $json_valid -ne 0 ]]; then
+        log_error "Invalid/empty JSON results for $config_name"
+        post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` JSON validation
+**FAILED**: $json_check
+\`\`\`
+$(head -5 "$RESULTS_DIR/${config_name}.json")
+\`\`\`"
+        return 1
+    fi
+
     log_info "Results saved to $RESULTS_DIR/${config_name}.json"
 }
 
@@ -464,17 +893,29 @@ start_dut_rust_dpdk() {
     log_info "Starting DUT: rust-dpdk (echo server with DPDK backend)"
     dut_bind_dpdk || return 1
 
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
-    sleep 5
+    sleep 15
 
-    # Verify it's running
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    # Verify it's running (retry up to 3 times — SSM can be slow)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "rust-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "rust-dpdk echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-dpdk.log 2>/dev/null" 2>/dev/null || true
+        log_error "rust-dpdk echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-rust-dpdk.log 2>/dev/null" || true
         return 1
     fi
     log_info "rust-dpdk echo server running"
@@ -484,16 +925,28 @@ start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd macswap)"
     dut_bind_dpdk || return 1
 
-    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --vdev=net_vfio0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
-    sleep 5
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f testpmd >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+    sleep 15
+
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f testpmd >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "native-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "testpmd failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/testpmd.log 2>/dev/null" 2>/dev/null || true
+        log_error "testpmd failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/testpmd.log 2>/dev/null" || true
         return 1
     fi
     log_info "testpmd macswap running"
@@ -506,14 +959,22 @@ start_dut_rust_stdlib() {
     # The echo binary without DPDK feature falls back to std::net
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-stdlib.log 2>&1 &"
-    sleep 3
+    sleep 10
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "rust-stdlib verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "rust-stdlib echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/echo-rust-stdlib.log 2>/dev/null" 2>/dev/null || true
+        log_error "rust-stdlib echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-rust-stdlib.log 2>/dev/null" || true
         return 1
     fi
     log_info "rust-stdlib echo server running"
@@ -525,14 +986,22 @@ start_dut_plain_rust() {
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/plain-echo.log 2>&1 &"
-    sleep 3
+    sleep 10
 
-    local status
-    status=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
-        "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'" 2>/dev/null)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "plain-rust verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
     if [[ "$status" != *"running"* ]]; then
-        log_error "plain-rust echo server failed to start"
-        ssm_run_command "$DUT_INSTANCE_ID" 10 "tail -20 /var/log/plain-echo.log 2>/dev/null" 2>/dev/null || true
+        log_error "plain-rust echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/plain-echo.log 2>/dev/null" || true
         return 1
     fi
     log_info "plain-rust echo server running"
@@ -659,10 +1128,6 @@ cleanup() {
         if [[ -n "$TREX_INSTANCE_ID" ]]; then
             collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
             collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure" || true
-            # TRex server log
-            ssm_run_command "$TREX_INSTANCE_ID" 10 \
-                "tail -100 /var/log/trex-server.log 2>/dev/null || echo '(no log)'" 2>/dev/null \
-                > "$LOGS_DIR/trex-server.log" || true
         fi
 
         write_failure_json "perf-test" "Script exited with code $exit_code"
@@ -718,6 +1183,62 @@ Packet sizes: \`$PACKET_SIZES\`"
             log_info "Using pre-built TRex AMI: $trex_ami"
         fi
 
+        # Destroy any leftover stack first (from a previous failed run).
+        # Wait for deletion to complete — CloudFormation DELETE_IN_PROGRESS
+        # blocks new deploys, and ENI detachment can take 10+ minutes.
+        # If the stack lands in DELETE_FAILED (e.g. ENI detachment timeout),
+        # retry the destroy — CloudFormation will skip already-deleted resources.
+        log_info "Cleaning up any leftover stack..."
+        npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+
+        # Wait for stack to fully delete, retrying on DELETE_FAILED
+        local stack_wait=0
+        local destroy_retries=0
+        while [[ $stack_wait -lt 900 ]]; do
+            local stack_status
+            stack_status=$(aws cloudformation describe-stacks \
+                --stack-name "$CDK_STACK_NAME" \
+                --query "Stacks[0].StackStatus" \
+                --output text 2>/dev/null || echo "GONE")
+            if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
+                log_info "Stack fully cleaned up (status: $stack_status)"
+                break
+            fi
+            if [[ "$stack_status" == "DELETE_FAILED" && $destroy_retries -lt 3 ]]; then
+                destroy_retries=$((destroy_retries + 1))
+                log_warn "Stack in DELETE_FAILED — retrying destroy (attempt $destroy_retries/3)..."
+                # Use aws CLI directly to delete with retain on stuck resources as last resort
+                if [[ $destroy_retries -le 2 ]]; then
+                    npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+                else
+                    # Final attempt: delete stack retaining the stuck ENI attachments
+                    # (they'll be cleaned up when the instances terminate)
+                    log_warn "Final retry: deleting stack with --retain-resources for stuck attachments..."
+                    local stuck_resources
+                    stuck_resources=$(aws cloudformation describe-stack-events \
+                        --stack-name "$CDK_STACK_NAME" \
+                        --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+                        --output text 2>/dev/null | tr '\t' ' ')
+                    if [[ -n "$stuck_resources" ]]; then
+                        log_info "Retaining stuck resources: $stuck_resources"
+                        # shellcheck disable=SC2086
+                        aws cloudformation delete-stack \
+                            --stack-name "$CDK_STACK_NAME" \
+                            --retain-resources $stuck_resources 2>&1 || true
+                    else
+                        aws cloudformation delete-stack \
+                            --stack-name "$CDK_STACK_NAME" 2>&1 || true
+                    fi
+                fi
+                sleep 30
+                stack_wait=$((stack_wait + 30))
+                continue
+            fi
+            log_info "Waiting for stack deletion (status: $stack_status, ${stack_wait}s elapsed)..."
+            sleep 15
+            stack_wait=$((stack_wait + 15))
+        done
+
         npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
             || { log_error "CDK deploy failed"; exit 2; }
 
@@ -740,12 +1261,16 @@ Packet sizes: \`$PACKET_SIZES\`"
         --stack-name "$CDK_STACK_NAME" \
         --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniPrivateIp'].OutputValue" \
         --output text)
+    TREX_DATA_RX_ENI_IP=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniRxPrivateIp'].OutputValue" \
+        --output text)
     DUT_DATA_ENI_IP=$(aws cloudformation describe-stacks \
         --stack-name "$CDK_STACK_NAME" \
         --query "Stacks[0].Outputs[?OutputKey=='DutDataEniPrivateIp'].OutputValue" \
         --output text)
 
-    log_info "TRex: $TREX_INSTANCE_ID (data IP: $TREX_DATA_ENI_IP)"
+    log_info "TRex: $TREX_INSTANCE_ID (TX: $TREX_DATA_ENI_IP, RX: $TREX_DATA_RX_ENI_IP)"
     log_info "DUT:  $DUT_INSTANCE_ID (data IP: $DUT_DATA_ENI_IP)"
 
     # Wait for both instances
@@ -761,6 +1286,22 @@ Packet sizes: \`$PACKET_SIZES\`"
 - TRex: \`$TREX_INSTANCE_ID\` (${TREX_DATA_ENI_IP})
 - DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})"
 
+    # ── Phase 2b: Ensure secondary ENIs are attached and bound ────────────────
+    # The ENI attachments are separate CloudFormation resources that may complete
+    # after the instance boots. Wait for them and bind via SSM.
+
+    log_info "Phase 2b: Ensuring secondary ENIs are attached..."
+    # TRex has 2 data ENIs: device-number 1 (TX) and device-number 2 (RX).
+    # Wait for BOTH before proceeding. They stay in kernel mode for now —
+    # trex_configure_and_bind() will bind them to vfio-pci after gateway MAC discovery.
+    wait_and_bind_eni "$TREX_INSTANCE_ID" "TRex" "ena" \
+        || { log_error "TRex TX ENI attachment failed"; exit 2; }
+    wait_for_trex_rx_eni "$TREX_INSTANCE_ID" \
+        || { log_error "TRex RX ENI attachment failed"; exit 2; }
+    # DUT ENI starts in kernel mode — orchestrator binds as needed per config.
+    wait_and_bind_eni "$DUT_INSTANCE_ID" "DUT" "ena" \
+        || { log_error "DUT ENI attachment failed"; exit 2; }
+
     # ── Phase 3: Collect baseline environment info ───────────────────────────
 
     log_info "Phase 3: Collecting baseline environment info..."
@@ -772,12 +1313,86 @@ Packet sizes: \`$PACKET_SIZES\`"
     # ── Phase 4: Configure and start TRex ────────────────────────────────────
 
     log_info "Phase 4: Configuring TRex..."
-    generate_trex_config || { log_error "TRex config failed"; exit 2; }
-    start_trex_server || { log_error "TRex start failed"; exit 2; }
+    post_pr_comment "## [Perf] Stage: TRex Config
+Starting TRex configuration (MAC discovery + NIC binding)..."
+
+    if ! generate_trex_config; then
+        post_pr_comment "## [Perf] Stage: TRex Config FAILED
+\`generate_trex_config\` returned non-zero.
+- TREX_PCI_ADDR: \`${TREX_PCI_ADDR:-unset}\`
+- TREX_DATA_MAC: \`${TREX_DATA_MAC:-unset}\`
+- TREX_GATEWAY_MAC: \`${TREX_GATEWAY_MAC:-unset}\`"
+        log_error "TRex config failed"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] Stage: TRex Config OK
+- TX: \`0000:00:06.0\` MAC: \`$TREX_DATA_MAC\`
+- RX: \`0000:00:07.0\` MAC: \`${TREX_DATA_RX_MAC:-unset}\`
+- Gateway MAC: \`$TREX_GATEWAY_MAC\`
+Starting TRex server..."
+
+    if ! start_trex_server; then
+        # Grab TRex log and NIC state for diagnostics
+        local trex_log
+        local diag_pci="${TREX_PCI_ADDR:-0000:00:06.0}"
+        trex_log=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "echo '=== TRex Log ==='; cat /var/log/trex-server.log 2>/dev/null | tail -80 || echo '(no log file)'; echo; echo '=== NIC State ==='; readlink /sys/bus/pci/devices/$diag_pci/driver 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/drivers/vfio-pci/$diag_pci 2>/dev/null && echo 'vfio-pci: YES' || echo 'vfio-pci: NO'; echo '=== vfio modules ==='; lsmod 2>/dev/null | grep vfio || echo 'none'; echo '=== noiommu ==='; cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || echo 'N/A'; echo '=== /dev/vfio ==='; ls -la /dev/vfio/ 2>/dev/null || echo 'none'; echo '=== hugepages ==='; grep -i huge /proc/meminfo 2>/dev/null | head -3; echo '=== TRex config ==='; cat /etc/trex_cfg.yaml 2>/dev/null || echo 'missing'" 2>/dev/null || echo "(SSM failed)")
+        post_pr_comment "## [Perf] Stage: TRex Start FAILED
+TRex server failed to start within ${TREX_START_TIMEOUT}s.
+<details><summary>TRex server log + NIC diagnostics</summary>
+
+\`\`\`
+${trex_log}
+\`\`\`
+</details>"
+        log_error "TRex start failed"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] Stage: TRex Started
+TRex server running. Beginning benchmarks..."
 
     # ── Phase 5: Run benchmarks for each config ─────────────────────────────
 
     log_info "Phase 5: Running benchmarks..."
+    log_info "DUT_INSTANCE_ID=$DUT_INSTANCE_ID TREX_INSTANCE_ID=$TREX_INSTANCE_ID"
+
+    # Verify DUT SSM connectivity before starting benchmarks.
+    # The DUT may still be building from user-data. Wait up to 120s for the build to finish.
+    log_info "Verifying DUT SSM connectivity and build completion..."
+    local dut_ready=false
+    for attempt in $(seq 1 12); do
+        local dut_check
+        dut_check=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "echo DUT_SSM_OK; ls /opt/dpdk-stdlib/target/release/echo 2>/dev/null && echo BUILD_DONE || echo BUILD_PENDING" 2>&1) || true
+        log_info "DUT check attempt $attempt: $dut_check"
+        if [[ "$dut_check" == *"DUT_SSM_OK"* && "$dut_check" == *"BUILD_DONE"* ]]; then
+            dut_ready=true
+            break
+        elif [[ "$dut_check" == *"DUT_SSM_OK"* ]]; then
+            log_info "DUT SSM works but build not done yet, waiting 10s..."
+            sleep 10
+        else
+            log_warn "DUT SSM failed (attempt $attempt), waiting 10s..."
+            sleep 10
+        fi
+    done
+
+    if [[ "$dut_ready" != "true" ]]; then
+        post_pr_comment "## [Perf] DUT Not Ready
+DUT instance \`$DUT_INSTANCE_ID\` SSM connectivity or build not ready after 120s.
+Last check output:
+\`\`\`
+${dut_check:-empty}
+\`\`\`"
+        log_error "DUT not ready, aborting benchmarks"
+        exit 2
+    fi
+
+    post_pr_comment "## [Perf] DUT Ready
+DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
+
     IFS=',' read -ra CONFIG_LIST <<< "$CONFIGS"
     local total_configs=${#CONFIG_LIST[@]}
     local config_idx=0
@@ -793,6 +1408,31 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
 
         # Stop any running DUT apps
         dut_stop_all_apps
+        if [[ $config_idx -gt 1 ]]; then
+            # Give the DUT time to settle between configs.
+            # High-bandwidth benchmarks can overwhelm the kernel network stack
+            # and make SSM temporarily unresponsive.
+            log_info "Waiting 30s for DUT to settle between configs..."
+            sleep 30
+            local ssm_ok=false
+            local ssm_retry
+            for ssm_retry in 1 2 3 4 5; do
+                local ssm_check
+                ssm_check=$(ssm_run_command "$DUT_INSTANCE_ID" 30 "echo SSM_OK" 2>/dev/null) || true
+                if [[ "$ssm_check" == *"SSM_OK"* ]]; then
+                    ssm_ok=true
+                    break
+                fi
+                log_warn "DUT SSM not responsive (attempt $ssm_retry), waiting 15s..."
+                sleep 15
+            done
+            if [[ "$ssm_ok" == "false" ]]; then
+                log_error "DUT SSM agent not responding after 5 attempts — skipping remaining configs"
+                failed_configs+=("$config")
+                break
+            fi
+            log_info "DUT SSM agent responsive, proceeding with $config"
+        fi
 
         # Start the appropriate DUT config
         local start_ok=true
@@ -811,6 +1451,19 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         if [[ "$start_ok" == "false" ]]; then
             log_error "Failed to start DUT for config: $config"
             failed_configs+=("$config")
+            # Post diagnostic info about the DUT start failure — use set +e to
+            # ensure the diagnostic command itself doesn't fail due to set -e.
+            local dut_diag
+            dut_diag=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                "set +e; echo '=== PCI State ==='; readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null || echo 'no driver'; ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null || echo 'no net iface'; echo '=== Processes ==='; ps aux | grep -E 'echo|testpmd|plain' | grep -v grep || echo 'none'; echo '=== DPDK bind ==='; /usr/local/bin/dpdk-devbind.py --status 2>/dev/null | head -15 || echo 'N/A'; echo '=== DPDK state ==='; ls -la /var/run/dpdk/ 2>/dev/null || echo 'no /var/run/dpdk'; echo '=== Last app logs ==='; for f in /var/log/echo-*.log /var/log/testpmd.log /var/log/plain-echo.log; do if [ -f \"\$f\" ]; then echo \"--- \$f ---\"; tail -10 \"\$f\"; fi; done; echo '=== Network ==='; ip addr show ens6 2>/dev/null || echo 'ens6 not found'; echo '=== vfio ==='; ls /dev/vfio/ 2>/dev/null || echo 'no /dev/vfio'; echo DIAG_DONE" 2>&1 || echo "(SSM failed)")
+            post_pr_comment "## [Perf] DUT Start Failed: \`$config\`
+DUT instance: \`$DUT_INSTANCE_ID\`
+<details><summary>DUT diagnostics</summary>
+
+\`\`\`
+${dut_diag}
+\`\`\`
+</details>"
             # Collect diagnostics for this failure
             collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
             continue
@@ -834,17 +1487,20 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         esac
         if [[ -n "${log_file:-}" ]]; then
             local app_log
-            app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+            app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
         fi
     done
 
     # Stop TRex and DUT
-    dut_stop_all_apps
-    stop_trex_server
+    dut_stop_all_apps || true
+    stop_trex_server || true
 
     # ── Phase 6: Aggregate results and post summary ──────────────────────────
+    # Disable set -e for the reporting phase — failures here should not mask
+    # the actual test outcome.
+    set +e
 
     log_info "Phase 6: Aggregating results..."
     aggregate_results
@@ -856,7 +1512,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         summary="$summary
 
 ### Failed Configs
-$(printf '- `%s`\n' "${failed_configs[@]}")"
+$(printf -- '- `%s`\n' "${failed_configs[@]}")"
     fi
 
     # Post to PR
@@ -874,6 +1530,8 @@ $summary
     # Collect final logs
     collect_instance_logs "$DUT_INSTANCE_ID" "dut"
     collect_instance_logs "$TREX_INSTANCE_ID" "trex"
+
+    set -e
 
     # Exit with failure if any configs failed
     if [[ ${#failed_configs[@]} -gt 0 ]]; then

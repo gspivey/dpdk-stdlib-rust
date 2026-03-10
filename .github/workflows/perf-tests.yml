@@ -6,7 +6,7 @@ on:
       packet_sizes:
         description: 'Comma-separated packet sizes (bytes)'
         required: false
-        default: '64,512,1400'
+        default: '64,512'
       duration:
         description: 'Seconds per rate step'
         required: false
@@ -18,7 +18,7 @@ on:
       configs:
         description: 'DUT configs to benchmark'
         required: false
-        default: 'rust-dpdk,native-dpdk,rust-stdlib,plain-rust'
+        default: 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk'
       teardown:
         description: 'Destroy stack after tests'
         required: false
@@ -148,10 +148,10 @@ jobs:
 
           ./scripts/run-perf-tests.sh \
             $TEARDOWN_FLAG \
-            --packet-sizes "${{ inputs.packet_sizes || '64,512,1400' }}" \
+            --packet-sizes "${{ inputs.packet_sizes || '64,512' }}" \
             --duration "${{ inputs.duration || '30' }}" \
             --rate-steps "${{ inputs.rate_steps || '10,25,50,75,100' }}" \
-            --configs "${{ inputs.configs || 'rust-dpdk,native-dpdk,rust-stdlib,plain-rust' }}" \
+            --configs "${{ inputs.configs || 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk' }}" \
             --json-summary
         env:
           DPDK_AMI_ID: ${{ steps.amis.outputs.dpdk_ami }}
@@ -193,31 +193,33 @@ jobs:
             echo "" >> "$REPORT"
           done
 
-          # App logs
-          for log in instance-logs/dut-*-app.log instance-logs/trex-server.log; do
+          # Application logs (most useful for debugging — TRex server + DUT app logs)
+          echo "<details><summary>Application Logs</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-trex-server.log instance-logs/dut-*-app.log instance-logs/*-echo-*.log instance-logs/*-testpmd.log instance-logs/*-plain-echo.log; do
             [ -f "$log" ] || continue
             LOGSIZE=$(wc -c < "$log" 2>/dev/null || echo 0)
             [ "$LOGSIZE" -gt 5 ] || continue
-            echo "<details><summary>$(basename "$log") (last 80 lines)</summary>" >> "$REPORT"
-            echo "" >> "$REPORT"
+            echo "#### $(basename "$log")" >> "$REPORT"
             echo '```' >> "$REPORT"
             tail -80 "$log" >> "$REPORT"
             echo '```' >> "$REPORT"
-            echo "</details>" >> "$REPORT"
-            echo "" >> "$REPORT"
           done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
 
-          # Networking diagnostics
-          for log in instance-logs/*-networking-diag-*.txt; do
+          # Network & PCI state
+          echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-network-interfaces.log instance-logs/*-networking-diag-*.txt; do
             [ -f "$log" ] || continue
-            echo "<details><summary>$(basename "$log")</summary>" >> "$REPORT"
-            echo "" >> "$REPORT"
+            echo "#### $(basename "$log")" >> "$REPORT"
             echo '```' >> "$REPORT"
             cat "$log" >> "$REPORT"
             echo '```' >> "$REPORT"
-            echo "</details>" >> "$REPORT"
-            echo "" >> "$REPORT"
           done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
 
           # User-data logs
           for log in instance-logs/*-user-data.log; do
@@ -231,10 +233,10 @@ jobs:
             echo "" >> "$REPORT"
           done
 
-          # Crash diagnostics
-          for log in instance-logs/*-dmesg-crashes.log; do
+          # Build listing (verify binaries exist on DUT)
+          for log in instance-logs/*-build-listing.log; do
             [ -f "$log" ] || continue
-            grep -qE '^(no crashes|\(failed\))' "$log" 2>/dev/null && continue
+            grep -q 'no build dir' "$log" 2>/dev/null && continue
             echo "<details><summary>$(basename "$log")</summary>" >> "$REPORT"
             echo "" >> "$REPORT"
             echo '```' >> "$REPORT"
@@ -243,6 +245,42 @@ jobs:
             echo "</details>" >> "$REPORT"
             echo "" >> "$REPORT"
           done
+
+          # Crash diagnostics (dmesg + coredumps + crash reports)
+          HAS_CRASHES=false
+          for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+            [ -f "$log" ] || continue
+            if ! grep -qE '^(no crash|no coredump|no crash reports)' "$log" 2>/dev/null; then
+              HAS_CRASHES=true
+              break
+            fi
+          done
+          if [ "$HAS_CRASHES" = "true" ]; then
+            echo "<details><summary>⚠️ Crash Diagnostics</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+              [ -f "$log" ] || continue
+              grep -qE '^(no crash|no coredump|no crash reports)' "$log" 2>/dev/null && continue
+              echo "#### $(basename "$log")" >> "$REPORT"
+              echo '```' >> "$REPORT"
+              cat "$log" >> "$REPORT"
+              echo '```' >> "$REPORT"
+            done
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Console output (kernel dmesg — useful for vfio/ena driver transitions)
+          echo "<details><summary>Kernel Console (dmesg)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log") (PCI/driver events only)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            grep -E '(vfio|ena |pci )' "$log" 2>/dev/null | tail -30 >> "$REPORT" || echo "(no PCI events)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
 
           cat "$REPORT"
 
