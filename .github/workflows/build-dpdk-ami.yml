@@ -2,7 +2,7 @@ name: Build DPDK AMI
 
 on:
   schedule:
-    - cron: '0 4 * * 0' # Sunday 4:00 AM UTC (weekly)
+    - cron: '0 4 * * 0,3' # Sunday and Wednesday 4:00 AM UTC (twice weekly)
   workflow_dispatch:
     inputs:
       dpdk_version:
@@ -192,10 +192,12 @@ jobs:
 
       - name: Deregister old AMIs (keep last 3)
         run: |
-          # List all AMIs with our naming pattern, sorted by creation date (oldest first)
+          # List only DPDK AMIs (exclude TRex AMIs which have their own lifecycle).
+          # Without the name filter, this step was deregistering TRex AMIs too,
+          # causing "image does not exist" errors in the perf test stack.
           OLD_AMIS=$(aws ec2 describe-images \
             --owners self \
-            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=*dpdk*" \
             --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
             --output text)
 

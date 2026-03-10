@@ -1,6 +1,8 @@
 name: Build TRex AMI
 
 on:
+  schedule:
+    - cron: '0 4 * * 1,4' # Monday and Thursday 4:00 AM UTC (twice weekly)
   workflow_dispatch:
     inputs:
       trex_version:
