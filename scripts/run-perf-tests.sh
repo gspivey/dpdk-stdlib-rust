@@ -1184,12 +1184,15 @@ Packet sizes: \`$PACKET_SIZES\`"
         # Destroy any leftover stack first (from a previous failed run).
         # Wait for deletion to complete — CloudFormation DELETE_IN_PROGRESS
         # blocks new deploys, and ENI detachment can take 10+ minutes.
+        # If the stack lands in DELETE_FAILED (e.g. ENI detachment timeout),
+        # retry the destroy — CloudFormation will skip already-deleted resources.
         log_info "Cleaning up any leftover stack..."
         npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
 
-        # Wait for stack to fully delete (DELETE_IN_PROGRESS → DELETE_COMPLETE/gone)
+        # Wait for stack to fully delete, retrying on DELETE_FAILED
         local stack_wait=0
-        while [[ $stack_wait -lt 600 ]]; do
+        local destroy_retries=0
+        while [[ $stack_wait -lt 900 ]]; do
             local stack_status
             stack_status=$(aws cloudformation describe-stacks \
                 --stack-name "$CDK_STACK_NAME" \
@@ -1198,6 +1201,36 @@ Packet sizes: \`$PACKET_SIZES\`"
             if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
                 log_info "Stack fully cleaned up (status: $stack_status)"
                 break
+            fi
+            if [[ "$stack_status" == "DELETE_FAILED" && $destroy_retries -lt 3 ]]; then
+                destroy_retries=$((destroy_retries + 1))
+                log_warn "Stack in DELETE_FAILED — retrying destroy (attempt $destroy_retries/3)..."
+                # Use aws CLI directly to delete with retain on stuck resources as last resort
+                if [[ $destroy_retries -le 2 ]]; then
+                    npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+                else
+                    # Final attempt: delete stack retaining the stuck ENI attachments
+                    # (they'll be cleaned up when the instances terminate)
+                    log_warn "Final retry: deleting stack with --retain-resources for stuck attachments..."
+                    local stuck_resources
+                    stuck_resources=$(aws cloudformation describe-stack-events \
+                        --stack-name "$CDK_STACK_NAME" \
+                        --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+                        --output text 2>/dev/null | tr '\t' ' ')
+                    if [[ -n "$stuck_resources" ]]; then
+                        log_info "Retaining stuck resources: $stuck_resources"
+                        # shellcheck disable=SC2086
+                        aws cloudformation delete-stack \
+                            --stack-name "$CDK_STACK_NAME" \
+                            --retain-resources $stuck_resources 2>&1 || true
+                    else
+                        aws cloudformation delete-stack \
+                            --stack-name "$CDK_STACK_NAME" 2>&1 || true
+                    fi
+                fi
+                sleep 30
+                stack_wait=$((stack_wait + 30))
+                continue
             fi
             log_info "Waiting for stack deletion (status: $stack_status, ${stack_wait}s elapsed)..."
             sleep 15
