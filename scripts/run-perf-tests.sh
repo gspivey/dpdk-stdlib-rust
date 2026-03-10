@@ -14,7 +14,7 @@
 #   --skip-deploy       Skip CDK deploy (reuse existing stack)
 #   --packet-sizes      Comma-separated sizes (default: 64,512,1400)
 #   --duration          Seconds per rate step (default: 30)
-#   --rate-steps        Comma-separated rate percentages (default: 10,25,50,75,100)
+#   --rate-steps        Comma-separated target PPS values (default: 70000,140000,350000,700000)
 #   --configs           Comma-separated DUT configs (default: rust-dpdk,native-dpdk,rust-stdlib,plain-rust)
 #   --json-summary      Write JSON summary file
 #   -h, --help          Show help
@@ -29,9 +29,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEARDOWN=true
 SKIP_DEPLOY=false
-PACKET_SIZES="64,512"
+PACKET_SIZES="64,512,1400"
 DURATION=30
-RATE_STEPS="10,25,50,75,100"
+RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
 CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
@@ -1082,8 +1082,8 @@ else:
     for pkt_size in sorted(all_sizes):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
-        lines.append("| Config | Rate | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps |")
-        lines.append("|--------|------|--------|--------|--------|-------------|-------------|---------|")
+        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
 
         for cfg_name in ["native-dpdk", "rust-dpdk", "rust-stdlib", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
@@ -1098,9 +1098,10 @@ else:
                 lat_avg_s = f"{lat_avg:.1f}" if lat_avg >= 0 else "N/A"
                 lat_max_s = f"{lat_max:.1f}" if lat_max >= 0 else "N/A"
                 tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
-                rate = f"{r.get('offered_pct', 0)}%"
+                rx_mbps = f"{r.get('rx_mbps', 0):.1f}"
+                target = f"{r.get('target_pps', 0):,}"
 
-                lines.append(f"| {cfg_name} | {rate} | {tx_pps} | {rx_pps} | {drop} | {lat_avg_s} | {lat_max_s} | {tx_mbps} |")
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
 
         lines.append("")
 
@@ -1404,7 +1405,7 @@ DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 
         post_pr_comment "## [Perf] Stage: Benchmark ($config_idx/$total_configs)
 Running \`$config\` benchmark...
-Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_STEPS\`%"
+Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$RATE_STEPS\`"
 
         # Stop any running DUT apps
         dut_stop_all_apps

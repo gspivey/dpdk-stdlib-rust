@@ -62,8 +62,8 @@ def build_streams(packet_size, src_ip, dst_ip, src_mac, dst_mac, src_port=12000,
     return [main_stream, latency_stream]
 
 
-def run_single_benchmark(client, port, streams, rate_pct, duration_sec):
-    """Run a single benchmark at a given rate percentage and return stats."""
+def run_single_benchmark(client, port, streams, target_pps, duration_sec):
+    """Run a single benchmark at a given target PPS and return stats."""
     client.reset(ports=[port])
     client.add_streams(streams, ports=[port])
 
@@ -71,7 +71,8 @@ def run_single_benchmark(client, port, streams, rate_pct, duration_sec):
     client.clear_stats()
 
     # Start traffic with duration — TRex will stop TX after duration_sec.
-    client.start(ports=[port], mult=f'{rate_pct}%', duration=duration_sec)
+    # Use TRex 'pps' multiplier format for deterministic rate control.
+    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec)
 
     # Sleep for the duration + drain time, then explicitly stop.
     # We avoid wait_on_traffic() because it can timeout on some setups
@@ -96,7 +97,7 @@ def run_single_benchmark(client, port, streams, rate_pct, duration_sec):
     drop_pct = (drop_pkts / max(tx_pkts, 1)) * 100.0
 
     result = {
-        'offered_pct': rate_pct,
+        'target_pps': target_pps,
         'duration_sec': duration_sec,
         'tx_pkts': tx_pkts,
         'rx_pkts': rx_pkts,
@@ -135,7 +136,7 @@ def main():
     parser.add_argument('--dst-mac', required=True, help='Destination MAC (gateway MAC for AWS VPC)')
     parser.add_argument('--dst-port', type=int, default=9000, help='UDP destination port')
     parser.add_argument('--packet-sizes', default='64,512,1400', help='Comma-separated packet sizes')
-    parser.add_argument('--rate-steps', default='10,25,50,75,100', help='Comma-separated rate percentages')
+    parser.add_argument('--rate-steps', default='70000,140000,350000,700000', help='Comma-separated target PPS values')
     parser.add_argument('--duration', type=int, default=30, help='Seconds per rate step')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     args = parser.parse_args()
@@ -147,7 +148,7 @@ def main():
     print(f"Server: {args.server}, Port: {args.port}")
     print(f"Src: {args.src_ip} -> Dst: {args.dst_ip} (MAC: {args.dst_mac})")
     print(f"Packet sizes: {packet_sizes}")
-    print(f"Rate steps: {rate_steps}%")
+    print(f"Rate steps (target PPS): {rate_steps}")
     print(f"Duration per step: {args.duration}s")
 
     # Connect to TRex
@@ -177,13 +178,13 @@ def main():
             )
 
             size_results = []
-            for rate_pct in rate_steps:
-                print(f"  Rate: {rate_pct}% ... ", end='', flush=True)
+            for target_pps in rate_steps:
+                print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
                 result = run_single_benchmark(
                     client=client,
                     port=args.port,
                     streams=streams,
-                    rate_pct=rate_pct,
+                    target_pps=target_pps,
                     duration_sec=args.duration,
                 )
                 size_results.append(result)
