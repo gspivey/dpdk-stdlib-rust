@@ -922,7 +922,7 @@ start_dut_rust_dpdk() {
 }
 
 start_dut_native_dpdk() {
-    log_info "Starting DUT: native-dpdk (testpmd macswap)"
+    log_info "Starting DUT: native-dpdk (testpmd 5tswap)"
     dut_bind_dpdk || return 1
 
     # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
@@ -930,7 +930,7 @@ start_dut_native_dpdk() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
     sleep 15
 
     local status=""
@@ -949,7 +949,7 @@ start_dut_native_dpdk() {
         ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/testpmd.log 2>/dev/null" || true
         return 1
     fi
-    log_info "testpmd macswap running"
+    log_info "testpmd 5tswap running"
 }
 
 start_dut_rust_stdlib() {
