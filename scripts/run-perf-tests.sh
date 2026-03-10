@@ -534,45 +534,55 @@ generate_trex_config() {
     fi
     log_info "TRex TX MAC: $TREX_DATA_MAC, RX MAC: $TREX_DATA_RX_MAC"
 
-    # Step 2: Discover gateway MAC while TX ENI is still in kernel mode
-    # In AWS VPC, all frames must use gateway MAC (L3-routed, not L2-switched)
+    # Step 2: Discover gateway MAC while TX ENI is still in kernel mode.
+    # TRex uses DPDK (raw Ethernet frames), so it needs the L2 destination MAC.
+    # AWS VPC is L3-routed: all outbound frames must use the gateway MAC.
+    # The kernel already has this from boot DHCP — just read it.
     local subnet_gw
     subnet_gw=$(echo "$TREX_DATA_ENI_IP" | sed 's/\.[0-9]*$/.1/')
-    log_info "Step 2: Discovering gateway MAC (subnet gateway: $subnet_gw)..."
+    log_info "Step 2: Reading gateway MAC from kernel ARP cache (gw=$subnet_gw)..."
 
-    # Discover interface names for both data ENIs
-    local tx_iface rx_iface
-    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+    local tx_iface
+    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
         "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" || echo "ens6")
     tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
     if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
 
-    # Retry gateway discovery up to 3 times — the interface may need time to get an IP via DHCP
+    # Get TX ENI's own MAC so we can reject it if ARP returns it
+    local tx_own_mac
+    tx_own_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+        "cat /sys/class/net/$tx_iface/address 2>/dev/null" || echo "")
+    tx_own_mac=$(echo "$tx_own_mac" | tr -d '[:space:]')
+
     TREX_GATEWAY_MAC=""
     local gw_attempt
-    for gw_attempt in 1 2 3; do
+    for gw_attempt in 1 2 3 4 5; do
         local gw_raw
-        gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 45 \
-            "ip link set $tx_iface up 2>/dev/null || true; dhclient $tx_iface 2>/dev/null || true; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null || true; sleep 2; ip addr show $tx_iface 2>/dev/null; ping -c 3 -W 3 $subnet_gw 2>/dev/null || true; ping -c 2 -W 2 ${DUT_DATA_ENI_IP} 2>/dev/null || true; sleep 2; echo NEIGH:; ip neigh show dev $tx_iface 2>/dev/null || echo none; echo GW_ENTRY:; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null || echo none" || echo "SSM_FAILED")
-        log_info "Gateway discovery attempt $gw_attempt raw: $(echo "$gw_raw" | tail -10)"
+        gw_raw=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+            "set +e; ip link set $tx_iface up 2>/dev/null; ping -c 2 -W 2 $subnet_gw 2>/dev/null; ip neigh show ${subnet_gw} dev $tx_iface 2>/dev/null" || echo "")
 
-        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -A1 "^GW_ENTRY:" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
-        if [[ -z "$TREX_GATEWAY_MAC" ]]; then
-            TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+        TREX_GATEWAY_MAC=$(echo "$gw_raw" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+
+        # Reject if ARP returned our own MAC (broken ARP cache)
+        if [[ -n "$TREX_GATEWAY_MAC" && -n "$tx_own_mac" && "$TREX_GATEWAY_MAC" == "$tx_own_mac" ]]; then
+            log_warn "Attempt $gw_attempt: got own MAC, not gateway — retrying..."
+            TREX_GATEWAY_MAC=""
         fi
 
-        if [[ -n "$TREX_GATEWAY_MAC" ]]; then
-            break
-        fi
-        log_warn "Gateway MAC not found on attempt $gw_attempt, retrying in 10s..."
-        sleep 10
+        if [[ -n "$TREX_GATEWAY_MAC" ]]; then break; fi
+
+        # Interface may not have an IP yet — run dhclient as fallback
+        log_warn "Gateway MAC not found (attempt $gw_attempt), ensuring interface has IP..."
+        ssm_run_command "$TREX_INSTANCE_ID" 20 \
+            "set +e; dhclient $tx_iface 2>/dev/null; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null; sleep 3; ping -c 3 -W 2 $subnet_gw 2>/dev/null" || true
+        sleep 5
     done
 
     if [[ -z "$TREX_GATEWAY_MAC" ]]; then
-        log_error "Could not discover gateway MAC on TRex data ENI — packets will be dropped by VPC"
+        log_error "Could not discover gateway MAC — packets will be dropped by VPC"
         return 1
     fi
-    log_info "Gateway MAC: $TREX_GATEWAY_MAC"
+    log_info "Gateway MAC: $TREX_GATEWAY_MAC (own: ${tx_own_mac:-unknown})"
 
     # Step 3: Bind BOTH data ENIs to vfio-pci
     # Use sysfs driver_override — works without any DPDK tools installed.
