@@ -1136,8 +1136,9 @@ cleanup() {
 
     if [[ "$TEARDOWN" == "true" && "$SKIP_DEPLOY" == "false" ]]; then
         log_info "Tearing down PerfTestStack..."
-        cd "$CDK_DIR"
-        npx cdk destroy "$CDK_STACK_NAME" --force 2>/dev/null || log_warn "Teardown failed"
+        # Use non-blocking delete to avoid consuming OIDC token time.
+        # The safety-net teardown step in the workflow will also attempt cleanup.
+        aws cloudformation delete-stack --stack-name "$CDK_STACK_NAME" 2>/dev/null || log_warn "Teardown failed"
     fi
 }
 
@@ -1185,18 +1186,27 @@ Packet sizes: \`$PACKET_SIZES\`"
         fi
 
         # Destroy any leftover stack first (from a previous failed run).
-        # Wait for deletion to complete — CloudFormation DELETE_IN_PROGRESS
-        # blocks new deploys, and ENI detachment can take 10+ minutes.
-        # If the stack lands in DELETE_FAILED (e.g. ENI detachment timeout),
-        # retry the destroy — CloudFormation will skip already-deleted resources.
+        # IMPORTANT: Do NOT use `npx cdk destroy --force` here — it blocks
+        # and monitors CloudFormation events, which can consume the entire
+        # 1-hour OIDC token if a previous stack is stuck in DELETE_IN_PROGRESS.
+        # Use non-blocking `aws cloudformation delete-stack` + polling instead.
         log_info "Cleaning up any leftover stack..."
-        npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+        local stack_status
+        stack_status=$(aws cloudformation describe-stacks \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "Stacks[0].StackStatus" \
+            --output text 2>/dev/null || echo "GONE")
+        log_info "Current stack status: $stack_status"
+
+        if [[ "$stack_status" != "GONE" && "$stack_status" != "DELETE_COMPLETE" && "$stack_status" != "DELETE_IN_PROGRESS" ]]; then
+            log_info "Requesting stack deletion..."
+            aws cloudformation delete-stack --stack-name "$CDK_STACK_NAME" 2>&1 || true
+        fi
 
         # Wait for stack to fully delete, retrying on DELETE_FAILED
         local stack_wait=0
         local destroy_retries=0
         while [[ $stack_wait -lt 900 ]]; do
-            local stack_status
             stack_status=$(aws cloudformation describe-stacks \
                 --stack-name "$CDK_STACK_NAME" \
                 --query "Stacks[0].StackStatus" \
@@ -1208,9 +1218,9 @@ Packet sizes: \`$PACKET_SIZES\`"
             if [[ "$stack_status" == "DELETE_FAILED" && $destroy_retries -lt 3 ]]; then
                 destroy_retries=$((destroy_retries + 1))
                 log_warn "Stack in DELETE_FAILED — retrying destroy (attempt $destroy_retries/3)..."
-                # Use aws CLI directly to delete with retain on stuck resources as last resort
                 if [[ $destroy_retries -le 2 ]]; then
-                    npx cdk destroy "$CDK_STACK_NAME" --force 2>&1 || true
+                    aws cloudformation delete-stack \
+                        --stack-name "$CDK_STACK_NAME" 2>&1 || true
                 else
                     # Final attempt: delete stack retaining the stuck ENI attachments
                     # (they'll be cleaned up when the instances terminate)
