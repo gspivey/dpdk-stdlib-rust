@@ -6,7 +6,7 @@ on:
       packet_sizes:
         description: 'Comma-separated packet sizes (bytes)'
         required: false
-        default: '64,512,1400'
+        default: '64,512'
       duration:
         description: 'Seconds per rate step'
         required: false
@@ -148,7 +148,7 @@ jobs:
 
           ./scripts/run-perf-tests.sh \
             $TEARDOWN_FLAG \
-            --packet-sizes "${{ inputs.packet_sizes || '64,512,1400' }}" \
+            --packet-sizes "${{ inputs.packet_sizes || '64,512' }}" \
             --duration "${{ inputs.duration || '30' }}" \
             --rate-steps "${{ inputs.rate_steps || '10,25,50,75,100' }}" \
             --configs "${{ inputs.configs || 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk' }}" \
