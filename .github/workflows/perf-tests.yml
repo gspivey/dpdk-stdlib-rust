@@ -6,15 +6,15 @@ on:
       packet_sizes:
         description: 'Comma-separated packet sizes (bytes)'
         required: false
-        default: '64,512'
+        default: '64,512,1400'
       duration:
         description: 'Seconds per rate step'
         required: false
         default: '30'
       rate_steps:
-        description: 'Comma-separated rate percentages'
+        description: 'Comma-separated target PPS values (e.g. 70000,140000)'
         required: false
-        default: '10,25,50,75,100'
+        default: '70000,140000,350000,700000'
       configs:
         description: 'DUT configs to benchmark'
         required: false
@@ -148,9 +148,9 @@ jobs:
 
           ./scripts/run-perf-tests.sh \
             $TEARDOWN_FLAG \
-            --packet-sizes "${{ inputs.packet_sizes || '64,512' }}" \
+            --packet-sizes "${{ inputs.packet_sizes || '64,512,1400' }}" \
             --duration "${{ inputs.duration || '30' }}" \
-            --rate-steps "${{ inputs.rate_steps || '10,25,50,75,100' }}" \
+            --rate-steps "${{ inputs.rate_steps || '70000,140000,350000,700000' }}" \
             --configs "${{ inputs.configs || 'rust-stdlib,plain-rust,rust-dpdk,native-dpdk' }}" \
             --json-summary
         env:
