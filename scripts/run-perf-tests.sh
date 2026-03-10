@@ -1374,28 +1374,23 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
         # Stop any running DUT apps
         dut_stop_all_apps
         if [[ $config_idx -gt 1 ]]; then
-            # After a heavy benchmark, the DUT may need time to recover.
-            # Wait for SSM agent to become responsive before proceeding.
-            log_info "Waiting for DUT SSM agent to recover between configs..."
-            sleep 15
-            local ssm_ok=false
-            local ssm_retry
-            for ssm_retry in 1 2 3 4 5; do
-                local ssm_check
-                ssm_check=$(ssm_run_command "$DUT_INSTANCE_ID" 15 "echo SSM_OK" 2>/dev/null) || true
-                if [[ "$ssm_check" == *"SSM_OK"* ]]; then
-                    ssm_ok=true
-                    break
-                fi
-                log_warn "DUT SSM not responsive (attempt $ssm_retry), waiting 10s..."
-                sleep 10
-            done
-            if [[ "$ssm_ok" == "false" ]]; then
-                log_error "DUT SSM agent not responding after 5 attempts — skipping remaining configs"
+            # After a heavy benchmark (~160K+ pps echo processing), the DUT's SSM
+            # agent becomes unresponsive — the kernel network stack is overwhelmed.
+            # SSM commands fail with empty stdout/stderr. The only reliable recovery
+            # is a full EC2 reboot, which restarts the SSM agent and resets NIC state.
+            # The DUT user-data binds the data ENI to vfio-pci on boot, so after
+            # reboot we get a clean starting state for any config.
+            log_info "Rebooting DUT instance to recover SSM agent..."
+            aws ec2 reboot-instances --instance-ids "$DUT_INSTANCE_ID" 2>&1 || true
+            # Wait for instance to go through reboot cycle
+            sleep 30
+            # Wait for SSM agent to come back online
+            if ! wait_ssm_ready "$DUT_INSTANCE_ID" "DUT-reboot"; then
+                log_error "DUT SSM agent not ready after reboot — skipping remaining configs"
                 failed_configs+=("$config")
                 break
             fi
-            log_info "DUT SSM agent responsive, proceeding with $config"
+            log_info "DUT SSM agent back online after reboot, proceeding with $config"
         fi
 
         # Start the appropriate DUT config
