@@ -543,14 +543,14 @@ generate_trex_config() {
     log_info "Step 2: Reading gateway MAC from kernel ARP cache (gw=$subnet_gw)..."
 
     local tx_iface
-    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 15 \
+    tx_iface=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
         "ls /sys/bus/pci/devices/$TX_PCI/net/ 2>/dev/null | head -1 || echo ens6" || echo "ens6")
     tx_iface=$(echo "$tx_iface" | tr -d '[:space:]')
     if [[ -z "$tx_iface" ]]; then tx_iface="ens6"; fi
 
     # Get TX ENI's own MAC so we can reject it if ARP returns it
     local tx_own_mac
-    tx_own_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 10 \
+    tx_own_mac=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
         "cat /sys/class/net/$tx_iface/address 2>/dev/null" || echo "")
     tx_own_mac=$(echo "$tx_own_mac" | tr -d '[:space:]')
 
@@ -573,7 +573,7 @@ generate_trex_config() {
 
         # Interface may not have an IP yet — run dhclient as fallback
         log_warn "Gateway MAC not found (attempt $gw_attempt), ensuring interface has IP..."
-        ssm_run_command "$TREX_INSTANCE_ID" 20 \
+        ssm_run_command "$TREX_INSTANCE_ID" 30 \
             "set +e; dhclient $tx_iface 2>/dev/null; ip addr add ${TREX_DATA_ENI_IP}/24 dev $tx_iface 2>/dev/null; sleep 3; ping -c 3 -W 2 $subnet_gw 2>/dev/null" || true
         sleep 5
     done
@@ -667,7 +667,7 @@ start_trex_server() {
 
     # Ensure hugepages are allocated and mounted (TRex/DPDK requires them)
     log_info "Ensuring hugepages are allocated..."
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
         "echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true; grep -i huge /proc/meminfo" || true
 
     # Start TRex via fire-and-forget SSM command.
@@ -714,7 +714,7 @@ start_trex_server() {
 
 stop_trex_server() {
     log_info "Stopping TRex server..."
-    ssm_run_command "$TREX_INSTANCE_ID" 15 \
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
         "pkill -9 -f t-rex-64 2>/dev/null || true; sleep 2; pgrep -f t-rex-64 >/dev/null && echo 'WARNING: TRex still running' || echo 'TRex stopped'" 2>/dev/null || true
 }
 
@@ -1416,7 +1416,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Rates: \`$RATE_S
             local ssm_retry
             for ssm_retry in 1 2 3 4 5; do
                 local ssm_check
-                ssm_check=$(ssm_run_command "$DUT_INSTANCE_ID" 15 "echo SSM_OK" 2>/dev/null) || true
+                ssm_check=$(ssm_run_command "$DUT_INSTANCE_ID" 30 "echo SSM_OK" 2>/dev/null) || true
                 if [[ "$ssm_check" == *"SSM_OK"* ]]; then
                     ssm_ok=true
                     break
@@ -1485,7 +1485,7 @@ ${dut_diag}
         esac
         if [[ -n "${log_file:-}" ]]; then
             local app_log
-            app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 10 \
+            app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
         fi

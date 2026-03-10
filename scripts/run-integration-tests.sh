@@ -170,9 +170,9 @@ warm_arp_cache() {
     local subnet_prefix
     subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
     local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
-    ssm_run_command "$SENDER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    ssm_run_command "$SENDER_INSTANCE_ID" 30 "$arp_warm_cmd" || true
     sleep 2
-    ssm_run_command "$RECEIVER_INSTANCE_ID" 15 "$arp_warm_cmd" || true
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 30 "$arp_warm_cmd" || true
 }
 
 # ── Networking diagnostics ───────────────────────────────────────────────────
@@ -683,7 +683,7 @@ configure_eni() {
 
     if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
         log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
-        ssm_run_command "$instance_id" 15 \
+        ssm_run_command "$instance_id" 30 \
             "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
         return 1
     fi
