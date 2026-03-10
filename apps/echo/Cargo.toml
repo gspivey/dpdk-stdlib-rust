@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 dpdk-udp = { path = "../../dpdk-udp", optional = true }
+libc = "0.2"
 
 [features]
 default = []
