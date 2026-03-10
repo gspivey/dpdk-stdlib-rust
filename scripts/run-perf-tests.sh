@@ -446,10 +446,10 @@ wait_for_trex_rx_eni() {
 
 dut_bind_dpdk() {
     log_info "Binding DUT secondary ENI to vfio-pci (DPDK mode)..."
-    # Clean up any DPDK state first — must use set +e because pkill returns 1
-    # when no matching process exists, and SSM RunShellScript uses set -e by default.
+    # Gracefully stop any running DPDK/echo apps first — SIGTERM lets DPDK run
+    # rte_eal_cleanup() so vfio-pci devices are properly released.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo CLEANUP_DONE" || true
 
     # Use sysfs driver_override — same method that works for TRex binding.
     # This avoids dpdk-devbind.py which can fail in edge cases.
@@ -466,10 +466,9 @@ dut_bind_dpdk() {
 
 dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
-    # Clean up DPDK state first — must use set +e because pkill returns 1
-    # when no matching process exists, and SSM RunShellScript uses set -e by default.
+    # Gracefully stop any running DPDK/echo apps — SIGTERM lets DPDK cleanup run.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
@@ -485,10 +484,13 @@ dut_bind_kernel() {
 dut_stop_all_apps() {
     log_info "Stopping all DUT applications..."
     local stop_result
+    # Use SIGTERM first for graceful shutdown — DPDK apps need to run their
+    # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
+    # Only escalate to SIGKILL after 10s if the process won't die.
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "pkill -9 -f 'target/release/echo' 2>/dev/null || true; pkill -9 -f 'target/release/plain-echo' 2>/dev/null || true; pkill -9 -f testpmd 2>/dev/null || true; pkill -9 -f dpdk-testpmd 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; rm -rf /var/run/dpdk 2>/dev/null || true; echo 'All apps stopped'") || true
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
-    # Give SSM agent a breather between operations
+    # Give the system time to finish DPDK cleanup after process exit
     sleep 5
 }
 
@@ -891,9 +893,9 @@ start_dut_rust_dpdk() {
     log_info "Starting DUT: rust-dpdk (echo server with DPDK backend)"
     dut_bind_dpdk || return 1
 
-    # Ensure clean DPDK state and hugepages
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
@@ -923,9 +925,9 @@ start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd macswap)"
     dut_bind_dpdk || return 1
 
-    # Ensure clean DPDK state and hugepages
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 -a 0000:00:06.0 -- --forward-mode=macswap --port-topology=chained --auto-start > /var/log/testpmd.log 2>&1 &"
