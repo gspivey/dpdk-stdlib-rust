@@ -229,7 +229,7 @@ export class PerfTestStack extends cdk.Stack {
           cpuType: ec2.AmazonLinuxCpuType.X86_64,
         });
 
-    const dutCreationTimeout = usePrebuiltDpdkAmi ? 'PT20M' : 'PT35M';
+    const dutCreationTimeout = usePrebuiltDpdkAmi ? 'PT30M' : 'PT45M';
 
     const dutUserData = ec2.UserData.forLinux();
     const dutPreamble = [
