@@ -13,14 +13,15 @@
 
 ## Phase B: Multi-Core RX/TX Pipeline
 
-- [ ] **B1**: Extend `DpdkResources` with optional `MultiCoreTopology` — RX core and worker core structs, lcore thread handles
-- [ ] **B2**: Implement RX lcore loop — `rte_eth_rx_burst()` on assigned queue, classify (ARP/ICMP handled inline), enqueue data frames to worker SPSC rings
-- [ ] **B3**: Implement Worker lcore loop — dequeue from SPSC ring, protocol processing, enqueue `ProcessedPacket` to MPSC `app_ring`
-- [ ] **B4**: Implement TX path — `send_to()` builds frame, enqueues to TX ring, RX lcore drains TX ring and calls `rte_eth_tx_burst()`
-- [ ] **B5**: Wire `recv_from()` to dequeue from `app_ring` when `MultiCoreTopology` is active (fall back to inline poll when `None`)
-- [ ] **B6**: Wire `send_to()` to route through TX ring when topology is active
-- [ ] **B7**: Graceful shutdown — signal lcore threads to stop, join handles, drain rings
-- [ ] **B8**: Integration test on EC2 — multi-queue RSS echo server, verify packets arrive on different queues, measure throughput vs single-core baseline
+- [x] **B1**: Extend `UdpSocket` with optional `MultiCoreTopology` — RX core and worker core structs, lcore thread handles, `topology_plan()` and `is_run_to_completion()` query methods
+- [x] **B2**: Implement RX lcore loop — poll backend for frames, classify (ARP/ICMP handled inline on RX core), distribute data frames round-robin to worker SPSC rings, drain TX ring and send outbound frames
+- [x] **B3**: Implement Worker lcore loop — dequeue from SPSC ring, parse UDP, filter by local port, learn source MAC into ARP cache, enqueue `ProcessedPacket` to MPSC `app_ring`
+- [x] **B4**: Implement TX path — `send_to()` builds frame, enqueues to TX ring (`SpscRing<TxFrame>`), RX lcore drains TX ring batch and calls send_fn
+- [x] **B5**: Wire `recv_from()` — when `MultiCoreTopology` is active: dequeue from `app_ring` (pipeline path via `recv_from_pipeline`); when `None`: inline poll (original `recv_from_inline` path). Connected socket filtering works in both paths.
+- [x] **B6**: Wire `send_to()` — when topology is active: enqueue `TxFrame` to `tx_ring` (RX lcore transmits); when `None`: direct `send_frame()` via backend
+- [x] **B7**: Graceful shutdown — `AtomicBool` shutdown flag, `MultiCoreTopology::shutdown()` signals + joins all threads, `Drop` impl ensures cleanup
+- [x] **B8**: Configurable worker fan-out — `UdpSocketBuilder.workers_per_queue(0)` forces run-to-completion (no pipeline, lowest latency); `workers_per_queue(N)` enables N workers per RX queue; under stubs, always run-to-completion regardless of config
+- [ ] **B9**: Integration test on EC2 — multi-queue RSS echo server, verify packets arrive on different queues, measure throughput vs single-core baseline
 
 ## Phase C: Shared Memory Daemon + ShmBackend
 

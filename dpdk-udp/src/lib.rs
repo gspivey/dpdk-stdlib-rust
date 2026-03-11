@@ -45,7 +45,7 @@ pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};
-pub use topology::{TopologyConfig, TopologyPlan, TopologySource};
+pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
 
 // ============================================================================
 // Error Types
@@ -931,6 +931,9 @@ pub struct UdpSocket {
     read_timeout: Mutex<Option<Duration>>,
     /// Write timeout for send operations (None = block forever)
     write_timeout: Mutex<Option<Duration>>,
+    /// Multi-core pipeline topology (None = run-to-completion, the default).
+    /// When active, recv_from() reads from app_ring and send_to() writes to tx_ring.
+    topology: Mutex<Option<MultiCoreTopology>>,
 }
 
 impl UdpSocket {
@@ -992,6 +995,7 @@ impl UdpSocket {
             auto_icmp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
+            topology: Mutex::new(None),
         })
     }
 
@@ -1070,12 +1074,27 @@ impl UdpSocket {
             auto_icmp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
+            topology: Mutex::new(None),
         })
     }
 
     /// Get the name of the active packet I/O backend.
     pub fn active_backend(&self) -> &'static str {
         self.socket_backend.backend_name()
+    }
+
+    /// Returns the active topology plan, if a multi-core pipeline is running.
+    ///
+    /// Returns `None` when the socket is in run-to-completion mode (default
+    /// for `UdpSocket::bind()` and when `workers_per_queue(0)` is configured).
+    pub fn topology_plan(&self) -> Option<TopologyPlan> {
+        self.topology.lock().unwrap().as_ref().map(|t| t.plan.clone())
+    }
+
+    /// Returns `true` if the socket is running in simple run-to-completion mode
+    /// (no pipeline threads, lowest latency).
+    pub fn is_run_to_completion(&self) -> bool {
+        self.topology.lock().unwrap().is_none()
     }
 
     /// Sets the read timeout for `recv`, `recv_from`, and `peek` operations.
@@ -1169,8 +1188,19 @@ impl UdpSocket {
             self.ttl,
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
 
-        // Send via the active backend
-        self.socket_backend.send_frame(&frame)?;
+        // If multi-core topology is active, enqueue to TX ring (RX lcore will transmit).
+        // Otherwise, send directly via the backend (run-to-completion).
+        let has_topology = self.topology.lock().unwrap().is_some();
+        if has_topology {
+            let topo_guard = self.topology.lock().unwrap();
+            if let Some(ref topo) = *topo_guard {
+                topo.tx_ring.enqueue(topology::TxFrame { frame }).map_err(|_| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "TX ring full")
+                })?;
+            }
+        } else {
+            self.socket_backend.send_frame(&frame)?;
+        }
 
         // Update connection state if connected
         if let Ok(mut guard) = self.connection_state.write() {
@@ -1194,6 +1224,76 @@ impl UdpSocket {
     ///
     /// On success, returns the number of bytes received and the source address.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // Check if multi-core topology is active — if so, dequeue from app_ring.
+        let has_topology = self.topology.lock().unwrap().is_some();
+        if has_topology {
+            return self.recv_from_pipeline(buf);
+        }
+
+        // Run-to-completion path (original single-threaded behavior).
+        self.recv_from_inline(buf)
+    }
+
+    /// Pipeline recv path: dequeue processed packets from the MPSC app_ring.
+    fn recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
+
+        loop {
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"));
+                }
+            }
+
+            // Check buffered packets first (from connected socket filtering)
+            {
+                let mut queue = self.recv_queue.lock().unwrap();
+                if let Some((payload, src_addr)) = queue.pop() {
+                    let copy_len = std::cmp::min(buf.len(), payload.len());
+                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    return Ok((copy_len, src_addr));
+                }
+            }
+
+            // Dequeue from the app_ring (filled by worker threads)
+            let packet = {
+                let topo_guard = self.topology.lock().unwrap();
+                if let Some(ref topo) = *topo_guard {
+                    topo.app_ring.dequeue()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(packet) = packet {
+                // If connected, only accept packets from connected peer
+                if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                    if packet.src_addr != connected {
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        queue.push(packet.payload, packet.src_addr);
+                        continue;
+                    }
+                }
+
+                let copy_len = std::cmp::min(buf.len(), packet.payload.len());
+                buf[..copy_len].copy_from_slice(&packet.payload[..copy_len]);
+
+                if let Ok(mut guard) = self.connection_state.write() {
+                    if let Some(ref mut state) = *guard {
+                        state.record_recv(copy_len);
+                    }
+                }
+
+                return Ok((copy_len, packet.src_addr));
+            }
+
+            // No packet available — brief pause
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    /// Inline recv path: single-threaded run-to-completion (original behavior).
+    fn recv_from_inline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         // Get our local port for filtering (do this once outside the loop)
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
@@ -1818,14 +1918,90 @@ impl UdpSocketBuilder {
     ///
     /// This is equivalent to `UdpSocket::bind()` but uses the builder's
     /// topology configuration instead of pure auto-detection.
+    ///
+    /// When the topology plan is **not** run-to-completion, pipeline threads
+    /// are spawned automatically. Use `.workers_per_queue(0)` to force
+    /// run-to-completion mode (no pipeline threads, lowest latency).
     pub fn bind<A: ToSocketAddrs>(self, addr: A) -> io::Result<UdpSocket> {
-        // For now, delegate to the standard bind path.
-        // The topology config is computed and stored but pipeline threads
-        // are not spawned until Phase B wires them up.
-        let _topo_config = self.topology_config();
+        let topo_config = self.topology_config();
 
-        // TODO(Phase B): Pass topo_config into bind to set up MultiCoreTopology
-        UdpSocket::bind(addr)
+        // Create the socket using the standard bind path
+        let socket = UdpSocket::bind(addr)?;
+
+        // Detect topology from config + runtime environment.
+        // Under stubs this always returns run-to-completion.
+        let plan = topology::detect_topology(
+            &topo_config,
+            // Under stubs we report 1 lcore, so the plan will be run-to-completion.
+            // With real DPDK we'd query eal_lcore_count().
+            if dpdk_sys::is_stub() { 1 } else { 8 },
+            // Under stubs NIC max queues = 1.
+            if dpdk_sys::is_stub() { 1 } else { 16 },
+            0, // NUMA node
+        );
+
+        if !plan.is_run_to_completion() {
+            // Build pipeline configuration from the socket's state
+            let local_port = match socket.local_addr {
+                SocketAddr::V4(v4) => v4.port(),
+                _ => 0,
+            };
+            let local_mac = socket.socket_backend.mac_address();
+            let local_ip = match socket.local_addr {
+                SocketAddr::V4(v4) => *v4.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+
+            let pipeline_config = topology::PipelineConfig {
+                plan: plan.clone(),
+                local_port,
+                local_mac,
+                local_ip,
+                arp_cache: Arc::clone(&socket.resources.arp_cache),
+            };
+
+            // Create backend closures that capture the socket's backend for the pipeline
+            // We need raw function pointers since SocketBackend isn't Clone.
+            // Use a shared reference approach via Arc.
+            let resources_for_recv = Arc::clone(&socket.resources);
+            let resources_for_send = Arc::clone(&socket.resources);
+
+            let recv_fn = move |max_frames: usize| -> io::Result<Vec<Vec<u8>>> {
+                let packets = resources_for_recv.port.rx_burst(0, max_frames as u16)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+                let mut frames = Vec::with_capacity(packets.len());
+                for mbuf in &packets {
+                    if let Some(data) = mbuf.data() {
+                        let len = mbuf.data_len() as usize;
+                        let actual_len = len.min(data.len());
+                        frames.push(data[..actual_len].to_vec());
+                    }
+                }
+                Ok(frames)
+            };
+
+            let send_fn = move |frame: &[u8]| -> io::Result<usize> {
+                let mut mbuf = resources_for_send.mempool.alloc()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
+                mbuf.set_data_len(frame.len() as u16);
+                mbuf.set_packet_len(frame.len() as u32);
+                let data = mbuf.data_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
+                data.copy_from_slice(frame);
+                let mut packets = vec![mbuf];
+                let sent = resources_for_send.port.tx_burst(0, &mut packets)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
+                if sent == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+                }
+                Ok(frame.len())
+            };
+
+            let topo = topology::start_pipeline(pipeline_config, recv_fn, send_fn);
+            *socket.topology.lock().unwrap() = topo;
+        }
+
+        Ok(socket)
     }
 }
 
@@ -2397,5 +2573,62 @@ mod tests {
         assert_eq!(BackendType::RawSocketMmap, BackendType::RawSocketMmap);
         assert_eq!(BackendType::Auto, BackendType::Auto);
         assert_ne!(BackendType::Dpdk, BackendType::RawSocket);
+    }
+
+    // ========================================================================
+    // PHASE B: BUILDER TOPOLOGY CONFIGURATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_builder_default_is_run_to_completion_under_stubs() {
+        // Under stubs, builder.bind() should produce a run-to-completion socket
+        // (no pipeline threads, no topology overhead)
+        let socket = UdpSocket::builder()
+            .bind("127.0.0.1:0")
+            .expect("builder bind should succeed");
+        assert!(socket.is_run_to_completion());
+        assert!(socket.topology_plan().is_none());
+    }
+
+    #[test]
+    fn test_builder_explicit_rtc_override() {
+        // Explicitly requesting workers_per_queue(0) forces run-to-completion
+        // even if more cores would be available (under stubs this is the default
+        // anyway, but the explicit setting is tested for the API contract)
+        let socket = UdpSocket::builder()
+            .rx_queues(1)
+            .workers_per_queue(0)
+            .bind("127.0.0.1:0")
+            .expect("builder bind should succeed");
+        assert!(socket.is_run_to_completion());
+    }
+
+    #[test]
+    fn test_builder_topology_config() {
+        // Test that builder correctly produces TopologyConfig
+        let builder = UdpSocketBuilder::new()
+            .rx_queues(4)
+            .workers_per_queue(2);
+        let config = builder.topology_config();
+        assert_eq!(config.rx_queues, Some(4));
+        assert_eq!(config.workers_per_queue, Some(2));
+    }
+
+    #[test]
+    fn test_builder_partial_config() {
+        // Setting only one parameter should leave the other as auto-detect
+        let builder = UdpSocketBuilder::new()
+            .workers_per_queue(0);
+        let config = builder.topology_config();
+        assert_eq!(config.rx_queues, None);
+        assert_eq!(config.workers_per_queue, Some(0));
+    }
+
+    #[test]
+    fn test_socket_is_run_to_completion_by_default() {
+        // Standard bind() with no builder should be run-to-completion
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .expect("bind should succeed");
+        assert!(socket.is_run_to_completion());
     }
 }
