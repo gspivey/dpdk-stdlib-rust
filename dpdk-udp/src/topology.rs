@@ -101,6 +101,10 @@ impl fmt::Display for TopologyPlan {
 
 /// Detect the optimal multi-core topology.
 ///
+/// The `nic_numa_node` parameter should come from `Port::numa_node()` —
+/// this ensures lcores and memory are allocated on the same NUMA node as
+/// the NIC, avoiding cross-socket memory access penalties.
+///
 /// Configuration precedence: builder API > environment variables > auto-detection.
 ///
 /// Under stubs, always returns a run-to-completion plan regardless of config.
@@ -108,13 +112,20 @@ pub fn detect_topology(
     config: &TopologyConfig,
     available_lcores: u32,
     nic_max_rx_queues: u16,
+    nic_numa_node: i32,
 ) -> TopologyPlan {
+    let numa_node = if nic_numa_node >= 0 {
+        nic_numa_node as u32
+    } else {
+        0 // SOCKET_ID_ANY (-1) → default to node 0
+    };
+
     // Under stubs, always run-to-completion
     if dpdk_sys::is_stub() {
         return TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
-            numa_node: 0,
+            numa_node,
             source: TopologySource::Stub,
         };
     }
@@ -124,7 +135,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: clamp_rx_queues(rq, nic_max_rx_queues),
             workers_per_queue: wpq,
-            numa_node: current_numa_node(),
+            numa_node,
             source: TopologySource::Builder,
         };
     }
@@ -148,7 +159,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: clamp_rx_queues(rx_queues, nic_max_rx_queues),
             workers_per_queue,
-            numa_node: current_numa_node(),
+            numa_node,
             source,
         };
     }
@@ -160,7 +171,7 @@ pub fn detect_topology(
     TopologyPlan {
         rx_queues,
         workers_per_queue,
-        numa_node: current_numa_node(),
+        numa_node,
         source: TopologySource::AutoDetected,
     }
 }
@@ -199,11 +210,6 @@ fn clamp_rx_queues(requested: u16, nic_max: u16) -> u16 {
     requested.min(nic_max).max(1)
 }
 
-/// Get the NUMA node of the current lcore.
-fn current_numa_node() -> u32 {
-    dpdk_sys::rte_socket_id() as u32
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -223,7 +229,7 @@ mod tests {
             rx_queues: Some(4),
             workers_per_queue: Some(2),
         };
-        let plan = detect_topology(&config, 16, 16);
+        let plan = detect_topology(&config, 16, 16, 0);
         assert!(plan.is_run_to_completion());
         assert_eq!(plan.source, TopologySource::Stub);
         assert_eq!(plan.rx_queues, 1);
@@ -321,5 +327,22 @@ mod tests {
         let s = format!("{plan}");
         assert!(s.contains("4 RX queues"));
         assert!(s.contains("2 workers/queue"));
+    }
+
+    #[test]
+    fn stub_propagates_nic_numa_node() {
+        let config = TopologyConfig::default();
+        let plan = detect_topology(&config, 8, 16, 1);
+        // Even under stubs (run-to-completion), the NIC's NUMA node is recorded
+        assert_eq!(plan.numa_node, 1);
+        assert!(plan.is_run_to_completion());
+    }
+
+    #[test]
+    fn negative_numa_defaults_to_zero() {
+        let config = TopologyConfig::default();
+        // SOCKET_ID_ANY is -1
+        let plan = detect_topology(&config, 8, 16, -1);
+        assert_eq!(plan.numa_node, 0);
     }
 }

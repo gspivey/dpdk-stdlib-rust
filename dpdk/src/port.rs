@@ -486,6 +486,15 @@ impl Port {
         &self.capabilities
     }
 
+    /// Get the NUMA node of this NIC port.
+    ///
+    /// Returns the NUMA socket ID where the NIC is attached. Use this to
+    /// allocate mempools and pin lcores on the same NUMA node for optimal
+    /// memory access latency.
+    pub fn numa_node(&self) -> i32 {
+        dpdk_sys::rte_eth_dev_socket_id(self.port_id)
+    }
+
     /// Get the active RX offload flags
     pub fn active_rx_offload(&self) -> u64 {
         self.active_rx_offload

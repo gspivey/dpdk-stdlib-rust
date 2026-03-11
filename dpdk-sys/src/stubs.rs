@@ -843,6 +843,11 @@ pub extern "C" fn rte_eth_dev_info_get(
 }
 
 #[no_mangle]
+pub extern "C" fn rte_eth_dev_socket_id(_port_id: u16) -> c_int {
+    0 // NUMA node 0
+}
+
+#[no_mangle]
 pub extern "C" fn rte_eth_link_get(_port_id: u16, link: *mut rte_eth_link) -> c_int {
     if !link.is_null() {
         unsafe {
