@@ -59,12 +59,32 @@ impl UdpSocketTrait for dpdk_udp::UdpSocket {
 }
 
 /// Try DPDK first, then fall back to standard networking.
-fn bind_socket(bind_addr: &str) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::error::Error>> {
+fn bind_socket(bind_addr: &str, workers: u16, rx_queues: u16) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
-        match dpdk_udp::UdpSocket::bind(bind_addr) {
+        let result = if workers > 0 || rx_queues > 0 {
+            // Use builder for explicit multi-core configuration
+            let mut builder = dpdk_udp::UdpSocket::builder();
+            if workers > 0 {
+                builder = builder.workers_per_queue(workers);
+            }
+            if rx_queues > 0 {
+                builder = builder.rx_queues(rx_queues);
+            }
+            builder.bind(bind_addr)
+        } else {
+            // Default: simple run-to-completion
+            dpdk_udp::UdpSocket::bind(bind_addr)
+        };
+
+        match result {
             Ok(socket) => {
-                println!("Using DPDK acceleration");
+                if socket.is_run_to_completion() {
+                    println!("Using DPDK acceleration (run-to-completion)");
+                } else if let Some(plan) = socket.topology_plan() {
+                    println!("Using DPDK acceleration (multi-core: {} RX queues, {} workers/queue)",
+                        plan.rx_queues, plan.workers_per_queue);
+                }
                 return Ok(Box::new(socket));
             }
             Err(e) => {
@@ -73,7 +93,7 @@ fn bind_socket(bind_addr: &str) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::
         }
     }
 
-    // Standard library fallback
+    // Standard library fallback (ignores workers/rx_queues — kernel handles threading)
     println!("Using standard networking");
     let socket = std::net::UdpSocket::bind(bind_addr)?;
     Ok(Box::new(socket))
@@ -98,6 +118,16 @@ struct Args {
     /// Port to bind to
     #[arg(long, default_value_t = 9000)]
     port: u16,
+
+    /// Number of worker threads per RX queue.
+    /// 0 = run-to-completion (default, lowest latency).
+    /// >0 = multi-core pipeline with N workers per RX queue (higher throughput).
+    #[arg(long, default_value_t = 0)]
+    workers: u16,
+
+    /// Number of RSS RX queues (0 = auto-detect).
+    #[arg(long, default_value_t = 0)]
+    rx_queues: u16,
 
     /// Use synthetic packet mode (for protocol testing - developer option)
     #[arg(long, hide = true)]
@@ -124,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = format!("{}:{}", args.ip, args.port);
         println!("Binding to {}", bind_addr);
 
-        let socket = bind_socket(&bind_addr)?;
+        let socket = bind_socket(&bind_addr, args.workers, args.rx_queues)?;
         run_echo_server(socket)?;
     }
 

@@ -57,6 +57,55 @@ socket.send_to(b"hello", "192.168.1.100:9000").await?;
 
 Backend selection is automatic: DPDK if available, otherwise AF_PACKET raw sockets.
 
+### Multi-Core Pipeline
+
+By default, `UdpSocket::bind()` runs in single-threaded run-to-completion mode — one core handles NIC polling, protocol processing, and application logic. This is the lowest-latency path and is optimal for low-to-moderate packet rates.
+
+For high-throughput workloads, use the builder API to enable the multi-core pipeline:
+
+```rust
+use dpdk_udp::UdpSocket;
+
+// Auto-detect: multi-core when enough cores + real DPDK are available
+let socket = UdpSocket::builder()
+    .bind("0.0.0.0:9000")?;
+
+// Explicit: 2 worker threads per RX queue
+let socket = UdpSocket::builder()
+    .workers_per_queue(2)
+    .bind("0.0.0.0:9000")?;
+
+// Explicit: 4 RSS queues, 2 workers each (12 cores total: 4 RX + 8 workers)
+let socket = UdpSocket::builder()
+    .rx_queues(4)
+    .workers_per_queue(2)
+    .bind("0.0.0.0:9000")?;
+
+// Force simple mode: no pipeline threads, lowest latency
+let socket = UdpSocket::builder()
+    .workers_per_queue(0)
+    .bind("0.0.0.0:9000")?;
+```
+
+When the pipeline is active, the data flow is:
+
+```
+NIC → RX lcore (ARP/ICMP inline) → SPSC rings → N workers → MPSC app_ring → recv_from()
+send_to() → TX ring → RX lcore → NIC
+```
+
+Environment variables override builder settings: `DPDK_RX_QUEUES`, `DPDK_WORKERS_PER_QUEUE`.
+
+Query the active topology at runtime:
+
+```rust
+if socket.is_run_to_completion() {
+    println!("Simple mode (single-threaded)");
+} else if let Some(plan) = socket.topology_plan() {
+    println!("Pipeline: {} RX queues, {} workers/queue", plan.rx_queues, plan.workers_per_queue);
+}
+```
+
 ### Running Examples
 
 ```bash
@@ -129,9 +178,19 @@ let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", backend)?;
 
 ### Packet Path
 
-TX: `UdpSocket::send_to()` → build Ethernet frame (14B Eth + 20B IPv4 + 8B UDP + payload) → backend dispatch → either direct mbuf write (DPDK) or `sendto()` on raw socket (AF_PACKET).
+**Run-to-completion (default):**
 
-RX: Backend `recv_frames()` → parse Ethernet/IP/UDP headers → ARP/ICMP handled internally → UDP payload delivered to caller.
+TX: `send_to()` → build frame → backend `send_frame()` → NIC.
+
+RX: Backend `recv_frames()` → parse headers → ARP/ICMP inline → UDP payload to caller.
+
+**Multi-core pipeline (when configured via builder):**
+
+TX: `send_to()` → build frame → enqueue to TX ring → RX lcore drains → NIC.
+
+RX: RX lcore polls NIC → ARP/ICMP inline → SPSC fan-out to workers → workers parse UDP → MPSC app_ring → `recv_from()` dequeues.
+
+All ring communication uses lock-free SPSC/MPSC rings with cache-line-padded atomics for zero contention between cores.
 
 Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` writes directly into DPDK mbufs (zero-copy), while `build_udp_frame() -> Vec<u8>` produces owned bytes for the generic backend path. Both emit identical wire-format frames.
 
@@ -143,7 +202,7 @@ Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` wri
 # Build everything (works without DPDK - uses stubs)
 cargo build
 
-# Run 170+ unit tests (no DPDK required)
+# Run 180+ unit tests (no DPDK required)
 cargo test
 
 # Run specific crate tests
@@ -216,11 +275,13 @@ Benchmarked on AWS c5n.2xlarge (8 vCPU, 25 Gbps ENA) using TRex traffic generato
 ## Status
 
 - **Phase 1-5 complete** (see `API_COMPATIBILITY.md`)
+- **Phase B (multi-core pipeline)**: Configurable worker fan-out with lock-free rings
 - **std::net::UdpSocket**: 19/19 methods implemented
 - **tokio::net::UdpSocket**: All async methods + poll API
 - **ARP resolution** and **ICMP echo reply** support
 - **Hardware checksum offload** (IPv4, UDP, TCP)
 - **Backend abstraction** (DPDK, AF_PACKET, MMAP)
+- **Multi-core scaling**: Configurable RX queues and worker threads per queue
 - **Integration tests** on AWS EC2 (c6gn.large with ENA)
 
 ## DPDK Installation (Optional)
