@@ -492,7 +492,7 @@ impl Port {
     /// allocate mempools and pin lcores on the same NUMA node for optimal
     /// memory access latency.
     pub fn numa_node(&self) -> i32 {
-        dpdk_sys::rte_eth_dev_socket_id(self.port_id)
+        unsafe { dpdk_sys::rte_eth_dev_socket_id(self.port_id) }
     }
 
     /// Get the active RX offload flags
