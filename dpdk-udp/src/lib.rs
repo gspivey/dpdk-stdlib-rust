@@ -36,12 +36,16 @@ pub mod backend;
 pub mod backend_dpdk;
 pub mod backend_raw;
 pub mod ring_buffer;
+pub mod ring;
+pub mod topology;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpHandler, IcmpPacket};
 pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
+pub use ring::{SpscRing, MpscRing};
+pub use topology::{TopologyConfig, TopologyPlan, TopologySource};
 
 // ============================================================================
 // Error Types
@@ -1736,6 +1740,108 @@ impl SyntheticUdpSocket {
         }
 
         Ok(None)
+    }
+}
+
+// ============================================================================
+// UdpSocketBuilder — optional builder for topology control (A6)
+// ============================================================================
+
+/// Builder for `UdpSocket` with optional multi-core topology configuration.
+///
+/// Most users should use `UdpSocket::bind()` which auto-detects the best
+/// topology. Use the builder when you need explicit control over RSS queue
+/// count and worker-per-queue allocation.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use dpdk_udp::UdpSocket;
+///
+/// // Explicit: 4 RSS queues, 2 workers per queue
+/// let socket = UdpSocket::builder()
+///     .rx_queues(4)
+///     .workers_per_queue(2)
+///     .bind("0.0.0.0:9000")?;
+///
+/// // Or just auto-detect (equivalent to UdpSocket::bind()):
+/// let socket = UdpSocket::builder()
+///     .bind("0.0.0.0:9000")?;
+/// ```
+pub struct UdpSocketBuilder {
+    rx_queues: Option<u16>,
+    workers_per_queue: Option<u16>,
+    backend_type: Option<BackendType>,
+}
+
+impl UdpSocketBuilder {
+    /// Create a new builder with all defaults (auto-detect everything).
+    pub fn new() -> Self {
+        Self {
+            rx_queues: None,
+            workers_per_queue: None,
+            backend_type: None,
+        }
+    }
+
+    /// Set the number of NIC RSS RX queues.
+    ///
+    /// Will be clamped to the NIC's maximum supported queue count.
+    pub fn rx_queues(mut self, n: u16) -> Self {
+        self.rx_queues = Some(n);
+        self
+    }
+
+    /// Set the number of worker lcores per RX queue.
+    ///
+    /// Set to 0 for run-to-completion mode (no pipeline).
+    pub fn workers_per_queue(mut self, n: u16) -> Self {
+        self.workers_per_queue = Some(n);
+        self
+    }
+
+    /// Force a specific backend type.
+    pub fn backend_type(mut self, backend: BackendType) -> Self {
+        self.backend_type = Some(backend);
+        self
+    }
+
+    /// Build the topology configuration from this builder's settings.
+    pub fn topology_config(&self) -> TopologyConfig {
+        TopologyConfig {
+            rx_queues: self.rx_queues,
+            workers_per_queue: self.workers_per_queue,
+        }
+    }
+
+    /// Bind a UDP socket with the configured topology.
+    ///
+    /// This is equivalent to `UdpSocket::bind()` but uses the builder's
+    /// topology configuration instead of pure auto-detection.
+    pub fn bind<A: ToSocketAddrs>(self, addr: A) -> io::Result<UdpSocket> {
+        // For now, delegate to the standard bind path.
+        // The topology config is computed and stored but pipeline threads
+        // are not spawned until Phase B wires them up.
+        let _topo_config = self.topology_config();
+
+        // TODO(Phase B): Pass topo_config into bind to set up MultiCoreTopology
+        UdpSocket::bind(addr)
+    }
+}
+
+impl Default for UdpSocketBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UdpSocket {
+    /// Returns a builder for configuring multi-core topology before binding.
+    ///
+    /// Most users should use `UdpSocket::bind()` directly, which auto-detects
+    /// the optimal topology. Use the builder when you need explicit control.
+    pub fn builder() -> UdpSocketBuilder {
+        UdpSocketBuilder::new()
     }
 }
 

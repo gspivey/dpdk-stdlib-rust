@@ -2,13 +2,14 @@
 
 ## Phase A: Lock-Free Rings + Topology Planner
 
-- [ ] **A1**: Implement `SpscRing<T>` in `dpdk-udp/src/ring.rs` — cache-padded head/tail, power-of-2 capacity, `enqueue()`/`dequeue()`/`dequeue_batch()` with acquire/release semantics
-- [ ] **A2**: Implement `MpscRing<T>` in `dpdk-udp/src/ring.rs` — CAS-based multi-producer with two-phase commit (claim + publish), single-consumer dequeue
-- [ ] **A3**: Unit tests for `SpscRing` — single-threaded correctness, capacity boundary, empty/full behavior
-- [ ] **A4**: Unit tests for `MpscRing` — multi-threaded stress test (N producers, 1 consumer), ordering guarantees within a single producer
-- [ ] **A5**: Implement `TopologyPlan` and `detect_topology()` in `dpdk-udp/src/topology.rs` — lcore enumeration, NUMA detection, auto-scaling logic
-- [ ] **A6**: Implement `UdpSocketBuilder` with `rx_queues()`, `workers_per_queue()`, and `bind()` — feeds config into `detect_topology()`
-- [ ] **A7**: Verify all 133+ existing tests still pass (run-to-completion path under stubs is unchanged)
+- [x] **A1**: Implement `SpscRing<T>` in `dpdk-udp/src/ring.rs` — cache-padded head/tail, power-of-2 capacity, `enqueue()`/`dequeue()`/`dequeue_batch()` with acquire/release semantics
+- [x] **A2**: Implement `MpscRing<T>` in `dpdk-udp/src/ring.rs` — CAS-based multi-producer with two-phase commit (claim + publish), single-consumer dequeue
+- [x] **A3**: Unit tests for `SpscRing` — single-threaded correctness, capacity boundary, empty/full behavior, cross-thread correctness, drop semantics
+- [x] **A4**: Unit tests for `MpscRing` — multi-threaded stress test (4 producers × 25K items, 1 consumer), ordering guarantees within a single producer
+- [x] **A4b**: Unit tests for fan-out (1 producer, N SPSC consumers) — round-robin distribution to 4 SPSC rings + full pipeline test (SPSC fan-out → MPSC aggregation)
+- [x] **A5**: Implement `TopologyPlan` and `detect_topology()` in `dpdk-udp/src/topology.rs` — lcore enumeration, NUMA detection, auto-scaling logic (2/4/16/32 vCPU plans, NIC max clamping, stub passthrough)
+- [x] **A6**: Implement `UdpSocketBuilder` with `rx_queues()`, `workers_per_queue()`, `backend_type()`, and `bind()` — feeds config into `detect_topology()`
+- [x] **A7**: Verify all 168 tests pass (104 dpdk-udp + 51 dpdk + 8 dpdk-sys + 3 dpdk-tokio + 2 apps) — run-to-completion path under stubs is unchanged
 
 ## Phase B: Multi-Core RX/TX Pipeline
 

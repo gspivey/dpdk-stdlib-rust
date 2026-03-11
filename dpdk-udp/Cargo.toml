@@ -7,4 +7,5 @@ description = "UDP protocol implementation with DPDK acceleration and raw socket
 [dependencies]
 thiserror = { workspace = true }
 dpdk = { path = "../dpdk" }
+dpdk-sys = { path = "../dpdk-sys" }
 libc = { workspace = true }
