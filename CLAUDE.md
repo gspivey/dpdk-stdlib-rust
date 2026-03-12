@@ -2,6 +2,61 @@
 
 @AGENTS.md
 
+## Development Loop
+
+**Every code change MUST follow this loop. Do not skip steps.**
+
+```
+  +------------------+
+  |  1. Write Code   |<-----------------------------------------+
+  +--------+---------+                                           |
+           |                                                     |
+           v                                                     |
+  +------------------+                                           |
+  |  2. Unit Tests   |   cargo build && cargo test               |
+  +--------+---------+                                           |
+           |                                                     |
+       pass|   fail --> fix code --------------------------------+
+           v                                                     |
+  +------------------+                                           |
+  |  3. Push / PR    |   git push or gh pr create                |
+  +--------+---------+                                           |
+           |                                                     |
+           v                                                     |
+  +------------------+                                           |
+  | 4. Integration   |   (auto-triggered on PR, or               |
+  |    Tests         |    ./scripts/ci-validate.sh)              |
+  +--------+---------+                                           |
+           |                                                     |
+       pass|   fail --> read logs, fix code ---------------------+
+           v                                                     |
+  +------------------+                                           |
+  | 5. Performance   |   gh workflow run perf-tests.yml          |
+  |    Tests         |   poll with gh run view --json            |
+  +--------+---------+                                           |
+           |                                                     |
+       pass|   fail --> read PR comments, fix code -------------+
+           v
+  +------------------+
+  | 6. Success!      |   Ask user to review PR
+  +------------------+
+```
+
+**Step details:**
+
+1. **Write code** — read files before modifying, follow patterns in AGENTS.md
+2. **Unit tests** — `cargo build && cargo test` locally. If they fail, fix and re-run. Do NOT proceed with failures.
+3. **Push / PR** — push to the feature branch. Create a PR if one doesn't exist yet, otherwise push a new commit.
+4. **Integration tests** — triggered automatically on PR, or manually via `./scripts/ci-validate.sh`. Poll with `gh run view --json status,conclusion`. If they fail, read the PR comments and instance logs to diagnose. Fix the code and go back to step 1.
+5. **Performance tests** — trigger with `gh workflow run perf-tests.yml`. Poll until complete. Read the PR comments for benchmark results and app logs. If they fail or regress, fix and go back to step 1.
+6. **Success** — all tests pass. Ask the user to review the PR.
+
+**Key rules:**
+- Never skip straight to PR without passing local tests
+- Never assume CI will catch what local tests missed
+- On failure, read the actual logs — do not guess
+- Loop back to step 1 on any failure, do not try to patch forward
+
 ## Claude Code (Hooks & Skills)
 
 ### Querying CI / GitHub Actions Results
