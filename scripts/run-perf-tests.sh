@@ -1374,7 +1374,26 @@ Packet sizes: \`$PACKET_SIZES\`"
         fi
 
         npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
-            || { log_error "CDK deploy failed"; exit 2; }
+            || {
+                log_error "CDK deploy failed — dumping CloudFormation events..."
+                # Capture CFN events so we can diagnose what resource failed
+                aws cloudformation describe-stack-events \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackEvents[?contains(ResourceStatus,'FAILED') || contains(ResourceStatus,'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+                    --output table 2>/dev/null || true
+                # Also post to PR so we can read it remotely
+                local cfn_events
+                cfn_events=$(aws cloudformation describe-stack-events \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackEvents[?contains(ResourceStatus,'FAILED') || contains(ResourceStatus,'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+                    --output text 2>/dev/null | head -20 || echo "(no events)")
+                post_pr_comment "## [Perf] Stage: Deploy FAILED
+CDK deploy failed. CloudFormation events:
+\`\`\`
+$cfn_events
+\`\`\`"
+                exit 2
+            }
 
         cd "$REPO_ROOT"
     fi
