@@ -553,7 +553,7 @@ pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
         return None;
     }
 
-    let src_mac: [u8; 6] = frame[0..6].try_into().ok()?;
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     if ethertype != ETH_TYPE_IPV4 {
         return None;

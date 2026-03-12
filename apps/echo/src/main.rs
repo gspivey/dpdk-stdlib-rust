@@ -59,9 +59,10 @@ impl UdpSocketTrait for dpdk_udp::UdpSocket {
 }
 
 /// Try DPDK first, then fall back to standard networking.
-fn bind_socket(bind_addr: &str, workers: u16, rx_queues: u16) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::error::Error>> {
+fn bind_socket(bind_addr: &str, _workers: u16, _rx_queues: u16) -> Result<Box<dyn UdpSocketTrait>, Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
+        let (workers, rx_queues) = (_workers, _rx_queues);
         let result = if workers > 0 || rx_queues > 0 {
             // Use builder for explicit multi-core configuration
             let mut builder = dpdk_udp::UdpSocket::builder();
