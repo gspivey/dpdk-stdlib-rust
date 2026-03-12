@@ -935,8 +935,9 @@ start_dut_rust_dpdk_multicore() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     # Launch with --workers 2 to enable multi-core pipeline (2 workers per RX queue)
+    # --perf-interval 10 enables instrumentation output every 10s to the log file
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --workers 2 > /var/log/echo-rust-dpdk-multicore.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --workers 2 --perf-interval 10 > /var/log/echo-rust-dpdk-multicore.log 2>&1 &"
     sleep 15
 
     # Verify it's running (retry up to 3 times — SSM can be slow)

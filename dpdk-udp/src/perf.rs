@@ -5,11 +5,64 @@
 //!
 //! All hot-path counters use `AtomicU64` with `Relaxed` ordering — the cheapest
 //! atomic operation (single cache-line bounce on x86, no memory fence).
+//!
+//! ## Feature gate: `perf-counters`
+//!
+//! Hot-path counter increments are gated behind the `perf-counters` cargo feature
+//! (enabled by default). Disable with `--no-default-features` to compile out all
+//! instrumentation overhead from the TX/RX fast paths.
+//!
+//! The `PerfCounters` struct, `PerfReporter`, and `LatencySampler` always exist
+//! so the API doesn't break — but counter values stay at zero when the feature
+//! is disabled.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+// ============================================================================
+// Feature-gated hot-path macros
+// ============================================================================
+
+/// Increment an `AtomicU64` counter with `Relaxed` ordering.
+/// Compiles to nothing when the `perf-counters` feature is disabled.
+#[cfg(feature = "perf-counters")]
+#[macro_export]
+macro_rules! perf_inc {
+    ($counter:expr, $val:expr) => {
+        $counter.fetch_add($val, std::sync::atomic::Ordering::Relaxed)
+    };
+    ($counter:expr) => {
+        $counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+}
+
+/// No-op when `perf-counters` feature is disabled.
+#[cfg(not(feature = "perf-counters"))]
+#[macro_export]
+macro_rules! perf_inc {
+    ($counter:expr, $val:expr) => { 0u64 };
+    ($counter:expr) => { 0u64 };
+}
+
+/// Check if latency should be sampled for this packet.
+/// Always returns false when `perf-counters` feature is disabled.
+#[cfg(feature = "perf-counters")]
+#[macro_export]
+macro_rules! perf_should_sample {
+    ($sampler:expr) => {
+        $sampler.should_sample()
+    };
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[macro_export]
+macro_rules! perf_should_sample {
+    ($sampler:expr) => {
+        false
+    };
+}
 
 // ============================================================================
 // PerfCounters — lock-free hot-path counters

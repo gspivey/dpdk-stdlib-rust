@@ -20,7 +20,7 @@ use crate::arp::{self, ArpCache, ArpHandler};
 use crate::icmp::{self, IcmpHandler};
 use crate::perf::PerfCounters;
 use crate::ring::{MpscRing, SpscRing};
-use crate::{parse_udp_packet, ETH_HEADER_LEN, ETH_TYPE_IPV4};
+use crate::{parse_udp_packet, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
 
 // ============================================================================
 // TopologyConfig — input from builder / env / auto
@@ -208,8 +208,10 @@ where
     let shutdown = Arc::new(AtomicBool::new(false));
     let workers_per_queue = config.plan.workers_per_queue as usize;
 
-    // Ring sizes: 4096 slots per ring should handle bursts without backpressure.
-    let ring_capacity = 4096;
+    // Ring sizes: 16384 slots to absorb bursts without TX backpressure.
+    // The TX ring is the bottleneck under echo workloads where send rate ≈ recv rate,
+    // because the RX lcore must drain TX between RX bursts.
+    let ring_capacity = 16384;
 
     // App ring: all workers → recv_from(). MPSC.
     let app_ring = Arc::new(MpscRing::new(ring_capacity));
@@ -310,8 +312,8 @@ fn rx_loop<R, S>(
     let mut rr_index: usize = 0;
 
     while !shutdown.load(Ordering::Acquire) {
-        // 1. Drain TX ring → send to NIC
-        let tx_batch = tx_ring.dequeue_batch(32);
+        // 1. Drain TX ring → send to NIC (up to 256 frames per cycle to keep up with echo workloads)
+        let tx_batch = tx_ring.dequeue_batch(256);
         for tx in &tx_batch {
             let _ = send_fn(&tx.frame);
         }
@@ -332,8 +334,8 @@ fn rx_loop<R, S>(
         }
 
         if !frames.is_empty() {
-            perf_counters.rx_bursts.fetch_add(1, Ordering::Relaxed);
-            perf_counters.rx_burst_sum.fetch_add(frames.len() as u64, Ordering::Relaxed);
+            perf_inc!(perf_counters.rx_bursts);
+            perf_inc!(perf_counters.rx_burst_sum, frames.len() as u64);
         }
 
         for frame_data in frames {
@@ -348,7 +350,7 @@ fn rx_loop<R, S>(
                 if let Some(reply) = arp_handler.process_arp(&frame_data) {
                     let _ = send_fn(&reply);
                 }
-                perf_counters.rx_arp_handled.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(perf_counters.rx_arp_handled);
                 continue;
             }
 
@@ -359,7 +361,7 @@ fn rx_loop<R, S>(
                     if let Some(reply) = icmp_handler.process_icmp(&frame_data) {
                         let _ = send_fn(&reply);
                     }
-                    perf_counters.rx_icmp_handled.fetch_add(1, Ordering::Relaxed);
+                    perf_inc!(perf_counters.rx_icmp_handled);
                     continue;
                 }
             }
@@ -379,9 +381,17 @@ fn rx_loop<R, S>(
             }
             if !sent {
                 // All worker rings full — drop frame (backpressure)
-                perf_counters.rx_drops_ring_full.fetch_add(1, Ordering::Relaxed);
-                perf_counters.worker_ring_enqueue_fail.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(perf_counters.rx_drops_ring_full);
+                perf_inc!(perf_counters.worker_ring_enqueue_fail);
             }
+        }
+
+        // 3. Second TX drain pass — workers may have enqueued replies while we were
+        //    processing RX frames. Draining here cuts echo latency in half by not
+        //    waiting for the next loop iteration.
+        let tx_batch2 = tx_ring.dequeue_batch(256);
+        for tx in &tx_batch2 {
+            let _ = send_fn(&tx.frame);
         }
     }
 }
@@ -401,7 +411,7 @@ fn worker_loop(
     while !shutdown.load(Ordering::Acquire) {
         let batch = rx_ring.dequeue_batch(32);
         if batch.is_empty() {
-            perf_counters.worker_idle_polls.fetch_add(1, Ordering::Relaxed);
+            perf_inc!(perf_counters.worker_idle_polls);
             std::hint::spin_loop();
             continue;
         }
@@ -409,9 +419,9 @@ fn worker_loop(
         for frame_data in batch {
             // Parse UDP packet
             if let Some(parsed) = parse_udp_packet(&frame_data) {
-                perf_counters.worker_packets_processed.fetch_add(1, Ordering::Relaxed);
-                perf_counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-                perf_counters.rx_bytes.fetch_add(parsed.payload.len() as u64, Ordering::Relaxed);
+                perf_inc!(perf_counters.worker_packets_processed);
+                perf_inc!(perf_counters.rx_packets);
+                perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
 
                 // Learn source MAC from incoming packets
                 if frame_data.len() >= 12 {
@@ -442,11 +452,11 @@ fn worker_loop(
 
                     // Enqueue to app ring; if full, drop (backpressure)
                     if app_ring.enqueue(packet).is_err() {
-                        perf_counters.app_ring_enqueue_fail.fetch_add(1, Ordering::Relaxed);
+                        perf_inc!(perf_counters.app_ring_enqueue_fail);
                     }
                 }
             } else {
-                perf_counters.rx_drops_parse_fail.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(perf_counters.rx_drops_parse_fail);
             }
         }
     }

@@ -1337,16 +1337,16 @@ impl UdpSocket {
         // Resolve destination MAC via ARP (or use configured/broadcast MAC)
         let dst_mac = match self.arp_handler.resolve(&dst_ip) {
             Some(mac) => {
-                self.perf_counters.arp_cache_hits.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.arp_cache_hits);
                 mac
             }
             None if self.auto_arp => {
-                self.perf_counters.arp_cache_misses.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.arp_cache_misses);
                 // Proactively send ARP request and wait for reply
                 self.resolve_arp(&dst_ip)?
             }
             None => {
-                self.perf_counters.arp_cache_misses.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.arp_cache_misses);
                 self.dst_mac.clone()
             }
         };
@@ -1369,8 +1369,8 @@ impl UdpSocket {
             let topo_guard = self.topology.lock().unwrap();
             if let Some(ref topo) = *topo_guard {
                 if let Err(_) = topo.tx_ring.enqueue(topology::TxFrame { frame }) {
-                    self.perf_counters.tx_ring_enqueue_fail.fetch_add(1, Ordering::Relaxed);
-                    self.perf_counters.tx_failures.fetch_add(1, Ordering::Relaxed);
+                    perf_inc!(self.perf_counters.tx_ring_enqueue_fail);
+                    perf_inc!(self.perf_counters.tx_failures);
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "TX ring full"));
                 }
             }
@@ -1386,14 +1386,14 @@ impl UdpSocket {
                 buf, self.ttl,
             ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
             if let Err(e) = self.socket_backend.send_frame(&tx_buf) {
-                self.perf_counters.tx_failures.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
             }
         }
 
         // Increment TX counters
-        self.perf_counters.tx_packets.fetch_add(1, Ordering::Relaxed);
-        self.perf_counters.tx_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        perf_inc!(self.perf_counters.tx_packets);
+        perf_inc!(self.perf_counters.tx_bytes, buf.len() as u64);
 
         // Update connection state if connected
         if let Ok(mut guard) = self.connection_state.write() {
@@ -1533,11 +1533,11 @@ impl UdpSocket {
                     }
 
                     // Record burst stats
-                    self.perf_counters.rx_bursts.fetch_add(1, Ordering::Relaxed);
-                    self.perf_counters.rx_burst_sum.fetch_add(packets.len() as u64, Ordering::Relaxed);
+                    perf_inc!(self.perf_counters.rx_bursts);
+                    perf_inc!(self.perf_counters.rx_burst_sum, packets.len() as u64);
 
                     // Latency sampling: timestamp at rx_burst return
-                    let sample_this_burst = self.latency_sampler.should_sample();
+                    let sample_this_burst = perf_should_sample!(self.latency_sampler);
                     let rx_timestamp = if sample_this_burst { Some(Instant::now()) } else { None };
 
                     let mut result: Option<(usize, SocketAddr)> = None;
@@ -1552,8 +1552,8 @@ impl UdpSocket {
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
                                 self.latency_sampler.record(latency_ns);
-                                self.perf_counters.latency_sample_count.fetch_add(1, Ordering::Relaxed);
-                                self.perf_counters.latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+                                perf_inc!(self.perf_counters.latency_sample_count);
+                                perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
                                 self.perf_counters.update_latency_max(latency_ns);
                             }
                             return Ok(r);
@@ -1566,8 +1566,8 @@ impl UdpSocket {
                         if let Some(ts) = rx_timestamp {
                             let latency_ns = ts.elapsed().as_nanos() as u64;
                             self.latency_sampler.record(latency_ns);
-                            self.perf_counters.latency_sample_count.fetch_add(1, Ordering::Relaxed);
-                            self.perf_counters.latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+                            perf_inc!(self.perf_counters.latency_sample_count);
+                            perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
                             self.perf_counters.update_latency_max(latency_ns);
                         }
                         return Ok(r);
@@ -1584,11 +1584,11 @@ impl UdpSocket {
                     }
 
                     // Record burst stats
-                    self.perf_counters.rx_bursts.fetch_add(1, Ordering::Relaxed);
-                    self.perf_counters.rx_burst_sum.fetch_add(frames.len() as u64, Ordering::Relaxed);
+                    perf_inc!(self.perf_counters.rx_bursts);
+                    perf_inc!(self.perf_counters.rx_burst_sum, frames.len() as u64);
 
                     // Latency sampling: timestamp at recv_frames return
-                    let sample_this_burst = self.latency_sampler.should_sample();
+                    let sample_this_burst = perf_should_sample!(self.latency_sampler);
                     let rx_timestamp = if sample_this_burst { Some(Instant::now()) } else { None };
 
                     let mut result: Option<(usize, SocketAddr)> = None;
@@ -1598,8 +1598,8 @@ impl UdpSocket {
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
                                 self.latency_sampler.record(latency_ns);
-                                self.perf_counters.latency_sample_count.fetch_add(1, Ordering::Relaxed);
-                                self.perf_counters.latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+                                perf_inc!(self.perf_counters.latency_sample_count);
+                                perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
                                 self.perf_counters.update_latency_max(latency_ns);
                             }
                             return Ok(r);
@@ -1610,8 +1610,8 @@ impl UdpSocket {
                         if let Some(ts) = rx_timestamp {
                             let latency_ns = ts.elapsed().as_nanos() as u64;
                             self.latency_sampler.record(latency_ns);
-                            self.perf_counters.latency_sample_count.fetch_add(1, Ordering::Relaxed);
-                            self.perf_counters.latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+                            perf_inc!(self.perf_counters.latency_sample_count);
+                            perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
                             self.perf_counters.update_latency_max(latency_ns);
                         }
                         return Ok(r);
@@ -1648,7 +1648,7 @@ impl UdpSocket {
             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
                 let _ = self.socket_backend.send_frame(&reply_frame);
             }
-            self.perf_counters.rx_arp_handled.fetch_add(1, Ordering::Relaxed);
+            perf_inc!(self.perf_counters.rx_arp_handled);
             return None;
         }
 
@@ -1659,7 +1659,7 @@ impl UdpSocket {
                 if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
                     let _ = self.socket_backend.send_frame(&reply_frame);
                 }
-                self.perf_counters.rx_icmp_handled.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.rx_icmp_handled);
                 return None;
             }
         }
@@ -1668,14 +1668,14 @@ impl UdpSocket {
         let parsed = match parse_udp_packet_ref(frame_data) {
             Some(p) => p,
             None => {
-                self.perf_counters.rx_drops_parse_fail.fetch_add(1, Ordering::Relaxed);
+                perf_inc!(self.perf_counters.rx_drops_parse_fail);
                 return None;
             }
         };
 
         // Count successfully parsed RX packets
-        self.perf_counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-        self.perf_counters.rx_bytes.fetch_add(parsed.payload.len() as u64, Ordering::Relaxed);
+        perf_inc!(self.perf_counters.rx_packets);
+        perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
 
         // Learn source MAC for reply routing
         self.arp_handler.cache.insert(
@@ -2384,7 +2384,14 @@ impl UdpSocketBuilder {
             };
 
             let topo = topology::start_pipeline(pipeline_config, recv_fn, send_fn);
+            let is_multicore = topo.is_some();
             *socket.topology.lock().unwrap() = topo;
+
+            // Auto-enable perf reporting in multi-core mode so instrumentation
+            // output is always visible in logs (10s interval).
+            if is_multicore {
+                let _ = socket.enable_perf_reporting(Duration::from_secs(10));
+            }
         }
 
         Ok(socket)
