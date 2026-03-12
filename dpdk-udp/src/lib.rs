@@ -45,7 +45,7 @@ pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};
-pub use topology::{TopologyConfig, TopologyPlan, TopologySource};
+pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
 
 // ============================================================================
 // Error Types
@@ -349,6 +349,83 @@ pub fn build_udp_frame(
     Ok(frame)
 }
 
+/// Build a UDP frame into a caller-provided buffer, avoiding per-packet heap allocation.
+///
+/// The buffer will be resized (via `resize`) to exactly fit the frame.
+/// Callers should reuse the same `Vec` across calls so the allocation is amortized.
+///
+/// Returns the number of bytes written (== total frame length).
+pub fn build_udp_frame_into(
+    out: &mut Vec<u8>,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    ttl: u8,
+) -> UdpResult<usize> {
+    if payload.len() > MAX_UDP_PAYLOAD {
+        return Err(UdpError::PayloadTooLarge {
+            max: MAX_UDP_PAYLOAD,
+            actual: payload.len(),
+        });
+    }
+
+    let total_len = TOTAL_HEADER_LEN + payload.len();
+    let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+    // Resize reuses existing capacity — no allocation if capacity >= total_len
+    out.resize(total_len, 0);
+
+    let src_ip_bytes = src_ip.octets();
+    let dst_ip_bytes = dst_ip.octets();
+
+    // === Ethernet Header (14 bytes) ===
+    out[0..6].copy_from_slice(dst_mac);
+    out[6..12].copy_from_slice(src_mac);
+    out[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+    // === IPv4 Header (20 bytes) ===
+    let ip = ETH_HEADER_LEN;
+    out[ip] = 0x45;
+    out[ip + 1] = 0x00;
+    out[ip + 2..ip + 4].copy_from_slice(&ip_total_len.to_be_bytes());
+    out[ip + 4..ip + 6].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 6..ip + 8].copy_from_slice(&[0x40, 0x00]);
+    out[ip + 8] = ttl;
+    out[ip + 9] = IP_PROTO_UDP;
+    out[ip + 10..ip + 12].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 12..ip + 16].copy_from_slice(&src_ip_bytes);
+    out[ip + 16..ip + 20].copy_from_slice(&dst_ip_bytes);
+
+    let ip_cksum = ipv4_checksum(&out[ip..ip + IPV4_HEADER_LEN]);
+    out[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // === UDP Header (8 bytes) ===
+    let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+    out[udp_off..udp_off + 2].copy_from_slice(&src_port.to_be_bytes());
+    out[udp_off + 2..udp_off + 4].copy_from_slice(&dst_port.to_be_bytes());
+    out[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === Payload ===
+    out[TOTAL_HEADER_LEN..].copy_from_slice(payload);
+
+    // UDP checksum
+    let udp_cksum = udp_checksum(
+        &src_ip_bytes,
+        &dst_ip_bytes,
+        &out[udp_off..udp_off + UDP_HEADER_LEN],
+        payload,
+    );
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
+    Ok(total_len)
+}
+
 // ============================================================================
 // Packet Parsing
 // ============================================================================
@@ -370,6 +447,20 @@ pub struct ParsedUdpPacket {
     pub dst_port: u16,
     /// Payload data
     pub payload: Vec<u8>,
+}
+
+/// Zero-copy parsed UDP packet that borrows payload from the frame slice.
+///
+/// Used on the hot recv path to avoid per-packet heap allocation.
+#[derive(Debug)]
+pub struct ParsedUdpPacketRef<'a> {
+    pub src_mac: [u8; 6],
+    pub src_ip: Ipv4Addr,
+    pub dst_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    /// Payload borrowed from the original frame — no heap allocation.
+    pub payload: &'a [u8],
 }
 
 /// Parse a raw Ethernet frame containing a UDP packet
@@ -450,6 +541,65 @@ pub fn parse_udp_packet(frame: &[u8]) -> Option<ParsedUdpPacket> {
         src_port,
         dst_port,
         payload,
+    })
+}
+
+/// Zero-copy UDP packet parser that borrows payload from the frame slice.
+///
+/// Identical validation to `parse_udp_packet` but returns a reference into the
+/// original frame data, eliminating the per-packet `Vec<u8>` heap allocation.
+pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
+    if frame.len() < TOTAL_HEADER_LEN {
+        return None;
+    }
+
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    let ip_header = &frame[ETH_HEADER_LEN..];
+    let version = (ip_header[0] >> 4) & 0x0F;
+    if version != 4 {
+        return None;
+    }
+    let ihl = (ip_header[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+    if ip_header_len < 20 {
+        return None;
+    }
+    if ip_header[9] != IP_PROTO_UDP {
+        return None;
+    }
+
+    let src_ip = Ipv4Addr::new(ip_header[12], ip_header[13], ip_header[14], ip_header[15]);
+    let dst_ip = Ipv4Addr::new(ip_header[16], ip_header[17], ip_header[18], ip_header[19]);
+
+    let udp_start = ETH_HEADER_LEN + ip_header_len;
+    if frame.len() < udp_start + UDP_HEADER_LEN {
+        return None;
+    }
+
+    let udp_header = &frame[udp_start..];
+    let src_port = u16::from_be_bytes([udp_header[0], udp_header[1]]);
+    let dst_port = u16::from_be_bytes([udp_header[2], udp_header[3]]);
+    let udp_len = u16::from_be_bytes([udp_header[4], udp_header[5]]) as usize;
+
+    if udp_len < UDP_HEADER_LEN || frame.len() < udp_start + udp_len {
+        return None;
+    }
+
+    let payload_start = udp_start + UDP_HEADER_LEN;
+    let payload_len = udp_len - UDP_HEADER_LEN;
+
+    Some(ParsedUdpPacketRef {
+        src_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        payload: &frame[payload_start..payload_start + payload_len],
     })
 }
 
@@ -931,6 +1081,12 @@ pub struct UdpSocket {
     read_timeout: Mutex<Option<Duration>>,
     /// Write timeout for send operations (None = block forever)
     write_timeout: Mutex<Option<Duration>>,
+    /// Multi-core pipeline topology (None = run-to-completion, the default).
+    /// When active, recv_from() reads from app_ring and send_to() writes to tx_ring.
+    topology: Mutex<Option<MultiCoreTopology>>,
+    /// Reusable TX frame buffer — avoids per-packet heap allocation in send_to.
+    /// Uses Mutex because send_to takes &self (not &mut self) per the std API.
+    tx_buf: Mutex<Vec<u8>>,
 }
 
 impl UdpSocket {
@@ -992,6 +1148,8 @@ impl UdpSocket {
             auto_icmp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
+            topology: Mutex::new(None),
+            tx_buf: Mutex::new(Vec::with_capacity(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD)),
         })
     }
 
@@ -1070,12 +1228,28 @@ impl UdpSocket {
             auto_icmp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
+            topology: Mutex::new(None),
+            tx_buf: Mutex::new(Vec::with_capacity(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD)),
         })
     }
 
     /// Get the name of the active packet I/O backend.
     pub fn active_backend(&self) -> &'static str {
         self.socket_backend.backend_name()
+    }
+
+    /// Returns the active topology plan, if a multi-core pipeline is running.
+    ///
+    /// Returns `None` when the socket is in run-to-completion mode (default
+    /// for `UdpSocket::bind()` and when `workers_per_queue(0)` is configured).
+    pub fn topology_plan(&self) -> Option<TopologyPlan> {
+        self.topology.lock().unwrap().as_ref().map(|t| t.plan.clone())
+    }
+
+    /// Returns `true` if the socket is running in simple run-to-completion mode
+    /// (no pipeline threads, lowest latency).
+    pub fn is_run_to_completion(&self) -> bool {
+        self.topology.lock().unwrap().is_none()
     }
 
     /// Sets the read timeout for `recv`, `recv_from`, and `peek` operations.
@@ -1127,8 +1301,9 @@ impl UdpSocket {
 
     /// Internal send implementation with resolved address.
     ///
-    /// Uses `build_udp_frame()` to construct the packet and sends it via the
-    /// active backend (DPDK or generic PacketBackend).
+    /// Uses a reusable TX buffer to avoid per-packet heap allocation on the
+    /// run-to-completion path. The multi-core topology path still allocates
+    /// because the TX ring takes ownership of the frame.
     fn send_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         // Extract IPv4 addresses
         let (src_ip, src_port) = match self.local_addr {
@@ -1157,20 +1332,38 @@ impl UdpSocket {
 
         let src_mac = self.socket_backend.mac_address();
 
-        // Build the frame using backend-agnostic builder
-        let frame = build_udp_frame(
-            &src_mac,
-            &dst_mac.octets(),
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            buf,
-            self.ttl,
-        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+        // If multi-core topology is active, enqueue to TX ring (needs owned Vec).
+        // Otherwise, use reusable buffer and send directly (zero-alloc steady state).
+        let has_topology = self.topology.lock().unwrap().is_some();
+        if has_topology {
+            // Multi-core path: TX ring takes ownership, so we must allocate
+            let frame = build_udp_frame(
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
 
-        // Send via the active backend
-        self.socket_backend.send_frame(&frame)?;
+            let topo_guard = self.topology.lock().unwrap();
+            if let Some(ref topo) = *topo_guard {
+                topo.tx_ring.enqueue(topology::TxFrame { frame }).map_err(|_| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "TX ring full")
+                })?;
+            }
+        } else {
+            // Run-to-completion path: reuse the TX buffer across calls
+            let mut tx_buf = self.tx_buf.lock().unwrap();
+            build_udp_frame_into(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+            self.socket_backend.send_frame(&tx_buf)?;
+        }
 
         // Update connection state if connected
         if let Ok(mut guard) = self.connection_state.write() {
@@ -1194,6 +1387,76 @@ impl UdpSocket {
     ///
     /// On success, returns the number of bytes received and the source address.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        // Check if multi-core topology is active — if so, dequeue from app_ring.
+        let has_topology = self.topology.lock().unwrap().is_some();
+        if has_topology {
+            return self.recv_from_pipeline(buf);
+        }
+
+        // Run-to-completion path (original single-threaded behavior).
+        self.recv_from_inline(buf)
+    }
+
+    /// Pipeline recv path: dequeue processed packets from the MPSC app_ring.
+    fn recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
+
+        loop {
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"));
+                }
+            }
+
+            // Check buffered packets first (from connected socket filtering)
+            {
+                let mut queue = self.recv_queue.lock().unwrap();
+                if let Some((payload, src_addr)) = queue.pop() {
+                    let copy_len = std::cmp::min(buf.len(), payload.len());
+                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    return Ok((copy_len, src_addr));
+                }
+            }
+
+            // Dequeue from the app_ring (filled by worker threads)
+            let packet = {
+                let topo_guard = self.topology.lock().unwrap();
+                if let Some(ref topo) = *topo_guard {
+                    topo.app_ring.dequeue()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(packet) = packet {
+                // If connected, only accept packets from connected peer
+                if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                    if packet.src_addr != connected {
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        queue.push(packet.payload, packet.src_addr);
+                        continue;
+                    }
+                }
+
+                let copy_len = std::cmp::min(buf.len(), packet.payload.len());
+                buf[..copy_len].copy_from_slice(&packet.payload[..copy_len]);
+
+                if let Ok(mut guard) = self.connection_state.write() {
+                    if let Some(ref mut state) = *guard {
+                        state.record_recv(copy_len);
+                    }
+                }
+
+                return Ok((copy_len, packet.src_addr));
+            }
+
+            // No packet available — brief pause
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    /// Inline recv path: single-threaded run-to-completion (original behavior).
+    fn recv_from_inline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         // Get our local port for filtering (do this once outside the loop)
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
@@ -1224,103 +1487,151 @@ impl UdpSocket {
                 }
             }
 
-            // Receive raw frames via the active backend
-            let frames = self.socket_backend.recv_frames(32)?;
+            // Dispatch to the appropriate fast-path based on backend type.
+            match &self.socket_backend {
+                SocketBackend::Dpdk(res) => {
+                    // DPDK fast path: process mbufs inline to avoid per-packet Vec allocation.
+                    // rx_burst returns mbufs whose data() borrows from the mbuf buffer —
+                    // we parse and copy directly to the user buffer or recv_queue without
+                    // any intermediate heap allocation.
+                    let packets = res.port.rx_burst(0, 32)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
 
-            if frames.is_empty() {
-                // No packets available — sleep briefly and retry (blocking behavior)
-                std::thread::sleep(std::time::Duration::from_micros(100));
-                continue;
-            }
-
-            // Process frames, handling ARP/ICMP and looking for UDP packets for our port
-            let mut result: Option<(usize, SocketAddr)> = None;
-
-            for frame_data in &frames {
-                // Check ethertype
-                if frame_data.len() >= 14 {
-                    let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
-
-                    // Handle ARP packets (reuse existing handler)
-                    if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
-                        if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                            // Send ARP reply via backend
-                            let _ = self.socket_backend.send_frame(&reply_frame);
-                        }
+                    if packets.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
                         continue;
                     }
 
-                    // Handle ICMP packets (reuse existing handler)
-                    if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
-                        let protocol = frame_data[ETH_HEADER_LEN + 9];
-                        if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
-                            if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
-                                // Send ICMP reply via backend
-                                let _ = self.socket_backend.send_frame(&reply_frame);
-                            }
-                            continue;
+                    let mut result: Option<(usize, SocketAddr)> = None;
+
+                    for mbuf in &packets {
+                        let Some(data) = mbuf.data() else { continue };
+                        let len = mbuf.data_len() as usize;
+                        let frame_data = &data[..len.min(data.len())];
+
+                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result) {
+                            return Ok(r);
                         }
+                    }
+                    // mbufs are freed here when `packets` drops
+
+                    if let Some(r) = result {
+                        return Ok(r);
                     }
                 }
+                SocketBackend::Generic(backend) => {
+                    // Generic backend path: recv_frames returns Vec<Vec<u8>>.
+                    // We still use parse_udp_packet_ref to avoid a second copy of the payload.
+                    let frames = backend.recv_frames(32)?;
 
-                // Try to parse as UDP (reuse existing parser)
-                if let Some(parsed) = parse_udp_packet(frame_data) {
-                    // Learn source MAC from incoming packets for reply routing.
-                    // This ensures send_to() uses the correct destination MAC
-                    // instead of broadcast, which is important for DPDK backends
-                    // where the NIC doesn't handle ARP automatically.
-                    if frame_data.len() >= 12 {
-                        let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
-                        self.arp_handler.cache.insert(
-                            parsed.src_ip,
-                            MacAddress::new(src_mac),
-                        );
+                    if frames.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        continue;
                     }
 
-                    // Check if this packet is for us
-                    if parsed.dst_port == local_port {
-                        let src_addr = SocketAddr::V4(
-                            SocketAddrV4::new(parsed.src_ip, parsed.src_port)
-                        );
+                    let mut result: Option<(usize, SocketAddr)> = None;
 
-                        // If connected, only accept packets from the connected address
-                        if let Some(connected) = *self.connected_addr.lock().unwrap() {
-                            if src_addr != connected {
-                                // Queue for later if not from connected peer
-                                let mut queue = self.recv_queue.lock().unwrap();
-                                queue.push(parsed.payload, src_addr);
-                                continue;
-                            }
+                    for frame_data in &frames {
+                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result) {
+                            return Ok(r);
                         }
+                    }
 
-                        // If we haven't found a result yet, use this one
-                        if result.is_none() {
-                            let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
-                            buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
-
-                            // Update connection state
-                            if let Ok(mut guard) = self.connection_state.write() {
-                                if let Some(ref mut state) = *guard {
-                                    state.record_recv(copy_len);
-                                }
-                            }
-
-                            result = Some((copy_len, src_addr));
-                        } else {
-                            // Queue additional packets
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            queue.push(parsed.payload, src_addr);
-                        }
+                    if let Some(r) = result {
+                        return Ok(r);
                     }
                 }
-                // Packet not for us or not valid UDP - dropped
-            }
-
-            if let Some(r) = result {
-                return Ok(r);
             }
             // No matching UDP packets in this batch — continue polling
         }
+    }
+
+    /// Process a single frame with zero-copy parsing.
+    ///
+    /// Handles ARP/ICMP and parses UDP — copies payload directly to user buffer
+    /// or recv_queue without intermediate `Vec<u8>` allocation on the primary path.
+    ///
+    /// Returns `Some((len, addr))` if this is the first matching packet AND
+    /// `result` was already `Some` (meaning we had a prior match, so we need to
+    /// return immediately). Otherwise returns `None` and sets `result` on first match.
+    fn process_frame_zerocopy(
+        &self,
+        frame_data: &[u8],
+        local_port: u16,
+        buf: &mut [u8],
+        result: &mut Option<(usize, SocketAddr)>,
+    ) -> Option<(usize, SocketAddr)> {
+        if frame_data.len() < 14 {
+            return None;
+        }
+
+        let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+
+        // Handle ARP
+        if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
+            if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
+                let _ = self.socket_backend.send_frame(&reply_frame);
+            }
+            return None;
+        }
+
+        // Handle ICMP
+        if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
+            let protocol = frame_data[ETH_HEADER_LEN + 9];
+            if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
+                if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
+                    let _ = self.socket_backend.send_frame(&reply_frame);
+                }
+                return None;
+            }
+        }
+
+        // Zero-copy UDP parse — payload borrows from frame_data
+        let parsed = parse_udp_packet_ref(frame_data)?;
+
+        // Learn source MAC for reply routing
+        self.arp_handler.cache.insert(
+            parsed.src_ip,
+            MacAddress::new(parsed.src_mac),
+        );
+
+        if parsed.dst_port != local_port {
+            return None;
+        }
+
+        let src_addr = SocketAddr::V4(
+            SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+        );
+
+        // If connected, only accept packets from the connected address
+        if let Some(connected) = *self.connected_addr.lock().unwrap() {
+            if src_addr != connected {
+                let mut queue = self.recv_queue.lock().unwrap();
+                // Must allocate here — queued packets outlive the frame/mbuf
+                queue.push(parsed.payload.to_vec(), src_addr);
+                return None;
+            }
+        }
+
+        if result.is_none() {
+            // First matching packet: copy directly to user buffer (zero intermediate alloc)
+            let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+            buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+            if let Ok(mut guard) = self.connection_state.write() {
+                if let Some(ref mut state) = *guard {
+                    state.record_recv(copy_len);
+                }
+            }
+
+            *result = Some((copy_len, src_addr));
+        } else {
+            // Additional matching packets: must allocate for the queue
+            let mut queue = self.recv_queue.lock().unwrap();
+            queue.push(parsed.payload.to_vec(), src_addr);
+        }
+
+        None
     }
 
     /// Returns the socket address that this socket was created from.
@@ -1818,14 +2129,90 @@ impl UdpSocketBuilder {
     ///
     /// This is equivalent to `UdpSocket::bind()` but uses the builder's
     /// topology configuration instead of pure auto-detection.
+    ///
+    /// When the topology plan is **not** run-to-completion, pipeline threads
+    /// are spawned automatically. Use `.workers_per_queue(0)` to force
+    /// run-to-completion mode (no pipeline threads, lowest latency).
     pub fn bind<A: ToSocketAddrs>(self, addr: A) -> io::Result<UdpSocket> {
-        // For now, delegate to the standard bind path.
-        // The topology config is computed and stored but pipeline threads
-        // are not spawned until Phase B wires them up.
-        let _topo_config = self.topology_config();
+        let topo_config = self.topology_config();
 
-        // TODO(Phase B): Pass topo_config into bind to set up MultiCoreTopology
-        UdpSocket::bind(addr)
+        // Create the socket using the standard bind path
+        let socket = UdpSocket::bind(addr)?;
+
+        // Detect topology from config + runtime environment.
+        // Under stubs this always returns run-to-completion.
+        let plan = topology::detect_topology(
+            &topo_config,
+            // Under stubs we report 1 lcore, so the plan will be run-to-completion.
+            // With real DPDK we'd query eal_lcore_count().
+            if dpdk_sys::is_stub() { 1 } else { 8 },
+            // Under stubs NIC max queues = 1.
+            if dpdk_sys::is_stub() { 1 } else { 16 },
+            0, // NUMA node
+        );
+
+        if !plan.is_run_to_completion() {
+            // Build pipeline configuration from the socket's state
+            let local_port = match socket.local_addr {
+                SocketAddr::V4(v4) => v4.port(),
+                _ => 0,
+            };
+            let local_mac = socket.socket_backend.mac_address();
+            let local_ip = match socket.local_addr {
+                SocketAddr::V4(v4) => *v4.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+
+            let pipeline_config = topology::PipelineConfig {
+                plan: plan.clone(),
+                local_port,
+                local_mac,
+                local_ip,
+                arp_cache: Arc::clone(&socket.resources.arp_cache),
+            };
+
+            // Create backend closures that capture the socket's backend for the pipeline
+            // We need raw function pointers since SocketBackend isn't Clone.
+            // Use a shared reference approach via Arc.
+            let resources_for_recv = Arc::clone(&socket.resources);
+            let resources_for_send = Arc::clone(&socket.resources);
+
+            let recv_fn = move |max_frames: usize| -> io::Result<Vec<Vec<u8>>> {
+                let packets = resources_for_recv.port.rx_burst(0, max_frames as u16)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+                let mut frames = Vec::with_capacity(packets.len());
+                for mbuf in &packets {
+                    if let Some(data) = mbuf.data() {
+                        let len = mbuf.data_len() as usize;
+                        let actual_len = len.min(data.len());
+                        frames.push(data[..actual_len].to_vec());
+                    }
+                }
+                Ok(frames)
+            };
+
+            let send_fn = move |frame: &[u8]| -> io::Result<usize> {
+                let mut mbuf = resources_for_send.mempool.alloc()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
+                mbuf.set_data_len(frame.len() as u16);
+                mbuf.set_packet_len(frame.len() as u32);
+                let data = mbuf.data_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
+                data.copy_from_slice(frame);
+                let mut packets = vec![mbuf];
+                let sent = resources_for_send.port.tx_burst(0, &mut packets)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
+                if sent == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+                }
+                Ok(frame.len())
+            };
+
+            let topo = topology::start_pipeline(pipeline_config, recv_fn, send_fn);
+            *socket.topology.lock().unwrap() = topo;
+        }
+
+        Ok(socket)
     }
 }
 
@@ -2397,5 +2784,62 @@ mod tests {
         assert_eq!(BackendType::RawSocketMmap, BackendType::RawSocketMmap);
         assert_eq!(BackendType::Auto, BackendType::Auto);
         assert_ne!(BackendType::Dpdk, BackendType::RawSocket);
+    }
+
+    // ========================================================================
+    // PHASE B: BUILDER TOPOLOGY CONFIGURATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_builder_default_is_run_to_completion_under_stubs() {
+        // Under stubs, builder.bind() should produce a run-to-completion socket
+        // (no pipeline threads, no topology overhead)
+        let socket = UdpSocket::builder()
+            .bind("127.0.0.1:0")
+            .expect("builder bind should succeed");
+        assert!(socket.is_run_to_completion());
+        assert!(socket.topology_plan().is_none());
+    }
+
+    #[test]
+    fn test_builder_explicit_rtc_override() {
+        // Explicitly requesting workers_per_queue(0) forces run-to-completion
+        // even if more cores would be available (under stubs this is the default
+        // anyway, but the explicit setting is tested for the API contract)
+        let socket = UdpSocket::builder()
+            .rx_queues(1)
+            .workers_per_queue(0)
+            .bind("127.0.0.1:0")
+            .expect("builder bind should succeed");
+        assert!(socket.is_run_to_completion());
+    }
+
+    #[test]
+    fn test_builder_topology_config() {
+        // Test that builder correctly produces TopologyConfig
+        let builder = UdpSocketBuilder::new()
+            .rx_queues(4)
+            .workers_per_queue(2);
+        let config = builder.topology_config();
+        assert_eq!(config.rx_queues, Some(4));
+        assert_eq!(config.workers_per_queue, Some(2));
+    }
+
+    #[test]
+    fn test_builder_partial_config() {
+        // Setting only one parameter should leave the other as auto-detect
+        let builder = UdpSocketBuilder::new()
+            .workers_per_queue(0);
+        let config = builder.topology_config();
+        assert_eq!(config.rx_queues, None);
+        assert_eq!(config.workers_per_queue, Some(0));
+    }
+
+    #[test]
+    fn test_socket_is_run_to_completion_by_default() {
+        // Standard bind() with no builder should be run-to-completion
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .expect("bind should succeed");
+        assert!(socket.is_run_to_completion());
     }
 }

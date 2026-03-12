@@ -3,7 +3,7 @@
 # run-perf-tests.sh — Performance test orchestrator for dpdk-stdlib-rust
 #
 # Deploys a TRex generator + DUT instance, runs UDP echo benchmarks across
-# 4 configurations (rust-dpdk, native-dpdk, rust-stdlib, plain-rust),
+# 5 configurations (rust-dpdk, rust-dpdk-multicore, native-dpdk, rust-stdlib, plain-rust),
 # collects structured JSON results, and posts a summary to the PR.
 #
 # Usage:
@@ -15,7 +15,7 @@
 #   --packet-sizes      Comma-separated sizes (default: 64,512,1400)
 #   --duration          Seconds per rate step (default: 30)
 #   --rate-steps        Comma-separated target PPS values (default: 70000,140000,350000,700000)
-#   --configs           Comma-separated DUT configs (default: rust-dpdk,native-dpdk,rust-stdlib,plain-rust)
+#   --configs           Comma-separated DUT configs (default: rust-stdlib,plain-rust,rust-dpdk,rust-dpdk-multicore,native-dpdk)
 #   --json-summary      Write JSON summary file
 #   -h, --help          Show help
 # =============================================================================
@@ -34,7 +34,7 @@ DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
+CONFIGS="rust-stdlib,plain-rust,rust-dpdk,rust-dpdk-multicore,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
@@ -926,6 +926,39 @@ start_dut_rust_dpdk() {
     log_info "rust-dpdk echo server running"
 }
 
+start_dut_rust_dpdk_multicore() {
+    log_info "Starting DUT: rust-dpdk-multicore (echo server with DPDK backend + multi-core pipeline)"
+    dut_bind_dpdk || return 1
+
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+
+    # Launch with --workers 2 to enable multi-core pipeline (2 workers per RX queue)
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --workers 2 > /var/log/echo-rust-dpdk-multicore.log 2>&1 &"
+    sleep 15
+
+    # Verify it's running (retry up to 3 times — SSM can be slow)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "rust-dpdk-multicore verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
+    if [[ "$status" != *"running"* ]]; then
+        log_error "rust-dpdk-multicore echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-rust-dpdk-multicore.log 2>/dev/null" || true
+        return 1
+    fi
+    log_info "rust-dpdk-multicore echo server running"
+}
+
 start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd 5tswap)"
     dut_bind_dpdk || return 1
@@ -1090,7 +1123,7 @@ else:
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
         lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-stdlib", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-dpdk-multicore", "rust-stdlib", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {}).get(pkt_size, [])
 
@@ -1453,10 +1486,11 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
         # Start the appropriate DUT config
         local start_ok=true
         case "$config" in
-            rust-dpdk)    start_dut_rust_dpdk   || start_ok=false ;;
-            native-dpdk)  start_dut_native_dpdk || start_ok=false ;;
-            rust-stdlib)  start_dut_rust_stdlib  || start_ok=false ;;
-            plain-rust)   start_dut_plain_rust   || start_ok=false ;;
+            rust-dpdk)           start_dut_rust_dpdk           || start_ok=false ;;
+            rust-dpdk-multicore) start_dut_rust_dpdk_multicore || start_ok=false ;;
+            native-dpdk)         start_dut_native_dpdk         || start_ok=false ;;
+            rust-stdlib)         start_dut_rust_stdlib          || start_ok=false ;;
+            plain-rust)          start_dut_plain_rust           || start_ok=false ;;
             *)
                 log_error "Unknown config: $config"
                 failed_configs+=("$config")
@@ -1496,10 +1530,11 @@ ${dut_diag}
         # Collect DUT app log for this config
         local log_file
         case "$config" in
-            rust-dpdk)    log_file="/var/log/echo-rust-dpdk.log" ;;
-            native-dpdk)  log_file="/var/log/testpmd.log" ;;
-            rust-stdlib)  log_file="/var/log/echo-rust-stdlib.log" ;;
-            plain-rust)   log_file="/var/log/plain-echo.log" ;;
+            rust-dpdk)           log_file="/var/log/echo-rust-dpdk.log" ;;
+            rust-dpdk-multicore) log_file="/var/log/echo-rust-dpdk-multicore.log" ;;
+            native-dpdk)         log_file="/var/log/testpmd.log" ;;
+            rust-stdlib)         log_file="/var/log/echo-rust-stdlib.log" ;;
+            plain-rust)          log_file="/var/log/plain-echo.log" ;;
         esac
         if [[ -n "${log_file:-}" ]]; then
             local app_log
