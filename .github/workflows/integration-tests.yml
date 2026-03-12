@@ -237,16 +237,32 @@ jobs:
           done
           echo "" >> "$REPORT"
 
-          # Application logs (most useful for debugging test failures)
-          echo "<details><summary>Application Logs</summary>" >> "$REPORT"
+          # Application logs — last 20 lines shown inline for quick context,
+          # full log (last 200 lines) in collapsible section.
+          echo "### Application Logs (last 20 lines)" >> "$REPORT"
           echo "" >> "$REPORT"
           for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log instance-logs/*-test-client-iperf.log instance-logs/*-iperf3-server.log; do
             [ -f "$log" ] || continue
             LOGSIZE=$(wc -c < "$log")
             [ "$LOGSIZE" -gt 5 ] || continue  # skip near-empty files
+            LOGNAME=$(basename "$log")
+            echo "**${LOGNAME}**" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "" >> "$REPORT"
+
+          # Full application logs in collapsible section
+          echo "<details><summary>Full Application Logs (last 200 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log instance-logs/*-test-client-iperf.log instance-logs/*-iperf3-server.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
             echo "#### $(basename "$log")" >> "$REPORT"
             echo '```' >> "$REPORT"
-            tail -40 "$log" >> "$REPORT"
+            tail -200 "$log" >> "$REPORT"
             echo '```' >> "$REPORT"
           done
           echo "</details>" >> "$REPORT"

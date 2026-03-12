@@ -18,8 +18,9 @@ use std::thread::{self, JoinHandle};
 
 use crate::arp::{self, ArpCache, ArpHandler};
 use crate::icmp::{self, IcmpHandler};
+use crate::perf::PerfCounters;
 use crate::ring::{MpscRing, SpscRing};
-use crate::{parse_udp_packet, ETH_HEADER_LEN, ETH_TYPE_IPV4};
+use crate::{parse_udp_packet, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
 
 // ============================================================================
 // TopologyConfig — input from builder / env / auto
@@ -180,6 +181,8 @@ pub struct PipelineConfig {
     pub local_ip: Ipv4Addr,
     /// Shared ARP cache for MAC learning.
     pub arp_cache: Arc<ArpCache>,
+    /// Shared performance counters.
+    pub perf_counters: Arc<PerfCounters>,
 }
 
 /// Build and start the multi-core pipeline.
@@ -205,8 +208,10 @@ where
     let shutdown = Arc::new(AtomicBool::new(false));
     let workers_per_queue = config.plan.workers_per_queue as usize;
 
-    // Ring sizes: 4096 slots per ring should handle bursts without backpressure.
-    let ring_capacity = 4096;
+    // Ring sizes: 16384 slots to absorb bursts without TX backpressure.
+    // The TX ring is the bottleneck under echo workloads where send rate ≈ recv rate,
+    // because the RX lcore must drain TX between RX bursts.
+    let ring_capacity = 16384;
 
     // App ring: all workers → recv_from(). MPSC.
     let app_ring = Arc::new(MpscRing::new(ring_capacity));
@@ -230,11 +235,12 @@ where
         let shutdown = Arc::clone(&shutdown);
         let local_port = config.local_port;
         let arp_cache = Arc::clone(&config.arp_cache);
+        let perf_counters = Arc::clone(&config.perf_counters);
 
         let handle = thread::Builder::new()
             .name(format!("dpdk-worker-{}", w_idx))
             .spawn(move || {
-                worker_loop(w_ring, app_ring, shutdown, local_port, arp_cache);
+                worker_loop(w_ring, app_ring, shutdown, local_port, arp_cache, perf_counters);
             })
             .expect("failed to spawn worker thread");
         handles.push(handle);
@@ -251,6 +257,7 @@ where
         let local_mac = config.local_mac;
         let local_ip = config.local_ip;
         let arp_cache = Arc::clone(&config.arp_cache);
+        let perf_counters = Arc::clone(&config.perf_counters);
 
         let handle = thread::Builder::new()
             .name("dpdk-rx-0".to_string())
@@ -264,6 +271,7 @@ where
                     local_mac,
                     local_ip,
                     arp_cache,
+                    perf_counters,
                 );
             })
             .expect("failed to spawn RX thread");
@@ -293,6 +301,7 @@ fn rx_loop<R, S>(
     local_mac: [u8; 6],
     local_ip: Ipv4Addr,
     arp_cache: Arc<ArpCache>,
+    perf_counters: Arc<PerfCounters>,
 ) where
     R: Fn(usize) -> io::Result<Vec<Vec<u8>>>,
     S: Fn(&[u8]) -> io::Result<usize>,
@@ -303,8 +312,8 @@ fn rx_loop<R, S>(
     let mut rr_index: usize = 0;
 
     while !shutdown.load(Ordering::Acquire) {
-        // 1. Drain TX ring → send to NIC
-        let tx_batch = tx_ring.dequeue_batch(32);
+        // 1. Drain TX ring → send to NIC (up to 256 frames per cycle to keep up with echo workloads)
+        let tx_batch = tx_ring.dequeue_batch(256);
         for tx in &tx_batch {
             let _ = send_fn(&tx.frame);
         }
@@ -324,6 +333,11 @@ fn rx_loop<R, S>(
             continue;
         }
 
+        if !frames.is_empty() {
+            perf_inc!(perf_counters.rx_bursts);
+            perf_inc!(perf_counters.rx_burst_sum, frames.len() as u64);
+        }
+
         for frame_data in frames {
             if frame_data.len() < 14 {
                 continue;
@@ -336,6 +350,7 @@ fn rx_loop<R, S>(
                 if let Some(reply) = arp_handler.process_arp(&frame_data) {
                     let _ = send_fn(&reply);
                 }
+                perf_inc!(perf_counters.rx_arp_handled);
                 continue;
             }
 
@@ -346,6 +361,7 @@ fn rx_loop<R, S>(
                     if let Some(reply) = icmp_handler.process_icmp(&frame_data) {
                         let _ = send_fn(&reply);
                     }
+                    perf_inc!(perf_counters.rx_icmp_handled);
                     continue;
                 }
             }
@@ -365,8 +381,17 @@ fn rx_loop<R, S>(
             }
             if !sent {
                 // All worker rings full — drop frame (backpressure)
-                // In production, this would increment a counter
+                perf_inc!(perf_counters.rx_drops_ring_full);
+                perf_inc!(perf_counters.worker_ring_enqueue_fail);
             }
+        }
+
+        // 3. Second TX drain pass — workers may have enqueued replies while we were
+        //    processing RX frames. Draining here cuts echo latency in half by not
+        //    waiting for the next loop iteration.
+        let tx_batch2 = tx_ring.dequeue_batch(256);
+        for tx in &tx_batch2 {
+            let _ = send_fn(&tx.frame);
         }
     }
 }
@@ -381,10 +406,12 @@ fn worker_loop(
     shutdown: Arc<AtomicBool>,
     local_port: u16,
     arp_cache: Arc<ArpCache>,
+    perf_counters: Arc<PerfCounters>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         let batch = rx_ring.dequeue_batch(32);
         if batch.is_empty() {
+            perf_inc!(perf_counters.worker_idle_polls);
             std::hint::spin_loop();
             continue;
         }
@@ -392,6 +419,10 @@ fn worker_loop(
         for frame_data in batch {
             // Parse UDP packet
             if let Some(parsed) = parse_udp_packet(&frame_data) {
+                perf_inc!(perf_counters.worker_packets_processed);
+                perf_inc!(perf_counters.rx_packets);
+                perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
+
                 // Learn source MAC from incoming packets
                 if frame_data.len() >= 12 {
                     let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
@@ -420,8 +451,12 @@ fn worker_loop(
                     };
 
                     // Enqueue to app ring; if full, drop (backpressure)
-                    let _ = app_ring.enqueue(packet);
+                    if app_ring.enqueue(packet).is_err() {
+                        perf_inc!(perf_counters.app_ring_enqueue_fail);
+                    }
                 }
+            } else {
+                perf_inc!(perf_counters.rx_drops_parse_fail);
             }
         }
     }
@@ -549,6 +584,7 @@ fn clamp_rx_queues(requested: u16, nic_max: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::PerfCounters;
     use std::sync::Mutex;
 
     fn default_config() -> TopologyConfig {
@@ -732,6 +768,7 @@ mod tests {
             local_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02],
             local_ip: Ipv4Addr::new(10, 0, 0, 2),
             arp_cache: Arc::new(crate::ArpCache::new()),
+            perf_counters: Arc::new(PerfCounters::new()),
         };
 
         let mut topo = start_pipeline(config, recv_fn, send_fn)
@@ -773,6 +810,7 @@ mod tests {
             local_mac: [0; 6],
             local_ip: Ipv4Addr::UNSPECIFIED,
             arp_cache: Arc::new(crate::ArpCache::new()),
+            perf_counters: Arc::new(PerfCounters::new()),
         };
 
         let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
@@ -808,6 +846,7 @@ mod tests {
             local_mac: [0; 6],
             local_ip: Ipv4Addr::UNSPECIFIED,
             arp_cache: Arc::new(crate::ArpCache::new()),
+            perf_counters: Arc::new(PerfCounters::new()),
         };
 
         let mut topo = start_pipeline(config, recv_fn, send_fn)
@@ -882,6 +921,7 @@ mod tests {
             local_mac: [0; 6],
             local_ip: Ipv4Addr::UNSPECIFIED,
             arp_cache: Arc::new(crate::ArpCache::new()),
+            perf_counters: Arc::new(PerfCounters::new()),
         };
 
         let mut topo = start_pipeline(config, recv_fn, send_fn)

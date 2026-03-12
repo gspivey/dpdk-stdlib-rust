@@ -935,8 +935,9 @@ start_dut_rust_dpdk_multicore() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     # Launch with --workers 2 to enable multi-core pipeline (2 workers per RX queue)
+    # --perf-interval 10 enables instrumentation output every 10s to the log file
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --workers 2 > /var/log/echo-rust-dpdk-multicore.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --workers 2 --perf-interval 10 > /var/log/echo-rust-dpdk-multicore.log 2>&1 &"
     sleep 15
 
     # Verify it's running (retry up to 3 times — SSM can be slow)
@@ -1244,6 +1245,7 @@ Packet sizes: \`$PACKET_SIZES\`"
         # Wait for stack to fully delete, retrying on DELETE_FAILED
         local stack_wait=0
         local destroy_retries=0
+        local stack_deleted=false
         while [[ $stack_wait -lt 900 ]]; do
             stack_status=$(aws cloudformation describe-stacks \
                 --stack-name "$CDK_STACK_NAME" \
@@ -1251,6 +1253,7 @@ Packet sizes: \`$PACKET_SIZES\`"
                 --output text 2>/dev/null || echo "GONE")
             if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
                 log_info "Stack fully cleaned up (status: $stack_status)"
+                stack_deleted=true
                 break
             fi
             if [[ "$stack_status" == "DELETE_FAILED" && $destroy_retries -lt 3 ]]; then
@@ -1260,9 +1263,8 @@ Packet sizes: \`$PACKET_SIZES\`"
                     aws cloudformation delete-stack \
                         --stack-name "$CDK_STACK_NAME" 2>&1 || true
                 else
-                    # Final attempt: delete stack retaining the stuck ENI attachments
-                    # (they'll be cleaned up when the instances terminate)
-                    log_warn "Final retry: deleting stack with --retain-resources for stuck attachments..."
+                    # Final attempt: delete stack retaining the stuck resources
+                    log_warn "Final retry: deleting stack with --retain-resources for stuck resources..."
                     local stuck_resources
                     stuck_resources=$(aws cloudformation describe-stack-events \
                         --stack-name "$CDK_STACK_NAME" \
@@ -1288,8 +1290,110 @@ Packet sizes: \`$PACKET_SIZES\`"
             stack_wait=$((stack_wait + 15))
         done
 
+        # If the wait loop timed out, the stack is still not deleted.
+        # Try force-delete with --retain-resources as a last resort before giving up.
+        if [[ "$stack_deleted" == "false" ]]; then
+            stack_status=$(aws cloudformation describe-stacks \
+                --stack-name "$CDK_STACK_NAME" \
+                --query "Stacks[0].StackStatus" \
+                --output text 2>/dev/null || echo "GONE")
+
+            if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
+                log_info "Stack deleted just after timeout (status: $stack_status)"
+            elif [[ "$stack_status" == "DELETE_IN_PROGRESS" ]]; then
+                # Stack is still deleting after 15 min — something is stuck.
+                # Cancel the in-progress delete by requesting a new delete with
+                # --retain-resources for everything that's blocking deletion.
+                log_warn "Stack still DELETE_IN_PROGRESS after 900s — escalating with --retain-resources..."
+                local all_resources
+                all_resources=$(aws cloudformation list-stack-resources \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackResourceSummaries[?ResourceStatus!='DELETE_COMPLETE'].LogicalResourceId" \
+                    --output text 2>/dev/null | tr '\t' ' ')
+                if [[ -n "$all_resources" ]]; then
+                    log_info "Retaining undeletable resources: $all_resources"
+                    # shellcheck disable=SC2086
+                    aws cloudformation delete-stack \
+                        --stack-name "$CDK_STACK_NAME" \
+                        --retain-resources $all_resources 2>&1 || true
+                fi
+                # Wait up to 120s more for the retain-resources delete to complete
+                local extra_wait=0
+                while [[ $extra_wait -lt 120 ]]; do
+                    sleep 15
+                    extra_wait=$((extra_wait + 15))
+                    stack_status=$(aws cloudformation describe-stacks \
+                        --stack-name "$CDK_STACK_NAME" \
+                        --query "Stacks[0].StackStatus" \
+                        --output text 2>/dev/null || echo "GONE")
+                    if [[ "$stack_status" == "GONE" || "$stack_status" == "DELETE_COMPLETE" ]]; then
+                        log_info "Stack cleaned up after retain-resources escalation"
+                        break
+                    fi
+                    log_info "Waiting for retain-resources delete (status: $stack_status, ${extra_wait}s)..."
+                done
+                # Final check
+                stack_status=$(aws cloudformation describe-stacks \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "Stacks[0].StackStatus" \
+                    --output text 2>/dev/null || echo "GONE")
+                if [[ "$stack_status" != "GONE" && "$stack_status" != "DELETE_COMPLETE" ]]; then
+                    log_error "Stack still not deleted after all retries (status: $stack_status). Cannot deploy."
+                    exit 2
+                fi
+            elif [[ "$stack_status" == "DELETE_FAILED" ]]; then
+                # One more try with --retain-resources
+                log_warn "Stack in DELETE_FAILED after timeout — final retain-resources attempt..."
+                local stuck_resources
+                stuck_resources=$(aws cloudformation describe-stack-events \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+                    --output text 2>/dev/null | tr '\t' ' ')
+                if [[ -n "$stuck_resources" ]]; then
+                    # shellcheck disable=SC2086
+                    aws cloudformation delete-stack \
+                        --stack-name "$CDK_STACK_NAME" \
+                        --retain-resources $stuck_resources 2>&1 || true
+                else
+                    aws cloudformation delete-stack \
+                        --stack-name "$CDK_STACK_NAME" 2>&1 || true
+                fi
+                sleep 30
+                stack_status=$(aws cloudformation describe-stacks \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "Stacks[0].StackStatus" \
+                    --output text 2>/dev/null || echo "GONE")
+                if [[ "$stack_status" != "GONE" && "$stack_status" != "DELETE_COMPLETE" ]]; then
+                    log_error "Stack still not deleted after all retries (status: $stack_status). Cannot deploy."
+                    exit 2
+                fi
+            else
+                log_error "Stack in unexpected state after cleanup timeout: $stack_status"
+                exit 2
+            fi
+        fi
+
         npx cdk deploy "$CDK_STACK_NAME" --require-approval never $context_args \
-            || { log_error "CDK deploy failed"; exit 2; }
+            || {
+                log_error "CDK deploy failed — dumping CloudFormation events..."
+                # Capture CFN events so we can diagnose what resource failed
+                aws cloudformation describe-stack-events \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackEvents[?contains(ResourceStatus,'FAILED') || contains(ResourceStatus,'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+                    --output table 2>/dev/null || true
+                # Also post to PR so we can read it remotely
+                local cfn_events
+                cfn_events=$(aws cloudformation describe-stack-events \
+                    --stack-name "$CDK_STACK_NAME" \
+                    --query "StackEvents[?contains(ResourceStatus,'FAILED') || contains(ResourceStatus,'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+                    --output text 2>/dev/null | head -20 || echo "(no events)")
+                post_pr_comment "## [Perf] Stage: Deploy FAILED
+CDK deploy failed. CloudFormation events:
+\`\`\`
+$cfn_events
+\`\`\`"
+                exit 2
+            }
 
         cd "$REPO_ROOT"
     fi

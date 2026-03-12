@@ -2,14 +2,14 @@
 
 ## Phase 1: Instrumentation (Visibility First)
 
-- [ ] **P1.1**: Implement `PerfCounters` struct in `dpdk-udp/src/perf.rs` — all `AtomicU64` fields, cache-line aligned, `new()`, `snapshot()`, `reset_interval()` methods
-- [ ] **P1.2**: Implement `LatencySampler` in `dpdk-udp/src/perf.rs` — fixed-size ring buffer, configurable sample rate (default 1:1000), `record(duration_ns)`, `percentiles() -> (p50, p95, p99, p99.9, max)`
-- [ ] **P1.3**: Implement `PerfReporter` background thread — reads counters + sampler every N seconds, computes rates by diffing snapshots, emits structured key=value log line to stderr
-- [ ] **P1.4**: Wire counters into `UdpSocket` — add `Arc<PerfCounters>` field, increment on send/recv/drop/arp/icmp paths, add `perf_counters()`, `enable_perf_reporting()`, `perf_snapshot()` API methods
-- [ ] **P1.5**: Wire counters into multi-core topology — increment `rx_drops_ring_full`, `worker_idle_polls`, `worker_packets_processed`, ring enqueue failures in `rx_loop` and `worker_loop`
-- [ ] **P1.6**: Wire latency sampling — timestamp at `rx_burst` return, timestamp at `recv_from()` return, record delta on sampled packets
-- [ ] **P1.7**: Add `--perf-interval <seconds>` flag to echo app — enables `enable_perf_reporting()` at startup, default 10s
-- [ ] **P1.8**: Unit tests for `PerfCounters` (concurrent increment + snapshot), `LatencySampler` (percentile accuracy), `PerfReporter` (output format)
+- [x] **P1.1**: Implement `PerfCounters` struct in `dpdk-udp/src/perf.rs` — all `AtomicU64` fields, cache-line aligned, `new()`, `snapshot()`, `reset_interval()` methods
+- [x] **P1.2**: Implement `LatencySampler` in `dpdk-udp/src/perf.rs` — fixed-size ring buffer, configurable sample rate (default 1:1000), `record(duration_ns)`, `percentiles() -> (p50, p95, p99, p99.9, max)`
+- [x] **P1.3**: Implement `PerfReporter` background thread — reads counters + sampler every N seconds, computes rates by diffing snapshots, emits structured key=value log line to stderr
+- [x] **P1.4**: Wire counters into `UdpSocket` — add `Arc<PerfCounters>` field, increment on send/recv/drop/arp/icmp paths, add `perf_counters()`, `enable_perf_reporting()`, `perf_snapshot()` API methods
+- [x] **P1.5**: Wire counters into multi-core topology — increment `rx_drops_ring_full`, `worker_idle_polls`, `worker_packets_processed`, ring enqueue failures in `rx_loop` and `worker_loop`
+- [x] **P1.6**: Wire latency sampling — timestamp at `rx_burst` return, timestamp at `recv_from()` return, record delta on sampled packets
+- [x] **P1.7**: Add `--perf-interval <seconds>` flag to echo app — enables `enable_perf_reporting()` at startup, default 10s
+- [x] **P1.8**: Unit tests for `PerfCounters` (concurrent increment + snapshot), `LatencySampler` (percentile accuracy), `PerfReporter` (output format)
 - [ ] **P1.9**: Run perf benchmark with instrumentation enabled — verify < 1% throughput regression at 350K PPS vs uninstrumented baseline
 
 ## Phase 2: Quick Wins (Low-Risk, High-Impact)

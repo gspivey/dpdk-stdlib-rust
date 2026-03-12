@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "UDP protocol implementation with DPDK acceleration and raw socket fallback"
 
+[features]
+default = ["perf-counters"]
+## Enable hot-path performance counters (atomic increments on every packet).
+## Disable with `--no-default-features` to eliminate all instrumentation overhead
+## from the TX/RX fast paths — useful for latency-critical production deployments.
+perf-counters = []
+
 [dependencies]
 thiserror = { workspace = true }
 dpdk = { path = "../dpdk" }
