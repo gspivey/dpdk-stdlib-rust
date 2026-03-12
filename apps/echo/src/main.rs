@@ -17,6 +17,7 @@ trait UdpSocketTrait {
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn enable_perf_reporting(&self, _interval: Duration) -> io::Result<()> { Ok(()) }
 }
 
 // Implement trait for std::net::UdpSocket
@@ -55,6 +56,10 @@ impl UdpSocketTrait for dpdk_udp::UdpSocket {
 
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         self.set_read_timeout(dur)
+    }
+
+    fn enable_perf_reporting(&self, interval: Duration) -> io::Result<()> {
+        self.enable_perf_reporting(interval)
     }
 }
 
@@ -130,6 +135,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     rx_queues: u16,
 
+    /// Performance reporting interval in seconds (0 = disabled).
+    /// When set, emits structured [PERF] log lines to stderr every N seconds.
+    #[arg(long, default_value_t = 0)]
+    perf_interval: u64,
+
     /// Use synthetic packet mode (for protocol testing - developer option)
     #[arg(long, hide = true)]
     synthetic: bool,
@@ -156,6 +166,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Binding to {}", bind_addr);
 
         let socket = bind_socket(&bind_addr, args.workers, args.rx_queues)?;
+        if args.perf_interval > 0 {
+            socket.enable_perf_reporting(Duration::from_secs(args.perf_interval))?;
+            println!("Performance reporting enabled (interval: {}s)", args.perf_interval);
+        }
         run_echo_server(socket)?;
     }
 
