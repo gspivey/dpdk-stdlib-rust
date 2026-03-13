@@ -21,14 +21,14 @@
 
 ## Phase 3: Multi-Core Pipeline Redesign
 
-- [ ] **P3.1**: Implement `FramePool` slab allocator — pre-allocated contiguous buffer of N × frame_size bytes, SPSC free list, `alloc() -> Option<u32>`, `free(u32)`, `frame_mut(u32) -> &mut [u8]`
-- [ ] **P3.2**: Define `FrameRef { pool_idx: u32, len: u16 }` — replace `Vec<u8>` in worker SPSC rings with `FrameRef`, update `rx_loop` to allocate from pool and enqueue `FrameRef`
-- [ ] **P3.3**: Update `worker_loop` to use `FrameRef` — access frame data via pool, free frame index back to pool after processing
-- [ ] **P3.4**: Replace MPSC `app_ring` with per-worker SPSC app rings — `recv_from()` polls round-robin across worker app rings
+- [x] **P3.1**: Implement `FramePool` slab allocator — pre-allocated contiguous buffer of N × frame_size bytes, SPSC free list, `alloc() -> Option<u32>`, `free(u32)`, `frame_mut(u32) -> &mut [u8]`
+- [x] **P3.2**: Define `FrameRef { pool_idx: u32, len: u16 }` — replace `Vec<u8>` in worker SPSC rings with `FrameRef`, update `rx_loop` to allocate from pool and enqueue `FrameRef`
+- [x] **P3.3**: Update `worker_loop` to use `FrameRef` — access frame data via pool, free frame index back to pool after processing
+- [x] **P3.4**: Replace MPSC `app_ring` with per-worker SPSC app rings — `recv_from()` polls round-robin across worker app rings
 - [ ] **P3.5**: Implement worker-direct TX — detect NIC TX queue count, assign TX queues to workers, workers call `port.tx_burst(queue_id)` directly instead of enqueuing to TX ring
-- [ ] **P3.6**: Fix RSS-aware worker affinity — each RSS queue maps 1:1 to its worker set, remove round-robin distribution
+- [x] **P3.6**: Fix RSS-aware worker affinity — each RSS queue maps 1:1 to its worker set, remove round-robin distribution
 - [ ] **P3.7**: Benchmark Phase 3 changes — measure multi-core latency + throughput at 70K/140K/350K/700K PPS, compare to single-core and native baselines
-- [ ] **P3.8**: Unit tests for `FramePool` — alloc/free cycle, pool exhaustion, concurrent access patterns
+- [x] **P3.8**: Unit tests for `FramePool` — alloc/free cycle, pool exhaustion, concurrent access patterns
 
 ## Phase 4: Hardware Offload & Polish
 

@@ -5,6 +5,35 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #3: Phase 3 — Multi-Core Pipeline Redesign
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-03-13 |
+| **Git Hash** | `6499d51` |
+| **Branch** | `claude/performance-optimization-phase-3-CHQub` |
+| **PR** | [#25](https://github.com/gspivey/dpdk-stdlib-rust/pull/25) |
+| **GH Actions Run** | [23035215239](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/23035215239) |
+| **Instance Type** | c5n.2xlarge |
+| **Traffic Generator** | TRex |
+
+### Changes Since Previous Run
+
+- **P3.1 FramePool slab allocator**: Pre-allocated contiguous buffer (16384 × 2048 bytes) with lock-free SPSC free list. Zero per-packet heap allocation on RX→Worker path.
+- **P3.2-P3.3 FrameRef zero-copy**: 8-byte `FrameRef` (pool_idx + len) replaces `Vec<u8>` in worker SPSC rings. No frame cloning.
+- **P3.4 Per-worker SPSC app rings**: Replaces shared MPSC `app_ring`. `recv_from()` polls round-robin. Eliminates CAS contention.
+- **P3.6 RSS-aware worker affinity**: Direct queue-to-worker mapping for flow locality.
+
+### Results: 1400B Packets
+
+*Pending — perf-tests.yml run [23035215239](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/23035215239) in progress.*
+
+### Analysis
+
+*Pending benchmark results.*
+
+---
+
 ## Run #2: Phase 2 — Quick Wins
 
 | Field | Value |
