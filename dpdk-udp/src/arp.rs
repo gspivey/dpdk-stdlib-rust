@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -244,10 +245,49 @@ impl ArpCacheEntry {
     }
 }
 
-/// Thread-safe ARP cache for storing IP -> MAC mappings
-#[derive(Debug)]
+/// Thread-safe ARP cache for storing IP -> MAC mappings.
+///
+/// Includes a lock-free fast-path for the common single-peer pattern (echo server):
+/// the most recently seen (IP, MAC) pair is cached in atomics and checked before
+/// acquiring the RwLock. This covers the steady-state case with zero synchronization.
 pub struct ArpCache {
     entries: RwLock<HashMap<Ipv4Addr, ArpCacheEntry>>,
+    /// Fast-path: last-seen IP address (as u32, network byte order). 0 = empty.
+    fast_ip: AtomicU32,
+    /// Fast-path: last-seen MAC address (6 bytes packed into lower 48 bits of u64).
+    fast_mac: AtomicU64,
+}
+
+impl std::fmt::Debug for ArpCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArpCache")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pack a 6-byte MAC address into the lower 48 bits of a u64.
+#[inline]
+fn mac_to_u64(mac: &[u8; 6]) -> u64 {
+    (mac[0] as u64) << 40
+        | (mac[1] as u64) << 32
+        | (mac[2] as u64) << 24
+        | (mac[3] as u64) << 16
+        | (mac[4] as u64) << 8
+        | (mac[5] as u64)
+}
+
+/// Unpack a u64 (lower 48 bits) back into a 6-byte MAC address.
+#[inline]
+fn u64_to_mac(val: u64) -> [u8; 6] {
+    [
+        (val >> 40) as u8,
+        (val >> 32) as u8,
+        (val >> 24) as u8,
+        (val >> 16) as u8,
+        (val >> 8) as u8,
+        val as u8,
+    ]
 }
 
 impl ArpCache {
@@ -255,11 +295,25 @@ impl ArpCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            fast_ip: AtomicU32::new(0),
+            fast_mac: AtomicU64::new(0),
         }
     }
 
-    /// Look up a MAC address for an IP
+    /// Look up a MAC address for an IP.
+    ///
+    /// Uses a lock-free fast-path: if the IP matches the most recently cached
+    /// (IP, MAC) pair, returns immediately without acquiring the RwLock.
     pub fn lookup(&self, ip: &Ipv4Addr) -> Option<MacAddress> {
+        // Fast-path: check the atomic last-seen pair
+        let ip_bits = u32::from(*ip);
+        let cached_ip = self.fast_ip.load(Ordering::Relaxed);
+        if cached_ip != 0 && cached_ip == ip_bits {
+            let mac_bits = self.fast_mac.load(Ordering::Relaxed);
+            return Some(MacAddress::new(u64_to_mac(mac_bits)));
+        }
+
+        // Slow-path: RwLock HashMap lookup
         let entries = self.entries.read().unwrap();
         entries.get(ip).and_then(|entry| {
             if entry.is_expired() {
@@ -270,14 +324,26 @@ impl ArpCache {
         })
     }
 
-    /// Insert or update an entry
+    /// Insert or update an entry.
+    ///
+    /// Also updates the atomic fast-path cache with this (IP, MAC) pair.
     pub fn insert(&self, ip: Ipv4Addr, mac: MacAddress) {
+        // Update fast-path atomics
+        self.fast_ip.store(u32::from(ip), Ordering::Relaxed);
+        self.fast_mac.store(mac_to_u64(&mac.octets()), Ordering::Relaxed);
+
         let mut entries = self.entries.write().unwrap();
         entries.insert(ip, ArpCacheEntry::new(mac));
     }
 
     /// Remove an entry
     pub fn remove(&self, ip: &Ipv4Addr) {
+        // Invalidate fast-path if it matches the removed IP
+        let ip_bits = u32::from(*ip);
+        if self.fast_ip.load(Ordering::Relaxed) == ip_bits {
+            self.fast_ip.store(0, Ordering::Relaxed);
+            self.fast_mac.store(0, Ordering::Relaxed);
+        }
         let mut entries = self.entries.write().unwrap();
         entries.remove(ip);
     }
@@ -300,6 +366,8 @@ impl ArpCache {
 
     /// Clear all entries
     pub fn clear(&self) {
+        self.fast_ip.store(0, Ordering::Relaxed);
+        self.fast_mac.store(0, Ordering::Relaxed);
         self.entries.write().unwrap().clear();
     }
 }
@@ -681,5 +749,69 @@ mod tests {
         let other_ip = Ipv4Addr::new(172, 16, 0, 1);
         let request3 = build_arp_request(&requester_mac, requester_ip, other_ip);
         assert!(handler.process_arp(&request3).is_none());
+    }
+
+    #[test]
+    fn test_arp_cache_fast_path() {
+        let cache = ArpCache::new();
+
+        let ip = Ipv4Addr::new(10, 0, 1, 5);
+        let mac = MacAddress::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+
+        // Fast-path should be empty initially
+        assert!(cache.lookup(&ip).is_none());
+
+        // Insert populates fast-path
+        cache.insert(ip, mac.clone());
+
+        // Lookup should hit fast-path (same IP)
+        let found = cache.lookup(&ip);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().octets(), mac.octets());
+
+        // Different IP should miss fast-path but still work via HashMap
+        let ip2 = Ipv4Addr::new(10, 0, 1, 6);
+        let mac2 = MacAddress::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        cache.insert(ip2, mac2.clone());
+
+        // ip2 is now the fast-path entry
+        let found2 = cache.lookup(&ip2);
+        assert_eq!(found2.unwrap().octets(), mac2.octets());
+
+        // ip1 is still in HashMap (slow path)
+        let found1 = cache.lookup(&ip);
+        assert_eq!(found1.unwrap().octets(), mac.octets());
+    }
+
+    #[test]
+    fn test_arp_cache_fast_path_remove_invalidates() {
+        let cache = ArpCache::new();
+
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let mac = MacAddress::new([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+
+        cache.insert(ip, mac);
+
+        // Should be in fast-path
+        assert!(cache.lookup(&ip).is_some());
+
+        // Remove should invalidate fast-path
+        cache.remove(&ip);
+        assert!(cache.lookup(&ip).is_none());
+    }
+
+    #[test]
+    fn test_mac_packing_roundtrip() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let packed = super::mac_to_u64(&mac);
+        let unpacked = super::u64_to_mac(packed);
+        assert_eq!(mac, unpacked);
+
+        // Edge cases
+        let zeros = [0u8; 6];
+        assert_eq!(zeros, super::u64_to_mac(super::mac_to_u64(&zeros)));
+
+        let ones = [0xFF; 6];
+        assert_eq!(ones, super::u64_to_mac(super::mac_to_u64(&ones)));
     }
 }
