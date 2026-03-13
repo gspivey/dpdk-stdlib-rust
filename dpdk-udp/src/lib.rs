@@ -15,7 +15,7 @@ use std::cell::UnsafeCell;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,7 @@ pub mod ring_buffer;
 pub mod ring;
 pub mod topology;
 pub mod perf;
+pub mod frame_pool;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpHandler, IcmpPacket};
@@ -48,6 +49,7 @@ pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};
 pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
+pub use frame_pool::{FramePool, FrameRef};
 pub use perf::{PerfCounters, PerfSnapshot, PerfReporter, LatencySampler};
 
 // ============================================================================
@@ -1186,6 +1188,8 @@ pub struct UdpSocket {
     latency_sampler: Arc<LatencySampler>,
     /// Background perf reporter (None if not enabled).
     perf_reporter: Mutex<Option<PerfReporter>>,
+    /// Round-robin index for polling per-worker app rings in recv_from_pipeline.
+    recv_from_rr_index: AtomicUsize,
 }
 
 impl UdpSocket {
@@ -1252,6 +1256,7 @@ impl UdpSocket {
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
+            recv_from_rr_index: AtomicUsize::new(0),
         })
     }
 
@@ -1335,6 +1340,7 @@ impl UdpSocket {
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
+            recv_from_rr_index: AtomicUsize::new(0),
         })
     }
 
@@ -1518,7 +1524,10 @@ impl UdpSocket {
         self.recv_from_inline(buf)
     }
 
-    /// Pipeline recv path: dequeue processed packets from the MPSC app_ring.
+    /// Pipeline recv path: dequeue processed packets from per-worker SPSC app rings.
+    ///
+    /// Phase 3: replaces MPSC app_ring with round-robin polling of per-worker
+    /// SPSC app rings, eliminating CAS contention.
     fn recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
 
@@ -1539,11 +1548,14 @@ impl UdpSocket {
                 }
             }
 
-            // Dequeue from the app_ring (filled by worker threads)
+            // Phase 3: Poll per-worker SPSC app rings round-robin
             let packet = {
                 let topo_guard = self.topology.lock().unwrap();
                 if let Some(ref topo) = *topo_guard {
-                    topo.app_ring.dequeue()
+                    let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
+                    let result = topo.dequeue_app(&mut rr);
+                    self.recv_from_rr_index.store(rr, Ordering::Relaxed);
+                    result
                 } else {
                     None
                 }
