@@ -31,11 +31,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::arp::{self, ArpCache, ArpHandler};
-use crate::frame_pool::{FramePool, FrameRef};
+use crate::frame_pool::{AppPacket, FramePool, FrameRef};
 use crate::icmp::{self, IcmpHandler};
 use crate::perf::PerfCounters;
 use crate::ring::{MpscRing, SpscRing};
-use crate::{parse_udp_packet, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
+use crate::{parse_udp_packet_ref, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
 
 // ============================================================================
 // TopologyConfig — input from builder / env / auto
@@ -148,19 +148,15 @@ pub struct TxFrame {
 /// The live multi-core topology: RX cores, worker cores, and shared rings.
 ///
 /// Phase 3 redesign:
-/// - `app_rings`: Per-worker SPSC rings (replaces shared MPSC app_ring)
+/// - `app_rings`: Per-worker SPSC rings carrying `AppPacket` (zero-copy FrameRef)
 /// - `tx_ring`: Still used for application-initiated sends (send_to)
 /// - Workers transmit echo replies directly via send_fn (worker-direct TX)
 pub struct MultiCoreTopology {
-    /// Per-worker SPSC app rings: each worker enqueues to its own ring,
+    /// Per-worker SPSC app rings: each worker enqueues `AppPacket` (zero-copy),
     /// `recv_from()` polls round-robin across all worker app rings.
-    pub app_rings: Vec<Arc<SpscRing<ProcessedPacket>>>,
+    pub app_rings: Vec<Arc<SpscRing<AppPacket>>>,
 
-    /// Legacy MPSC app_ring — kept for backward compatibility with existing
-    /// `recv_from_pipeline()` code. Phase 3 workers use per-worker SPSC rings,
-    /// but we still expose this so the existing dequeue code works.
-    /// In Phase 3, this is unused by workers but we keep it to avoid breaking
-    /// the API. `recv_from_pipeline` now polls `app_rings` instead.
+    /// Legacy MPSC app_ring — unused by Phase 3 workers but kept for API compat.
     pub app_ring: Arc<MpscRing<ProcessedPacket>>,
 
     /// TX ring for outbound frames. `send_to()` enqueues here;
@@ -178,6 +174,9 @@ pub struct MultiCoreTopology {
 
     /// Number of workers (for round-robin polling in recv_from).
     pub num_workers: usize,
+
+    /// Shared frame pool — `recv_from()` reads payload from here, then frees.
+    pub frame_pool: Arc<FramePool>,
 }
 
 impl MultiCoreTopology {
@@ -189,11 +188,12 @@ impl MultiCoreTopology {
         }
     }
 
-    /// Dequeue a processed packet from per-worker app rings (round-robin).
+    /// Dequeue an AppPacket from per-worker app rings (round-robin).
     ///
-    /// `rr_index` is the caller's round-robin counter — it should be
-    /// incremented after each successful dequeue to spread load evenly.
-    pub fn dequeue_app(&self, rr_index: &mut usize) -> Option<ProcessedPacket> {
+    /// The returned `AppPacket` holds a `FrameRef` into the shared `FramePool`.
+    /// The caller MUST free the frame via `frame_pool.free(pkt.frame_ref.pool_idx)`
+    /// after copying the payload.
+    pub fn dequeue_app(&self, rr_index: &mut usize) -> Option<AppPacket> {
         let n = self.app_rings.len();
         if n == 0 {
             return None;
@@ -269,7 +269,8 @@ where
     let frame_pool = Arc::new(FramePool::new(ring_capacity, 2048));
 
     // Per-worker SPSC app rings: worker → recv_from() (P3.4)
-    let app_rings: Vec<Arc<SpscRing<ProcessedPacket>>> = (0..workers_per_queue)
+    // Now carry AppPacket (zero-copy FrameRef) instead of ProcessedPacket (Vec<u8>)
+    let app_rings: Vec<Arc<SpscRing<AppPacket>>> = (0..workers_per_queue)
         .map(|_| Arc::new(SpscRing::new(ring_capacity)))
         .collect();
 
@@ -365,6 +366,7 @@ where
         handles,
         plan: config.plan,
         num_workers: workers_per_queue,
+        frame_pool,
     })
 }
 
@@ -528,14 +530,15 @@ fn rx_loop<R, S>(
     }
 }
 
-/// Worker core main loop (Phase 3).
+/// Worker core main loop (Phase 3 — true zero-copy).
 ///
-/// Dequeues FrameRefs from the SPSC ring, accesses frame data via the pool,
-/// parses UDP, and enqueues `ProcessedPacket` to its per-worker SPSC app ring.
-/// Frees frames back to the pool after processing.
+/// Dequeues FrameRefs from the SPSC ring, parses UDP headers in-place,
+/// and enqueues `AppPacket` (carrying FrameRef + payload offset) to its
+/// per-worker SPSC app ring. The frame is NOT freed here — `recv_from()`
+/// reads the payload directly from the pool and frees it afterward.
 fn worker_loop(
     rx_ring: Arc<SpscRing<FrameRef>>,
-    app_ring: Arc<SpscRing<ProcessedPacket>>,
+    app_ring: Arc<SpscRing<AppPacket>>,
     shutdown: Arc<AtomicBool>,
     local_port: u16,
     arp_cache: Arc<ArpCache>,
@@ -557,18 +560,20 @@ fn worker_loop(
 
         for frame_ref in batch {
             // SAFETY: frame_ref was allocated by rx_loop from the same pool.
-            // We hold exclusive access until we free it below.
-            let frame_data = unsafe { frame_pool.get_frame_data(&frame_ref) };
+            // We hold exclusive access until recv_from() frees it.
+            let frame_data = unsafe { frame_pool.frame(frame_ref.pool_idx) };
+            let frame_len = frame_ref.len as usize;
+            let frame_slice = &frame_data[..frame_len];
 
-            // Parse UDP packet
-            if let Some(parsed) = parse_udp_packet(frame_data) {
+            // Parse UDP packet headers in-place (zero-copy — borrows payload)
+            if let Some(parsed) = parse_udp_packet_ref(frame_slice) {
                 perf_inc!(perf_counters.worker_packets_processed);
                 perf_inc!(perf_counters.rx_packets);
                 perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
 
                 // Learn source MAC from incoming packets
-                if frame_data.len() >= 12 {
-                    let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
+                if frame_slice.len() >= 12 {
+                    let src_mac: [u8; 6] = frame_slice[6..12].try_into().unwrap();
                     arp_cache.insert(
                         parsed.src_ip,
                         dpdk::port::MacAddress::new(src_mac),
@@ -577,14 +582,20 @@ fn worker_loop(
 
                 // Filter by destination port
                 if parsed.dst_port == local_port {
-                    let src_mac: [u8; 6] = if frame_data.len() >= 12 {
-                        frame_data[6..12].try_into().unwrap()
+                    let src_mac: [u8; 6] = if frame_slice.len() >= 12 {
+                        frame_slice[6..12].try_into().unwrap()
                     } else {
                         [0; 6]
                     };
 
-                    let packet = ProcessedPacket {
-                        payload: parsed.payload,
+                    // Compute payload offset within the frame
+                    let payload_offset = parsed.payload.as_ptr() as usize
+                        - frame_slice.as_ptr() as usize;
+
+                    let app_pkt = AppPacket {
+                        frame_ref,
+                        payload_offset: payload_offset as u16,
+                        payload_len: parsed.payload.len() as u16,
                         src_addr: SocketAddr::V4(SocketAddrV4::new(
                             parsed.src_ip,
                             parsed.src_port,
@@ -594,16 +605,21 @@ fn worker_loop(
                     };
 
                     // P3.4: Enqueue to per-worker SPSC app ring (no CAS contention)
-                    if app_ring.enqueue(packet).is_err() {
+                    // Frame stays alive in pool until recv_from() frees it.
+                    if app_ring.enqueue(app_pkt).is_err() {
+                        // Ring full — must free the frame since recv_from won't see it
+                        frame_pool.free(frame_ref.pool_idx);
                         perf_inc!(perf_counters.app_ring_enqueue_fail);
                     }
+                } else {
+                    // Not our port — free the frame
+                    frame_pool.free(frame_ref.pool_idx);
                 }
             } else {
                 perf_inc!(perf_counters.rx_drops_parse_fail);
+                // Parse failed — free the frame
+                frame_pool.free(frame_ref.pool_idx);
             }
-
-            // P3.1: Free frame back to pool after processing
-            frame_pool.free(frame_ref.pool_idx);
         }
     }
 }
@@ -931,14 +947,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        topo.shutdown();
-
         let pkt = received.expect("should have received a packet through the pipeline");
-        assert_eq!(pkt.payload, b"hello pipeline");
+
+        // Read payload from pool via AppPacket (zero-copy verification)
+        let payload = unsafe {
+            let frame_data = topo.frame_pool.frame(pkt.frame_ref.pool_idx);
+            let start = pkt.payload_offset as usize;
+            let end = start + pkt.payload_len as usize;
+            &frame_data[start..end]
+        };
+        assert_eq!(payload, b"hello pipeline");
         assert_eq!(
             pkt.src_addr,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 12345))
         );
+
+        // Free the frame and shut down
+        topo.frame_pool.free(pkt.frame_ref.pool_idx);
+        topo.shutdown();
     }
 
     #[test]
@@ -1171,10 +1197,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        topo.shutdown();
-
         assert_eq!(received.len(), 4, "should have received all 4 packets");
         // Verify app_rings is populated (>= 1 ring per worker)
         assert_eq!(topo.app_rings.len(), 2);
+
+        // Free frames back to pool
+        for pkt in &received {
+            topo.frame_pool.free(pkt.frame_ref.pool_idx);
+        }
+
+        topo.shutdown();
     }
 }

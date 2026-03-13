@@ -49,7 +49,7 @@ pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};
 pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
-pub use frame_pool::{FramePool, FrameRef};
+pub use frame_pool::{AppPacket, FramePool, FrameRef};
 pub use perf::{PerfCounters, PerfSnapshot, PerfReporter, LatencySampler};
 
 // ============================================================================
@@ -1524,10 +1524,10 @@ impl UdpSocket {
         self.recv_from_inline(buf)
     }
 
-    /// Pipeline recv path: dequeue processed packets from per-worker SPSC app rings.
+    /// Pipeline recv path: dequeue AppPackets from per-worker SPSC app rings.
     ///
-    /// Phase 3: replaces MPSC app_ring with round-robin polling of per-worker
-    /// SPSC app rings, eliminating CAS contention.
+    /// Phase 3 zero-copy: reads payload directly from the FramePool via the
+    /// AppPacket's FrameRef, copies it to the user buffer, then frees the frame.
     fn recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
 
@@ -1561,26 +1561,45 @@ impl UdpSocket {
                 }
             };
 
-            if let Some(packet) = packet {
+            if let Some(app_pkt) = packet {
+                // Read payload from pool (zero-copy until this final memcpy to user buf)
+                let payload_data = {
+                    let topo_guard = self.topology.lock().unwrap();
+                    if let Some(ref topo) = *topo_guard {
+                        let start = app_pkt.payload_offset as usize;
+                        let len = app_pkt.payload_len as usize;
+                        // SAFETY: frame_ref is valid — allocated by rx_loop, not yet freed.
+                        let frame_data = unsafe {
+                            topo.frame_pool.frame(app_pkt.frame_ref.pool_idx)
+                        };
+                        // Copy payload to a stack/heap buffer before freeing
+                        let copy_len = std::cmp::min(buf.len(), len);
+                        buf[..copy_len].copy_from_slice(&frame_data[start..start + copy_len]);
+                        // Free the frame back to pool
+                        topo.frame_pool.free(app_pkt.frame_ref.pool_idx);
+                        copy_len
+                    } else {
+                        continue;
+                    }
+                };
+
                 // If connected, only accept packets from connected peer
                 if let Some(connected) = *self.connected_addr.lock().unwrap() {
-                    if packet.src_addr != connected {
+                    if app_pkt.src_addr != connected {
+                        // Buffer this packet for later — need to re-copy since we freed the frame
                         let mut queue = self.recv_queue.lock().unwrap();
-                        queue.push(packet.payload, packet.src_addr);
+                        queue.push(buf[..payload_data].to_vec(), app_pkt.src_addr);
                         continue;
                     }
                 }
 
-                let copy_len = std::cmp::min(buf.len(), packet.payload.len());
-                buf[..copy_len].copy_from_slice(&packet.payload[..copy_len]);
-
                 if let Ok(mut guard) = self.connection_state.write() {
                     if let Some(ref mut state) = *guard {
-                        state.record_recv(copy_len);
+                        state.record_recv(payload_data);
                     }
                 }
 
-                return Ok((copy_len, packet.src_addr));
+                return Ok((payload_data, app_pkt.src_addr));
             }
 
             // No packet available — brief pause

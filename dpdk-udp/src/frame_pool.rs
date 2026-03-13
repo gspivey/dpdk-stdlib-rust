@@ -3,12 +3,19 @@
 //! Replaces per-packet `Vec<u8>` heap allocations with a pre-allocated slab of
 //! fixed-size frame buffers. Frames are passed by index (`FrameRef`) through
 //! SPSC rings instead of by value, eliminating all allocator traffic on the
-//! RX→Worker hot path.
+//! RX→Worker→App hot path.
 //!
 //! The pool is single-allocation: one contiguous `Box<[u8]>` of `capacity × frame_size`
-//! bytes, with a lock-free SPSC free list of available indices.
+//! bytes, with a lock-free free list of available indices.
+//!
+//! ## Thread Safety
+//!
+//! The free list uses `fetch_add` for the head pointer, making `free()` safe
+//! to call from multiple threads (MPSC pattern: multiple freers, single allocator).
+//! `alloc()` is single-consumer (RX thread only).
 
 use std::cell::UnsafeCell;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Maximum Ethernet frame size (MTU 1500 + 14 Ethernet header + 4 FCS).
@@ -43,10 +50,33 @@ impl FrameRef {
     }
 }
 
+/// A processed packet referencing frame data in the pool (zero-copy).
+///
+/// Carries parsed metadata plus a `FrameRef` pointing to the raw frame in
+/// the `FramePool`. The consumer (`recv_from()`) copies the payload directly
+/// from the pool to the user buffer, then frees the frame.
+///
+/// This eliminates the `Vec<u8>` payload allocation that `ProcessedPacket` had.
+#[derive(Debug, Clone, Copy)]
+pub struct AppPacket {
+    /// Reference to the raw frame in the pool.
+    pub frame_ref: FrameRef,
+    /// Byte offset of the UDP payload within the frame.
+    pub payload_offset: u16,
+    /// Length of the UDP payload in bytes.
+    pub payload_len: u16,
+    /// Source address (IP + port) of the packet.
+    pub src_addr: SocketAddr,
+    /// Source MAC address (for ARP cache learning).
+    pub src_mac: [u8; 6],
+    /// Source IP (for ARP cache learning).
+    pub src_ip: Ipv4Addr,
+}
+
 /// Pre-allocated pool of fixed-size frame buffers.
 ///
-/// Frames are allocated by index and freed back to the pool. The pool uses a
-/// lock-free free list (SPSC ring of `u32` indices) for O(1) alloc/free.
+/// Frames are allocated by index and freed back to the pool. The free list
+/// uses `fetch_add` for thread-safe multi-producer (free) / single-consumer (alloc).
 ///
 /// # Safety
 ///
@@ -62,7 +92,9 @@ pub struct FramePool {
     /// Total number of frame slots.
     capacity: usize,
     /// Free list: ring buffer of available frame indices.
-    /// Uses atomic head/tail for lock-free SPSC access.
+    /// head = producer side (free adds here), tail = consumer side (alloc takes from here).
+    /// `free()` uses `fetch_add` on head for MPSC safety (multiple workers free).
+    /// `alloc()` uses simple load/store since only one thread (RX) allocates.
     free_head: AtomicU64,
     free_tail: AtomicU64,
     free_list: Box<[AtomicU32]>,
@@ -84,8 +116,9 @@ impl FramePool {
         // Allocate the contiguous buffer
         let buffer = vec![0u8; capacity * frame_size].into_boxed_slice();
 
-        // Initialize the free list with all indices
-        let free_cap = capacity.next_power_of_two();
+        // Free list must be >= capacity and power of 2 for masking.
+        // Use 2x capacity to allow head to advance past tail without wraparound issues.
+        let free_cap = (capacity * 2).next_power_of_two();
         let free_list: Vec<AtomicU32> = (0..free_cap)
             .map(|i| AtomicU32::new(if i < capacity { i as u32 } else { u32::MAX }))
             .collect();
@@ -124,6 +157,8 @@ impl FramePool {
     /// Allocate a frame index from the pool.
     ///
     /// Returns `None` if the pool is exhausted (all frames are in use).
+    ///
+    /// Only one thread should call this (single-consumer on the free list).
     #[inline]
     pub fn alloc(&self) -> Option<u32> {
         let tail = self.free_tail.load(Ordering::Relaxed);
@@ -142,6 +177,9 @@ impl FramePool {
 
     /// Return a frame index to the pool.
     ///
+    /// Thread-safe: multiple threads can call this concurrently (MPSC pattern).
+    /// Uses `fetch_add` to atomically claim a slot in the free list.
+    ///
     /// # Panics
     ///
     /// Panics if `idx >= capacity` (debug builds only).
@@ -149,10 +187,10 @@ impl FramePool {
     pub fn free(&self, idx: u32) {
         debug_assert!((idx as usize) < self.capacity, "frame index out of bounds");
 
-        let head = self.free_head.load(Ordering::Relaxed);
+        // Atomically claim a slot — safe for concurrent callers
+        let head = self.free_head.fetch_add(1, Ordering::AcqRel);
         let slot = (head & self.free_mask()) as usize;
-        self.free_list[slot].store(idx, Ordering::Relaxed);
-        self.free_head.store(head + 1, Ordering::Release);
+        self.free_list[slot].store(idx, Ordering::Release);
     }
 
     /// Get a mutable slice to the frame data at the given index.
@@ -390,6 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn pool_multi_thread_free() {
+        // Verify that multiple threads can free concurrently (MPSC pattern)
+        let pool = Arc::new(FramePool::new(256, 64));
+
+        // Allocate all frames
+        let mut indices: Vec<u32> = Vec::new();
+        for _ in 0..256 {
+            indices.push(pool.alloc().unwrap());
+        }
+        assert!(pool.alloc().is_none());
+
+        // Free from 4 threads concurrently
+        let chunks: Vec<Vec<u32>> = indices
+            .chunks(64)
+            .map(|c| c.to_vec())
+            .collect();
+
+        let mut handles = Vec::new();
+        for chunk in chunks {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for idx in chunk {
+                    pool.free(idx);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All 256 frames should be back
+        assert_eq!(pool.available(), 256);
+
+        // Should be able to allocate again
+        for _ in 0..256 {
+            assert!(pool.alloc().is_some());
+        }
+        assert!(pool.alloc().is_none());
+    }
+
+    #[test]
     fn pool_with_defaults() {
         let pool = FramePool::with_defaults();
         assert_eq!(pool.capacity(), DEFAULT_POOL_CAPACITY);
@@ -402,5 +482,12 @@ mod tests {
         let fr = FrameRef::new(42, 1500);
         assert_eq!(fr.pool_idx, 42);
         assert_eq!(fr.len, 1500);
+    }
+
+    #[test]
+    fn app_packet_size() {
+        // AppPacket should be small enough to pass through rings efficiently.
+        // Contains FrameRef (8B) + offsets (4B) + SocketAddr (32B) + MAC (6B) + IP (4B).
+        assert!(std::mem::size_of::<AppPacket>() <= 64);
     }
 }
