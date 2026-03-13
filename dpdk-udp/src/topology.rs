@@ -15,6 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::arp::{self, ArpCache, ArpHandler};
 use crate::icmp::{self, IcmpHandler};
@@ -247,6 +248,9 @@ where
     }
 
     // Spawn single RX lcore thread.
+    // The ready flag ensures send_to() doesn't enqueue to the TX ring before
+    // the RX thread is actively draining it (prevents "TX ring full" at startup).
+    let rx_ready = Arc::new(AtomicBool::new(false));
     {
         let worker_rings_clone: Vec<Arc<SpscRing<Vec<u8>>>> =
             worker_rings.iter().map(Arc::clone).collect();
@@ -258,6 +262,7 @@ where
         let local_ip = config.local_ip;
         let arp_cache = Arc::clone(&config.arp_cache);
         let perf_counters = Arc::clone(&config.perf_counters);
+        let rx_ready_clone = Arc::clone(&rx_ready);
 
         let handle = thread::Builder::new()
             .name("dpdk-rx-0".to_string())
@@ -272,10 +277,18 @@ where
                     local_ip,
                     arp_cache,
                     perf_counters,
+                    rx_ready_clone,
                 );
             })
             .expect("failed to spawn RX thread");
         handles.push(handle);
+    }
+
+    // Wait for the RX thread to signal ready (it sets rx_ready before entering
+    // its main loop). This prevents "TX ring full" errors at startup when the
+    // application calls send_to() before the RX thread starts draining.
+    while !rx_ready.load(Ordering::Acquire) {
+        std::hint::spin_loop();
     }
 
     Some(MultiCoreTopology {
@@ -285,6 +298,36 @@ where
         handles,
         plan: config.plan,
     })
+}
+
+// ============================================================================
+// Adaptive Polling — spin → yield → sleep backoff
+// ============================================================================
+
+/// Number of iterations to spin (cheapest, ~3 us total on modern CPUs).
+const SPIN_ITERS: u32 = 64;
+/// Number of iterations to yield after spinning (gives OS scheduler a chance).
+const YIELD_ITERS: u32 = 16;
+/// Sleep duration after spin + yield phases are exhausted.
+const SLEEP_US: u64 = 1;
+
+/// Three-phase adaptive wait to avoid burning CPU when no work is available.
+///
+/// Phase 1: `spin_loop()` for up to `SPIN_ITERS` — minimal latency for bursty traffic.
+/// Phase 2: `yield_now()` for up to `YIELD_ITERS` — allows other threads to run.
+/// Phase 3: `sleep(1us)` — prevents CPU waste on idle sockets.
+///
+/// Caller resets `empty_polls` to 0 when work is found.
+#[inline]
+fn adaptive_wait(empty_polls: &mut u32) {
+    *empty_polls += 1;
+    if *empty_polls <= SPIN_ITERS {
+        std::hint::spin_loop();
+    } else if *empty_polls <= SPIN_ITERS + YIELD_ITERS {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_micros(SLEEP_US));
+    }
 }
 
 /// RX lcore main loop.
@@ -302,6 +345,7 @@ fn rx_loop<R, S>(
     local_ip: Ipv4Addr,
     arp_cache: Arc<ArpCache>,
     perf_counters: Arc<PerfCounters>,
+    rx_ready: Arc<AtomicBool>,
 ) where
     R: Fn(usize) -> io::Result<Vec<Vec<u8>>>,
     S: Fn(&[u8]) -> io::Result<usize>,
@@ -310,6 +354,11 @@ fn rx_loop<R, S>(
     let icmp_handler = IcmpHandler::new(local_mac, local_ip);
     let num_workers = worker_rings.len();
     let mut rr_index: usize = 0;
+    let mut empty_polls: u32 = 0;
+
+    // Signal that the RX thread is ready to drain the TX ring.
+    // start_pipeline() spins on this before returning.
+    rx_ready.store(true, Ordering::Release);
 
     while !shutdown.load(Ordering::Acquire) {
         // 1. Drain TX ring → send to NIC (up to 256 frames per cycle to keep up with echo workloads)
@@ -322,16 +371,19 @@ fn rx_loop<R, S>(
         let frames = match recv_fn(32) {
             Ok(f) => f,
             Err(_) => {
-                std::hint::spin_loop();
+                adaptive_wait(&mut empty_polls);
                 continue;
             }
         };
 
         if frames.is_empty() && tx_batch.is_empty() {
-            // Nothing to do — brief pause to avoid burning CPU
-            std::hint::spin_loop();
+            // Nothing to do — adaptive backoff to avoid burning CPU
+            adaptive_wait(&mut empty_polls);
             continue;
         }
+
+        // Work found — reset backoff
+        empty_polls = 0;
 
         if !frames.is_empty() {
             perf_inc!(perf_counters.rx_bursts);
@@ -408,13 +460,18 @@ fn worker_loop(
     arp_cache: Arc<ArpCache>,
     perf_counters: Arc<PerfCounters>,
 ) {
+    let mut empty_polls: u32 = 0;
+
     while !shutdown.load(Ordering::Acquire) {
         let batch = rx_ring.dequeue_batch(32);
         if batch.is_empty() {
             perf_inc!(perf_counters.worker_idle_polls);
-            std::hint::spin_loop();
+            adaptive_wait(&mut empty_polls);
             continue;
         }
+
+        // Work found — reset backoff
+        empty_polls = 0;
 
         for frame_data in batch {
             // Parse UDP packet
@@ -933,5 +990,32 @@ mod tests {
         // Shutdown should complete without hanging
         topo.shutdown();
         // If we get here, all threads joined successfully
+    }
+
+    #[test]
+    fn adaptive_wait_phases() {
+        // Verify the three phases of adaptive_wait don't panic
+        let mut empty_polls = 0u32;
+
+        // Phase 1: spin (should be fast)
+        for _ in 0..SPIN_ITERS {
+            adaptive_wait(&mut empty_polls);
+        }
+        assert_eq!(empty_polls, SPIN_ITERS);
+
+        // Phase 2: yield
+        for _ in 0..YIELD_ITERS {
+            adaptive_wait(&mut empty_polls);
+        }
+        assert_eq!(empty_polls, SPIN_ITERS + YIELD_ITERS);
+
+        // Phase 3: sleep (just verify it doesn't panic)
+        adaptive_wait(&mut empty_polls);
+        assert_eq!(empty_polls, SPIN_ITERS + YIELD_ITERS + 1);
+
+        // Reset
+        empty_polls = 0;
+        adaptive_wait(&mut empty_polls);
+        assert_eq!(empty_polls, 1); // back to spin phase
     }
 }

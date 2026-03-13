@@ -14,9 +14,9 @@
 
 ## Phase 2: Quick Wins (Low-Risk, High-Impact)
 
-- [ ] **P2.1**: Implement adaptive polling in `rx_loop` and `worker_loop` — spin (64 iters) → yield (16 iters) → sleep(1us), reset on work found
-- [ ] **P2.2**: Replace `Mutex<Vec<u8>>` tx_buf with `UnsafeCell<Vec<u8>>` in run-to-completion mode — safe because RTC is single-threaded; add runtime assertion
-- [ ] **P2.3**: Add ARP cache fast-path — `AtomicU64` storing last (IP, MAC) pair for single-peer echo pattern, bypass HashMap on cache hit
+- [x] **P2.1**: Implement adaptive polling in `rx_loop` and `worker_loop` — spin (64 iters) → yield (16 iters) → sleep(1us), reset on work found
+- [x] **P2.2**: Replace `Mutex<Vec<u8>>` tx_buf with `UnsafeCell<Vec<u8>>` in run-to-completion mode — safe because RTC is single-threaded; add runtime assertion
+- [x] **P2.3**: Add ARP cache fast-path — `AtomicU64` storing last (IP, MAC) pair for single-peer echo pattern, bypass HashMap on cache hit
 - [ ] **P2.4**: Benchmark Phase 2 changes — measure latency improvement on single-core path at 70K/140K/350K PPS
 
 ## Phase 3: Multi-Core Pipeline Redesign

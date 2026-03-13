@@ -11,10 +11,11 @@
 //! - **Multiple Backends** - DPDK, AF_PACKET raw sockets, or AF_PACKET with PACKET_MMAP
 //! - **Runtime Backend Selection** - Choose backend at runtime based on availability
 
+use std::cell::UnsafeCell;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -1057,6 +1058,95 @@ fn allocate_ephemeral_port() -> u16 {
     }
 }
 
+// ============================================================================
+// TxBuffer — lock-free TX buffer for run-to-completion mode
+// ============================================================================
+
+/// A reusable TX frame buffer that avoids `Mutex` overhead in run-to-completion mode.
+///
+/// In RTC mode (single-threaded `send_to` path), the inner `Vec<u8>` is accessed
+/// via `UnsafeCell` — no locking overhead. A debug-mode assertion verifies that
+/// concurrent access never occurs.
+///
+/// # Safety
+///
+/// This type is `Sync` because:
+/// - In RTC mode, only one thread ever calls `send_to`, so `borrow_mut` is
+///   called from a single thread. The `AtomicBool` guard catches violations in debug builds.
+/// - In multi-core mode, `send_to` uses `build_udp_frame` (allocates a new Vec)
+///   and enqueues to the TX ring — `TxBuffer` is never accessed.
+struct TxBuffer {
+    buf: UnsafeCell<Vec<u8>>,
+    #[cfg(debug_assertions)]
+    in_use: AtomicBool,
+}
+
+// SAFETY: TxBuffer is only accessed in RTC mode from a single thread.
+// The debug-mode AtomicBool guard detects misuse.
+unsafe impl Sync for TxBuffer {}
+
+impl TxBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: UnsafeCell::new(Vec::with_capacity(capacity)),
+            #[cfg(debug_assertions)]
+            in_use: AtomicBool::new(false),
+        }
+    }
+
+    /// Get a mutable reference to the inner buffer.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee that no other thread is accessing the buffer
+    /// concurrently. In debug builds, a runtime assertion enforces this.
+    #[inline]
+    fn borrow_mut(&self) -> TxBufferGuard<'_> {
+        #[cfg(debug_assertions)]
+        {
+            let was_in_use = self.in_use.swap(true, Ordering::Acquire);
+            debug_assert!(
+                !was_in_use,
+                "TxBuffer: concurrent access detected — this should only be used in RTC mode"
+            );
+        }
+        TxBufferGuard { tx_buf: self }
+    }
+}
+
+/// RAII guard that provides `&mut Vec<u8>` access and clears the in-use flag on drop.
+struct TxBufferGuard<'a> {
+    tx_buf: &'a TxBuffer,
+}
+
+impl<'a> std::ops::Deref for TxBufferGuard<'a> {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        // SAFETY: single-thread guarantee enforced by debug assertion in borrow_mut
+        unsafe { &*self.tx_buf.buf.get() }
+    }
+}
+
+impl<'a> std::ops::DerefMut for TxBufferGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        // SAFETY: single-thread guarantee enforced by debug assertion in borrow_mut
+        unsafe { &mut *self.tx_buf.buf.get() }
+    }
+}
+
+impl<'a> Drop for TxBufferGuard<'a> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.tx_buf.in_use.store(false, Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for TxBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxBuffer").finish_non_exhaustive()
+    }
+}
+
 pub struct UdpSocket {
     local_addr: SocketAddr,
     connected_addr: Mutex<Option<SocketAddr>>,
@@ -1087,8 +1177,9 @@ pub struct UdpSocket {
     /// When active, recv_from() reads from app_ring and send_to() writes to tx_ring.
     topology: Mutex<Option<MultiCoreTopology>>,
     /// Reusable TX frame buffer — avoids per-packet heap allocation in send_to.
-    /// Uses Mutex because send_to takes &self (not &mut self) per the std API.
-    tx_buf: Mutex<Vec<u8>>,
+    /// Uses UnsafeCell (via TxBuffer) instead of Mutex for zero-overhead access
+    /// in run-to-completion mode. Only accessed from the RTC send path.
+    tx_buf: TxBuffer,
     /// Performance counters — always available, zero-cost if not read.
     perf_counters: Arc<PerfCounters>,
     /// Latency sampler — samples 1 in N packets for percentile tracking.
@@ -1157,7 +1248,7 @@ impl UdpSocket {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: Mutex::new(Vec::with_capacity(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD)),
+            tx_buf: TxBuffer::new(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
@@ -1240,7 +1331,7 @@ impl UdpSocket {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: Mutex::new(Vec::with_capacity(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD)),
+            tx_buf: TxBuffer::new(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
@@ -1375,8 +1466,8 @@ impl UdpSocket {
                 }
             }
         } else {
-            // Run-to-completion path: reuse the TX buffer across calls
-            let mut tx_buf = self.tx_buf.lock().unwrap();
+            // Run-to-completion path: reuse the TX buffer across calls (lock-free)
+            let mut tx_buf = self.tx_buf.borrow_mut();
             build_udp_frame_into(
                 &mut tx_buf,
                 &src_mac,
