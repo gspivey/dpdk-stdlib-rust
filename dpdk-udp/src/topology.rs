@@ -64,6 +64,9 @@ pub struct TopologyPlan {
     pub rx_queues: u16,
     /// Number of worker lcores per RX queue.
     pub workers_per_queue: u16,
+    /// Number of NIC TX queues provisioned (P3.5).
+    /// Queue 0 = RX lcore (ARP/ICMP), queue 1+ = app/worker direct TX.
+    pub nb_tx_queues: u16,
     /// NUMA node ID (0-based). Used for memory allocation affinity.
     pub numa_node: u32,
     /// How the plan was determined.
@@ -110,9 +113,10 @@ impl fmt::Display for TopologyPlan {
         } else {
             write!(
                 f,
-                "{} RX queues x {} workers/queue ({} lcores, NUMA {}, {:?})",
+                "{} RX queues x {} workers/queue, {} TX queues ({} lcores, NUMA {}, {:?})",
                 self.rx_queues,
                 self.workers_per_queue,
+                self.nb_tx_queues,
                 self.total_lcores_needed(),
                 self.numa_node,
                 self.source,
@@ -149,8 +153,9 @@ pub struct TxFrame {
 ///
 /// Phase 3 redesign:
 /// - `app_rings`: Per-worker SPSC rings carrying `AppPacket` (zero-copy FrameRef)
-/// - `tx_ring`: Still used for application-initiated sends (send_to)
+/// - `tx_ring`: Kept for backward compat (unused when `direct_send_fn` is set)
 /// - Workers transmit echo replies directly via send_fn (worker-direct TX)
+/// - `direct_send_fn`: Application thread bypasses tx_ring, sends on its own TX queue (P3.5)
 pub struct MultiCoreTopology {
     /// Per-worker SPSC app rings: each worker enqueues `AppPacket` (zero-copy),
     /// `recv_from()` polls round-robin across all worker app rings.
@@ -159,9 +164,15 @@ pub struct MultiCoreTopology {
     /// Legacy MPSC app_ring — unused by Phase 3 workers but kept for API compat.
     pub app_ring: Arc<MpscRing<ProcessedPacket>>,
 
-    /// TX ring for outbound frames. `send_to()` enqueues here;
-    /// the RX lcore thread drains and transmits via the NIC.
+    /// TX ring for outbound frames. Kept as fallback; unused when `direct_send_fn`
+    /// is available (P3.5 worker-direct TX).
     pub tx_ring: Arc<SpscRing<TxFrame>>,
+
+    /// P3.5: Direct send function for the application thread.
+    /// When set, `send_to()` calls this instead of enqueuing to `tx_ring`,
+    /// eliminating the ring hop through the RX lcore. Uses a dedicated NIC
+    /// TX queue (queue 1) to avoid contention with the RX lcore's TX queue 0.
+    pub direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 
     /// Shutdown signal — set to `true` to stop all pipeline threads.
     pub shutdown: Arc<AtomicBool>,
@@ -250,6 +261,7 @@ pub fn start_pipeline<R, S>(
     config: PipelineConfig,
     recv_fn: R,
     send_fn: S,
+    direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 ) -> Option<MultiCoreTopology>
 where
     R: Fn(usize) -> io::Result<Vec<Vec<u8>>> + Send + Sync + 'static,
@@ -362,6 +374,7 @@ where
         app_rings,
         app_ring,
         tx_ring,
+        direct_send_fn,
         shutdown,
         handles,
         plan: config.plan,
@@ -641,6 +654,7 @@ pub fn detect_topology(
     config: &TopologyConfig,
     available_lcores: u32,
     nic_max_rx_queues: u16,
+    nic_max_tx_queues: u16,
     nic_numa_node: i32,
 ) -> TopologyPlan {
     let numa_node = if nic_numa_node >= 0 {
@@ -654,6 +668,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node,
             source: TopologySource::Stub,
         };
@@ -661,9 +676,11 @@ pub fn detect_topology(
 
     // Try builder config first
     if let (Some(rq), Some(wpq)) = (config.rx_queues, config.workers_per_queue) {
+        let rx_queues = clamp_rx_queues(rq, nic_max_rx_queues);
         return TopologyPlan {
-            rx_queues: clamp_rx_queues(rq, nic_max_rx_queues),
+            rx_queues,
             workers_per_queue: wpq,
+            nb_tx_queues: compute_tx_queues(wpq, nic_max_tx_queues),
             numa_node,
             source: TopologySource::Builder,
         };
@@ -688,6 +705,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: clamp_rx_queues(rx_queues, nic_max_rx_queues),
             workers_per_queue,
+            nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
             numa_node,
             source,
         };
@@ -700,6 +718,7 @@ pub fn detect_topology(
     TopologyPlan {
         rx_queues,
         workers_per_queue,
+        nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
         numa_node,
         source: TopologySource::AutoDetected,
     }
@@ -739,6 +758,23 @@ fn clamp_rx_queues(requested: u16, nic_max: u16) -> u16 {
     requested.min(nic_max).max(1)
 }
 
+/// P3.5: Compute the number of TX queues to provision.
+///
+/// Queue 0 is reserved for the RX lcore (ARP/ICMP replies).
+/// Queue 1 is for the application thread (worker-direct TX via send_to).
+/// In run-to-completion mode (workers_per_queue == 0), only 1 TX queue is needed.
+fn compute_tx_queues(workers_per_queue: u16, nic_max_tx_queues: u16) -> u16 {
+    if workers_per_queue == 0 {
+        return 1; // RTC mode: single TX queue
+    }
+    // Pipeline mode: queue 0 for RX lcore + queue 1 for app thread
+    let desired = 2u16;
+    if nic_max_tx_queues == 0 {
+        return desired; // unknown NIC, assume capable
+    }
+    desired.min(nic_max_tx_queues)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -760,11 +796,12 @@ mod tests {
             rx_queues: Some(4),
             workers_per_queue: Some(2),
         };
-        let plan = detect_topology(&config, 16, 16, 0);
+        let plan = detect_topology(&config, 16, 16, 16, 0);
         assert!(plan.is_run_to_completion());
         assert_eq!(plan.source, TopologySource::Stub);
         assert_eq!(plan.rx_queues, 1);
         assert_eq!(plan.workers_per_queue, 0);
+        assert_eq!(plan.nb_tx_queues, 1);
     }
 
     #[test]
@@ -812,10 +849,32 @@ mod tests {
     }
 
     #[test]
+    fn compute_tx_queues_rtc() {
+        // RTC mode (no workers) → 1 TX queue
+        assert_eq!(compute_tx_queues(0, 16), 1);
+    }
+
+    #[test]
+    fn compute_tx_queues_pipeline() {
+        // Pipeline mode → 2 TX queues (RX lcore + app thread)
+        assert_eq!(compute_tx_queues(1, 16), 2);
+        assert_eq!(compute_tx_queues(4, 16), 2);
+    }
+
+    #[test]
+    fn compute_tx_queues_clamped() {
+        // NIC only supports 1 TX queue → clamped to 1
+        assert_eq!(compute_tx_queues(2, 1), 1);
+        // Unknown NIC (max=0) → assume capable
+        assert_eq!(compute_tx_queues(2, 0), 2);
+    }
+
+    #[test]
     fn total_lcores_run_to_completion() {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::AutoDetected,
         };
@@ -828,6 +887,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 4,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::AutoDetected,
         };
@@ -840,6 +900,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Stub,
         };
@@ -852,18 +913,20 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 4,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 1,
             source: TopologySource::Builder,
         };
         let s = format!("{plan}");
         assert!(s.contains("4 RX queues"));
         assert!(s.contains("2 workers/queue"));
+        assert!(s.contains("2 TX queues"));
     }
 
     #[test]
     fn stub_propagates_nic_numa_node() {
         let config = TopologyConfig::default();
-        let plan = detect_topology(&config, 8, 16, 1);
+        let plan = detect_topology(&config, 8, 16, 16, 1);
         // Even under stubs (run-to-completion), the NIC's NUMA node is recorded
         assert_eq!(plan.numa_node, 1);
         assert!(plan.is_run_to_completion());
@@ -873,7 +936,7 @@ mod tests {
     fn negative_numa_defaults_to_zero() {
         let config = TopologyConfig::default();
         // SOCKET_ID_ANY is -1
-        let plan = detect_topology(&config, 8, 16, -1);
+        let plan = detect_topology(&config, 8, 16, 16, -1);
         assert_eq!(plan.numa_node, 0);
     }
 
@@ -920,6 +983,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -933,7 +997,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline for non-RTC plan");
 
         // Wait for the packet to flow through the pipeline
@@ -973,6 +1037,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -989,7 +1054,7 @@ mod tests {
         let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
 
-        let topo = start_pipeline(config, recv_fn, send_fn);
+        let topo = start_pipeline(config, recv_fn, send_fn, None);
         assert!(topo.is_none(), "RTC plan should not start a pipeline");
     }
 
@@ -1009,6 +1074,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 1,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -1022,7 +1088,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline");
 
         // Enqueue a TX frame
@@ -1051,6 +1117,7 @@ mod tests {
             let plan = TopologyPlan {
                 rx_queues: 1,
                 workers_per_queue: wpq,
+                nb_tx_queues: 2,
                 numa_node: 0,
                 source: TopologySource::Builder,
             };
@@ -1065,6 +1132,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -1084,6 +1152,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 3,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -1097,7 +1166,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline");
 
         // Let threads run briefly
@@ -1168,6 +1237,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -1181,7 +1251,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline");
 
         // Collect all packets

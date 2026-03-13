@@ -721,8 +721,10 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
             .with_cache_size(256),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-    // Initialize port
-    let port_config = PortConfig::default();
+    // Initialize port with 2 TX queues:
+    // - TX queue 0: RX lcore (ARP/ICMP replies, tx_ring drain)
+    // - TX queue 1: Application thread (worker-direct TX for send_to)
+    let port_config = PortConfig::default().with_queues(1, 2);
     let port = Port::init(port_id, port_config, &mempool)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 
@@ -1450,38 +1452,33 @@ impl UdpSocket {
 
         let src_mac = self.socket_backend.mac_address();
 
-        // If multi-core topology is active, enqueue to TX ring (needs owned Vec).
-        // Otherwise, use reusable buffer and send directly (zero-alloc steady state).
-        let has_topology = self.topology.lock().unwrap().is_some();
-        if has_topology {
-            // Multi-core path: TX ring takes ownership, so we must allocate
-            let frame = build_udp_frame(
-                &src_mac,
-                &dst_mac.octets(),
-                src_ip, dst_ip,
-                src_port, dst_port,
-                buf, self.ttl,
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
-
+        // P3.5: Try worker-direct TX first (bypasses tx_ring, zero-alloc).
+        // Clone the Arc<direct_send_fn> while holding the lock, then release.
+        let direct_fn = {
             let topo_guard = self.topology.lock().unwrap();
-            if let Some(ref topo) = *topo_guard {
-                if let Err(_) = topo.tx_ring.enqueue(topology::TxFrame { frame }) {
-                    perf_inc!(self.perf_counters.tx_ring_enqueue_fail);
-                    perf_inc!(self.perf_counters.tx_failures);
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "TX ring full"));
-                }
+            topo_guard.as_ref().and_then(|t| t.direct_send_fn.clone())
+        };
+
+        // Build frame into reusable buffer (zero-alloc) and send.
+        // Both RTC and worker-direct TX paths use the same tx_buf.
+        let mut tx_buf = self.tx_buf.borrow_mut();
+        build_udp_frame_into(
+            &mut tx_buf,
+            &src_mac,
+            &dst_mac.octets(),
+            src_ip, dst_ip,
+            src_port, dst_port,
+            buf, self.ttl,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+
+        if let Some(direct_send) = direct_fn {
+            // Worker-direct TX: send on dedicated TX queue (no ring hop)
+            if let Err(e) = direct_send(&tx_buf) {
+                perf_inc!(self.perf_counters.tx_failures);
+                return Err(e);
             }
         } else {
-            // Run-to-completion path: reuse the TX buffer across calls (lock-free)
-            let mut tx_buf = self.tx_buf.borrow_mut();
-            build_udp_frame_into(
-                &mut tx_buf,
-                &src_mac,
-                &dst_mac.octets(),
-                src_ip, dst_ip,
-                src_port, dst_port,
-                buf, self.ttl,
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+            // Run-to-completion path: send via backend on TX queue 0
             if let Err(e) = self.socket_backend.send_frame(&tx_buf) {
                 perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
@@ -2443,7 +2440,8 @@ impl UdpSocketBuilder {
             // With real DPDK we'd query eal_lcore_count().
             if dpdk_sys::is_stub() { 1 } else { 8 },
             // Under stubs NIC max queues = 1.
-            if dpdk_sys::is_stub() { 1 } else { 16 },
+            if dpdk_sys::is_stub() { 1 } else { 16 }, // max RX queues
+            if dpdk_sys::is_stub() { 1 } else { 16 }, // max TX queues (P3.5)
             0, // NUMA node
         );
 
@@ -2505,7 +2503,32 @@ impl UdpSocketBuilder {
                 Ok(frame.len())
             };
 
-            let topo = topology::start_pipeline(pipeline_config, recv_fn, send_fn);
+            // P3.5: Worker-direct TX — app thread sends on TX queue 1, bypassing
+            // the tx_ring → RX lcore → TX queue 0 hop. This halves echo latency
+            // by eliminating cross-thread synchronization on the TX path.
+            let resources_for_direct = Arc::clone(&socket.resources);
+            let direct_send_fn: Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync> =
+                Arc::new(move |frame: &[u8]| -> io::Result<usize> {
+                    let mut mbuf = resources_for_direct.mempool.alloc()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
+                    mbuf.set_data_len(frame.len() as u16);
+                    mbuf.set_packet_len(frame.len() as u32);
+                    let data = mbuf.data_mut()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
+                    data.copy_from_slice(frame);
+                    let mut packets = vec![mbuf];
+                    // TX queue 1 = dedicated app thread TX queue (no RX lcore contention)
+                    let sent = resources_for_direct.port.tx_burst(1, &mut packets)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
+                    if sent == 0 {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+                    }
+                    Ok(frame.len())
+                });
+
+            let topo = topology::start_pipeline(
+                pipeline_config, recv_fn, send_fn, Some(direct_send_fn),
+            );
             let is_multicore = topo.is_some();
             *socket.topology.lock().unwrap() = topo;
 

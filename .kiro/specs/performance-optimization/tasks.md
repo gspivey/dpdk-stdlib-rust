@@ -25,7 +25,7 @@
 - [x] **P3.2**: Define `FrameRef { pool_idx: u32, len: u16 }` — replace `Vec<u8>` in worker SPSC rings with `FrameRef`, update `rx_loop` to allocate from pool and enqueue `FrameRef`
 - [x] **P3.3**: Update `worker_loop` to use `FrameRef` — access frame data via pool, free frame index back to pool after processing
 - [x] **P3.4**: Replace MPSC `app_ring` with per-worker SPSC app rings — `recv_from()` polls round-robin across worker app rings
-- [ ] **P3.5**: Implement worker-direct TX — detect NIC TX queue count, assign TX queues to workers, workers call `port.tx_burst(queue_id)` directly instead of enqueuing to TX ring
+- [x] **P3.5**: Implement worker-direct TX — detect NIC TX queue count, assign TX queues to workers, workers call `port.tx_burst(queue_id)` directly instead of enqueuing to TX ring
 - [x] **P3.6**: Fix RSS-aware worker affinity — each RSS queue maps 1:1 to its worker set, remove round-robin distribution
 - [x] **P3.7**: Benchmark Phase 3 changes — measure multi-core latency + throughput at 70K/140K/350K/700K PPS, compare to single-core and native baselines
 - [x] **P3.8**: Unit tests for `FramePool` — alloc/free cycle, pool exhaustion, concurrent access patterns
