@@ -1192,6 +1192,16 @@ pub struct UdpSocket {
     perf_reporter: Mutex<Option<PerfReporter>>,
     /// Round-robin index for polling per-worker app rings in recv_from_pipeline.
     recv_from_rr_index: AtomicUsize,
+    // ---- Cached pipeline handles (set once during builder.bind()) ----
+    // These avoid locking `topology` on every send/recv in the hot path.
+    /// True when a multi-core pipeline is active (avoids topology.lock() in recv_from).
+    has_pipeline: AtomicBool,
+    /// Cached per-worker app rings for lock-free recv_from_pipeline.
+    cached_app_rings: Option<Vec<Arc<SpscRing<AppPacket>>>>,
+    /// Cached frame pool for lock-free payload reads in recv_from_pipeline.
+    cached_frame_pool: Option<Arc<FramePool>>,
+    /// Cached direct-send function for lock-free send_to in pipeline mode.
+    cached_direct_send: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 }
 
 impl UdpSocket {
@@ -1259,6 +1269,10 @@ impl UdpSocket {
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
             recv_from_rr_index: AtomicUsize::new(0),
+            has_pipeline: AtomicBool::new(false),
+            cached_app_rings: None,
+            cached_frame_pool: None,
+            cached_direct_send: None,
         })
     }
 
@@ -1343,6 +1357,10 @@ impl UdpSocket {
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
             recv_from_rr_index: AtomicUsize::new(0),
+            has_pipeline: AtomicBool::new(false),
+            cached_app_rings: None,
+            cached_frame_pool: None,
+            cached_direct_send: None,
         })
     }
 
@@ -1452,15 +1470,7 @@ impl UdpSocket {
 
         let src_mac = self.socket_backend.mac_address();
 
-        // P3.5: Try worker-direct TX first (bypasses tx_ring, zero-alloc).
-        // Clone the Arc<direct_send_fn> while holding the lock, then release.
-        let direct_fn = {
-            let topo_guard = self.topology.lock().unwrap();
-            topo_guard.as_ref().and_then(|t| t.direct_send_fn.clone())
-        };
-
         // Build frame into reusable buffer (zero-alloc) and send.
-        // Both RTC and worker-direct TX paths use the same tx_buf.
         let mut tx_buf = self.tx_buf.borrow_mut();
         build_udp_frame_into(
             &mut tx_buf,
@@ -1471,7 +1481,8 @@ impl UdpSocket {
             buf, self.ttl,
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
 
-        if let Some(direct_send) = direct_fn {
+        // P3.5: Worker-direct TX uses cached send function (no topology.lock()).
+        if let Some(ref direct_send) = self.cached_direct_send {
             // Worker-direct TX: send on dedicated TX queue (no ring hop)
             if let Err(e) = direct_send(&tx_buf) {
                 perf_inc!(self.perf_counters.tx_failures);
@@ -1512,8 +1523,8 @@ impl UdpSocket {
     /// On success, returns the number of bytes received and the source address.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         // Check if multi-core topology is active — if so, dequeue from app_ring.
-        let has_topology = self.topology.lock().unwrap().is_some();
-        if has_topology {
+        // Uses cached AtomicBool to avoid topology.lock() on every recv.
+        if self.has_pipeline.load(Ordering::Acquire) {
             return self.recv_from_pipeline(buf);
         }
 
@@ -1525,8 +1536,20 @@ impl UdpSocket {
     ///
     /// Phase 3 zero-copy: reads payload directly from the FramePool via the
     /// AppPacket's FrameRef, copies it to the user buffer, then frees the frame.
+    ///
+    /// Uses cached pipeline handles (set once during builder.bind()) to avoid
+    /// locking `topology` on every packet. Uses adaptive backoff (spin → yield
+    /// → sleep 1us) matching the worker thread strategy instead of a fixed 100us
+    /// sleep, which was causing catastrophic backpressure at high packet rates.
     fn recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
+        let mut empty_polls: u32 = 0;
+
+        // Cache references from the struct — these never change after bind().
+        let app_rings = self.cached_app_rings.as_ref()
+            .expect("recv_from_pipeline called without pipeline");
+        let frame_pool = self.cached_frame_pool.as_ref()
+            .expect("recv_from_pipeline called without pipeline");
 
         loop {
             if let Some(dl) = deadline {
@@ -1545,62 +1568,55 @@ impl UdpSocket {
                 }
             }
 
-            // Phase 3: Poll per-worker SPSC app rings round-robin
-            let packet = {
-                let topo_guard = self.topology.lock().unwrap();
-                if let Some(ref topo) = *topo_guard {
-                    let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
-                    let result = topo.dequeue_app(&mut rr);
-                    self.recv_from_rr_index.store(rr, Ordering::Relaxed);
-                    result
-                } else {
-                    None
-                }
-            };
+            // Poll per-worker SPSC app rings round-robin (lock-free).
+            let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
+            let packet = dequeue_app_rings(app_rings, &mut rr);
+            self.recv_from_rr_index.store(rr, Ordering::Relaxed);
 
             if let Some(app_pkt) = packet {
+                empty_polls = 0;
+
                 // Read payload from pool (zero-copy until this final memcpy to user buf)
-                let payload_data = {
-                    let topo_guard = self.topology.lock().unwrap();
-                    if let Some(ref topo) = *topo_guard {
-                        let start = app_pkt.payload_offset as usize;
-                        let len = app_pkt.payload_len as usize;
-                        // SAFETY: frame_ref is valid — allocated by rx_loop, not yet freed.
-                        let frame_data = unsafe {
-                            topo.frame_pool.frame(app_pkt.frame_ref.pool_idx)
-                        };
-                        // Copy payload to a stack/heap buffer before freeing
-                        let copy_len = std::cmp::min(buf.len(), len);
-                        buf[..copy_len].copy_from_slice(&frame_data[start..start + copy_len]);
-                        // Free the frame back to pool
-                        topo.frame_pool.free(app_pkt.frame_ref.pool_idx);
-                        copy_len
-                    } else {
-                        continue;
-                    }
+                let start = app_pkt.payload_offset as usize;
+                let len = app_pkt.payload_len as usize;
+                // SAFETY: frame_ref is valid — allocated by rx_loop, not yet freed.
+                let frame_data = unsafe {
+                    frame_pool.frame(app_pkt.frame_ref.pool_idx)
                 };
+                let copy_len = std::cmp::min(buf.len(), len);
+                buf[..copy_len].copy_from_slice(&frame_data[start..start + copy_len]);
+                // Free the frame back to pool
+                frame_pool.free(app_pkt.frame_ref.pool_idx);
 
                 // If connected, only accept packets from connected peer
                 if let Some(connected) = *self.connected_addr.lock().unwrap() {
                     if app_pkt.src_addr != connected {
-                        // Buffer this packet for later — need to re-copy since we freed the frame
                         let mut queue = self.recv_queue.lock().unwrap();
-                        queue.push(buf[..payload_data].to_vec(), app_pkt.src_addr);
+                        queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr);
                         continue;
                     }
                 }
 
                 if let Ok(mut guard) = self.connection_state.write() {
                     if let Some(ref mut state) = *guard {
-                        state.record_recv(payload_data);
+                        state.record_recv(copy_len);
                     }
                 }
 
-                return Ok((payload_data, app_pkt.src_addr));
+                return Ok((copy_len, app_pkt.src_addr));
             }
 
-            // No packet available — brief pause
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            // No packet available — adaptive backoff (spin → yield → sleep 1us).
+            // Matches the worker thread backoff strategy instead of the old fixed
+            // 100us sleep, which caused ~35 packets to pile up per idle cycle at 350k pps.
+            empty_polls += 1;
+            if empty_polls <= 64 {
+                std::hint::spin_loop();
+            } else if empty_polls <= 80 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(1));
+            }
         }
     }
 
@@ -2261,6 +2277,31 @@ impl UdpSocket {
 }
 
 // ============================================================================
+// Pipeline helpers (free functions to avoid topology.lock() in hot path)
+// ============================================================================
+
+/// Poll per-worker SPSC app rings in round-robin order (lock-free).
+///
+/// This is a free function that operates on cached `Arc<SpscRing>` references
+/// instead of going through `MultiCoreTopology::dequeue_app()`, which would
+/// require holding the `topology` Mutex.
+#[inline]
+fn dequeue_app_rings(app_rings: &[Arc<SpscRing<AppPacket>>], rr_index: &mut usize) -> Option<AppPacket> {
+    let n = app_rings.len();
+    if n == 0 {
+        return None;
+    }
+    for offset in 0..*rr_index + n {
+        let idx = offset % n;
+        if let Some(pkt) = app_rings[idx].dequeue() {
+            *rr_index = idx + 1;
+            return Some(pkt);
+        }
+    }
+    None
+}
+
+// ============================================================================
 // SYNTHETIC TESTING UTILITIES
 // ============================================================================
 
@@ -2430,7 +2471,7 @@ impl UdpSocketBuilder {
         let topo_config = self.topology_config();
 
         // Create the socket using the standard bind path
-        let socket = UdpSocket::bind(addr)?;
+        let mut socket = UdpSocket::bind(addr)?;
 
         // Detect topology from config + runtime environment.
         // Under stubs this always returns run-to-completion.
@@ -2529,12 +2570,16 @@ impl UdpSocketBuilder {
             let topo = topology::start_pipeline(
                 pipeline_config, recv_fn, send_fn, Some(direct_send_fn),
             );
-            let is_multicore = topo.is_some();
-            *socket.topology.lock().unwrap() = topo;
+            if let Some(topo) = topo {
+                // Cache hot-path handles to avoid topology.lock() per packet.
+                socket.cached_app_rings = Some(topo.app_rings.clone());
+                socket.cached_frame_pool = Some(Arc::clone(&topo.frame_pool));
+                socket.cached_direct_send = topo.direct_send_fn.clone();
+                socket.has_pipeline.store(true, Ordering::Release);
+                *socket.topology.lock().unwrap() = Some(topo);
 
-            // Auto-enable perf reporting in multi-core mode so instrumentation
-            // output is always visible in logs (10s interval).
-            if is_multicore {
+                // Auto-enable perf reporting in multi-core mode so instrumentation
+                // output is always visible in logs (10s interval).
                 let _ = socket.enable_perf_reporting(Duration::from_secs(10));
             }
         }
