@@ -1202,6 +1202,13 @@ pub struct UdpSocket {
     cached_frame_pool: Option<Arc<FramePool>>,
     /// Cached direct-send function for lock-free send_to in pipeline mode.
     cached_direct_send: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
+    // ---- Atomic fast-path flags to skip Mutex locks in hot path ----
+    /// True after connect() is called — skip connected_addr.lock() when false.
+    is_connected: AtomicBool,
+    /// True when recv_queue has buffered packets — skip recv_queue.lock() when false.
+    has_buffered_packets: AtomicBool,
+    /// True when connection_state is Some — skip connection_state.write() when false.
+    has_connection_state: AtomicBool,
 }
 
 impl UdpSocket {
@@ -1273,6 +1280,9 @@ impl UdpSocket {
             cached_app_rings: None,
             cached_frame_pool: None,
             cached_direct_send: None,
+            is_connected: AtomicBool::new(false),
+            has_buffered_packets: AtomicBool::new(false),
+            has_connection_state: AtomicBool::new(false),
         })
     }
 
@@ -1361,6 +1371,9 @@ impl UdpSocket {
             cached_app_rings: None,
             cached_frame_pool: None,
             cached_direct_send: None,
+            is_connected: AtomicBool::new(false),
+            has_buffered_packets: AtomicBool::new(false),
+            has_connection_state: AtomicBool::new(false),
         })
     }
 
@@ -1500,10 +1513,12 @@ impl UdpSocket {
         perf_inc!(self.perf_counters.tx_packets);
         perf_inc!(self.perf_counters.tx_bytes, buf.len() as u64);
 
-        // Update connection state if connected
-        if let Ok(mut guard) = self.connection_state.write() {
-            if let Some(ref mut state) = *guard {
-                state.record_send(buf.len());
+        // Update connection state if connected — skip lock when no state exists
+        if self.has_connection_state.load(Ordering::Acquire) {
+            if let Ok(mut guard) = self.connection_state.write() {
+                if let Some(ref mut state) = *guard {
+                    state.record_send(buf.len());
+                }
             }
         }
 
@@ -1558,14 +1573,19 @@ impl UdpSocket {
                 }
             }
 
-            // Check buffered packets first (from connected socket filtering)
-            {
+            // Check buffered packets first (from connected socket filtering).
+            // Fast-path: skip the lock entirely when no packets are buffered.
+            if self.has_buffered_packets.load(Ordering::Acquire) {
                 let mut queue = self.recv_queue.lock().unwrap();
                 if let Some((payload, src_addr)) = queue.pop() {
+                    if queue.is_empty() {
+                        self.has_buffered_packets.store(false, Ordering::Release);
+                    }
                     let copy_len = std::cmp::min(buf.len(), payload.len());
                     buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                     return Ok((copy_len, src_addr));
                 }
+                self.has_buffered_packets.store(false, Ordering::Release);
             }
 
             // Poll per-worker SPSC app rings round-robin (lock-free).
@@ -1588,18 +1608,25 @@ impl UdpSocket {
                 // Free the frame back to pool
                 frame_pool.free(app_pkt.frame_ref.pool_idx);
 
-                // If connected, only accept packets from connected peer
-                if let Some(connected) = *self.connected_addr.lock().unwrap() {
-                    if app_pkt.src_addr != connected {
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr);
-                        continue;
+                // If connected, only accept packets from connected peer.
+                // Fast-path: skip the lock when not connected (common for echo servers).
+                if self.is_connected.load(Ordering::Acquire) {
+                    if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                        if app_pkt.src_addr != connected {
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr);
+                            self.has_buffered_packets.store(true, Ordering::Release);
+                            continue;
+                        }
                     }
                 }
 
-                if let Ok(mut guard) = self.connection_state.write() {
-                    if let Some(ref mut state) = *guard {
-                        state.record_recv(copy_len);
+                // Update connection stats — skip lock when no connection state exists.
+                if self.has_connection_state.load(Ordering::Acquire) {
+                    if let Ok(mut guard) = self.connection_state.write() {
+                        if let Some(ref mut state) = *guard {
+                            state.record_recv(copy_len);
+                        }
                     }
                 }
 
@@ -1882,8 +1909,10 @@ impl UdpSocket {
             self.local_addr,
             addr,
         ));
+        self.has_connection_state.store(true, Ordering::Release);
 
         *self.connected_addr.lock().unwrap() = Some(addr);
+        self.is_connected.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2513,18 +2542,22 @@ impl UdpSocketBuilder {
             let resources_for_recv = Arc::clone(&socket.resources);
             let resources_for_send = Arc::clone(&socket.resources);
 
-            let recv_fn = move |max_frames: usize| -> io::Result<Vec<Vec<u8>>> {
+            let recv_fn = move |max_frames: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
                 let packets = resources_for_recv.port.rx_burst(0, max_frames as u16)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
-                let mut frames = Vec::with_capacity(packets.len());
+                let mut refs = Vec::with_capacity(packets.len());
                 for mbuf in &packets {
                     if let Some(data) = mbuf.data() {
                         let len = mbuf.data_len() as usize;
                         let actual_len = len.min(data.len());
-                        frames.push(data[..actual_len].to_vec());
+                        // Write directly from mbuf into FramePool — eliminates the
+                        // intermediate Vec<u8> allocation and one full memcpy per packet.
+                        if let Some(frame_ref) = pool.alloc_copy(&data[..actual_len]) {
+                            refs.push(frame_ref);
+                        }
                     }
                 }
-                Ok(frames)
+                Ok(refs)
             };
 
             let send_fn = move |frame: &[u8]| -> io::Result<usize> {

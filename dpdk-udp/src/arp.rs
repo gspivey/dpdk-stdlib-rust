@@ -336,6 +336,32 @@ impl ArpCache {
         entries.insert(ip, ArpCacheEntry::new(mac));
     }
 
+    /// Insert only if the (IP, MAC) pair differs from the fast-path cache.
+    ///
+    /// In steady-state echo traffic from a single peer, the same IP→MAC mapping
+    /// is learned on every packet. This fast-path avoids taking the RwLock write
+    /// lock (~350k times/sec) when the mapping hasn't changed — just two atomic
+    /// loads instead.
+    #[inline]
+    pub fn insert_if_changed(&self, ip: Ipv4Addr, mac_bytes: &[u8; 6]) {
+        let ip_bits = u32::from(ip);
+        let mac_bits = mac_to_u64(mac_bytes);
+
+        // Fast-path: if both IP and MAC match the cached atomics, skip the write
+        if self.fast_ip.load(Ordering::Relaxed) == ip_bits
+            && self.fast_mac.load(Ordering::Relaxed) == mac_bits
+        {
+            return;
+        }
+
+        // Cache miss or changed — update atomics and take the write lock
+        self.fast_ip.store(ip_bits, Ordering::Relaxed);
+        self.fast_mac.store(mac_bits, Ordering::Relaxed);
+
+        let mut entries = self.entries.write().unwrap();
+        entries.insert(ip, ArpCacheEntry::new(MacAddress::new(*mac_bytes)));
+    }
+
     /// Remove an entry
     pub fn remove(&self, ip: &Ipv4Addr) {
         // Invalidate fast-path if it matches the removed IP

@@ -264,7 +264,7 @@ pub fn start_pipeline<R, S>(
     direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 ) -> Option<MultiCoreTopology>
 where
-    R: Fn(usize) -> io::Result<Vec<Vec<u8>>> + Send + Sync + 'static,
+    R: Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>> + Send + Sync + 'static,
     S: Fn(&[u8]) -> io::Result<usize> + Send + Sync + 'static,
 {
     if config.plan.is_run_to_completion() {
@@ -432,7 +432,7 @@ fn rx_loop<R, S>(
     rx_ready: Arc<AtomicBool>,
     frame_pool: Arc<FramePool>,
 ) where
-    R: Fn(usize) -> io::Result<Vec<Vec<u8>>>,
+    R: Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>>,
     S: Fn(&[u8]) -> io::Result<usize>,
 {
     let arp_handler = ArpHandler::with_cache(local_mac, local_ip, Arc::clone(&arp_cache));
@@ -452,8 +452,9 @@ fn rx_loop<R, S>(
             let _ = send_fn(&tx.frame);
         }
 
-        // 2. Poll NIC for incoming frames
-        let frames = match recv_fn(32) {
+        // 2. Poll NIC for incoming frames — recv_fn writes directly into FramePool,
+        //    eliminating the intermediate Vec<u8> allocation and double-copy.
+        let frame_refs = match recv_fn(32, &frame_pool) {
             Ok(f) => f,
             Err(_) => {
                 adaptive_wait(&mut empty_polls);
@@ -461,8 +462,7 @@ fn rx_loop<R, S>(
             }
         };
 
-        if frames.is_empty() && tx_batch.is_empty() {
-            // Nothing to do — adaptive backoff to avoid burning CPU
+        if frame_refs.is_empty() && tx_batch.is_empty() {
             adaptive_wait(&mut empty_polls);
             continue;
         }
@@ -470,66 +470,62 @@ fn rx_loop<R, S>(
         // Work found — reset backoff
         empty_polls = 0;
 
-        if !frames.is_empty() {
+        if !frame_refs.is_empty() {
             perf_inc!(perf_counters.rx_bursts);
-            perf_inc!(perf_counters.rx_burst_sum, frames.len() as u64);
+            perf_inc!(perf_counters.rx_burst_sum, frame_refs.len() as u64);
         }
 
-        for frame_data in frames {
-            if frame_data.len() < 14 {
+        for frame_ref in frame_refs {
+            // Read frame data from pool (zero-copy read for header inspection)
+            let frame_data = unsafe { frame_pool.frame(frame_ref.pool_idx) };
+            let frame_len = frame_ref.len as usize;
+            if frame_len < 14 {
+                frame_pool.free(frame_ref.pool_idx);
                 continue;
             }
+            let frame_slice = &frame_data[..frame_len];
 
-            let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+            let ethertype = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
 
-            // Handle ARP inline on RX core
+            // Handle ARP inline on RX core — free frame after handling
             if ethertype == arp::ETH_TYPE_ARP {
-                if let Some(reply) = arp_handler.process_arp(&frame_data) {
+                if let Some(reply) = arp_handler.process_arp(frame_slice) {
                     let _ = send_fn(&reply);
                 }
+                frame_pool.free(frame_ref.pool_idx);
                 perf_inc!(perf_counters.rx_arp_handled);
                 continue;
             }
 
-            // Handle ICMP inline on RX core
-            if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
-                let protocol = frame_data[ETH_HEADER_LEN + 9];
+            // Handle ICMP inline on RX core — free frame after handling
+            if ethertype == ETH_TYPE_IPV4 && frame_len > ETH_HEADER_LEN + 9 {
+                let protocol = frame_slice[ETH_HEADER_LEN + 9];
                 if protocol == icmp::IP_PROTO_ICMP {
-                    if let Some(reply) = icmp_handler.process_icmp(&frame_data) {
+                    if let Some(reply) = icmp_handler.process_icmp(frame_slice) {
                         let _ = send_fn(&reply);
                     }
+                    frame_pool.free(frame_ref.pool_idx);
                     perf_inc!(perf_counters.rx_icmp_handled);
                     continue;
                 }
             }
 
-            // P3.1-P3.2: Allocate from FramePool and pass FrameRef (zero-copy)
-            if let Some(frame_ref) = frame_pool.alloc_copy(&frame_data) {
-                // P3.6: RSS-aware 1:1 worker affinity
-                // Each frame goes to the next worker in round-robin order.
-                // With real RSS, the NIC distributes flows across RX queues,
-                // and each RX queue has its dedicated worker(s).
-                let target = rr_index % num_workers;
-                rr_index = rr_index.wrapping_add(1);
+            // Data frame: enqueue FrameRef to worker (already in pool, no copy needed)
+            let target = rr_index % num_workers;
+            rr_index = rr_index.wrapping_add(1);
 
-                // Try to enqueue to target worker, with fallback to next workers
-                let mut sent = false;
-                for offset in 0..num_workers {
-                    let idx = (target + offset) % num_workers;
-                    if worker_rings[idx].enqueue(frame_ref).is_ok() {
-                        sent = true;
-                        break;
-                    }
+            let mut sent = false;
+            for offset in 0..num_workers {
+                let idx = (target + offset) % num_workers;
+                if worker_rings[idx].enqueue(frame_ref).is_ok() {
+                    sent = true;
+                    break;
                 }
-                if !sent {
-                    // All worker rings full — free the frame back to pool and drop
-                    frame_pool.free(frame_ref.pool_idx);
-                    perf_inc!(perf_counters.rx_drops_ring_full);
-                    perf_inc!(perf_counters.worker_ring_enqueue_fail);
-                }
-            } else {
-                // Frame pool exhausted — drop frame
+            }
+            if !sent {
+                frame_pool.free(frame_ref.pool_idx);
                 perf_inc!(perf_counters.rx_drops_ring_full);
+                perf_inc!(perf_counters.worker_ring_enqueue_fail);
             }
         }
 
@@ -584,13 +580,11 @@ fn worker_loop(
                 perf_inc!(perf_counters.rx_packets);
                 perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
 
-                // Learn source MAC from incoming packets
+                // Learn source MAC from incoming packets (fast-path: skip
+                // RwLock write if the same IP→MAC is already cached)
                 if frame_slice.len() >= 12 {
                     let src_mac: [u8; 6] = frame_slice[6..12].try_into().unwrap();
-                    arp_cache.insert(
-                        parsed.src_ip,
-                        dpdk::port::MacAddress::new(src_mac),
-                    );
+                    arp_cache.insert_if_changed(parsed.src_ip, &src_mac);
                 }
 
                 // Filter by destination port
@@ -695,8 +689,16 @@ pub fn detect_topology(
     let wpq = config.workers_per_queue.or(env_wpq);
 
     if rq.is_some() || wpq.is_some() {
-        let rx_queues = rq.unwrap_or_else(|| auto_detect_queues(available_lcores, nic_max_rx_queues));
-        let workers_per_queue = wpq.unwrap_or_else(|| auto_detect_workers(available_lcores, rx_queues));
+        let workers_per_queue = wpq.unwrap_or(1);
+        let rx_queues = rq.unwrap_or_else(|| {
+            // When workers_per_queue is known, compute rx_queues to avoid
+            // oversubscription. Reserve 1 lcore for the app thread, then divide
+            // remaining lcores by (1 RX + N workers) per queue group.
+            let available = available_lcores.saturating_sub(1); // reserve for app thread
+            let per_group = 1 + workers_per_queue as u32;       // 1 RX + N workers
+            let queues = if per_group == 0 { 1 } else { (available / per_group).max(1) };
+            clamp_rx_queues(queues as u16, nic_max_rx_queues)
+        });
         let source = if config.rx_queues.is_some() || config.workers_per_queue.is_some() {
             TopologySource::Builder
         } else {
@@ -729,21 +731,31 @@ pub fn detect_topology(
 // ============================================================================
 
 /// Auto-detect the number of RX queues based on available lcores and NIC caps.
+///
+/// Reserves 1 lcore for the application thread to prevent oversubscription
+/// (pipeline threads fighting the app thread for CPU).
 fn auto_detect_queues(lcores: u32, nic_max: u16) -> u16 {
-    let queues = match lcores {
-        0..=2 => 1,                            // run-to-completion
-        3..=4 => 2.min(nic_max),               // small pipeline
+    // Reserve 1 lcore for the app thread
+    let available = lcores.saturating_sub(1);
+    let queues = match available {
+        0..=1 => 1,                            // run-to-completion
+        2..=3 => 1.min(nic_max),               // small pipeline: 1 RX + 1-2 workers
         n => ((n / 2) as u16).min(nic_max),    // half for RX, half for workers
     };
     clamp_rx_queues(queues, nic_max)
 }
 
 /// Auto-detect workers per queue from remaining lcores after RX allocation.
+///
+/// Accounts for the app thread: subtracts 1 from total lcores before computing.
 fn auto_detect_workers(lcores: u32, rx_queues: u16) -> u16 {
     if rx_queues == 0 {
         return 0;
     }
-    let remaining = (lcores as usize).saturating_sub(rx_queues as usize);
+    // Reserve 1 lcore for app thread, then subtract RX lcores
+    let remaining = (lcores as usize)
+        .saturating_sub(1)                     // app thread
+        .saturating_sub(rx_queues as usize);   // RX lcores
     if remaining == 0 {
         return 0; // run-to-completion
     }
@@ -806,34 +818,38 @@ mod tests {
 
     #[test]
     fn auto_detect_2_vcpu() {
+        // 2 vCPUs: 1 reserved for app, 1 available → run-to-completion
         let queues = auto_detect_queues(2, 16);
         assert_eq!(queues, 1);
         let workers = auto_detect_workers(2, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 0); // no workers after reserving 1 for app + 1 for RX
     }
 
     #[test]
     fn auto_detect_4_vcpu() {
+        // 4 vCPUs: 1 reserved for app, 3 available → 1 RX + 1 worker
         let queues = auto_detect_queues(4, 16);
-        assert_eq!(queues, 2);
+        assert_eq!(queues, 1);
         let workers = auto_detect_workers(4, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 2); // 4 - 1(app) - 1(RX) = 2 workers
     }
 
     #[test]
     fn auto_detect_16_vcpu() {
+        // 16 vCPUs: 1 reserved for app, 15 available → 7 RX + 7-8 workers
         let queues = auto_detect_queues(16, 16);
-        assert_eq!(queues, 8);
+        assert_eq!(queues, 7); // (16-1)/2 = 7
         let workers = auto_detect_workers(16, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 1); // (16-1-7)/7 = 1
     }
 
     #[test]
     fn auto_detect_32_vcpu() {
+        // 32 vCPUs: 1 reserved for app, 31 available → 15 RX, clamped to NIC max 16
         let queues = auto_detect_queues(32, 16);
-        assert_eq!(queues, 16); // clamped to NIC max
+        assert_eq!(queues, 15); // (32-1)/2 = 15, within NIC max 16
         let workers = auto_detect_workers(32, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 1); // (32-1-15)/15 = 1
     }
 
     #[test]
@@ -968,10 +984,15 @@ mod tests {
         frames.lock().unwrap().push(frame);
 
         let frames_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&frames);
-        let recv_fn = move |_max: usize| -> io::Result<Vec<Vec<u8>>> {
+        let recv_fn = move |_max: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
             let mut f = frames_clone.lock().unwrap();
-            let batch = f.drain(..).collect();
-            Ok(batch)
+            let mut refs = Vec::new();
+            for frame in f.drain(..) {
+                if let Some(fref) = pool.alloc_copy(&frame) {
+                    refs.push(fref);
+                }
+            }
+            Ok(refs)
         };
 
         let sent_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&sent);
@@ -1051,7 +1072,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> { Ok(vec![]) };
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
 
         let topo = start_pipeline(config, recv_fn, send_fn, None);
@@ -1063,7 +1084,7 @@ mod tests {
         // Verify that frames enqueued to tx_ring get sent via the send_fn
         let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> { Ok(vec![]) };
 
         let sent_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&sent);
         let send_fn = move |frame: &[u8]| -> io::Result<usize> {
@@ -1143,7 +1164,7 @@ mod tests {
     #[test]
     fn pipeline_graceful_shutdown() {
         // Verify shutdown joins all threads cleanly
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> {
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> {
             std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(vec![])
         };
@@ -1226,10 +1247,15 @@ mod tests {
         }
 
         let frames_clone = Arc::clone(&frames);
-        let recv_fn = move |_max: usize| -> io::Result<Vec<Vec<u8>>> {
+        let recv_fn = move |_max: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
             let mut f = frames_clone.lock().unwrap();
-            let batch = f.drain(..).collect();
-            Ok(batch)
+            let mut refs = Vec::new();
+            for frame in f.drain(..) {
+                if let Some(fref) = pool.alloc_copy(&frame) {
+                    refs.push(fref);
+                }
+            }
+            Ok(refs)
         };
 
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
