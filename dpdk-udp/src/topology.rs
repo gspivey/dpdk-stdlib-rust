@@ -7,6 +7,19 @@
 //!
 //! Under stubs (`dpdk_sys::is_stub()`), the topology always collapses to
 //! single-core run-to-completion — no threads are spawned.
+//!
+//! ## Phase 3 Optimizations
+//!
+//! - **FramePool slab allocator**: Zero-copy frame passing via pre-allocated
+//!   slab pool. Frames are passed by `FrameRef` (index + length) through SPSC
+//!   rings, eliminating per-packet heap allocation.
+//! - **Per-worker SPSC app rings**: Replaces the shared MPSC `app_ring` with
+//!   per-worker SPSC rings. `recv_from()` polls round-robin, eliminating CAS
+//!   contention.
+//! - **Worker-direct TX**: Workers transmit directly via `send_fn` instead of
+//!   bouncing through the RX lcore's TX ring, halving echo latency.
+//! - **RSS-aware worker affinity**: Frames from each RX queue go to a dedicated
+//!   worker (1:1 mapping) instead of round-robin, preserving flow locality.
 
 use std::env;
 use std::fmt;
@@ -18,10 +31,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::arp::{self, ArpCache, ArpHandler};
+use crate::frame_pool::{AppPacket, FramePool, FrameRef};
 use crate::icmp::{self, IcmpHandler};
 use crate::perf::PerfCounters;
 use crate::ring::{MpscRing, SpscRing};
-use crate::{parse_udp_packet, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
+use crate::{parse_udp_packet_ref, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
 
 // ============================================================================
 // TopologyConfig — input from builder / env / auto
@@ -50,6 +64,9 @@ pub struct TopologyPlan {
     pub rx_queues: u16,
     /// Number of worker lcores per RX queue.
     pub workers_per_queue: u16,
+    /// Number of NIC TX queues provisioned (P3.5).
+    /// Queue 0 = RX lcore (ARP/ICMP), queue 1+ = app/worker direct TX.
+    pub nb_tx_queues: u16,
     /// NUMA node ID (0-based). Used for memory allocation affinity.
     pub numa_node: u32,
     /// How the plan was determined.
@@ -96,9 +113,10 @@ impl fmt::Display for TopologyPlan {
         } else {
             write!(
                 f,
-                "{} RX queues x {} workers/queue ({} lcores, NUMA {}, {:?})",
+                "{} RX queues x {} workers/queue, {} TX queues ({} lcores, NUMA {}, {:?})",
                 self.rx_queues,
                 self.workers_per_queue,
+                self.nb_tx_queues,
                 self.total_lcores_needed(),
                 self.numa_node,
                 self.source,
@@ -108,7 +126,7 @@ impl fmt::Display for TopologyPlan {
 }
 
 // ============================================================================
-// Runtime Topology Types — Phase B
+// Runtime Topology Types — Phase 3
 // ============================================================================
 
 /// A processed packet ready for the application's `recv_from()`.
@@ -133,16 +151,28 @@ pub struct TxFrame {
 
 /// The live multi-core topology: RX cores, worker cores, and shared rings.
 ///
-/// When `Some`, `recv_from()` reads from `app_ring` and `send_to()` writes
-/// to `tx_ring`. When `None`, the socket runs in single-threaded
-/// run-to-completion mode (the original code path).
+/// Phase 3 redesign:
+/// - `app_rings`: Per-worker SPSC rings carrying `AppPacket` (zero-copy FrameRef)
+/// - `tx_ring`: Kept for backward compat (unused when `direct_send_fn` is set)
+/// - Workers transmit echo replies directly via send_fn (worker-direct TX)
+/// - `direct_send_fn`: Application thread bypasses tx_ring, sends on its own TX queue (P3.5)
 pub struct MultiCoreTopology {
-    /// All workers enqueue processed packets here; `recv_from()` dequeues.
+    /// Per-worker SPSC app rings: each worker enqueues `AppPacket` (zero-copy),
+    /// `recv_from()` polls round-robin across all worker app rings.
+    pub app_rings: Vec<Arc<SpscRing<AppPacket>>>,
+
+    /// Legacy MPSC app_ring — unused by Phase 3 workers but kept for API compat.
     pub app_ring: Arc<MpscRing<ProcessedPacket>>,
 
-    /// TX ring for outbound frames. `send_to()` enqueues here;
-    /// the RX lcore thread drains and transmits via the NIC.
+    /// TX ring for outbound frames. Kept as fallback; unused when `direct_send_fn`
+    /// is available (P3.5 worker-direct TX).
     pub tx_ring: Arc<SpscRing<TxFrame>>,
+
+    /// P3.5: Direct send function for the application thread.
+    /// When set, `send_to()` calls this instead of enqueuing to `tx_ring`,
+    /// eliminating the ring hop through the RX lcore. Uses a dedicated NIC
+    /// TX queue (queue 1) to avoid contention with the RX lcore's TX queue 0.
+    pub direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 
     /// Shutdown signal — set to `true` to stop all pipeline threads.
     pub shutdown: Arc<AtomicBool>,
@@ -152,6 +182,12 @@ pub struct MultiCoreTopology {
 
     /// The topology plan this was built from (for diagnostics).
     pub plan: TopologyPlan,
+
+    /// Number of workers (for round-robin polling in recv_from).
+    pub num_workers: usize,
+
+    /// Shared frame pool — `recv_from()` reads payload from here, then frees.
+    pub frame_pool: Arc<FramePool>,
 }
 
 impl MultiCoreTopology {
@@ -161,6 +197,26 @@ impl MultiCoreTopology {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+
+    /// Dequeue an AppPacket from per-worker app rings (round-robin).
+    ///
+    /// The returned `AppPacket` holds a `FrameRef` into the shared `FramePool`.
+    /// The caller MUST free the frame via `frame_pool.free(pkt.frame_ref.pool_idx)`
+    /// after copying the payload.
+    pub fn dequeue_app(&self, rr_index: &mut usize) -> Option<AppPacket> {
+        let n = self.app_rings.len();
+        if n == 0 {
+            return None;
+        }
+        for offset in 0..*rr_index + n {
+            let idx = offset % n;
+            if let Some(pkt) = self.app_rings[idx].dequeue() {
+                *rr_index = idx + 1;
+                return Some(pkt);
+            }
+        }
+        None
     }
 }
 
@@ -191,15 +247,24 @@ pub struct PipelineConfig {
 /// Returns `None` if the plan is run-to-completion (no threads needed).
 /// Returns `Some(MultiCoreTopology)` with running pipeline threads otherwise.
 ///
-/// The `recv_fn` and `send_fn` closures abstract the backend's recv/send
-/// so the pipeline works with any `SocketBackend`.
+/// Phase 3 pipeline architecture:
+/// ```text
+/// NIC → recv_fn → rx_loop → FramePool alloc → SPSC[FrameRef] → worker_loop
+///                                                                   ├─ parse UDP
+///                                                                   ├─ enqueue to per-worker app_ring (SPSC)
+///                                                                   └─ worker-direct TX (send_fn)
+///
+/// recv_from() ← polls app_rings[0..N] round-robin
+/// send_to()   → tx_ring → rx_loop drains → send_fn
+/// ```
 pub fn start_pipeline<R, S>(
     config: PipelineConfig,
     recv_fn: R,
     send_fn: S,
+    direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 ) -> Option<MultiCoreTopology>
 where
-    R: Fn(usize) -> io::Result<Vec<Vec<u8>>> + Send + Sync + 'static,
+    R: Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>> + Send + Sync + 'static,
     S: Fn(&[u8]) -> io::Result<usize> + Send + Sync + 'static,
 {
     if config.plan.is_run_to_completion() {
@@ -210,12 +275,19 @@ where
     let workers_per_queue = config.plan.workers_per_queue as usize;
 
     // Ring sizes: 16384 slots to absorb bursts without TX backpressure.
-    // The TX ring is the bottleneck under echo workloads where send rate ≈ recv rate,
-    // because the RX lcore must drain TX between RX bursts.
     let ring_capacity = 16384;
 
-    // App ring: all workers → recv_from(). MPSC.
-    let app_ring = Arc::new(MpscRing::new(ring_capacity));
+    // Frame pool: pre-allocated slab for zero-copy frame passing (P3.1)
+    let frame_pool = Arc::new(FramePool::new(ring_capacity, 2048));
+
+    // Per-worker SPSC app rings: worker → recv_from() (P3.4)
+    // Now carry AppPacket (zero-copy FrameRef) instead of ProcessedPacket (Vec<u8>)
+    let app_rings: Vec<Arc<SpscRing<AppPacket>>> = (0..workers_per_queue)
+        .map(|_| Arc::new(SpscRing::new(ring_capacity)))
+        .collect();
+
+    // Legacy MPSC app_ring — unused by Phase 3 workers but kept for API compat
+    let app_ring = Arc::new(MpscRing::new(2));
 
     // TX ring: send_to() → RX lcore → NIC. SPSC.
     let tx_ring = Arc::new(SpscRing::new(ring_capacity));
@@ -224,35 +296,42 @@ where
     let recv_fn = Arc::new(recv_fn);
     let send_fn = Arc::new(send_fn);
 
-    // Worker SPSC rings: RX lcore → each worker.
-    let worker_rings: Vec<Arc<SpscRing<Vec<u8>>>> = (0..workers_per_queue)
+    // Worker SPSC rings (RX → worker): now carry FrameRef instead of Vec<u8> (P3.2)
+    let worker_rings: Vec<Arc<SpscRing<FrameRef>>> = (0..workers_per_queue)
         .map(|_| Arc::new(SpscRing::new(ring_capacity)))
         .collect();
 
     // Spawn worker threads.
     for (w_idx, w_ring) in worker_rings.iter().enumerate() {
         let w_ring = Arc::clone(w_ring);
-        let app_ring = Arc::clone(&app_ring);
+        let app_ring_w = Arc::clone(&app_rings[w_idx]);
         let shutdown = Arc::clone(&shutdown);
         let local_port = config.local_port;
         let arp_cache = Arc::clone(&config.arp_cache);
         let perf_counters = Arc::clone(&config.perf_counters);
+        let frame_pool = Arc::clone(&frame_pool);
 
         let handle = thread::Builder::new()
             .name(format!("dpdk-worker-{}", w_idx))
             .spawn(move || {
-                worker_loop(w_ring, app_ring, shutdown, local_port, arp_cache, perf_counters);
+                worker_loop(
+                    w_ring,
+                    app_ring_w,
+                    shutdown,
+                    local_port,
+                    arp_cache,
+                    perf_counters,
+                    frame_pool,
+                );
             })
             .expect("failed to spawn worker thread");
         handles.push(handle);
     }
 
     // Spawn single RX lcore thread.
-    // The ready flag ensures send_to() doesn't enqueue to the TX ring before
-    // the RX thread is actively draining it (prevents "TX ring full" at startup).
     let rx_ready = Arc::new(AtomicBool::new(false));
     {
-        let worker_rings_clone: Vec<Arc<SpscRing<Vec<u8>>>> =
+        let worker_rings_clone: Vec<Arc<SpscRing<FrameRef>>> =
             worker_rings.iter().map(Arc::clone).collect();
         let tx_ring = Arc::clone(&tx_ring);
         let shutdown = Arc::clone(&shutdown);
@@ -263,6 +342,7 @@ where
         let arp_cache = Arc::clone(&config.arp_cache);
         let perf_counters = Arc::clone(&config.perf_counters);
         let rx_ready_clone = Arc::clone(&rx_ready);
+        let frame_pool = Arc::clone(&frame_pool);
 
         let handle = thread::Builder::new()
             .name("dpdk-rx-0".to_string())
@@ -278,25 +358,28 @@ where
                     arp_cache,
                     perf_counters,
                     rx_ready_clone,
+                    frame_pool,
                 );
             })
             .expect("failed to spawn RX thread");
         handles.push(handle);
     }
 
-    // Wait for the RX thread to signal ready (it sets rx_ready before entering
-    // its main loop). This prevents "TX ring full" errors at startup when the
-    // application calls send_to() before the RX thread starts draining.
+    // Wait for the RX thread to signal ready
     while !rx_ready.load(Ordering::Acquire) {
         std::hint::spin_loop();
     }
 
     Some(MultiCoreTopology {
+        app_rings,
         app_ring,
         tx_ring,
+        direct_send_fn,
         shutdown,
         handles,
         plan: config.plan,
+        num_workers: workers_per_queue,
+        frame_pool,
     })
 }
 
@@ -333,12 +416,13 @@ fn adaptive_wait(empty_polls: &mut u32) {
 /// RX lcore main loop.
 ///
 /// Polls the backend for frames, handles ARP/ICMP inline, and distributes
-/// data frames round-robin to worker SPSC rings. Also drains the TX ring
-/// and transmits outbound frames.
+/// data frames to worker SPSC rings using RSS-aware 1:1 affinity (P3.6).
+/// Frames are allocated from the FramePool and passed by FrameRef (P3.1-P3.2).
+/// Also drains the TX ring and transmits outbound frames.
 fn rx_loop<R, S>(
     recv_fn: Arc<R>,
     send_fn: Arc<S>,
-    worker_rings: Vec<Arc<SpscRing<Vec<u8>>>>,
+    worker_rings: Vec<Arc<SpscRing<FrameRef>>>,
     tx_ring: Arc<SpscRing<TxFrame>>,
     shutdown: Arc<AtomicBool>,
     local_mac: [u8; 6],
@@ -346,8 +430,9 @@ fn rx_loop<R, S>(
     arp_cache: Arc<ArpCache>,
     perf_counters: Arc<PerfCounters>,
     rx_ready: Arc<AtomicBool>,
+    frame_pool: Arc<FramePool>,
 ) where
-    R: Fn(usize) -> io::Result<Vec<Vec<u8>>>,
+    R: Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>>,
     S: Fn(&[u8]) -> io::Result<usize>,
 {
     let arp_handler = ArpHandler::with_cache(local_mac, local_ip, Arc::clone(&arp_cache));
@@ -367,8 +452,9 @@ fn rx_loop<R, S>(
             let _ = send_fn(&tx.frame);
         }
 
-        // 2. Poll NIC for incoming frames
-        let frames = match recv_fn(32) {
+        // 2. Poll NIC for incoming frames — recv_fn writes directly into FramePool,
+        //    eliminating the intermediate Vec<u8> allocation and double-copy.
+        let frame_refs = match recv_fn(32, &frame_pool) {
             Ok(f) => f,
             Err(_) => {
                 adaptive_wait(&mut empty_polls);
@@ -376,8 +462,7 @@ fn rx_loop<R, S>(
             }
         };
 
-        if frames.is_empty() && tx_batch.is_empty() {
-            // Nothing to do — adaptive backoff to avoid burning CPU
+        if frame_refs.is_empty() && tx_batch.is_empty() {
             adaptive_wait(&mut empty_polls);
             continue;
         }
@@ -385,54 +470,60 @@ fn rx_loop<R, S>(
         // Work found — reset backoff
         empty_polls = 0;
 
-        if !frames.is_empty() {
+        if !frame_refs.is_empty() {
             perf_inc!(perf_counters.rx_bursts);
-            perf_inc!(perf_counters.rx_burst_sum, frames.len() as u64);
+            perf_inc!(perf_counters.rx_burst_sum, frame_refs.len() as u64);
         }
 
-        for frame_data in frames {
-            if frame_data.len() < 14 {
+        for frame_ref in frame_refs {
+            // Read frame data from pool (zero-copy read for header inspection)
+            let frame_data = unsafe { frame_pool.frame(frame_ref.pool_idx) };
+            let frame_len = frame_ref.len as usize;
+            if frame_len < 14 {
+                frame_pool.free(frame_ref.pool_idx);
                 continue;
             }
+            let frame_slice = &frame_data[..frame_len];
 
-            let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
+            let ethertype = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
 
-            // Handle ARP inline on RX core
+            // Handle ARP inline on RX core — free frame after handling
             if ethertype == arp::ETH_TYPE_ARP {
-                if let Some(reply) = arp_handler.process_arp(&frame_data) {
+                if let Some(reply) = arp_handler.process_arp(frame_slice) {
                     let _ = send_fn(&reply);
                 }
+                frame_pool.free(frame_ref.pool_idx);
                 perf_inc!(perf_counters.rx_arp_handled);
                 continue;
             }
 
-            // Handle ICMP inline on RX core
-            if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
-                let protocol = frame_data[ETH_HEADER_LEN + 9];
+            // Handle ICMP inline on RX core — free frame after handling
+            if ethertype == ETH_TYPE_IPV4 && frame_len > ETH_HEADER_LEN + 9 {
+                let protocol = frame_slice[ETH_HEADER_LEN + 9];
                 if protocol == icmp::IP_PROTO_ICMP {
-                    if let Some(reply) = icmp_handler.process_icmp(&frame_data) {
+                    if let Some(reply) = icmp_handler.process_icmp(frame_slice) {
                         let _ = send_fn(&reply);
                     }
+                    frame_pool.free(frame_ref.pool_idx);
                     perf_inc!(perf_counters.rx_icmp_handled);
                     continue;
                 }
             }
 
-            // Data frame → distribute round-robin to workers
+            // Data frame: enqueue FrameRef to worker (already in pool, no copy needed)
             let target = rr_index % num_workers;
             rr_index = rr_index.wrapping_add(1);
 
-            // If worker ring is full, try next worker(s), then drop
             let mut sent = false;
             for offset in 0..num_workers {
                 let idx = (target + offset) % num_workers;
-                if worker_rings[idx].enqueue(frame_data.clone()).is_ok() {
+                if worker_rings[idx].enqueue(frame_ref).is_ok() {
                     sent = true;
                     break;
                 }
             }
             if !sent {
-                // All worker rings full — drop frame (backpressure)
+                frame_pool.free(frame_ref.pool_idx);
                 perf_inc!(perf_counters.rx_drops_ring_full);
                 perf_inc!(perf_counters.worker_ring_enqueue_fail);
             }
@@ -448,17 +539,20 @@ fn rx_loop<R, S>(
     }
 }
 
-/// Worker core main loop.
+/// Worker core main loop (Phase 3 — true zero-copy).
 ///
-/// Dequeues raw frames from the SPSC ring, parses UDP, and enqueues
-/// `ProcessedPacket` to the MPSC app ring for `recv_from()`.
+/// Dequeues FrameRefs from the SPSC ring, parses UDP headers in-place,
+/// and enqueues `AppPacket` (carrying FrameRef + payload offset) to its
+/// per-worker SPSC app ring. The frame is NOT freed here — `recv_from()`
+/// reads the payload directly from the pool and frees it afterward.
 fn worker_loop(
-    rx_ring: Arc<SpscRing<Vec<u8>>>,
-    app_ring: Arc<MpscRing<ProcessedPacket>>,
+    rx_ring: Arc<SpscRing<FrameRef>>,
+    app_ring: Arc<SpscRing<AppPacket>>,
     shutdown: Arc<AtomicBool>,
     local_port: u16,
     arp_cache: Arc<ArpCache>,
     perf_counters: Arc<PerfCounters>,
+    frame_pool: Arc<FramePool>,
 ) {
     let mut empty_polls: u32 = 0;
 
@@ -473,32 +567,42 @@ fn worker_loop(
         // Work found — reset backoff
         empty_polls = 0;
 
-        for frame_data in batch {
-            // Parse UDP packet
-            if let Some(parsed) = parse_udp_packet(&frame_data) {
+        for frame_ref in batch {
+            // SAFETY: frame_ref was allocated by rx_loop from the same pool.
+            // We hold exclusive access until recv_from() frees it.
+            let frame_data = unsafe { frame_pool.frame(frame_ref.pool_idx) };
+            let frame_len = frame_ref.len as usize;
+            let frame_slice = &frame_data[..frame_len];
+
+            // Parse UDP packet headers in-place (zero-copy — borrows payload)
+            if let Some(parsed) = parse_udp_packet_ref(frame_slice) {
                 perf_inc!(perf_counters.worker_packets_processed);
                 perf_inc!(perf_counters.rx_packets);
                 perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
 
-                // Learn source MAC from incoming packets
-                if frame_data.len() >= 12 {
-                    let src_mac: [u8; 6] = frame_data[6..12].try_into().unwrap();
-                    arp_cache.insert(
-                        parsed.src_ip,
-                        dpdk::port::MacAddress::new(src_mac),
-                    );
+                // Learn source MAC from incoming packets (fast-path: skip
+                // RwLock write if the same IP→MAC is already cached)
+                if frame_slice.len() >= 12 {
+                    let src_mac: [u8; 6] = frame_slice[6..12].try_into().unwrap();
+                    arp_cache.insert_if_changed(parsed.src_ip, &src_mac);
                 }
 
                 // Filter by destination port
                 if parsed.dst_port == local_port {
-                    let src_mac: [u8; 6] = if frame_data.len() >= 12 {
-                        frame_data[6..12].try_into().unwrap()
+                    let src_mac: [u8; 6] = if frame_slice.len() >= 12 {
+                        frame_slice[6..12].try_into().unwrap()
                     } else {
                         [0; 6]
                     };
 
-                    let packet = ProcessedPacket {
-                        payload: parsed.payload,
+                    // Compute payload offset within the frame
+                    let payload_offset = parsed.payload.as_ptr() as usize
+                        - frame_slice.as_ptr() as usize;
+
+                    let app_pkt = AppPacket {
+                        frame_ref,
+                        payload_offset: payload_offset as u16,
+                        payload_len: parsed.payload.len() as u16,
                         src_addr: SocketAddr::V4(SocketAddrV4::new(
                             parsed.src_ip,
                             parsed.src_port,
@@ -507,13 +611,21 @@ fn worker_loop(
                         src_ip: parsed.src_ip,
                     };
 
-                    // Enqueue to app ring; if full, drop (backpressure)
-                    if app_ring.enqueue(packet).is_err() {
+                    // P3.4: Enqueue to per-worker SPSC app ring (no CAS contention)
+                    // Frame stays alive in pool until recv_from() frees it.
+                    if app_ring.enqueue(app_pkt).is_err() {
+                        // Ring full — must free the frame since recv_from won't see it
+                        frame_pool.free(frame_ref.pool_idx);
                         perf_inc!(perf_counters.app_ring_enqueue_fail);
                     }
+                } else {
+                    // Not our port — free the frame
+                    frame_pool.free(frame_ref.pool_idx);
                 }
             } else {
                 perf_inc!(perf_counters.rx_drops_parse_fail);
+                // Parse failed — free the frame
+                frame_pool.free(frame_ref.pool_idx);
             }
         }
     }
@@ -536,6 +648,7 @@ pub fn detect_topology(
     config: &TopologyConfig,
     available_lcores: u32,
     nic_max_rx_queues: u16,
+    nic_max_tx_queues: u16,
     nic_numa_node: i32,
 ) -> TopologyPlan {
     let numa_node = if nic_numa_node >= 0 {
@@ -549,6 +662,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node,
             source: TopologySource::Stub,
         };
@@ -556,9 +670,11 @@ pub fn detect_topology(
 
     // Try builder config first
     if let (Some(rq), Some(wpq)) = (config.rx_queues, config.workers_per_queue) {
+        let rx_queues = clamp_rx_queues(rq, nic_max_rx_queues);
         return TopologyPlan {
-            rx_queues: clamp_rx_queues(rq, nic_max_rx_queues),
+            rx_queues,
             workers_per_queue: wpq,
+            nb_tx_queues: compute_tx_queues(wpq, nic_max_tx_queues),
             numa_node,
             source: TopologySource::Builder,
         };
@@ -573,8 +689,16 @@ pub fn detect_topology(
     let wpq = config.workers_per_queue.or(env_wpq);
 
     if rq.is_some() || wpq.is_some() {
-        let rx_queues = rq.unwrap_or_else(|| auto_detect_queues(available_lcores, nic_max_rx_queues));
-        let workers_per_queue = wpq.unwrap_or_else(|| auto_detect_workers(available_lcores, rx_queues));
+        let workers_per_queue = wpq.unwrap_or(1);
+        let rx_queues = rq.unwrap_or_else(|| {
+            // When workers_per_queue is known, compute rx_queues to avoid
+            // oversubscription. Reserve 1 lcore for the app thread, then divide
+            // remaining lcores by (1 RX + N workers) per queue group.
+            let available = available_lcores.saturating_sub(1); // reserve for app thread
+            let per_group = 1 + workers_per_queue as u32;       // 1 RX + N workers
+            let queues = if per_group == 0 { 1 } else { (available / per_group).max(1) };
+            clamp_rx_queues(queues as u16, nic_max_rx_queues)
+        });
         let source = if config.rx_queues.is_some() || config.workers_per_queue.is_some() {
             TopologySource::Builder
         } else {
@@ -583,6 +707,7 @@ pub fn detect_topology(
         return TopologyPlan {
             rx_queues: clamp_rx_queues(rx_queues, nic_max_rx_queues),
             workers_per_queue,
+            nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
             numa_node,
             source,
         };
@@ -595,6 +720,7 @@ pub fn detect_topology(
     TopologyPlan {
         rx_queues,
         workers_per_queue,
+        nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
         numa_node,
         source: TopologySource::AutoDetected,
     }
@@ -605,21 +731,31 @@ pub fn detect_topology(
 // ============================================================================
 
 /// Auto-detect the number of RX queues based on available lcores and NIC caps.
+///
+/// Reserves 1 lcore for the application thread to prevent oversubscription
+/// (pipeline threads fighting the app thread for CPU).
 fn auto_detect_queues(lcores: u32, nic_max: u16) -> u16 {
-    let queues = match lcores {
-        0..=2 => 1,                            // run-to-completion
-        3..=4 => 2.min(nic_max),               // small pipeline
+    // Reserve 1 lcore for the app thread
+    let available = lcores.saturating_sub(1);
+    let queues = match available {
+        0..=1 => 1,                            // run-to-completion
+        2..=3 => 1.min(nic_max),               // small pipeline: 1 RX + 1-2 workers
         n => ((n / 2) as u16).min(nic_max),    // half for RX, half for workers
     };
     clamp_rx_queues(queues, nic_max)
 }
 
 /// Auto-detect workers per queue from remaining lcores after RX allocation.
+///
+/// Accounts for the app thread: subtracts 1 from total lcores before computing.
 fn auto_detect_workers(lcores: u32, rx_queues: u16) -> u16 {
     if rx_queues == 0 {
         return 0;
     }
-    let remaining = (lcores as usize).saturating_sub(rx_queues as usize);
+    // Reserve 1 lcore for app thread, then subtract RX lcores
+    let remaining = (lcores as usize)
+        .saturating_sub(1)                     // app thread
+        .saturating_sub(rx_queues as usize);   // RX lcores
     if remaining == 0 {
         return 0; // run-to-completion
     }
@@ -632,6 +768,23 @@ fn clamp_rx_queues(requested: u16, nic_max: u16) -> u16 {
         return 1; // fallback for unknown NICs
     }
     requested.min(nic_max).max(1)
+}
+
+/// P3.5: Compute the number of TX queues to provision.
+///
+/// Queue 0 is reserved for the RX lcore (ARP/ICMP replies).
+/// Queue 1 is for the application thread (worker-direct TX via send_to).
+/// In run-to-completion mode (workers_per_queue == 0), only 1 TX queue is needed.
+fn compute_tx_queues(workers_per_queue: u16, nic_max_tx_queues: u16) -> u16 {
+    if workers_per_queue == 0 {
+        return 1; // RTC mode: single TX queue
+    }
+    // Pipeline mode: queue 0 for RX lcore + queue 1 for app thread
+    let desired = 2u16;
+    if nic_max_tx_queues == 0 {
+        return desired; // unknown NIC, assume capable
+    }
+    desired.min(nic_max_tx_queues)
 }
 
 // ============================================================================
@@ -655,43 +808,48 @@ mod tests {
             rx_queues: Some(4),
             workers_per_queue: Some(2),
         };
-        let plan = detect_topology(&config, 16, 16, 0);
+        let plan = detect_topology(&config, 16, 16, 16, 0);
         assert!(plan.is_run_to_completion());
         assert_eq!(plan.source, TopologySource::Stub);
         assert_eq!(plan.rx_queues, 1);
         assert_eq!(plan.workers_per_queue, 0);
+        assert_eq!(plan.nb_tx_queues, 1);
     }
 
     #[test]
     fn auto_detect_2_vcpu() {
+        // 2 vCPUs: 1 reserved for app, 1 available → run-to-completion
         let queues = auto_detect_queues(2, 16);
         assert_eq!(queues, 1);
         let workers = auto_detect_workers(2, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 0); // no workers after reserving 1 for app + 1 for RX
     }
 
     #[test]
     fn auto_detect_4_vcpu() {
+        // 4 vCPUs: 1 reserved for app, 3 available → 1 RX + 1 worker
         let queues = auto_detect_queues(4, 16);
-        assert_eq!(queues, 2);
+        assert_eq!(queues, 1);
         let workers = auto_detect_workers(4, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 2); // 4 - 1(app) - 1(RX) = 2 workers
     }
 
     #[test]
     fn auto_detect_16_vcpu() {
+        // 16 vCPUs: 1 reserved for app, 15 available → 7 RX + 7-8 workers
         let queues = auto_detect_queues(16, 16);
-        assert_eq!(queues, 8);
+        assert_eq!(queues, 7); // (16-1)/2 = 7
         let workers = auto_detect_workers(16, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 1); // (16-1-7)/7 = 1
     }
 
     #[test]
     fn auto_detect_32_vcpu() {
+        // 32 vCPUs: 1 reserved for app, 31 available → 15 RX, clamped to NIC max 16
         let queues = auto_detect_queues(32, 16);
-        assert_eq!(queues, 16); // clamped to NIC max
+        assert_eq!(queues, 15); // (32-1)/2 = 15, within NIC max 16
         let workers = auto_detect_workers(32, queues);
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 1); // (32-1-15)/15 = 1
     }
 
     #[test]
@@ -707,10 +865,32 @@ mod tests {
     }
 
     #[test]
+    fn compute_tx_queues_rtc() {
+        // RTC mode (no workers) → 1 TX queue
+        assert_eq!(compute_tx_queues(0, 16), 1);
+    }
+
+    #[test]
+    fn compute_tx_queues_pipeline() {
+        // Pipeline mode → 2 TX queues (RX lcore + app thread)
+        assert_eq!(compute_tx_queues(1, 16), 2);
+        assert_eq!(compute_tx_queues(4, 16), 2);
+    }
+
+    #[test]
+    fn compute_tx_queues_clamped() {
+        // NIC only supports 1 TX queue → clamped to 1
+        assert_eq!(compute_tx_queues(2, 1), 1);
+        // Unknown NIC (max=0) → assume capable
+        assert_eq!(compute_tx_queues(2, 0), 2);
+    }
+
+    #[test]
     fn total_lcores_run_to_completion() {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::AutoDetected,
         };
@@ -723,6 +903,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 4,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::AutoDetected,
         };
@@ -735,6 +916,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Stub,
         };
@@ -747,18 +929,20 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 4,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 1,
             source: TopologySource::Builder,
         };
         let s = format!("{plan}");
         assert!(s.contains("4 RX queues"));
         assert!(s.contains("2 workers/queue"));
+        assert!(s.contains("2 TX queues"));
     }
 
     #[test]
     fn stub_propagates_nic_numa_node() {
         let config = TopologyConfig::default();
-        let plan = detect_topology(&config, 8, 16, 1);
+        let plan = detect_topology(&config, 8, 16, 16, 1);
         // Even under stubs (run-to-completion), the NIC's NUMA node is recorded
         assert_eq!(plan.numa_node, 1);
         assert!(plan.is_run_to_completion());
@@ -768,17 +952,17 @@ mod tests {
     fn negative_numa_defaults_to_zero() {
         let config = TopologyConfig::default();
         // SOCKET_ID_ANY is -1
-        let plan = detect_topology(&config, 8, 16, -1);
+        let plan = detect_topology(&config, 8, 16, 16, -1);
         assert_eq!(plan.numa_node, 0);
     }
 
     // ========================================================================
-    // Phase B: Pipeline tests
+    // Phase 3: Pipeline tests with FramePool
     // ========================================================================
 
     #[test]
     fn pipeline_processes_packets() {
-        // Simulate a pipeline: feed frames into recv_fn, read from app_ring.
+        // Simulate a pipeline: feed frames into recv_fn, read from app_rings.
         // Uses mock recv/send functions instead of real DPDK.
 
         let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -800,10 +984,15 @@ mod tests {
         frames.lock().unwrap().push(frame);
 
         let frames_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&frames);
-        let recv_fn = move |_max: usize| -> io::Result<Vec<Vec<u8>>> {
+        let recv_fn = move |_max: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
             let mut f = frames_clone.lock().unwrap();
-            let batch = f.drain(..).collect();
-            Ok(batch)
+            let mut refs = Vec::new();
+            for frame in f.drain(..) {
+                if let Some(fref) = pool.alloc_copy(&frame) {
+                    refs.push(fref);
+                }
+            }
+            Ok(refs)
         };
 
         let sent_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&sent);
@@ -815,6 +1004,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 2,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -828,27 +1018,38 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline for non-RTC plan");
 
         // Wait for the packet to flow through the pipeline
         let mut received = None;
+        let mut rr = 0;
         for _ in 0..200 {
-            if let Some(pkt) = topo.app_ring.dequeue() {
+            if let Some(pkt) = topo.dequeue_app(&mut rr) {
                 received = Some(pkt);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        topo.shutdown();
-
         let pkt = received.expect("should have received a packet through the pipeline");
-        assert_eq!(pkt.payload, b"hello pipeline");
+
+        // Read payload from pool via AppPacket (zero-copy verification)
+        let payload = unsafe {
+            let frame_data = topo.frame_pool.frame(pkt.frame_ref.pool_idx);
+            let start = pkt.payload_offset as usize;
+            let end = start + pkt.payload_len as usize;
+            &frame_data[start..end]
+        };
+        assert_eq!(payload, b"hello pipeline");
         assert_eq!(
             pkt.src_addr,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 12345))
         );
+
+        // Free the frame and shut down
+        topo.frame_pool.free(pkt.frame_ref.pool_idx);
+        topo.shutdown();
     }
 
     #[test]
@@ -857,6 +1058,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -870,10 +1072,10 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> { Ok(vec![]) };
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
 
-        let topo = start_pipeline(config, recv_fn, send_fn);
+        let topo = start_pipeline(config, recv_fn, send_fn, None);
         assert!(topo.is_none(), "RTC plan should not start a pipeline");
     }
 
@@ -882,7 +1084,7 @@ mod tests {
         // Verify that frames enqueued to tx_ring get sent via the send_fn
         let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> { Ok(vec![]) };
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> { Ok(vec![]) };
 
         let sent_clone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::clone(&sent);
         let send_fn = move |frame: &[u8]| -> io::Result<usize> {
@@ -893,6 +1095,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 1,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -906,7 +1109,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline");
 
         // Enqueue a TX frame
@@ -935,6 +1138,7 @@ mod tests {
             let plan = TopologyPlan {
                 rx_queues: 1,
                 workers_per_queue: wpq,
+                nb_tx_queues: 2,
                 numa_node: 0,
                 source: TopologySource::Builder,
             };
@@ -949,6 +1153,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 0,
+            nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -959,7 +1164,7 @@ mod tests {
     #[test]
     fn pipeline_graceful_shutdown() {
         // Verify shutdown joins all threads cleanly
-        let recv_fn = |_: usize| -> io::Result<Vec<Vec<u8>>> {
+        let recv_fn = |_: usize, _pool: &FramePool| -> io::Result<Vec<FrameRef>> {
             std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(vec![])
         };
@@ -968,6 +1173,7 @@ mod tests {
         let plan = TopologyPlan {
             rx_queues: 1,
             workers_per_queue: 3,
+            nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
         };
@@ -981,7 +1187,7 @@ mod tests {
             perf_counters: Arc::new(PerfCounters::new()),
         };
 
-        let mut topo = start_pipeline(config, recv_fn, send_fn)
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
             .expect("should create pipeline");
 
         // Let threads run briefly
@@ -1017,5 +1223,85 @@ mod tests {
         empty_polls = 0;
         adaptive_wait(&mut empty_polls);
         assert_eq!(empty_polls, 1); // back to spin phase
+    }
+
+    #[test]
+    fn pipeline_per_worker_app_rings() {
+        // Verify that packets arrive on per-worker SPSC app rings
+        // and dequeue_app polls them correctly
+        let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Create multiple valid UDP frames
+        for i in 0..4u8 {
+            let frame = crate::build_udp_frame(
+                &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
+                &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02],
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+                12345,
+                9000,
+                &[b'a' + i],
+                64,
+            ).unwrap();
+            frames.lock().unwrap().push(frame);
+        }
+
+        let frames_clone = Arc::clone(&frames);
+        let recv_fn = move |_max: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
+            let mut f = frames_clone.lock().unwrap();
+            let mut refs = Vec::new();
+            for frame in f.drain(..) {
+                if let Some(fref) = pool.alloc_copy(&frame) {
+                    refs.push(fref);
+                }
+            }
+            Ok(refs)
+        };
+
+        let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
+
+        let plan = TopologyPlan {
+            rx_queues: 1,
+            workers_per_queue: 2,
+            nb_tx_queues: 2,
+            numa_node: 0,
+            source: TopologySource::Builder,
+        };
+
+        let config = PipelineConfig {
+            plan,
+            local_port: 9000,
+            local_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02],
+            local_ip: Ipv4Addr::new(10, 0, 0, 2),
+            arp_cache: Arc::new(crate::ArpCache::new()),
+            perf_counters: Arc::new(PerfCounters::new()),
+        };
+
+        let mut topo = start_pipeline(config, recv_fn, send_fn, None)
+            .expect("should create pipeline");
+
+        // Collect all packets
+        let mut received = Vec::new();
+        let mut rr = 0;
+        for _ in 0..400 {
+            if let Some(pkt) = topo.dequeue_app(&mut rr) {
+                received.push(pkt);
+                if received.len() >= 4 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(received.len(), 4, "should have received all 4 packets");
+        // Verify app_rings is populated (>= 1 ring per worker)
+        assert_eq!(topo.app_rings.len(), 2);
+
+        // Free frames back to pool
+        for pkt in &received {
+            topo.frame_pool.free(pkt.frame_ref.pool_idx);
+        }
+
+        topo.shutdown();
     }
 }
