@@ -70,31 +70,25 @@ use dpdk_udp::UdpSocket;
 let socket = UdpSocket::builder()
     .bind("0.0.0.0:9000")?;
 
-// Explicit: 2 worker threads per RX queue
-let socket = UdpSocket::builder()
-    .workers_per_queue(2)
-    .bind("0.0.0.0:9000")?;
-
-// Explicit: 4 RSS queues, 2 workers each (12 cores total: 4 RX + 8 workers)
+// Explicit: 4 RSS queues (1 RX dispatcher + 3 queue workers)
 let socket = UdpSocket::builder()
     .rx_queues(4)
-    .workers_per_queue(2)
     .bind("0.0.0.0:9000")?;
 
 // Force simple mode: no pipeline threads, lowest latency
 let socket = UdpSocket::builder()
-    .workers_per_queue(0)
+    .rx_queues(1)
     .bind("0.0.0.0:9000")?;
 ```
 
 When the pipeline is active, the data flow is:
 
 ```
-NIC → RX lcore (ARP/ICMP inline) → SPSC rings → N workers → MPSC app_ring → recv_from()
-send_to() → TX ring → RX lcore → NIC
+NIC → RX dispatcher (ARP/ICMP inline) → SPSC rings → queue workers → app_rings → recv_from()
+send_to() → direct TX (app thread's own TX queue)
 ```
 
-Environment variables override builder settings: `DPDK_RX_QUEUES`, `DPDK_WORKERS_PER_QUEUE`.
+Environment variable `DPDK_RX_QUEUES` overrides auto-detection (builder settings take precedence).
 
 Query the active topology at runtime:
 
@@ -102,7 +96,7 @@ Query the active topology at runtime:
 if socket.is_run_to_completion() {
     println!("Simple mode (single-threaded)");
 } else if let Some(plan) = socket.topology_plan() {
-    println!("Pipeline: {} RX queues, {} workers/queue", plan.rx_queues, plan.workers_per_queue);
+    println!("Pipeline: {} RSS queues", plan.rx_queues);
 }
 ```
 

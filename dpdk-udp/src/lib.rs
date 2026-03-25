@@ -1385,7 +1385,7 @@ impl UdpSocket {
     /// Returns the active topology plan, if a multi-core pipeline is running.
     ///
     /// Returns `None` when the socket is in run-to-completion mode (default
-    /// for `UdpSocket::bind()` and when `workers_per_queue(0)` is configured).
+    /// for `UdpSocket::bind()` and when `rx_queues(1)` is configured).
     pub fn topology_plan(&self) -> Option<TopologyPlan> {
         self.topology.lock().unwrap().as_ref().map(|t| t.plan.clone())
     }
@@ -2425,17 +2425,16 @@ impl SyntheticUdpSocket {
 ///
 /// Most users should use `UdpSocket::bind()` which auto-detects the best
 /// topology. Use the builder when you need explicit control over RSS queue
-/// count and worker-per-queue allocation.
+/// count.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use dpdk_udp::UdpSocket;
 ///
-/// // Explicit: 4 RSS queues, 2 workers per queue
+/// // Explicit: 4 RSS queues (1 RX dispatcher + 3 queue workers)
 /// let socket = UdpSocket::builder()
 ///     .rx_queues(4)
-///     .workers_per_queue(2)
 ///     .bind("0.0.0.0:9000")?;
 ///
 /// // Or just auto-detect (equivalent to UdpSocket::bind()):
@@ -2444,7 +2443,6 @@ impl SyntheticUdpSocket {
 /// ```
 pub struct UdpSocketBuilder {
     rx_queues: Option<u16>,
-    workers_per_queue: Option<u16>,
     backend_type: Option<BackendType>,
 }
 
@@ -2453,24 +2451,16 @@ impl UdpSocketBuilder {
     pub fn new() -> Self {
         Self {
             rx_queues: None,
-            workers_per_queue: None,
             backend_type: None,
         }
     }
 
-    /// Set the number of NIC RSS RX queues.
+    /// Set the number of RSS RX queues (pipeline threads).
     ///
-    /// Will be clamped to the NIC's maximum supported queue count.
+    /// Each queue gets 1 processing thread. Set to 1 for run-to-completion
+    /// mode (no pipeline). Will be clamped to the NIC's maximum.
     pub fn rx_queues(mut self, n: u16) -> Self {
         self.rx_queues = Some(n);
-        self
-    }
-
-    /// Set the number of worker lcores per RX queue.
-    ///
-    /// Set to 0 for run-to-completion mode (no pipeline).
-    pub fn workers_per_queue(mut self, n: u16) -> Self {
-        self.workers_per_queue = Some(n);
         self
     }
 
@@ -2484,7 +2474,6 @@ impl UdpSocketBuilder {
     pub fn topology_config(&self) -> TopologyConfig {
         TopologyConfig {
             rx_queues: self.rx_queues,
-            workers_per_queue: self.workers_per_queue,
         }
     }
 
@@ -2494,7 +2483,7 @@ impl UdpSocketBuilder {
     /// topology configuration instead of pure auto-detection.
     ///
     /// When the topology plan is **not** run-to-completion, pipeline threads
-    /// are spawned automatically. Use `.workers_per_queue(0)` to force
+    /// are spawned automatically. Use `.rx_queues(1)` to force
     /// run-to-completion mode (no pipeline threads, lowest latency).
     pub fn bind<A: ToSocketAddrs>(self, addr: A) -> io::Result<UdpSocket> {
         let topo_config = self.topology_config();
@@ -3208,12 +3197,11 @@ mod tests {
 
     #[test]
     fn test_builder_explicit_rtc_override() {
-        // Explicitly requesting workers_per_queue(0) forces run-to-completion
+        // Explicitly requesting rx_queues(1) forces run-to-completion
         // even if more cores would be available (under stubs this is the default
         // anyway, but the explicit setting is tested for the API contract)
         let socket = UdpSocket::builder()
             .rx_queues(1)
-            .workers_per_queue(0)
             .bind("127.0.0.1:0")
             .expect("builder bind should succeed");
         assert!(socket.is_run_to_completion());
@@ -3223,21 +3211,17 @@ mod tests {
     fn test_builder_topology_config() {
         // Test that builder correctly produces TopologyConfig
         let builder = UdpSocketBuilder::new()
-            .rx_queues(4)
-            .workers_per_queue(2);
+            .rx_queues(4);
         let config = builder.topology_config();
         assert_eq!(config.rx_queues, Some(4));
-        assert_eq!(config.workers_per_queue, Some(2));
     }
 
     #[test]
     fn test_builder_partial_config() {
-        // Setting only one parameter should leave the other as auto-detect
-        let builder = UdpSocketBuilder::new()
-            .workers_per_queue(0);
+        // Default builder has auto-detect for rx_queues
+        let builder = UdpSocketBuilder::new();
         let config = builder.topology_config();
         assert_eq!(config.rx_queues, None);
-        assert_eq!(config.workers_per_queue, Some(0));
     }
 
     #[test]
