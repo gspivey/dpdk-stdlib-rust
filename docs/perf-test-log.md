@@ -5,6 +5,35 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #4: Topology Simplification (No Performance Run)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-03-25 |
+| **Git Hash** | `9a526fc` |
+| **Branch** | `main` |
+| **PR** | [#26](https://github.com/gspivey/dpdk-stdlib-rust/pull/26) |
+| **GH Actions Run** | N/A — config-only change, no perf run |
+| **Instance Type** | N/A |
+| **Traffic Generator** | N/A |
+
+### Changes Since Previous Run
+
+- **Removed `workers_per_queue`**: Simplified topology from two knobs (`rx_queues` × `workers_per_queue`) to one (`rx_queues`). Each RX queue gets exactly one worker thread.
+- **Simplified `TopologyPlan`**: Removed `workers_per_queue` field, simplified thread spawning logic.
+- **Removed `DPDK_WORKERS_PER_QUEUE` env var**: Only `DPDK_RX_QUEUES` remains.
+- **Net reduction**: ~139 lines removed from topology code.
+
+### Results
+
+No performance run was executed. This was a config simplification only — the hot path (single-core run-to-completion and multi-core pipeline data flow) was unchanged. Phase 3 results remain the current baseline.
+
+### Analysis
+
+The multi-core pipeline remains experimental. Single-core run-to-completion is the recommended production path. The simplification reduces API surface without affecting performance characteristics.
+
+---
+
 ## Run #3: Phase 3 — Multi-Core Pipeline Redesign (True Zero-Copy)
 
 | Field | Value |

@@ -8,9 +8,9 @@ Traditional Linux networking routes every packet through the kernel: syscalls, c
 
 DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace drivers and polling. This eliminates syscalls and context switches, achieving:
 
-- **10-100x higher packet rates** — millions of packets/sec per core
-- **Microsecond-level latency** instead of milliseconds
-- **Zero kernel overhead** for packet I/O
+- **~2x higher packet throughput** at saturation (700K PPS: DPDK delivers ~1.5-2x the packets of kernel sockets)
+- **Zero packet drops** up to 350K PPS where the kernel already loses 3-14%
+- **Zero kernel overhead** for packet I/O — no syscalls, no context switches
 
 **But DPDK's C API is complex and unsafe.** This project wraps DPDK in safe Rust with a familiar `std::net` API, so you get kernel bypass without rewriting your application.
 
@@ -56,49 +56,6 @@ socket.send_to(b"hello", "192.168.1.100:9000").await?;
 ```
 
 Backend selection is automatic: DPDK if available, otherwise AF_PACKET raw sockets.
-
-### Multi-Core Pipeline
-
-By default, `UdpSocket::bind()` runs in single-threaded run-to-completion mode — one core handles NIC polling, protocol processing, and application logic. This is the lowest-latency path and is optimal for low-to-moderate packet rates.
-
-For high-throughput workloads, use the builder API to enable the multi-core pipeline:
-
-```rust
-use dpdk_udp::UdpSocket;
-
-// Auto-detect: multi-core when enough cores + real DPDK are available
-let socket = UdpSocket::builder()
-    .bind("0.0.0.0:9000")?;
-
-// Explicit: 4 RSS queues (1 RX dispatcher + 3 queue workers)
-let socket = UdpSocket::builder()
-    .rx_queues(4)
-    .bind("0.0.0.0:9000")?;
-
-// Force simple mode: no pipeline threads, lowest latency
-let socket = UdpSocket::builder()
-    .rx_queues(1)
-    .bind("0.0.0.0:9000")?;
-```
-
-When the pipeline is active, the data flow is:
-
-```
-NIC → RX dispatcher (ARP/ICMP inline) → SPSC rings → queue workers → app_rings → recv_from()
-send_to() → direct TX (app thread's own TX queue)
-```
-
-Environment variable `DPDK_RX_QUEUES` overrides auto-detection (builder settings take precedence).
-
-Query the active topology at runtime:
-
-```rust
-if socket.is_run_to_completion() {
-    println!("Simple mode (single-threaded)");
-} else if let Some(plan) = socket.topology_plan() {
-    println!("Pipeline: {} RSS queues", plan.rx_queues);
-}
-```
 
 ### Running Examples
 
@@ -166,25 +123,15 @@ let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", backend)?;
 - `DpdkBackend` — userspace DPDK with kernel bypass and direct mbuf writes
 - `RawSocketBackend` — Linux AF_PACKET with optional PACKET_MMAP ring buffers
 - ARP resolution (cache + handler) and ICMP echo reply, both backend-agnostic
-- Topology detection for multi-core scaling (NUMA-aware queue/worker planning)
+- Topology detection and NUMA-aware resource allocation
 
 **dpdk-tokio** — Async layer providing `tokio::net::UdpSocket`-compatible API with poll-based I/O. Includes a compat module (`dpdk_tokio::compat::tokio`) for zero-change migration from Tokio sockets.
 
 ### Packet Path
 
-**Run-to-completion (default):**
-
 TX: `send_to()` → build frame → backend `send_frame()` → NIC.
 
 RX: Backend `recv_frames()` → parse headers → ARP/ICMP inline → UDP payload to caller.
-
-**Multi-core pipeline (when configured via builder):**
-
-TX: `send_to()` → build frame → enqueue to TX ring → RX lcore drains → NIC.
-
-RX: RX lcore polls NIC → ARP/ICMP inline → SPSC fan-out to workers → workers parse UDP → MPSC app_ring → `recv_from()` dequeues.
-
-All ring communication uses lock-free SPSC/MPSC rings with cache-line-padded atomics for zero contention between cores.
 
 Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` writes directly into DPDK mbufs (zero-copy), while `build_udp_frame() -> Vec<u8>` produces owned bytes for the generic backend path. Both emit identical wire-format frames.
 
@@ -264,18 +211,18 @@ Benchmarked on AWS c5n.2xlarge (8 vCPU, 25 Gbps ENA) using TRex traffic generato
 | 350,000 | 350,000 | 0% | 299,882 | 14.3% |
 | 700,000 | 447,807 | 36.0% | 299,438 | 57.2% |
 
-**Key takeaway**: At 350k pps, DPDK handles all three packet sizes with zero drops. The kernel stack is already losing 3-14% of packets at the same rate. At 700k pps the gap widens — DPDK delivers ~1.5-2x the throughput of kernel sockets.
+**Key takeaway**: At 350K PPS, DPDK handles all three packet sizes with zero drops while the kernel already loses 3-14%. At 700K PPS, DPDK delivers ~1.5-2x the throughput of kernel sockets. The advantage is most pronounced at high packet rates where kernel overhead dominates.
+
+See `docs/perf-test-log.md` for detailed benchmark history across optimization phases.
 
 ## Status
 
 - **Phase 1-5 complete** (see `API_COMPATIBILITY.md`)
-- **Phase B (multi-core pipeline)**: Configurable worker fan-out with lock-free rings
 - **std::net::UdpSocket**: 19/19 methods implemented
 - **tokio::net::UdpSocket**: All async methods + poll API
 - **ARP resolution** and **ICMP echo reply** support
 - **Hardware checksum offload** (IPv4, UDP, TCP)
 - **Backend abstraction** (DPDK, AF_PACKET, MMAP)
-- **Multi-core scaling**: Configurable RX queues and worker threads per queue
 - **Integration tests** on AWS EC2 (c6gn.large with ENA)
 
 ## DPDK Installation (Optional)
@@ -293,8 +240,8 @@ This installs DPDK 23.11 and configures hugepages.
 ### Verify DPDK
 
 ```bash
-# Should show "real" not "stub"
-cargo run -p echo -- --dpdk
+# Build with the dpdk feature to use real DPDK
+cargo run -p echo --features dpdk -- --ip 0.0.0.0 --port 9000
 ```
 
 ### Platform Support

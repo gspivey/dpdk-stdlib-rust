@@ -3,7 +3,7 @@
 # run-perf-tests.sh — Performance test orchestrator for dpdk-stdlib-rust
 #
 # Deploys a TRex generator + DUT instance, runs UDP echo benchmarks across
-# 5 configurations (rust-dpdk, rust-dpdk-multicore, native-dpdk, rust-stdlib, plain-rust),
+# 4 configurations (rust-dpdk, native-dpdk, rust-stdlib, plain-rust),
 # collects structured JSON results, and posts a summary to the PR.
 #
 # Usage:
@@ -15,7 +15,7 @@
 #   --packet-sizes      Comma-separated sizes (default: 64,512,1400)
 #   --duration          Seconds per rate step (default: 30)
 #   --rate-steps        Comma-separated target PPS values (default: 70000,140000,350000,700000)
-#   --configs           Comma-separated DUT configs (default: rust-stdlib,plain-rust,rust-dpdk,rust-dpdk-multicore,native-dpdk)
+#   --configs           Comma-separated DUT configs (default: rust-stdlib,plain-rust,rust-dpdk,native-dpdk)
 #   --json-summary      Write JSON summary file
 #   -h, --help          Show help
 # =============================================================================
@@ -34,7 +34,7 @@ DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="rust-stdlib,plain-rust,rust-dpdk,rust-dpdk-multicore,native-dpdk"
+CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
@@ -1124,7 +1124,7 @@ else:
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
         lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-dpdk-multicore", "rust-stdlib", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-stdlib", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {}).get(pkt_size, [])
 
