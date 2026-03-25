@@ -1,25 +1,26 @@
 //! Multi-core topology planning for DPDK pipeline stages.
 //!
-//! Determines how many RSS RX queues and worker cores to allocate based on:
+//! Determines how many RSS RX queues to allocate based on:
 //! 1. Explicit builder configuration (highest priority)
-//! 2. Environment variables (`DPDK_RX_QUEUES`, `DPDK_WORKERS_PER_QUEUE`)
+//! 2. Environment variable (`DPDK_RX_QUEUES`)
 //! 3. Auto-detection from available lcores and NIC capabilities
+//!
+//! The single knob is `rx_queues`: each queue gets exactly one processing
+//! thread. When `rx_queues <= 1`, the socket runs in single-core
+//! run-to-completion mode (no pipeline threads spawned).
 //!
 //! Under stubs (`dpdk_sys::is_stub()`), the topology always collapses to
 //! single-core run-to-completion — no threads are spawned.
 //!
-//! ## Phase 3 Optimizations
+//! ## Optimizations
 //!
 //! - **FramePool slab allocator**: Zero-copy frame passing via pre-allocated
 //!   slab pool. Frames are passed by `FrameRef` (index + length) through SPSC
 //!   rings, eliminating per-packet heap allocation.
-//! - **Per-worker SPSC app rings**: Replaces the shared MPSC `app_ring` with
-//!   per-worker SPSC rings. `recv_from()` polls round-robin, eliminating CAS
-//!   contention.
-//! - **Worker-direct TX**: Workers transmit directly via `send_fn` instead of
-//!   bouncing through the RX lcore's TX ring, halving echo latency.
-//! - **RSS-aware worker affinity**: Frames from each RX queue go to a dedicated
-//!   worker (1:1 mapping) instead of round-robin, preserving flow locality.
+//! - **Per-queue SPSC app rings**: Each queue thread has its own SPSC app ring.
+//!   `recv_from()` polls round-robin, eliminating CAS contention.
+//! - **Direct TX**: App thread sends directly via its own TX queue,
+//!   bypassing the tx_ring → RX lcore hop.
 
 use std::env;
 use std::fmt;
@@ -46,8 +47,6 @@ use crate::{parse_udp_packet_ref, perf_inc, ETH_HEADER_LEN, ETH_TYPE_IPV4};
 pub struct TopologyConfig {
     /// Explicit RX queue count (from builder API).
     pub rx_queues: Option<u16>,
-    /// Explicit workers-per-queue count (from builder API).
-    pub workers_per_queue: Option<u16>,
 }
 
 // ============================================================================
@@ -56,16 +55,16 @@ pub struct TopologyConfig {
 
 /// The resolved multi-core topology plan.
 ///
-/// When `rx_queues == 1` and `workers_per_queue == 0`, this is run-to-completion
-/// mode (current single-threaded behavior, no pipeline overhead).
+/// When `rx_queues <= 1`, this is run-to-completion mode (single-threaded,
+/// no pipeline overhead). When `rx_queues > 1`, a pipeline is spawned with
+/// `rx_queues` threads total (1 RX dispatcher + rx_queues-1 queue workers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyPlan {
-    /// Number of NIC RSS RX queues to configure.
+    /// Number of RSS queues / pipeline threads.
+    /// `rx_queues <= 1` → run-to-completion, `rx_queues > 1` → pipeline.
     pub rx_queues: u16,
-    /// Number of worker lcores per RX queue.
-    pub workers_per_queue: u16,
-    /// Number of NIC TX queues provisioned (P3.5).
-    /// Queue 0 = RX lcore (ARP/ICMP), queue 1+ = app/worker direct TX.
+    /// Number of NIC TX queues provisioned.
+    /// Queue 0 = RX lcore (ARP/ICMP), queue 1 = app thread direct TX.
     pub nb_tx_queues: u16,
     /// NUMA node ID (0-based). Used for memory allocation affinity.
     pub numa_node: u32,
@@ -90,18 +89,16 @@ impl TopologyPlan {
     /// Returns true if this is a single-core run-to-completion plan
     /// (no pipeline threads needed).
     pub fn is_run_to_completion(&self) -> bool {
-        self.rx_queues <= 1 && self.workers_per_queue == 0
+        self.rx_queues <= 1
     }
 
-    /// Total number of lcores needed (RX cores + worker cores).
-    /// Does not include the main lcore (which calls recv_from/send_to).
+    /// Total number of pipeline threads (excluding the app thread).
+    /// When `rx_queues > 1`: 1 RX dispatcher + (rx_queues - 1) queue workers.
     pub fn total_lcores_needed(&self) -> usize {
-        let rx = self.rx_queues as usize;
-        let workers = rx * self.workers_per_queue as usize;
         if self.is_run_to_completion() {
-            0 // no extra threads
+            0
         } else {
-            rx + workers
+            self.rx_queues as usize
         }
     }
 }
@@ -113,9 +110,8 @@ impl fmt::Display for TopologyPlan {
         } else {
             write!(
                 f,
-                "{} RX queues x {} workers/queue, {} TX queues ({} lcores, NUMA {}, {:?})",
+                "{} RSS queues, {} TX queues ({} lcores, NUMA {}, {:?})",
                 self.rx_queues,
-                self.workers_per_queue,
                 self.nb_tx_queues,
                 self.total_lcores_needed(),
                 self.numa_node,
@@ -149,29 +145,25 @@ pub struct TxFrame {
     pub frame: Vec<u8>,
 }
 
-/// The live multi-core topology: RX cores, worker cores, and shared rings.
+/// The live multi-core topology: RX dispatcher, queue workers, and shared rings.
 ///
-/// Phase 3 redesign:
-/// - `app_rings`: Per-worker SPSC rings carrying `AppPacket` (zero-copy FrameRef)
-/// - `tx_ring`: Kept for backward compat (unused when `direct_send_fn` is set)
-/// - Workers transmit echo replies directly via send_fn (worker-direct TX)
-/// - `direct_send_fn`: Application thread bypasses tx_ring, sends on its own TX queue (P3.5)
+/// - `app_rings`: Per-queue SPSC rings carrying `AppPacket` (zero-copy FrameRef)
+/// - `tx_ring`: Fallback TX path (unused when `direct_send_fn` is set)
+/// - `direct_send_fn`: App thread sends on its own TX queue, bypassing tx_ring
 pub struct MultiCoreTopology {
-    /// Per-worker SPSC app rings: each worker enqueues `AppPacket` (zero-copy),
-    /// `recv_from()` polls round-robin across all worker app rings.
+    /// Per-queue SPSC app rings: each queue worker enqueues `AppPacket` (zero-copy),
+    /// `recv_from()` polls round-robin across all queue app rings.
     pub app_rings: Vec<Arc<SpscRing<AppPacket>>>,
 
-    /// Legacy MPSC app_ring — unused by Phase 3 workers but kept for API compat.
+    /// Legacy MPSC app_ring — kept for API compat.
     pub app_ring: Arc<MpscRing<ProcessedPacket>>,
 
-    /// TX ring for outbound frames. Kept as fallback; unused when `direct_send_fn`
-    /// is available (P3.5 worker-direct TX).
+    /// TX ring for outbound frames (fallback; unused when `direct_send_fn` is set).
     pub tx_ring: Arc<SpscRing<TxFrame>>,
 
-    /// P3.5: Direct send function for the application thread.
+    /// Direct send function for the application thread.
     /// When set, `send_to()` calls this instead of enqueuing to `tx_ring`,
-    /// eliminating the ring hop through the RX lcore. Uses a dedicated NIC
-    /// TX queue (queue 1) to avoid contention with the RX lcore's TX queue 0.
+    /// sending on TX queue 1 to avoid contention with the RX dispatcher's queue 0.
     pub direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
 
     /// Shutdown signal — set to `true` to stop all pipeline threads.
@@ -183,7 +175,7 @@ pub struct MultiCoreTopology {
     /// The topology plan this was built from (for diagnostics).
     pub plan: TopologyPlan,
 
-    /// Number of workers (for round-robin polling in recv_from).
+    /// Number of queue workers (for round-robin polling in recv_from).
     pub num_workers: usize,
 
     /// Shared frame pool — `recv_from()` reads payload from here, then frees.
@@ -199,7 +191,7 @@ impl MultiCoreTopology {
         }
     }
 
-    /// Dequeue an AppPacket from per-worker app rings (round-robin).
+    /// Dequeue an AppPacket from per-queue app rings (round-robin).
     ///
     /// The returned `AppPacket` holds a `FrameRef` into the shared `FramePool`.
     /// The caller MUST free the frame via `frame_pool.free(pkt.frame_ref.pool_idx)`
@@ -272,17 +264,17 @@ where
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let workers_per_queue = config.plan.workers_per_queue as usize;
+    // rx_queues total threads: 1 RX dispatcher + (rx_queues - 1) queue workers
+    let num_workers = (config.plan.rx_queues as usize).saturating_sub(1);
 
     // Ring sizes: 16384 slots to absorb bursts without TX backpressure.
     let ring_capacity = 16384;
 
-    // Frame pool: pre-allocated slab for zero-copy frame passing (P3.1)
+    // Frame pool: pre-allocated slab for zero-copy frame passing
     let frame_pool = Arc::new(FramePool::new(ring_capacity, 2048));
 
-    // Per-worker SPSC app rings: worker → recv_from() (P3.4)
-    // Now carry AppPacket (zero-copy FrameRef) instead of ProcessedPacket (Vec<u8>)
-    let app_rings: Vec<Arc<SpscRing<AppPacket>>> = (0..workers_per_queue)
+    // Per-queue SPSC app rings: queue worker → recv_from()
+    let app_rings: Vec<Arc<SpscRing<AppPacket>>> = (0..num_workers)
         .map(|_| Arc::new(SpscRing::new(ring_capacity)))
         .collect();
 
@@ -296,12 +288,12 @@ where
     let recv_fn = Arc::new(recv_fn);
     let send_fn = Arc::new(send_fn);
 
-    // Worker SPSC rings (RX → worker): now carry FrameRef instead of Vec<u8> (P3.2)
-    let worker_rings: Vec<Arc<SpscRing<FrameRef>>> = (0..workers_per_queue)
+    // Queue SPSC rings (RX dispatcher → queue workers): carry FrameRef
+    let worker_rings: Vec<Arc<SpscRing<FrameRef>>> = (0..num_workers)
         .map(|_| Arc::new(SpscRing::new(ring_capacity)))
         .collect();
 
-    // Spawn worker threads.
+    // Spawn queue worker threads.
     for (w_idx, w_ring) in worker_rings.iter().enumerate() {
         let w_ring = Arc::clone(w_ring);
         let app_ring_w = Arc::clone(&app_rings[w_idx]);
@@ -312,7 +304,7 @@ where
         let frame_pool = Arc::clone(&frame_pool);
 
         let handle = thread::Builder::new()
-            .name(format!("dpdk-worker-{}", w_idx))
+            .name(format!("dpdk-queue-{}", w_idx))
             .spawn(move || {
                 worker_loop(
                     w_ring,
@@ -378,7 +370,7 @@ where
         shutdown,
         handles,
         plan: config.plan,
-        num_workers: workers_per_queue,
+        num_workers,
         frame_pool,
     })
 }
@@ -413,11 +405,11 @@ fn adaptive_wait(empty_polls: &mut u32) {
     }
 }
 
-/// RX lcore main loop.
+/// RX dispatcher main loop.
 ///
 /// Polls the backend for frames, handles ARP/ICMP inline, and distributes
-/// data frames to worker SPSC rings using RSS-aware 1:1 affinity (P3.6).
-/// Frames are allocated from the FramePool and passed by FrameRef (P3.1-P3.2).
+/// data frames to queue worker SPSC rings round-robin.
+/// Frames are allocated from the FramePool and passed by FrameRef.
 /// Also drains the TX ring and transmits outbound frames.
 fn rx_loop<R, S>(
     recv_fn: Arc<R>,
@@ -539,11 +531,11 @@ fn rx_loop<R, S>(
     }
 }
 
-/// Worker core main loop (Phase 3 — true zero-copy).
+/// Queue worker main loop.
 ///
 /// Dequeues FrameRefs from the SPSC ring, parses UDP headers in-place,
 /// and enqueues `AppPacket` (carrying FrameRef + payload offset) to its
-/// per-worker SPSC app ring. The frame is NOT freed here — `recv_from()`
+/// per-queue SPSC app ring. The frame is NOT freed here — `recv_from()`
 /// reads the payload directly from the pool and frees it afterward.
 fn worker_loop(
     rx_ring: Arc<SpscRing<FrameRef>>,
@@ -637,11 +629,10 @@ fn worker_loop(
 
 /// Detect the optimal multi-core topology.
 ///
-/// The `nic_numa_node` parameter should come from `Port::numa_node()` —
-/// this ensures lcores and memory are allocated on the same NUMA node as
-/// the NIC, avoiding cross-socket memory access penalties.
+/// The single knob is `rx_queues`: each queue gets 1 processing thread.
+/// `rx_queues <= 1` → run-to-completion (no pipeline threads).
 ///
-/// Configuration precedence: builder API > environment variables > auto-detection.
+/// Configuration precedence: builder API > environment variable > auto-detection.
 ///
 /// Under stubs, always returns a run-to-completion plan regardless of config.
 pub fn detect_topology(
@@ -661,7 +652,6 @@ pub fn detect_topology(
     if dpdk_sys::is_stub() {
         return TopologyPlan {
             rx_queues: 1,
-            workers_per_queue: 0,
             nb_tx_queues: 1,
             numa_node,
             source: TopologySource::Stub,
@@ -669,58 +659,35 @@ pub fn detect_topology(
     }
 
     // Try builder config first
-    if let (Some(rq), Some(wpq)) = (config.rx_queues, config.workers_per_queue) {
+    if let Some(rq) = config.rx_queues {
         let rx_queues = clamp_rx_queues(rq, nic_max_rx_queues);
         return TopologyPlan {
             rx_queues,
-            workers_per_queue: wpq,
-            nb_tx_queues: compute_tx_queues(wpq, nic_max_tx_queues),
+            nb_tx_queues: compute_tx_queues(rx_queues, nic_max_tx_queues),
             numa_node,
             source: TopologySource::Builder,
         };
     }
 
-    // Try environment variables
+    // Try environment variable
     let env_rq = env::var("DPDK_RX_QUEUES").ok().and_then(|v| v.parse::<u16>().ok());
-    let env_wpq = env::var("DPDK_WORKERS_PER_QUEUE").ok().and_then(|v| v.parse::<u16>().ok());
 
-    // Builder partial + env partial: builder fields win where set
-    let rq = config.rx_queues.or(env_rq);
-    let wpq = config.workers_per_queue.or(env_wpq);
-
-    if rq.is_some() || wpq.is_some() {
-        let workers_per_queue = wpq.unwrap_or(1);
-        let rx_queues = rq.unwrap_or_else(|| {
-            // When workers_per_queue is known, compute rx_queues to avoid
-            // oversubscription. Reserve 1 lcore for the app thread, then divide
-            // remaining lcores by (1 RX + N workers) per queue group.
-            let available = available_lcores.saturating_sub(1); // reserve for app thread
-            let per_group = 1 + workers_per_queue as u32;       // 1 RX + N workers
-            let queues = if per_group == 0 { 1 } else { (available / per_group).max(1) };
-            clamp_rx_queues(queues as u16, nic_max_rx_queues)
-        });
-        let source = if config.rx_queues.is_some() || config.workers_per_queue.is_some() {
-            TopologySource::Builder
-        } else {
-            TopologySource::Environment
-        };
+    if let Some(rq) = env_rq {
+        let rx_queues = clamp_rx_queues(rq, nic_max_rx_queues);
         return TopologyPlan {
-            rx_queues: clamp_rx_queues(rx_queues, nic_max_rx_queues),
-            workers_per_queue,
-            nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
+            rx_queues,
+            nb_tx_queues: compute_tx_queues(rx_queues, nic_max_tx_queues),
             numa_node,
-            source,
+            source: TopologySource::Environment,
         };
     }
 
     // Full auto-detection
     let rx_queues = auto_detect_queues(available_lcores, nic_max_rx_queues);
-    let workers_per_queue = auto_detect_workers(available_lcores, rx_queues);
 
     TopologyPlan {
         rx_queues,
-        workers_per_queue,
-        nb_tx_queues: compute_tx_queues(workers_per_queue, nic_max_tx_queues),
+        nb_tx_queues: compute_tx_queues(rx_queues, nic_max_tx_queues),
         numa_node,
         source: TopologySource::AutoDetected,
     }
@@ -730,36 +697,17 @@ pub fn detect_topology(
 // Auto-detection helpers
 // ============================================================================
 
-/// Auto-detect the number of RX queues based on available lcores and NIC caps.
+/// Auto-detect the number of RSS queues based on available lcores and NIC caps.
 ///
-/// Reserves 1 lcore for the application thread to prevent oversubscription
-/// (pipeline threads fighting the app thread for CPU).
+/// Reserves 1 lcore for the application thread. Remaining lcores become
+/// pipeline threads (1 per RSS queue). When only 0-1 lcores remain,
+/// returns 1 (run-to-completion — no pipeline threads spawned).
 fn auto_detect_queues(lcores: u32, nic_max: u16) -> u16 {
-    // Reserve 1 lcore for the app thread
-    let available = lcores.saturating_sub(1);
-    let queues = match available {
-        0..=1 => 1,                            // run-to-completion
-        2..=3 => 1.min(nic_max),               // small pipeline: 1 RX + 1-2 workers
-        n => ((n / 2) as u16).min(nic_max),    // half for RX, half for workers
-    };
-    clamp_rx_queues(queues, nic_max)
-}
-
-/// Auto-detect workers per queue from remaining lcores after RX allocation.
-///
-/// Accounts for the app thread: subtracts 1 from total lcores before computing.
-fn auto_detect_workers(lcores: u32, rx_queues: u16) -> u16 {
-    if rx_queues == 0 {
-        return 0;
+    let available = lcores.saturating_sub(1); // reserve 1 for app thread
+    if available <= 1 {
+        return 1; // run-to-completion
     }
-    // Reserve 1 lcore for app thread, then subtract RX lcores
-    let remaining = (lcores as usize)
-        .saturating_sub(1)                     // app thread
-        .saturating_sub(rx_queues as usize);   // RX lcores
-    if remaining == 0 {
-        return 0; // run-to-completion
-    }
-    (remaining / rx_queues as usize).max(1) as u16
+    clamp_rx_queues(available as u16, nic_max)
 }
 
 /// Ensure rx_queues doesn't exceed NIC maximum.
@@ -770,16 +718,16 @@ fn clamp_rx_queues(requested: u16, nic_max: u16) -> u16 {
     requested.min(nic_max).max(1)
 }
 
-/// P3.5: Compute the number of TX queues to provision.
+/// Compute the number of TX queues to provision.
 ///
-/// Queue 0 is reserved for the RX lcore (ARP/ICMP replies).
-/// Queue 1 is for the application thread (worker-direct TX via send_to).
-/// In run-to-completion mode (workers_per_queue == 0), only 1 TX queue is needed.
-fn compute_tx_queues(workers_per_queue: u16, nic_max_tx_queues: u16) -> u16 {
-    if workers_per_queue == 0 {
+/// RTC (rx_queues <= 1): 1 TX queue (app thread does everything inline).
+/// Pipeline (rx_queues > 1): 2 TX queues — queue 0 for RX dispatcher
+/// (ARP/ICMP replies), queue 1 for app thread direct TX.
+fn compute_tx_queues(rx_queues: u16, nic_max_tx_queues: u16) -> u16 {
+    if rx_queues <= 1 {
         return 1; // RTC mode: single TX queue
     }
-    // Pipeline mode: queue 0 for RX lcore + queue 1 for app thread
+    // Pipeline mode: queue 0 for RX dispatcher + queue 1 for app thread
     let desired = 2u16;
     if nic_max_tx_queues == 0 {
         return desired; // unknown NIC, assume capable
@@ -797,22 +745,16 @@ mod tests {
     use crate::perf::PerfCounters;
     use std::sync::Mutex;
 
-    fn default_config() -> TopologyConfig {
-        TopologyConfig::default()
-    }
-
     #[test]
     fn stub_always_run_to_completion() {
         // Under stubs, regardless of config, we get run-to-completion
         let config = TopologyConfig {
             rx_queues: Some(4),
-            workers_per_queue: Some(2),
         };
         let plan = detect_topology(&config, 16, 16, 16, 0);
         assert!(plan.is_run_to_completion());
         assert_eq!(plan.source, TopologySource::Stub);
         assert_eq!(plan.rx_queues, 1);
-        assert_eq!(plan.workers_per_queue, 0);
         assert_eq!(plan.nb_tx_queues, 1);
     }
 
@@ -821,35 +763,27 @@ mod tests {
         // 2 vCPUs: 1 reserved for app, 1 available → run-to-completion
         let queues = auto_detect_queues(2, 16);
         assert_eq!(queues, 1);
-        let workers = auto_detect_workers(2, queues);
-        assert_eq!(workers, 0); // no workers after reserving 1 for app + 1 for RX
     }
 
     #[test]
     fn auto_detect_4_vcpu() {
-        // 4 vCPUs: 1 reserved for app, 3 available → 1 RX + 1 worker
+        // 4 vCPUs: 1 reserved for app, 3 available → 3 RSS queues
         let queues = auto_detect_queues(4, 16);
-        assert_eq!(queues, 1);
-        let workers = auto_detect_workers(4, queues);
-        assert_eq!(workers, 2); // 4 - 1(app) - 1(RX) = 2 workers
+        assert_eq!(queues, 3);
     }
 
     #[test]
     fn auto_detect_16_vcpu() {
-        // 16 vCPUs: 1 reserved for app, 15 available → 7 RX + 7-8 workers
+        // 16 vCPUs: 1 reserved for app, 15 available → 15 RSS queues
         let queues = auto_detect_queues(16, 16);
-        assert_eq!(queues, 7); // (16-1)/2 = 7
-        let workers = auto_detect_workers(16, queues);
-        assert_eq!(workers, 1); // (16-1-7)/7 = 1
+        assert_eq!(queues, 15);
     }
 
     #[test]
     fn auto_detect_32_vcpu() {
-        // 32 vCPUs: 1 reserved for app, 31 available → 15 RX, clamped to NIC max 16
+        // 32 vCPUs: 1 reserved for app, 31 available → clamped to NIC max 16
         let queues = auto_detect_queues(32, 16);
-        assert_eq!(queues, 15); // (32-1)/2 = 15, within NIC max 16
-        let workers = auto_detect_workers(32, queues);
-        assert_eq!(workers, 1); // (32-1-15)/15 = 1
+        assert_eq!(queues, 16);
     }
 
     #[test]
@@ -866,14 +800,14 @@ mod tests {
 
     #[test]
     fn compute_tx_queues_rtc() {
-        // RTC mode (no workers) → 1 TX queue
-        assert_eq!(compute_tx_queues(0, 16), 1);
+        // RTC mode (rx_queues=1) → 1 TX queue
+        assert_eq!(compute_tx_queues(1, 16), 1);
     }
 
     #[test]
     fn compute_tx_queues_pipeline() {
-        // Pipeline mode → 2 TX queues (RX lcore + app thread)
-        assert_eq!(compute_tx_queues(1, 16), 2);
+        // Pipeline mode → 2 TX queues (RX dispatcher + app thread)
+        assert_eq!(compute_tx_queues(2, 16), 2);
         assert_eq!(compute_tx_queues(4, 16), 2);
     }
 
@@ -889,7 +823,6 @@ mod tests {
     fn total_lcores_run_to_completion() {
         let plan = TopologyPlan {
             rx_queues: 1,
-            workers_per_queue: 0,
             nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::AutoDetected,
@@ -902,20 +835,18 @@ mod tests {
     fn total_lcores_pipeline() {
         let plan = TopologyPlan {
             rx_queues: 4,
-            workers_per_queue: 2,
             nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::AutoDetected,
         };
         assert!(!plan.is_run_to_completion());
-        assert_eq!(plan.total_lcores_needed(), 12); // 4 RX + 8 workers
+        assert_eq!(plan.total_lcores_needed(), 4);
     }
 
     #[test]
     fn display_run_to_completion() {
         let plan = TopologyPlan {
             rx_queues: 1,
-            workers_per_queue: 0,
             nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Stub,
@@ -928,14 +859,12 @@ mod tests {
     fn display_pipeline() {
         let plan = TopologyPlan {
             rx_queues: 4,
-            workers_per_queue: 2,
             nb_tx_queues: 2,
             numa_node: 1,
             source: TopologySource::Builder,
         };
         let s = format!("{plan}");
-        assert!(s.contains("4 RX queues"));
-        assert!(s.contains("2 workers/queue"));
+        assert!(s.contains("4 RSS queues"));
         assert!(s.contains("2 TX queues"));
     }
 
@@ -1001,9 +930,9 @@ mod tests {
             Ok(frame.len())
         };
 
+        // rx_queues=3 → 1 RX dispatcher + 2 queue workers
         let plan = TopologyPlan {
-            rx_queues: 1,
-            workers_per_queue: 2,
+            rx_queues: 3,
             nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1057,7 +986,6 @@ mod tests {
         // run-to-completion plan should return None (no pipeline threads)
         let plan = TopologyPlan {
             rx_queues: 1,
-            workers_per_queue: 0,
             nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1092,9 +1020,9 @@ mod tests {
             Ok(frame.len())
         };
 
+        // rx_queues=2 → 1 RX dispatcher + 1 queue worker
         let plan = TopologyPlan {
-            rx_queues: 1,
-            workers_per_queue: 1,
+            rx_queues: 2,
             nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1132,27 +1060,25 @@ mod tests {
     }
 
     #[test]
-    fn configurable_workers_per_queue() {
-        // Test various fan-out configurations
-        for wpq in [1, 2, 4, 8] {
+    fn configurable_rx_queues() {
+        // Test various queue configurations
+        for rq in [2, 3, 5, 9] {
             let plan = TopologyPlan {
-                rx_queues: 1,
-                workers_per_queue: wpq,
+                rx_queues: rq,
                 nb_tx_queues: 2,
                 numa_node: 0,
                 source: TopologySource::Builder,
             };
             assert!(!plan.is_run_to_completion());
-            assert_eq!(plan.total_lcores_needed(), 1 + wpq as usize);
+            assert_eq!(plan.total_lcores_needed(), rq as usize);
         }
     }
 
     #[test]
-    fn workers_per_queue_zero_is_rtc() {
-        // Setting workers_per_queue=0 forces run-to-completion (no pipeline threads)
+    fn rx_queues_one_is_rtc() {
+        // rx_queues=1 → run-to-completion (no pipeline threads)
         let plan = TopologyPlan {
             rx_queues: 1,
-            workers_per_queue: 0,
             nb_tx_queues: 1,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1170,9 +1096,9 @@ mod tests {
         };
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
 
+        // rx_queues=4 → 1 RX dispatcher + 3 queue workers
         let plan = TopologyPlan {
-            rx_queues: 1,
-            workers_per_queue: 3,
+            rx_queues: 4,
             nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1226,8 +1152,8 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_per_worker_app_rings() {
-        // Verify that packets arrive on per-worker SPSC app rings
+    fn pipeline_per_queue_app_rings() {
+        // Verify that packets arrive on per-queue SPSC app rings
         // and dequeue_app polls them correctly
         let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1260,9 +1186,9 @@ mod tests {
 
         let send_fn = |_: &[u8]| -> io::Result<usize> { Ok(0) };
 
+        // rx_queues=3 → 1 RX dispatcher + 2 queue workers = 2 app_rings
         let plan = TopologyPlan {
-            rx_queues: 1,
-            workers_per_queue: 2,
+            rx_queues: 3,
             nb_tx_queues: 2,
             numa_node: 0,
             source: TopologySource::Builder,
@@ -1294,7 +1220,7 @@ mod tests {
         }
 
         assert_eq!(received.len(), 4, "should have received all 4 packets");
-        // Verify app_rings is populated (>= 1 ring per worker)
+        // Verify app_rings: rx_queues=3 → 2 queue workers → 2 app_rings
         assert_eq!(topo.app_rings.len(), 2);
 
         // Free frames back to pool
