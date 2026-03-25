@@ -8,7 +8,7 @@ Traditional Linux networking routes every packet through the kernel: syscalls, c
 
 DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace drivers and polling. This eliminates syscalls and context switches, achieving:
 
-- **~2x higher packet throughput** at saturation (700K PPS: DPDK consistently delivers ~600K+ RX while kernel varies 150K-330K)
+- **~2x higher packet throughput** at saturation (700K PPS: DPDK delivers ~640-680K RX while kernel delivers ~310-340K)
 - **Zero packet drops** up to 350K PPS where the kernel starts dropping
 - **Zero kernel overhead** for packet I/O — no syscalls, no context switches
 
@@ -189,29 +189,29 @@ Benchmarked on AWS c5n.2xlarge (8 vCPU, 25 Gbps ENA) using TRex traffic generato
 | Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop |
 |-----------|-------------|------|----------|------|
 | 70,000 | 70,000 | 0% | 69,000 | 1.4% |
-| 140,000 | 140,000 | 0% | 138,994 | 0.7% |
-| 350,000 | 349,997 | 0% | 241,022 | 31.1% |
-| 700,000 | 642,255 | 8.2% | 153,728 | 78.0% |
+| 140,000 | 140,000 | 0% | 138,996 | 0.7% |
+| 350,000 | 349,903 | 0.03% | 327,975 | 6.3% |
+| 700,000 | 678,563 | 3.1% | 342,265 | 51.1% |
 
 ### 512-byte packets
 
 | Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop |
 |-----------|-------------|------|----------|------|
 | 70,000 | 70,000 | 0% | 69,000 | 1.4% |
-| 140,000 | 140,000 | 0% | 138,970 | 0.7% |
-| 350,000 | 349,999 | 0% | 221,801 | 36.6% |
-| 700,000 | 619,280 | 11.5% | 144,758 | 79.3% |
+| 140,000 | 139,992 | 0.01% | 138,968 | 0.7% |
+| 350,000 | 349,864 | 0.04% | 289,761 | 17.2% |
+| 700,000 | 638,416 | 8.8% | 324,749 | 53.6% |
 
 ### 1400-byte packets (near MTU)
 
 | Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop |
 |-----------|-------------|------|----------|------|
-| 70,000 | 70,000 | 0% | 68,999 | 1.4% |
-| 140,000 | 140,000 | 0% | 138,988 | 0.7% |
-| 350,000 | 350,000 | 0% | 221,808 | 36.6% |
-| 700,000 | 447,723 | 36.0% | 143,221 | 79.5% |
+| 70,000 | 70,000 | 0% | 68,996 | 1.4% |
+| 140,000 | 139,953 | 0.03% | 138,972 | 0.7% |
+| 350,000 | 350,000 | 0% | 283,868 | 18.9% |
+| 700,000 | 447,693 | 36.0% | 309,586 | 55.8% |
 
-**Key takeaway**: At 350K PPS, DPDK handles all three packet sizes with zero drops while the kernel starts dropping. At 700K PPS, DPDK delivers ~2x the throughput of kernel sockets (kernel numbers vary significantly between EC2 instances). The advantage is most pronounced at high packet rates where kernel overhead dominates.
+**Key takeaway**: At 350K PPS, DPDK handles all three packet sizes with near-zero drops while the kernel drops 6-19%. At 700K PPS, DPDK delivers ~2x the throughput of kernel sockets consistently across runs. The advantage is most pronounced at high packet rates where kernel overhead dominates.
 
 See `docs/perf-test-log.md` for detailed benchmark history across optimization phases.
 
