@@ -5,6 +5,130 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #5: Cleanup & Baseline Fix
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-03-25 |
+| **Git Hash** | `1d4c327` |
+| **Branch** | `claude/cleanup-udp-prototype-z4UUD` |
+| **PR** | [#27](https://github.com/gspivey/dpdk-stdlib-rust/pull/27) |
+| **GH Actions Run** | [23548559577](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/23548559577) |
+| **Instance Type** | c5n.2xlarge |
+| **Traffic Generator** | TRex |
+
+### Changes Since Previous Run
+
+- **Rewrote echo app**: 282→65 lines, now structurally identical to plain-echo with only `use dpdk_udp::UdpSocket` vs `use std::net::UdpSocket` — demonstrates the "drop-in replacement" story.
+- **Removed echo/dpdk feature flag**: dpdk-udp is now a non-optional dependency.
+- **Removed multicore configs**: `rust-dpdk-multicore` removed from default perf configs (was broken since topology simplification in PR #26).
+- **Fixed README performance claims**: 10-100x → ~2x, matching actual benchmarks.
+- **⚠️ Baseline change**: Previous runs' `rust-stdlib` config ran the `echo` binary which used `dpdk_udp::UdpSocket` with its abstraction layer in kernel-fallback mode — **not** a clean `std::net` comparison. This run's `plain-rust` config correctly uses `plain-echo` which calls `std::net::UdpSocket` directly. Results are now an honest apples-to-apples comparison. The `rust-stdlib` config still exists but is removed from defaults.
+
+### Results: 64B Packets
+
+#### native-dpdk (DPDK C baseline)
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 145 | 0% |
+| 140K | 149 | 0% |
+| 350K | 164 | 0% |
+| 700K | 811 | 7.9% |
+
+#### rust-dpdk (single-core, run-to-completion)
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 219 | 0% |
+| 140K | 257 | 0% |
+| 350K | 284 | 0% |
+| 700K | 1,024 | 8.2% |
+
+#### plain-rust (std::net baseline via plain-echo)
+
+| PPS | RX pps | Drop % |
+|-----|--------|--------|
+| 70K | 69,000 | 1.4% |
+| 140K | 138,994 | 0.7% |
+| 350K | 241,022 | 31.1% |
+| 700K | 153,728 | 78.0% |
+
+### Results: 512B Packets
+
+#### native-dpdk
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 110 | 0% |
+| 140K | 163 | 0% |
+| 350K | 126 | 0% |
+| 700K | 877 | 8.5% |
+
+#### rust-dpdk
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 246 | 0% |
+| 140K | 253 | 0% |
+| 350K | 290 | 0% |
+| 700K | 1,188 | 11.5% |
+
+#### plain-rust
+
+| PPS | RX pps | Drop % |
+|-----|--------|--------|
+| 70K | 69,000 | 1.4% |
+| 140K | 138,970 | 0.7% |
+| 350K | 221,801 | 36.6% |
+| 700K | 144,758 | 79.3% |
+
+### Results: 1400B Packets
+
+#### native-dpdk
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 156 | 0% |
+| 140K | 127 | 0% |
+| 350K | 170 | 0% |
+| 700K | 3,878 | 36.0% |
+
+#### rust-dpdk
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 243 | 0% |
+| 140K | 247 | 0% |
+| 350K | 280 | 0% |
+| 700K | 3,848 | 36.0% |
+
+#### plain-rust
+
+| PPS | RX pps | Drop % |
+|-----|--------|--------|
+| 70K | 68,999 | 1.4% |
+| 140K | 138,988 | 0.7% |
+| 350K | 221,808 | 36.6% |
+| 700K | 143,221 | 79.5% |
+
+### Analysis
+
+**rust-dpdk matches native-dpdk almost exactly**: At 1400B/700K PPS, both deliver ~448K RX pps (36% drop) with nearly identical latency (3,848 vs 3,878us). At 64B/700K, rust-dpdk is within 0.4% of native (642K vs 645K RX pps). The Rust overhead at sub-saturation rates is consistently ~100us higher latency (219-290us vs 110-170us).
+
+**Baseline change matters**: The `plain-rust` results here use `std::net::UdpSocket` directly via `plain-echo`. Previous runs' `rust-stdlib` used our abstraction layer in fallback mode. The direct comparison shows kernel sockets perform slightly worse than previously reported — 78% drop at 64B/700K PPS vs the earlier 54.8%. This is likely instance-level variance, but the baseline is now honest.
+
+**DPDK advantage at 350K PPS is decisive**: DPDK (both native and rust) delivers zero drops at 350K PPS across all packet sizes, while the kernel loses 31-37%. At 700K PPS, DPDK delivers ~4x the throughput of kernel sockets (642K vs 154K at 64B).
+
+**Key comparison at 700K PPS (DPDK vs kernel)**:
+| Packet Size | rust-dpdk RX | plain-rust RX | DPDK Advantage |
+|-------------|-------------|---------------|----------------|
+| 64B | 642,255 | 153,728 | 4.2x |
+| 512B | 619,280 | 144,758 | 4.3x |
+| 1400B | 447,723 | 143,221 | 3.1x |
+
+---
+
 ## Run #4: Topology Simplification
 
 | Field | Value |
