@@ -116,16 +116,18 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 **rust-dpdk matches native-dpdk almost exactly**: At 1400B/700K PPS, both deliver ~448K RX pps (36% drop) with nearly identical latency (3,848 vs 3,878us). At 64B/700K, rust-dpdk is within 0.4% of native (642K vs 645K RX pps). The Rust overhead at sub-saturation rates is consistently ~100us higher latency (219-290us vs 110-170us).
 
-**Baseline change matters**: The `plain-rust` results here use `std::net::UdpSocket` directly via `plain-echo`. Previous runs' `rust-stdlib` used our abstraction layer in fallback mode. The direct comparison shows kernel sockets perform slightly worse than previously reported — 78% drop at 64B/700K PPS vs the earlier 54.8%. This is likely instance-level variance, but the baseline is now honest.
+**Baseline is now honest**: The `plain-rust` results use `std::net::UdpSocket` directly via `plain-echo`. Previous runs' `rust-stdlib` used our abstraction layer in kernel-fallback mode, which was not a clean std::net comparison. The difference in kernel numbers between runs (78% drop here vs 54.8% in Run #4 at 64B/700K) is within normal EC2 instance-level variance — even two runs of the same binary on the same branch showed 2x variation in kernel throughput at saturation.
 
-**DPDK advantage at 350K PPS is decisive**: DPDK (both native and rust) delivers zero drops at 350K PPS across all packet sizes, while the kernel loses 31-37%. At 700K PPS, DPDK delivers ~4x the throughput of kernel sockets (642K vs 154K at 64B).
+**DPDK advantage at 350K PPS is decisive**: DPDK (both native and rust) delivers zero drops at 350K PPS across all packet sizes, while the kernel loses 31-37%. At 700K PPS, DPDK delivers significantly higher throughput than kernel sockets.
 
-**Key comparison at 700K PPS (DPDK vs kernel)**:
+**Key comparison at 700K PPS (this run)**:
 | Packet Size | rust-dpdk RX | plain-rust RX | DPDK Advantage |
 |-------------|-------------|---------------|----------------|
 | 64B | 642,255 | 153,728 | 4.2x |
 | 512B | 619,280 | 144,758 | 4.3x |
 | 1400B | 447,723 | 143,221 | 3.1x |
+
+**Note on DPDK advantage claims**: The 3-4x number is from this single run. Kernel performance varies significantly between EC2 instances (154K-332K RX at 64B/700K across runs in this PR alone), so the real-world DPDK advantage at saturation is likely **~2x on average**, consistent with what we've seen across multiple runs. The consistent finding is that DPDK delivers zero drops up to 350K PPS where the kernel cannot.
 
 ---
 

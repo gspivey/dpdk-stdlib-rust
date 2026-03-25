@@ -8,8 +8,8 @@ Traditional Linux networking routes every packet through the kernel: syscalls, c
 
 DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace drivers and polling. This eliminates syscalls and context switches, achieving:
 
-- **3-4x higher packet throughput** at saturation (700K PPS: DPDK delivers 642K vs kernel's 154K packets at 64B)
-- **Zero packet drops** up to 350K PPS where the kernel already loses 31-37%
+- **~2x higher packet throughput** at saturation (700K PPS: DPDK consistently delivers ~600K+ RX while kernel varies 150K-330K)
+- **Zero packet drops** up to 350K PPS where the kernel starts dropping
 - **Zero kernel overhead** for packet I/O — no syscalls, no context switches
 
 **But DPDK's C API is complex and unsafe.** This project wraps DPDK in safe Rust with a familiar `std::net` API, so you get kernel bypass without rewriting your application.
@@ -211,7 +211,7 @@ Benchmarked on AWS c5n.2xlarge (8 vCPU, 25 Gbps ENA) using TRex traffic generato
 | 350,000 | 350,000 | 0% | 221,808 | 36.6% |
 | 700,000 | 447,723 | 36.0% | 143,221 | 79.5% |
 
-**Key takeaway**: At 350K PPS, DPDK handles all three packet sizes with zero drops while the kernel already loses 31-37%. At 700K PPS, DPDK delivers 3-4x the throughput of kernel sockets. The advantage is most pronounced at high packet rates where kernel overhead dominates.
+**Key takeaway**: At 350K PPS, DPDK handles all three packet sizes with zero drops while the kernel starts dropping. At 700K PPS, DPDK delivers ~2x the throughput of kernel sockets (kernel numbers vary significantly between EC2 instances). The advantage is most pronounced at high packet rates where kernel overhead dominates.
 
 See `docs/perf-test-log.md` for detailed benchmark history across optimization phases.
 
