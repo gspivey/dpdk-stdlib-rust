@@ -3,7 +3,7 @@
 # run-perf-tests.sh — Performance test orchestrator for dpdk-stdlib-rust
 #
 # Deploys a TRex generator + DUT instance, runs UDP echo benchmarks across
-# 4 configurations (rust-dpdk, native-dpdk, rust-stdlib, plain-rust),
+# 3 configurations (rust-dpdk, native-dpdk, plain-rust),
 # collects structured JSON results, and posts a summary to the PR.
 #
 # Usage:
@@ -15,7 +15,7 @@
 #   --packet-sizes      Comma-separated sizes (default: 64,512,1400)
 #   --duration          Seconds per rate step (default: 30)
 #   --rate-steps        Comma-separated target PPS values (default: 70000,140000,350000,700000)
-#   --configs           Comma-separated DUT configs (default: rust-stdlib,plain-rust,rust-dpdk,native-dpdk)
+#   --configs           Comma-separated DUT configs (default: plain-rust,rust-dpdk,native-dpdk)
 #   --json-summary      Write JSON summary file
 #   -h, --help          Show help
 # =============================================================================
@@ -34,7 +34,7 @@ DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="rust-stdlib,plain-rust,rust-dpdk,native-dpdk"
+CONFIGS="plain-rust,rust-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
@@ -992,19 +992,19 @@ start_dut_native_dpdk() {
 }
 
 start_dut_rust_stdlib() {
-    log_info "Starting DUT: rust-stdlib (echo server with kernel backend)"
+    log_info "Starting DUT: rust-stdlib (plain-echo server with kernel backend)"
     dut_bind_kernel || return 1
 
-    # The echo binary without DPDK feature falls back to std::net
+    # plain-echo uses std::net::UdpSocket (the kernel baseline)
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-stdlib.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-stdlib.log 2>&1 &"
     sleep 10
 
     local status=""
     local verify_attempt
     for verify_attempt in 1 2 3; do
         status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-            "pgrep -f 'target/release/echo' >/dev/null && echo 'running' || echo 'not running'") || true
+            "pgrep -f 'target/release/plain-echo' >/dev/null && echo 'running' || echo 'not running'") || true
         if [[ "$status" == *"running"* ]]; then
             break
         fi
@@ -1124,7 +1124,7 @@ else:
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
         lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "rust-stdlib", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {}).get(pkt_size, [])
 
