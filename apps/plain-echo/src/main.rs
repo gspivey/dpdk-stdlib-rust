@@ -1,18 +1,9 @@
 use clap::Parser;
-use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn signal_handler(_sig: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
-}
 
 #[derive(Parser)]
 #[command(name = "plain-echo")]
-#[command(about = "UDP echo server using std::net (baseline for comparison)")]
+#[command(about = "Minimal UDP echo server using std::net (performance baseline)")]
 struct Args {
     /// IP address to bind to
     #[arg(long, default_value = "0.0.0.0")]
@@ -23,35 +14,16 @@ struct Args {
     port: u16,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
-    }
-
+fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let bind_addr = format!("{}:{}", args.ip, args.port);
 
     let socket = UdpSocket::bind(&bind_addr)?;
     eprintln!("plain-echo listening on {}", socket.local_addr()?);
 
-    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-
     let mut buf = [0u8; 2048];
-    while !SHUTDOWN.load(Ordering::Relaxed) {
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                let _ = socket.send_to(&buf[..len], src);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => {
-                eprintln!("recv error: {}", e);
-                break;
-            }
-        }
+    loop {
+        let (len, src) = socket.recv_from(&mut buf)?;
+        socket.send_to(&buf[..len], src)?;
     }
-
-    println!("Shutting down gracefully...");
-    Ok(())
 }
