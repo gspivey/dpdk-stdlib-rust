@@ -240,8 +240,8 @@ This installs DPDK 23.11 and configures hugepages.
 ### Verify DPDK
 
 ```bash
-# Build with the dpdk feature to use real DPDK
-cargo run -p echo --features dpdk -- --ip 0.0.0.0 --port 9000
+# Run the echo server (uses real DPDK when installed, stubs otherwise)
+cargo run -p echo -- --ip 0.0.0.0 --port 9000
 ```
 
 ### Platform Support

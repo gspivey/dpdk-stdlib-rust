@@ -325,7 +325,7 @@ export class PerfTestStack extends cdk.Stack {
       'cd /opt/dpdk-stdlib',
       'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
       // Build all binaries including plain-echo (no dpdk feature needed)
-      'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen,echo/dpdk',
+      'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
       'echo "=== Build complete ==="',
       'ls -la target/release/echo target/release/plain-echo',
       // Collect environment info
