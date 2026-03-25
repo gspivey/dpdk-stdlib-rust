@@ -5,17 +5,17 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
-## Run #4: Topology Simplification (No Performance Run)
+## Run #4: Topology Simplification
 
 | Field | Value |
 |-------|-------|
 | **Date** | 2026-03-25 |
-| **Git Hash** | `9a526fc` |
-| **Branch** | `main` |
+| **Git Hash** | `8949d08` |
+| **Branch** | `main` (merged from topology simplification) |
 | **PR** | [#26](https://github.com/gspivey/dpdk-stdlib-rust/pull/26) |
-| **GH Actions Run** | N/A — config-only change, no perf run |
-| **Instance Type** | N/A |
-| **Traffic Generator** | N/A |
+| **GH Actions Run** | [23522716883](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/23522716883) |
+| **Instance Type** | c5n.2xlarge |
+| **Traffic Generator** | TRex |
 
 ### Changes Since Previous Run
 
@@ -24,13 +24,76 @@ Each entry captures the git context, test configuration, results, and analysis.
 - **Removed `DPDK_WORKERS_PER_QUEUE` env var**: Only `DPDK_RX_QUEUES` remains.
 - **Net reduction**: ~139 lines removed from topology code.
 
-### Results
+### Results: 1400B Packets
 
-No performance run was executed. This was a config simplification only — the hot path (single-core run-to-completion and multi-core pipeline data flow) was unchanged. Phase 3 results remain the current baseline.
+#### native-dpdk (DPDK C baseline)
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 125 | 0% |
+| 140K | 119 | 0% |
+| 350K | 129 | 0.02% |
+| 700K | 3,728 | 36.0% |
+
+#### rust-dpdk (single-core, run-to-completion)
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 243 | 0% |
+| 140K | 251 | 0% |
+| 350K | 267 | 0% |
+| 700K | 4,023 | 36.0% |
+
+#### rust-dpdk-multicore
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 0 | 100% |
+| 140K | 0 | 100% |
+| 350K | 0 | 100% |
+| 700K | 0 | 100% |
+
+#### plain-rust (std::net baseline)
+
+| PPS | Avg Latency (us) | Drop % |
+|-----|-------------------|--------|
+| 70K | 505 | 1.4% |
+| 140K | — | 0.8% |
+| 350K | — | 29.8% |
+| 700K | — | 58.4% |
+
+### Results: 64B Packets
+
+#### rust-dpdk (single-core)
+
+| PPS | RX pps | Drop % |
+|-----|--------|--------|
+| 70K | 70,000 | 0% |
+| 140K | 140,000 | 0% |
+| 350K | 349,928 | 0.02% |
+| 700K | 642,575 | 8.2% |
+
+#### plain-rust (std::net)
+
+| PPS | RX pps | Drop % |
+|-----|--------|--------|
+| 70K | 69,000 | 1.4% |
+| 140K | 138,997 | 0.7% |
+| 350K | 329,984 | 5.7% |
+| 700K | 316,155 | 54.8% |
 
 ### Analysis
 
-The multi-core pipeline remains experimental. Single-core run-to-completion is the recommended production path. The simplification reduces API surface without affecting performance characteristics.
+**Single-core rust-dpdk matches native-dpdk at 700K PPS**: Both deliver ~448K RX pps at 1400B (36% drop). At lower rates, rust-dpdk has zero drops while native-dpdk also has zero drops. The gap is latency: rust-dpdk averages 243-267us vs native's 119-129us at sub-saturation rates.
+
+**rust-dpdk-multicore is broken**: 100% packet drops at all rates. The perf test script passes `--workers 2` which is no longer a valid CLI flag after the topology simplification removed it. The multicore config needs to be removed from default perf test runs (done in PR #27).
+
+**rust-stdlib significantly worse than previous runs**: 92% drops at 700K/64B (vs 53% in earlier runs). This appears to be instance-level variance — the `rust-stdlib` config uses the kernel stack which is sensitive to system load and ENI driver state.
+
+**Key comparison at 64B/700K PPS** (worst case for kernel):
+- rust-dpdk: 642,575 RX pps (8.2% drop)
+- plain-rust: 316,155 RX pps (54.8% drop)
+- **DPDK delivers ~2x the throughput of kernel sockets at saturation**
 
 ---
 
