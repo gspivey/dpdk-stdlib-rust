@@ -308,16 +308,6 @@ These are features the Linux kernel provides that we intentionally defer to the 
 - **GSO/GRO batching** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
 - **BPF/XDP integration** — Use DPDK `rte_flow` rules for hardware-level filtering instead
 
-## Status
-
-- **Phase 1-5 complete** (see `API_COMPATIBILITY.md`)
-- **std::net::UdpSocket**: 19/19 methods implemented
-- **tokio::net::UdpSocket**: All async methods + poll API
-- **ARP resolution** and **ICMP echo reply** support
-- **Hardware checksum offload** (IPv4, UDP, TCP)
-- **Backend abstraction** (DPDK, AF_PACKET, MMAP)
-- **Integration tests** on AWS EC2 (c6gn.large with ENA)
-
 ## DPDK Installation (Optional)
 
 Development and testing work without DPDK. For production kernel bypass:
