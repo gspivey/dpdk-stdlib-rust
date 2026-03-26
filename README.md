@@ -310,7 +310,7 @@ These are features the Linux kernel provides that we intentionally defer to the 
 - **GSO/GRO** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
 - **Netfilter / iptables** — Rely on external filtering (Security Groups, hardware ACLs, upstream firewalls)
 - **Network namespaces** — Container isolation is a kernel concern
-- **BPF/XDP** — Use DPDK `rte_flow` rules for hardware-level filtering instead
+- **BPF/XDP** — Not applicable to userspace DPDK; hardware filtering can be done via `rte_flow` at the FFI layer if needed
 - **TOS/DSCP** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
 - **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
 
