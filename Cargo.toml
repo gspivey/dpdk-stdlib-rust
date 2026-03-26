@@ -11,6 +11,15 @@ members = [
   "apps/plain-echo",
 ]
 
+[workspace.package]
+version = "0.1.0"
+authors = ["Gerard Spivey"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/gspivey/dpdk-stdlib-rust"
+keywords = ["dpdk", "networking", "udp", "kernel-bypass", "zero-copy"]
+categories = ["network-programming"]
+
 [workspace.dependencies]
 thiserror = "1"
 libc = "0.2"

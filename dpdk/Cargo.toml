@@ -1,11 +1,17 @@
 [package]
-name = "dpdk"
-version = "0.1.0"
-edition = "2021"
-description = "Safe Rust wrapper for DPDK"
+name = "dpdk-stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Safe Rust wrappers for DPDK EAL, Port, Mbuf, Mempool, and RX/TX queues"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
 
 [dependencies]
-dpdk-sys = { path = "../dpdk-sys" }
+dpdk-sys = { version = "0.1.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 thiserror = { workspace = true }
 libc = { workspace = true }
 

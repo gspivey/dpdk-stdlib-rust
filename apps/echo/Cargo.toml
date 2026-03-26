@@ -2,8 +2,9 @@
 name = "echo"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
-dpdk-udp = { path = "../../dpdk-udp" }
+dpdk-udp = { path = "../../dpdk-udp", package = "dpdk-stdlib-udp" }
 libc = "0.2"

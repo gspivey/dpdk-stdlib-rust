@@ -1,9 +1,14 @@
 [package]
-name = "dpdk-tokio"
-version = "0.1.0"
-edition = "2021"
-description = "Async Tokio integration for DPDK networking"
-license = "MIT OR Apache-2.0"
+name = "dpdk-stdlib-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async DPDK-accelerated replacement for tokio::net::UdpSocket"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
 
 [features]
 default = []
@@ -15,7 +20,7 @@ thiserror.workspace = true
 async-trait = "0.1"
 
 # Optional DPDK support
-dpdk-udp = { path = "../dpdk-udp", optional = true }
+dpdk-udp = { version = "0.1.0", path = "../dpdk-udp", optional = true, package = "dpdk-stdlib-udp" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

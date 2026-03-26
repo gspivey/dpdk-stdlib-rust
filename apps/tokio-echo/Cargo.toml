@@ -3,12 +3,13 @@ name = "tokio-echo"
 version = "0.1.0"
 edition = "2021"
 description = "Async UDP Echo Server using Tokio with DPDK support"
+publish = false
 
 [features]
 default = []
 dpdk = ["dpdk-tokio/dpdk"]
 
 [dependencies]
-dpdk-tokio = { path = "../../dpdk-tokio" }
+dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

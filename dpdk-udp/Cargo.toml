@@ -1,8 +1,14 @@
 [package]
-name = "dpdk-udp"
-version = "0.1.0"
-edition = "2021"
-description = "UDP protocol implementation with DPDK acceleration and raw socket fallback"
+name = "dpdk-stdlib-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Drop-in DPDK-accelerated replacement for std::net::UdpSocket"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
 
 [features]
 default = ["perf-counters"]
@@ -13,6 +19,6 @@ perf-counters = []
 
 [dependencies]
 thiserror = { workspace = true }
-dpdk = { path = "../dpdk" }
-dpdk-sys = { path = "../dpdk-sys" }
+dpdk = { version = "0.1.0", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-sys = { version = "0.1.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 libc = { workspace = true }

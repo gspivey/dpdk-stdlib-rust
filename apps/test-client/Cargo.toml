@@ -2,6 +2,7 @@
 name = "test-client"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [features]
 default = []
@@ -9,5 +10,5 @@ dpdk = ["dpdk-tokio/dpdk"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
-dpdk-tokio = { path = "../../dpdk-tokio" }
+dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio" }
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time"] }

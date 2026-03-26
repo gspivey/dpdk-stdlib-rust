@@ -1,10 +1,15 @@
 [package]
-name = "dpdk-sys"
-version = "0.1.0"
-edition = "2021"
-description = "Raw FFI bindings to DPDK"
-license = "MIT OR Apache-2.0"
+name = "dpdk-stdlib-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Raw FFI bindings for DPDK with stub support for building without DPDK installed"
+readme = "README.md"
 links = "dpdk"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
 
 [features]
 default = []
