@@ -260,7 +260,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **Network namespaces** | Per-namespace socket/routing isolation | None | No container-level network isolation |
 | **BPF/XDP** | Programmable packet processing at NIC driver level | None | No in-stack programmable filtering |
 | **TOS/DSCP** | `IP_TOS` socket option | Always 0x00 | No QoS marking |
-| **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Cannot participate in VLAN-tagged networks |
+| **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Planned — see Roadmap |
 | **Jumbo frames** | Configurable MTU | Hardcoded 1500-byte MTU | Planned — see Roadmap (Physical Hardware Support) |
 | **Encapsulation** | VXLAN, GUE, GENEVE tunnel endpoints | None | Planned — see Roadmap |
 | **Cork / MSG_MORE** | Accumulate multiple writes into one datagram | None | No scatter-gather send |
@@ -295,6 +295,8 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
 
+**VLAN (802.1q)** — Insert and strip VLAN tags in the socket layer. Required for physical networks with segmented L2 domains. DPDK NICs support VLAN offload, but the socket layer needs to handle tagging for backends that don't.
+
 **UDP Encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
 
 ### Not Currently Planned
@@ -308,7 +310,6 @@ These are features the Linux kernel provides that we intentionally defer to the 
 - **GSO/GRO batching** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
 - **BPF/XDP integration** — Use DPDK `rte_flow` rules for hardware-level filtering instead
 - **TOS/DSCP marking** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
-- **VLAN (802.1q)** — Rely on NIC-level VLAN offload or upstream switch port configuration
 - **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
 
 ## DPDK Installation (Optional)
