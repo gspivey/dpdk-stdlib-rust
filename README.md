@@ -261,7 +261,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **BPF/XDP** | Programmable packet processing at NIC driver level | None | No in-stack programmable filtering |
 | **TOS/DSCP** | `IP_TOS` socket option | Always 0x00 | No QoS marking |
 | **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Cannot participate in VLAN-tagged networks |
-| **Jumbo frames** | Configurable MTU | Hardcoded 1500-byte MTU | Cannot use jumbo frames even when NIC supports them |
+| **Jumbo frames** | Configurable MTU | Hardcoded 1500-byte MTU | Planned — see Roadmap (Physical Hardware Support) |
 | **Encapsulation** | VXLAN, GUE, GENEVE tunnel endpoints | None | Planned — see Roadmap |
 | **Cork / MSG_MORE** | Accumulate multiple writes into one datagram | None | No scatter-gather send |
 | **Gratuitous ARP** | Announces IP on interface up | None — purely reactive | Brief invisibility window on startup in physical networks |
@@ -307,6 +307,9 @@ These are features the Linux kernel provides that we intentionally defer to the 
 - **SO_REUSEPORT / multi-socket demux** — Use RSS to steer traffic to dedicated queues instead
 - **GSO/GRO batching** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
 - **BPF/XDP integration** — Use DPDK `rte_flow` rules for hardware-level filtering instead
+- **TOS/DSCP marking** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
+- **VLAN (802.1q)** — Rely on NIC-level VLAN offload or upstream switch port configuration
+- **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
 
 ## DPDK Installation (Optional)
 
