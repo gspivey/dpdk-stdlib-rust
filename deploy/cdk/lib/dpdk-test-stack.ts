@@ -267,7 +267,7 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "Checking pkg-config for libdpdk..."',
         'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
         'echo "DPDK found: $(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk)"',
-        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen,echo/dpdk,test-client/dpdk',
+        'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen,test-client/dpdk',
         'echo "=== Build complete ==="',
         'ls -la target/release/echo target/release/test-client',
         'echo "=== Setup complete! ==="',
