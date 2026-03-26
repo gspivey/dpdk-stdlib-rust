@@ -215,15 +215,106 @@ Benchmarked on AWS c5n.2xlarge (8 vCPU, 25 Gbps ENA) using TRex traffic generato
 
 See `docs/perf-test-log.md` for detailed benchmark history across optimization phases.
 
-## Status
+## Scope and Limitations
 
-- **Phase 1-5 complete** (see `API_COMPATIBILITY.md`)
-- **std::net::UdpSocket**: 19/19 methods implemented
-- **tokio::net::UdpSocket**: All async methods + poll API
-- **ARP resolution** and **ICMP echo reply** support
-- **Hardware checksum offload** (IPv4, UDP, TCP)
-- **Backend abstraction** (DPDK, AF_PACKET, MMAP)
-- **Integration tests** on AWS EC2 (c6gn.large with ENA)
+### What This Is
+
+A **high-performance UDP endpoint library** that replaces `std::net::UdpSocket` with DPDK kernel bypass. Designed for applications that are the **source or destination** of UDP traffic and need maximum packet throughput with minimum latency. Think: DNS servers, game servers, telemetry collectors, financial feed handlers, echo/relay services.
+
+### What This Is Not
+
+This is **not a general-purpose network stack**. It does not replace the Linux kernel's networking subsystem. It is not a router, firewall, load balancer, or network function. Applications that need full TCP/IP semantics, connection tracking, netfilter integration, or namespace isolation should use the kernel.
+
+### What's Implemented
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `std::net::UdpSocket` API | 19/19 methods | Full API compatibility |
+| `tokio::net::UdpSocket` API | Complete | All async + poll methods |
+| IPv4 UDP send/receive | Complete | Build and parse Ethernet/IPv4/UDP frames |
+| ARP resolution | Complete | Cache with atomic fast-path, auto-request, kernel ARP seeding |
+| ICMP echo reply | Complete | Auto-responds to ping |
+| Hardware checksum offload | Detected | Capability flags exposed, not yet used on TX path |
+| Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
+| Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
+| Multicast join/leave | Basic | IPv4 only, simplified group tracking |
+| Connected socket filtering | Complete | Buffers non-matching packets |
+| Socket timeouts | Complete | Read and write deadlines |
+
+### What's Not Implemented
+
+The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) handles significantly more than raw packet I/O. The following kernel features have **no equivalent** in this library. Planned items are listed first, matching the Roadmap order below.
+
+| Feature | Kernel | Us | Impact |
+|---------|--------|-----|--------|
+| **Subnet-aware routing** | Full FIB with longest-prefix match | None — ARP is the only routing decision | Planned |
+| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | None — unbounded buffering until hardware ring fills | Planned |
+| **RX checksum validation** | Hardware or software verification on every packet | Parsed but not verified | Planned |
+| **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | Always computed in software | Planned |
+| **ICMP error handling** | Destination/port unreachable queued to originating socket | Echo reply only — all ICMP errors ignored | Planned |
+| **Gratuitous ARP** | Announces IP on interface up | None — purely reactive | Planned |
+| **IPv6** | Full dual-stack | IPv4 only | Planned |
+| **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Planned |
+| **Jumbo frames** | Configurable MTU | Hardcoded 1500-byte MTU | Planned |
+| **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
+| **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
+| **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
+| **GSO/GRO** | Batch segmentation/coalescing for bulk transfers | Single-packet TX/RX | Not planned |
+| **Netfilter / iptables** | Full hook chain (PREROUTING through POSTROUTING) | None — DPDK bypasses kernel entirely | Not planned |
+| **Network namespaces** | Per-namespace socket/routing isolation | None | Not planned |
+| **BPF/XDP** | Programmable packet processing at NIC driver level | None | Not planned |
+| **TOS/DSCP** | `IP_TOS` socket option | Always 0x00 | Not planned |
+| **Cork / MSG_MORE** | Accumulate multiple writes into one datagram | None | Not planned |
+
+### Current Environment Assumptions
+
+Integration testing runs on **AWS EC2 with VPC networking**, which has specific properties that simplify our implementation:
+
+- AWS VPC is **L3-routed, not L2-switched** — all traffic (even same-subnet) transits a virtual router
+- ARP always resolves to the **VPC gateway MAC**, never the peer's actual MAC
+- No VLANs, no broadcast domains, no real L2 switching
+- Gateway is always at `subnet_base + 1` (e.g., `10.0.1.1`)
+
+**On physical hardware**, real L2/L3 networking requires subnet-aware routing decisions that the library does not currently make. See the Roadmap section for planned work.
+
+## Roadmap
+
+### Planned
+
+**Subnet-aware routing** — Remove AWS VPC assumptions. Implement subnet mask awareness so the stack can distinguish same-subnet (ARP for peer MAC directly) vs cross-subnet (ARP for gateway MAC). Add configurable default gateway, static routes, and MTU. This is required before the library can run correctly on bare-metal servers, on-premises data centers, or any non-VPC environment.
+
+**RX backpressure and drop counters** — Implement socket-level receive buffer accounting with configurable limits and exposed drop counters. Applications need visibility into packet loss. This is the most important gap for production use.
+
+**RX checksum validation** — Verify IPv4 and UDP checksums on received packets. Currently parsed but not checked. One-line fix with outsized correctness impact.
+
+**TX hardware checksum offload** — Use `CHECKSUM_PARTIAL` mode when the NIC supports it instead of computing checksums in software. Eliminates ~100ns per packet on capable hardware.
+
+**ICMP error handling** — Process destination unreachable and fragmentation needed messages. Surface errors to the application via the socket error API. Enables path MTU discovery.
+
+**Gratuitous ARP** — Announce our MAC/IP mapping on startup so switches and routers learn us immediately instead of waiting for inbound ARP requests.
+
+**IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
+
+**VLAN (802.1q)** — Insert and strip VLAN tags in the socket layer. Required for physical networks with segmented L2 domains. DPDK NICs support VLAN offload, but the socket layer needs to handle tagging for backends that don't.
+
+**Jumbo frames** — Configurable MTU to support jumbo frames (up to 9000 bytes) on NICs and networks that support them. Included as part of subnet-aware routing work.
+
+**UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
+
+### Not Currently Planned
+
+These are features the Linux kernel provides that we intentionally defer to the network infrastructure or consider out of scope:
+
+- **IP fragmentation/reassembly** — Modern networks use PMTUD; fragmentation is rare and problematic
+- **SO_REUSEPORT** — Use RSS to steer traffic to dedicated queues instead
+- **GSO/GRO** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
+- **Netfilter / iptables** — Rely on external filtering (Security Groups, hardware ACLs, upstream firewalls)
+- **Network namespaces** — Container isolation is a kernel concern
+- **BPF/XDP** — Not applicable to userspace DPDK. Hardware filtering is possible via DPDK's `rte_flow` API (FFI bindings exist but no safe wrapper yet — could be exposed if there is demand)
+- **TOS/DSCP** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
+- **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
+
+If you think a feature should be included, open an issue or feel free to cut a PR.
 
 ## DPDK Installation (Optional)
 
