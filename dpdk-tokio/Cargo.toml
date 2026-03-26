@@ -15,7 +15,7 @@ default = []
 dpdk = ["dep:dpdk-udp"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 thiserror.workspace = true
 async-trait = "0.1"
 
