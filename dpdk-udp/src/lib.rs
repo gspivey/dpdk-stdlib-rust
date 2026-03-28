@@ -38,6 +38,7 @@ pub mod backend_dpdk;
 pub mod backend_raw;
 pub mod ring_buffer;
 pub mod ring;
+pub mod routing;
 pub mod topology;
 pub mod perf;
 pub mod frame_pool;
@@ -51,6 +52,7 @@ pub use ring::{SpscRing, MpscRing};
 pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
 pub use frame_pool::{AppPacket, FramePool, FrameRef};
 pub use perf::{PerfCounters, PerfSnapshot, PerfReporter, LatencySampler};
+pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop};
 
 // ============================================================================
 // Error Types
@@ -1209,6 +1211,8 @@ pub struct UdpSocket {
     has_buffered_packets: AtomicBool,
     /// True when connection_state is Some — skip connection_state.write() when false.
     has_connection_state: AtomicBool,
+    /// Subnet-aware routing table for next-hop MAC resolution.
+    routing_table: RoutingTable,
 }
 
 impl UdpSocket {
@@ -1283,6 +1287,7 @@ impl UdpSocket {
             is_connected: AtomicBool::new(false),
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
+            routing_table: RoutingTable::new(),
         })
     }
 
@@ -1374,6 +1379,7 @@ impl UdpSocket {
             is_connected: AtomicBool::new(false),
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
+            routing_table: RoutingTable::new(),
         })
     }
 
@@ -1464,8 +1470,15 @@ impl UdpSocket {
             }
         };
 
-        // Resolve destination MAC via ARP (or use configured/broadcast MAC)
-        let dst_mac = match self.arp_handler.resolve(&dst_ip) {
+        // Determine the ARP target: for same-subnet destinations, ARP for the
+        // peer directly; for cross-subnet, ARP for the gateway instead.
+        let arp_target = match self.routing_table.lookup(dst_ip) {
+            routing::NextHop::Direct(ip) => ip,
+            routing::NextHop::Gateway(gw) => gw,
+        };
+
+        // Resolve next-hop MAC via ARP (or use configured/broadcast MAC)
+        let dst_mac = match self.arp_handler.resolve(&arp_target) {
             Some(mac) => {
                 perf_inc!(self.perf_counters.arp_cache_hits);
                 mac
@@ -1473,7 +1486,7 @@ impl UdpSocket {
             None if self.auto_arp => {
                 perf_inc!(self.perf_counters.arp_cache_misses);
                 // Proactively send ARP request and wait for reply
-                self.resolve_arp(&dst_ip)?
+                self.resolve_arp(&arp_target)?
             }
             None => {
                 perf_inc!(self.perf_counters.arp_cache_misses);
@@ -1953,6 +1966,25 @@ impl UdpSocket {
     /// Gets the source MAC address (from the active backend).
     pub fn src_mac(&self) -> MacAddress {
         MacAddress::new(self.socket_backend.mac_address())
+    }
+
+    // ========================================================================
+    // Routing Configuration
+    // ========================================================================
+
+    /// Configure subnet-aware routing for this socket.
+    ///
+    /// When set, the socket uses the routing table to determine whether to ARP
+    /// for the destination IP directly (same subnet) or for the gateway IP
+    /// (cross-subnet). Without this, all ARP targets the destination directly
+    /// (legacy behavior, compatible with AWS VPC where gateway MAC is seeded).
+    pub fn set_routing(&mut self, config: NetworkConfig) {
+        self.routing_table = RoutingTable::with_config(config);
+    }
+
+    /// Get a reference to the current routing table.
+    pub fn routing_table(&self) -> &RoutingTable {
+        &self.routing_table
     }
 
     // ========================================================================
@@ -2444,6 +2476,7 @@ impl SyntheticUdpSocket {
 pub struct UdpSocketBuilder {
     rx_queues: Option<u16>,
     backend_type: Option<BackendType>,
+    network_config: Option<NetworkConfig>,
 }
 
 impl UdpSocketBuilder {
@@ -2452,6 +2485,7 @@ impl UdpSocketBuilder {
         Self {
             rx_queues: None,
             backend_type: None,
+            network_config: None,
         }
     }
 
@@ -2467,6 +2501,29 @@ impl UdpSocketBuilder {
     /// Force a specific backend type.
     pub fn backend_type(mut self, backend: BackendType) -> Self {
         self.backend_type = Some(backend);
+        self
+    }
+
+    /// Configure subnet-aware routing.
+    ///
+    /// When set, the socket distinguishes same-subnet destinations (ARP for
+    /// peer directly) from cross-subnet destinations (ARP for gateway).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use dpdk_udp::{UdpSocket, NetworkConfig};
+    /// use std::net::Ipv4Addr;
+    ///
+    /// let socket = UdpSocket::builder()
+    ///     .network(
+    ///         NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 10), 24)
+    ///             .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
+    ///     )
+    ///     .bind("10.0.1.10:9000")?;
+    /// ```
+    pub fn network(mut self, config: NetworkConfig) -> Self {
+        self.network_config = Some(config);
         self
     }
 
@@ -2490,6 +2547,11 @@ impl UdpSocketBuilder {
 
         // Create the socket using the standard bind path
         let mut socket = UdpSocket::bind(addr)?;
+
+        // Apply routing configuration if provided
+        if let Some(net_config) = self.network_config {
+            socket.routing_table = RoutingTable::with_config(net_config);
+        }
 
         // Detect topology from config + runtime environment.
         // Under stubs this always returns run-to-completion.
