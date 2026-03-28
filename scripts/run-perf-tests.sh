@@ -504,7 +504,7 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # TRex has 3 ENIs on c5n.2xlarge:
+    # TRex has 3 ENIs:
     #   device 0 = ens5 (0000:00:05.0) — Management (kernel, SSM)
     #   device 1 = ens6 (0000:00:06.0) — Data TX (DPDK)
     #   device 2 = ens7 (0000:00:07.0) — Data RX (DPDK)
@@ -690,7 +690,7 @@ start_trex_server() {
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.
-    # TRex takes ~15-20s to probe ENA NICs via DPDK on c5n instances.
+    # TRex takes ~15-20s to probe ENA NICs via DPDK.
     log_info "Waiting 45s for TRex to initialize..."
     sleep 45
 
@@ -1076,7 +1076,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
 report = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "commit": os.environ.get("GITHUB_SHA", "unknown"),
-    "instance_type": "c5n.2xlarge",
+    "instance_type": "${DUT_INSTANCE_TYPE:-unknown}",
     "configs": configs,
 }
 
@@ -1201,7 +1201,7 @@ main() {
     if [[ "$SKIP_DEPLOY" == "false" ]]; then
         log_info "Phase 1: Deploying PerfTestStack..."
         post_pr_comment "## [Perf] Stage: Deploy
-Deploying \`PerfTestStack\` (TRex + DUT on c5n.2xlarge)...
+Deploying \`PerfTestStack\`...
 Configs: \`$CONFIGS\`
 Packet sizes: \`$PACKET_SIZES\`"
 
@@ -1437,9 +1437,15 @@ $cfn_events
     wait "$trex_wait_pid" || { log_error "TRex SSM not ready"; exit 2; }
     wait "$dut_wait_pid"  || { log_error "DUT SSM not ready"; exit 2; }
 
+    # Query actual instance type from DUT via IMDS
+    DUT_INSTANCE_TYPE=$(ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || echo "unknown")
+    log_info "DUT instance type: $DUT_INSTANCE_TYPE"
+
     post_pr_comment "## [Perf] Stage: Instances Ready
 - TRex: \`$TREX_INSTANCE_ID\` (${TREX_DATA_ENI_IP})
-- DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})"
+- DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})
+- Instance type: \`$DUT_INSTANCE_TYPE\`"
 
     # ── Phase 2b: Ensure secondary ENIs are attached and bound ────────────────
     # The ENI attachments are separate CloudFormation resources that may complete

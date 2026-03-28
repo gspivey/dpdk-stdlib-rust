@@ -9,7 +9,7 @@ import { Construct } from 'constructs';
  * instance for performance benchmarking of the dpdk-stdlib-rust UDP stack.
  *
  * Architecture:
- *   TRex (c5n.2xlarge)  <--UDP-->  DUT (c5n.2xlarge)
+ *   TRex (c6in.xlarge)  <--UDP-->  DUT (c6in.xlarge)
  *   ENI-0: mgmt/SSM              ENI-0: mgmt/SSM
  *   ENI-1: DPDK traffic           ENI-1: DPDK/kernel traffic
  *
