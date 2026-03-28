@@ -52,7 +52,7 @@ pub use ring::{SpscRing, MpscRing};
 pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
 pub use frame_pool::{AppPacket, FramePool, FrameRef};
 pub use perf::{PerfCounters, PerfSnapshot, PerfReporter, LatencySampler};
-pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop};
+pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
 
 // ============================================================================
 // Error Types
@@ -88,6 +88,11 @@ pub type UdpResult<T> = Result<T, UdpError>;
 
 /// Maximum UDP payload size (MTU 1500 - IP header 20 - UDP header 8)
 pub const MAX_UDP_PAYLOAD: usize = 1472;
+
+/// Maximum possible frame size for jumbo MTU (9001 + 14 Ethernet header).
+/// TxBuffer is always allocated at this size to avoid reallocation when
+/// `set_routing()` changes the MTU after bind.
+const MAX_FRAME_SIZE: usize = ETH_HEADER_LEN + 9001;
 
 /// Ethernet header size
 pub const ETH_HEADER_LEN: usize = 14;
@@ -1064,6 +1069,33 @@ fn allocate_ephemeral_port() -> u16 {
     }
 }
 
+/// Try to auto-detect routing configuration from the OS.
+///
+/// Reads `/proc/net/route` and `/proc/net/arp` to discover the local subnet,
+/// default gateway, and seed the ARP cache with known MAC entries (especially
+/// the gateway MAC). Falls back to `RoutingTable::new()` (passthrough) if
+/// detection fails — this preserves backward compatibility.
+fn auto_detect_routing(local_ip: Ipv4Addr, arp_handler: &ArpHandler) -> RoutingTable {
+    // Skip auto-detect for INADDR_ANY — we don't know which interface to look up.
+    if local_ip.is_unspecified() {
+        return RoutingTable::new();
+    }
+
+    match routing::detect_from_proc(local_ip) {
+        Some((config, arp_entries)) => {
+            // Seed ARP cache with entries from /proc/net/arp (especially gateway MAC).
+            for entry in &arp_entries {
+                arp_handler.cache.insert(
+                    entry.ip,
+                    dpdk::port::MacAddress::new(entry.mac),
+                );
+            }
+            RoutingTable::with_config(config)
+        }
+        None => RoutingTable::new(),
+    }
+}
+
 // ============================================================================
 // TxBuffer — lock-free TX buffer for run-to-completion mode
 // ============================================================================
@@ -1259,6 +1291,11 @@ impl UdpSocket {
 
         let socket_backend = SocketBackend::Dpdk(Arc::clone(&resources));
 
+        // Auto-detect routing from OS if possible (Phase 3).
+        // Seeds the ARP cache with gateway MAC from /proc/net/arp.
+        // Falls back to passthrough (no routing) if detection fails.
+        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
             connected_addr: Mutex::new(None),
@@ -1275,7 +1312,7 @@ impl UdpSocket {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: TxBuffer::new(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD),
+            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
@@ -1287,7 +1324,7 @@ impl UdpSocket {
             is_connected: AtomicBool::new(false),
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
-            routing_table: RoutingTable::new(),
+            routing_table,
         })
     }
 
@@ -1351,6 +1388,9 @@ impl UdpSocket {
             local_mac[0], local_mac[1], local_mac[2],
             local_mac[3], local_mac[4], local_mac[5]);
 
+        // Auto-detect routing from OS if possible (Phase 3).
+        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
             connected_addr: Mutex::new(None),
@@ -1367,7 +1407,7 @@ impl UdpSocket {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: TxBuffer::new(TOTAL_HEADER_LEN + MAX_UDP_PAYLOAD),
+            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
@@ -1379,7 +1419,7 @@ impl UdpSocket {
             is_connected: AtomicBool::new(false),
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
-            routing_table: RoutingTable::new(),
+            routing_table,
         })
     }
 
@@ -1469,6 +1509,18 @@ impl UdpSocket {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
             }
         };
+
+        // Reject payloads that exceed the MTU-derived limit.
+        let max_payload = self.routing_table.max_udp_payload();
+        if buf.len() > max_payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload too large: {} bytes exceeds max UDP payload {} (MTU {})",
+                    buf.len(), max_payload, self.routing_table.mtu(),
+                ),
+            ));
+        }
 
         // Determine the ARP target: for same-subnet destinations, ARP for the
         // peer directly; for cross-subnet, ARP for the gateway instead.
@@ -1985,6 +2037,15 @@ impl UdpSocket {
     /// Get a reference to the current routing table.
     pub fn routing_table(&self) -> &RoutingTable {
         &self.routing_table
+    }
+
+    /// Returns the maximum UDP payload size for the configured MTU.
+    ///
+    /// This is `MTU - 20 (IPv4 header) - 8 (UDP header)`. With the default
+    /// MTU of 1500 this returns 1472. With jumbo frames (MTU 9001) it returns
+    /// 8973. Payloads larger than this limit will be rejected by `send_to()`.
+    pub fn max_udp_payload(&self) -> usize {
+        self.routing_table.max_udp_payload()
     }
 
     // ========================================================================
