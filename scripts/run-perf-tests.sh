@@ -29,7 +29,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEARDOWN=true
 SKIP_DEPLOY=false
-PACKET_SIZES="64,512,1400"
+PACKET_SIZES="64,512,1400,8500"
 DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
@@ -472,7 +472,7 @@ dut_bind_kernel() {
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
-        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'ena' ]; then echo ALREADY_BOUND_TO_ENA; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; echo BIND_OK; exit 0; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip route del default dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'ena' ]; then echo ALREADY_BOUND_TO_ENA; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip link set \$IFACE mtu 9001 2>/dev/null; echo MTU: \$(cat /sys/class/net/\$IFACE/mtu 2>/dev/null); ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; echo BIND_OK; exit 0; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip link set \$IFACE mtu 9001 2>/dev/null; echo MTU: \$(cat /sys/class/net/\$IFACE/mtu 2>/dev/null); sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip route del default dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_kernel result (exit=$bind_exit): $bind_out"
     if [[ $bind_exit -ne 0 ]]; then
@@ -684,7 +684,7 @@ start_trex_server() {
     log_info "Starting TRex server..."
     local start_cmd_id
     start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 --mbuf-factor 8 </dev/null >/var/log/trex-server.log 2>&1 & disown")
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.
@@ -969,7 +969,7 @@ start_dut_native_dpdk() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start --max-pkt-len=9100 --mbuf-size=10240 > /var/log/testpmd.log 2>&1 &"
     sleep 15
 
     local status=""

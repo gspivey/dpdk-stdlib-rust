@@ -135,7 +135,7 @@ def main():
     parser.add_argument('--src-mac', default=None, help='Source MAC (auto-detected if omitted)')
     parser.add_argument('--dst-mac', required=True, help='Destination MAC (gateway MAC for AWS VPC)')
     parser.add_argument('--dst-port', type=int, default=9000, help='UDP destination port')
-    parser.add_argument('--packet-sizes', default='64,512,1400', help='Comma-separated packet sizes')
+    parser.add_argument('--packet-sizes', default='64,512,1400,8500', help='Comma-separated packet sizes')
     parser.add_argument('--rate-steps', default='70000,140000,350000,700000', help='Comma-separated target PPS values')
     parser.add_argument('--duration', type=int, default=30, help='Seconds per rate step')
     parser.add_argument('--output', required=True, help='Output JSON file path')

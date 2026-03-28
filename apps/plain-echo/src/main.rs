@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind(&bind_addr)?;
     eprintln!("plain-echo listening on {}", socket.local_addr()?);
 
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 10000];
     loop {
         let (len, src) = socket.recv_from(&mut buf)?;
         socket.send_to(&buf[..len], src)?;

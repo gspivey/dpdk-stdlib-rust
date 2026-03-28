@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
 
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 10000];
     while !SHUTDOWN.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
