@@ -116,7 +116,7 @@ export class PerfTestStack extends cdk.Stack {
     });
     projectAsset.grantRead(instanceRole);
 
-    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C5N, ec2.InstanceSize.XLARGE2);
+    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE);
 
     // ── TRex Instance ────────────────────────────────────────────────────────
 

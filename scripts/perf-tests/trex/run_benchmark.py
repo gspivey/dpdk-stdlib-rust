@@ -72,9 +72,7 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
 
     # Start traffic with duration — TRex will stop TX after duration_sec.
     # Use TRex 'pps' multiplier format for deterministic rate control.
-    # force=True bypasses TRex's line rate check — the ENA DPDK PMD
-    # reports 16 Gbps but the actual c5n NIC supports 25 Gbps.
-    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec, force=True)
+    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec)
 
     # Sleep for the duration + drain time, then explicitly stop.
     # We avoid wait_on_traffic() because it can timeout on some setups
