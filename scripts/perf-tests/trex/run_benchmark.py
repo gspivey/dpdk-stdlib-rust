@@ -178,9 +178,14 @@ def main():
                     dst_mac=args.dst_mac,
                     dst_port=args.dst_port,
                 )
+            except Exception as e:
+                print(f"\n  ERROR: {pkt_size}B stream build failed: {e}", flush=True)
+                errors.append(f'{pkt_size}B: {e}')
+                continue
 
-                size_results = []
-                for target_pps in rate_steps:
+            size_results = []
+            for target_pps in rate_steps:
+                try:
                     print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
                     result = run_single_benchmark(
                         client=client,
@@ -192,11 +197,12 @@ def main():
                     size_results.append(result)
                     print(f"TX: {result['tx_pps']:,} pps, RX: {result['rx_pps']:,} pps, "
                           f"Drop: {result['drop_pct']}%, Lat avg: {result['lat_avg_us']} us")
+                except Exception as e:
+                    print(f"\n  ERROR: {pkt_size}B @ {target_pps} pps failed: {e}", flush=True)
+                    errors.append(f'{pkt_size}B@{target_pps}pps: {e}')
 
+            if size_results:
                 results[f'{pkt_size}B'] = size_results
-            except Exception as e:
-                print(f"\n  ERROR: {pkt_size}B benchmark failed: {e}", flush=True)
-                errors.append(f'{pkt_size}B: {e}')
 
     finally:
         client.disconnect()

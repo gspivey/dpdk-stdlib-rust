@@ -1120,7 +1120,7 @@ else:
         for size_key in cfg_data.get("results", {}).keys():
             all_sizes.add(size_key)
 
-    for pkt_size in sorted(all_sizes):
+    for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
