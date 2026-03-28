@@ -94,6 +94,12 @@ pub const MAX_UDP_PAYLOAD: usize = 1472;
 /// `set_routing()` changes the MTU after bind.
 const MAX_FRAME_SIZE: usize = ETH_HEADER_LEN + 9001;
 
+/// Mbuf data room size for jumbo frames: 9216 bytes data + headroom.
+/// 9216 accommodates the largest AWS VPC frame (9001 MTU + 14 eth + padding).
+/// Compile-time assertion ensures this fits in u16 (required by DPDK API).
+pub(crate) const JUMBO_DATA_ROOM_SIZE: u16 = 9216 + 128; // 128 = RTE_PKTMBUF_HEADROOM
+const _: () = assert!(JUMBO_DATA_ROOM_SIZE as u32 == 9216 + 128, "JUMBO_DATA_ROOM_SIZE overflow");
+
 /// Ethernet header size
 pub const ETH_HEADER_LEN: usize = 14;
 
@@ -727,7 +733,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         &MempoolConfig::new()
             .with_size(8192)
             .with_cache_size(256)
-            .with_data_room_size(9216 + dpdk_sys::RTE_PKTMBUF_HEADROOM as u16),
+            .with_data_room_size(JUMBO_DATA_ROOM_SIZE),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
     // Initialize port with 2 TX queues and jumbo MTU (9001 = AWS VPC max):

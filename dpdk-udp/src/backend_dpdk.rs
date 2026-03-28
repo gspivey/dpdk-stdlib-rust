@@ -45,7 +45,7 @@ impl DpdkBackend {
             &MempoolConfig::new()
                 .with_size(8192)
                 .with_cache_size(256)
-                .with_data_room_size(9216 + dpdk_sys::RTE_PKTMBUF_HEADROOM as u16),
+                .with_data_room_size(crate::JUMBO_DATA_ROOM_SIZE),
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
         // Initialize port with jumbo MTU (9001 = AWS VPC max)
