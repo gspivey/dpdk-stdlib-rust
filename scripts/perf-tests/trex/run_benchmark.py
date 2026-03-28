@@ -125,6 +125,17 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     return result
 
 
+def max_pps_for_line_rate(packet_size, line_rate_bps):
+    """Calculate the max PPS that stays under the port's line rate.
+
+    TRex L1 bandwidth = (packet_size + 20) * 8 * PPS
+    where 20 = preamble(7) + SFD(1) + FCS(4) + IFG(12).
+    Returns max PPS at 95% of line rate to leave headroom.
+    """
+    l1_bits_per_pkt = (packet_size + 20) * 8
+    return int((line_rate_bps * 0.95) / l1_bits_per_pkt)
+
+
 def main():
     parser = argparse.ArgumentParser(description='TRex UDP echo benchmark')
     parser.add_argument('--server', default='localhost', help='TRex server address')
@@ -157,12 +168,14 @@ def main():
         client.connect()
         client.acquire(ports=[args.port])
 
-        # Get source MAC from port if not specified
-        src_mac = args.src_mac
-        if not src_mac:
-            port_info = client.get_port_info(ports=[args.port])[0]
-            src_mac = port_info.get('hw_mac', '00:00:00:00:00:00')
+        # Get source MAC and port line rate
+        port_info = client.get_port_info(ports=[args.port])[0]
+        src_mac = args.src_mac or port_info.get('hw_mac', '00:00:00:00:00:00')
+        port_speed_bps = int(port_info.get('speed', 0)) * 1_000_000  # speed is in Mbps
+        if port_speed_bps == 0:
+            port_speed_bps = 25_000_000_000  # fallback: 25 Gbps
         print(f"Source MAC: {src_mac}")
+        print(f"Port line rate: {port_speed_bps / 1e9:.1f} Gbps")
 
         results = {}
 
@@ -183,8 +196,13 @@ def main():
                 errors.append(f'{pkt_size}B: {e}')
                 continue
 
+            pps_cap = max_pps_for_line_rate(pkt_size, port_speed_bps)
             size_results = []
             for target_pps in rate_steps:
+                if target_pps > pps_cap:
+                    print(f"  Target: {target_pps:,} pps ... SKIPPED "
+                          f"(would exceed line rate; max ~{pps_cap:,} pps for {pkt_size}B)", flush=True)
+                    continue
                 try:
                     print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
                     result = run_single_benchmark(
@@ -216,6 +234,7 @@ def main():
         'duration_per_step': args.duration,
         'src_ip': args.src_ip,
         'dst_ip': args.dst_ip,
+        'port_line_rate_gbps': round(port_speed_bps / 1e9, 1),
         'results': results,
     }
     if errors:
