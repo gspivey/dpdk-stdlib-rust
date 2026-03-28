@@ -134,6 +134,38 @@ Our approach:
 
 This avoids the need for DPDK-level ARP entirely in AWS VPC.
 
+## Preferred Approach: NetworkConfig with Gateway
+
+As of the subnet-aware routing implementation, the preferred way to handle AWS VPC
+networking is to configure a `NetworkConfig` with the gateway IP. This replaces the
+ARP cache pre-population hack with proper routing semantics:
+
+```rust
+use dpdk_udp::{UdpSocket, NetworkConfig};
+use std::net::Ipv4Addr;
+
+// Configure the socket with subnet and gateway knowledge
+let socket = UdpSocket::builder()
+    .network(
+        NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 100), 24)
+            .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
+    )
+    .bind("10.0.1.100:9000")?;
+
+// Cross-subnet traffic automatically ARPs for the gateway IP
+// Same-subnet traffic ARPs for the peer IP directly
+// Both resolve to the gateway MAC in AWS VPC (via proxy ARP)
+```
+
+**Auto-detection**: On Linux, `UdpSocket::bind()` automatically reads `/proc/net/route`
+and `/proc/net/arp` to discover the subnet, gateway, and seed the ARP cache. In AWS VPC
+this means routing "just works" without any manual configuration — the gateway MAC from
+the kernel's ARP table is pre-loaded into the DPDK ARP cache at bind time.
+
+The ARP cache pre-population strategy (below) still works and is still used by the test
+harness for explicit control, but new code should prefer `NetworkConfig` or rely on
+auto-detection.
+
 ## Known Failure Patterns
 
 | Symptom | Root Cause | Fix |

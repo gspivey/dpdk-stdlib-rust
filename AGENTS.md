@@ -138,6 +138,7 @@ Before debugging networking issues, **READ these documents first**:
 | Document | When to Read |
 |----------|-------------|
 | `docs/aws-vpc-networking.md` | Before ANY work on DPDK packet sending, ARP, MAC resolution, or integration test failures |
+| `docs/routing.md` | Before working on subnet-aware routing, NetworkConfig, MTU, static routes, or OS auto-detection |
 | `docs/debugging-log.md` | Before debugging integration test failures — contains history of what was tried |
 | `docs/integration-tests-setup.md` | Before running or modifying integration tests |
 | `docs/ephemeral-ports.md` | Before working on port allocation, bind(port 0), or async recv_from deadlocks |

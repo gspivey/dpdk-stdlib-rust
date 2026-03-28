@@ -247,7 +247,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
-| **Subnet-aware routing** | Full FIB with longest-prefix match | None — ARP is the only routing decision | Planned |
+| **Subnet-aware routing** | Full FIB with longest-prefix match | Subnet-aware with longest-prefix-match, auto-detection from OS | Done |
 | **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | None — unbounded buffering until hardware ring fills | Planned |
 | **RX checksum validation** | Hardware or software verification on every packet | Parsed but not verified | Planned |
 | **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | Always computed in software | Planned |
@@ -255,7 +255,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **Gratuitous ARP** | Announces IP on interface up | None — purely reactive | Planned |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
 | **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Planned |
-| **Jumbo frames** | Configurable MTU | Hardcoded 1500-byte MTU | Planned |
+| **Jumbo frames** | Configurable MTU | Configurable MTU via NetworkConfig, send_to() guard | Done |
 | **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
 | **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
@@ -275,13 +275,17 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 - No VLANs, no broadcast domains, no real L2 switching
 - Gateway is always at `subnet_base + 1` (e.g., `10.0.1.1`)
 
-**On physical hardware**, real L2/L3 networking requires subnet-aware routing decisions that the library does not currently make. See the Roadmap section for planned work.
+**On physical hardware**, the subnet-aware routing table handles L2/L3 routing decisions automatically. On Linux, `UdpSocket::bind()` auto-detects the subnet, gateway, and ARP entries from `/proc/net/route` and `/proc/net/arp`. For non-standard topologies, use `NetworkConfig` to configure routing explicitly. See `docs/routing.md`.
 
 ## Roadmap
 
-### Planned
+### Done
 
-**Subnet-aware routing** — Remove AWS VPC assumptions. Implement subnet mask awareness so the stack can distinguish same-subnet (ARP for peer MAC directly) vs cross-subnet (ARP for gateway MAC). Add configurable default gateway, static routes, and MTU. This is required before the library can run correctly on bare-metal servers, on-premises data centers, or any non-VPC environment.
+**Subnet-aware routing** — Subnet mask awareness with longest-prefix-match static routes, configurable default gateway, and MTU. Auto-detects subnet/gateway from `/proc/net/route` and seeds ARP cache from `/proc/net/arp` on Linux. Falls back to passthrough when detection fails. The library now runs correctly on bare-metal servers and on-premises environments. See `docs/routing.md`.
+
+**Jumbo frames** — Configurable MTU via `NetworkConfig` (up to 9001 bytes). `send_to()` rejects payloads exceeding the MTU-derived limit. TxBuffer is always sized for jumbo frames to avoid reallocation.
+
+### Planned
 
 **RX backpressure and drop counters** — Implement socket-level receive buffer accounting with configurable limits and exposed drop counters. Applications need visibility into packet loss. This is the most important gap for production use.
 
@@ -296,8 +300,6 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
 
 **VLAN (802.1q)** — Insert and strip VLAN tags in the socket layer. Required for physical networks with segmented L2 domains. DPDK NICs support VLAN offload, but the socket layer needs to handle tagging for backends that don't.
-
-**Jumbo frames** — Configurable MTU to support jumbo frames (up to 9000 bytes) on NICs and networks that support them. Included as part of subnet-aware routing work.
 
 **UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
 
