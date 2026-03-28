@@ -627,6 +627,8 @@ generate_trex_config() {
       src_mac:  '${TREX_DATA_MAC}'
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_RX_MAC}'
+  memory:
+    mbuf_9k: 4096
 YAMLEOF
 )
     local yaml_b64
@@ -684,7 +686,7 @@ start_trex_server() {
     log_info "Starting TRex server..."
     local start_cmd_id
     start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 --mbuf-factor 8 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.

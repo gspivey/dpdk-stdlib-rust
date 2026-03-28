@@ -166,37 +166,42 @@ def main():
 
         results = {}
 
+        errors = []
         for pkt_size in packet_sizes:
             print(f"\n--- Packet size: {pkt_size}B ---")
-            streams = build_streams(
-                packet_size=pkt_size,
-                src_ip=args.src_ip,
-                dst_ip=args.dst_ip,
-                src_mac=src_mac,
-                dst_mac=args.dst_mac,
-                dst_port=args.dst_port,
-            )
-
-            size_results = []
-            for target_pps in rate_steps:
-                print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
-                result = run_single_benchmark(
-                    client=client,
-                    port=args.port,
-                    streams=streams,
-                    target_pps=target_pps,
-                    duration_sec=args.duration,
+            try:
+                streams = build_streams(
+                    packet_size=pkt_size,
+                    src_ip=args.src_ip,
+                    dst_ip=args.dst_ip,
+                    src_mac=src_mac,
+                    dst_mac=args.dst_mac,
+                    dst_port=args.dst_port,
                 )
-                size_results.append(result)
-                print(f"TX: {result['tx_pps']:,} pps, RX: {result['rx_pps']:,} pps, "
-                      f"Drop: {result['drop_pct']}%, Lat avg: {result['lat_avg_us']} us")
 
-            results[f'{pkt_size}B'] = size_results
+                size_results = []
+                for target_pps in rate_steps:
+                    print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
+                    result = run_single_benchmark(
+                        client=client,
+                        port=args.port,
+                        streams=streams,
+                        target_pps=target_pps,
+                        duration_sec=args.duration,
+                    )
+                    size_results.append(result)
+                    print(f"TX: {result['tx_pps']:,} pps, RX: {result['rx_pps']:,} pps, "
+                          f"Drop: {result['drop_pct']}%, Lat avg: {result['lat_avg_us']} us")
+
+                results[f'{pkt_size}B'] = size_results
+            except Exception as e:
+                print(f"\n  ERROR: {pkt_size}B benchmark failed: {e}", flush=True)
+                errors.append(f'{pkt_size}B: {e}')
 
     finally:
         client.disconnect()
 
-    # Write output
+    # Write output (including partial results if some packet sizes failed)
     output = {
         'config_name': args.config_name,
         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -207,12 +212,17 @@ def main():
         'dst_ip': args.dst_ip,
         'results': results,
     }
+    if errors:
+        output['errors'] = errors
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(output, f, indent=2)
 
     print(f"\nResults written to {args.output}")
+    if errors:
+        print(f"WARNING: {len(errors)} packet size(s) failed: {errors}")
+        sys.exit(0)  # Still exit 0 — partial results are valid
 
 
 if __name__ == '__main__':
