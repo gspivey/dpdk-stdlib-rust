@@ -72,7 +72,10 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
 
     # Start traffic with duration — TRex will stop TX after duration_sec.
     # Use TRex 'pps' multiplier format for deterministic rate control.
-    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec)
+    # force=True bypasses TRex's line rate check — ENA PMD reports 16 Gbps
+    # but actual c5n/c6in NICs support 25-30 Gbps. PPS is already capped by
+    # max_pps_for_line_rate() using the real instance bandwidth.
+    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec, force=True)
 
     # Sleep for the duration + drain time, then explicitly stop.
     # We avoid wait_on_traffic() because it can timeout on some setups
@@ -125,15 +128,15 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     return result
 
 
-def max_pps_for_line_rate(packet_size, line_rate_bps):
-    """Calculate the max PPS that stays under the port's line rate.
+def max_pps_for_bandwidth(packet_size, bandwidth_gbps):
+    """Calculate the max PPS that stays under a bandwidth limit.
 
-    TRex L1 bandwidth = (packet_size + 20) * 8 * PPS
+    L1 bits per packet = (packet_size + 20) * 8
     where 20 = preamble(7) + SFD(1) + FCS(4) + IFG(12).
-    Returns max PPS at 95% of line rate to leave headroom.
+    Returns max PPS at 95% of the limit to leave headroom.
     """
     l1_bits_per_pkt = (packet_size + 20) * 8
-    return int((line_rate_bps * 0.95) / l1_bits_per_pkt)
+    return int((bandwidth_gbps * 1e9 * 0.95) / l1_bits_per_pkt)
 
 
 def main():
@@ -149,6 +152,8 @@ def main():
     parser.add_argument('--packet-sizes', default='64,512,1400,8500', help='Comma-separated packet sizes')
     parser.add_argument('--rate-steps', default='70000,140000,350000,700000', help='Comma-separated target PPS values')
     parser.add_argument('--duration', type=int, default=30, help='Seconds per rate step')
+    parser.add_argument('--bandwidth-cap-gbps', type=float, default=30.0,
+                        help='Max bandwidth in Gbps — rate steps exceeding this are skipped (default: 30)')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     args = parser.parse_args()
 
@@ -168,14 +173,10 @@ def main():
         client.connect()
         client.acquire(ports=[args.port])
 
-        # Get source MAC and port line rate
+        # Get source MAC
         port_info = client.get_port_info(ports=[args.port])[0]
         src_mac = args.src_mac or port_info.get('hw_mac', '00:00:00:00:00:00')
-        port_speed_bps = int(port_info.get('speed', 0)) * 1_000_000  # speed is in Mbps
-        if port_speed_bps == 0:
-            port_speed_bps = 25_000_000_000  # fallback: 25 Gbps
         print(f"Source MAC: {src_mac}")
-        print(f"Port line rate: {port_speed_bps / 1e9:.1f} Gbps")
 
         results = {}
 
@@ -196,12 +197,16 @@ def main():
                 errors.append(f'{pkt_size}B: {e}')
                 continue
 
-            pps_cap = max_pps_for_line_rate(pkt_size, port_speed_bps)
+            # For jumbo frames (>1500B), cap PPS to stay under the instance
+            # bandwidth limit. Standard packets use all rate steps uncapped.
+            pps_cap = max_pps_for_bandwidth(pkt_size, args.bandwidth_cap_gbps) if pkt_size > 1500 else None
+            if pps_cap is not None:
+                print(f"  (jumbo: capping at {pps_cap:,} pps for {args.bandwidth_cap_gbps} Gbps limit)")
             size_results = []
             for target_pps in rate_steps:
-                if target_pps > pps_cap:
+                if pps_cap is not None and target_pps > pps_cap:
                     print(f"  Target: {target_pps:,} pps ... SKIPPED "
-                          f"(would exceed line rate; max ~{pps_cap:,} pps for {pkt_size}B)", flush=True)
+                          f"(exceeds {args.bandwidth_cap_gbps} Gbps cap)", flush=True)
                     continue
                 try:
                     print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
@@ -234,7 +239,6 @@ def main():
         'duration_per_step': args.duration,
         'src_ip': args.src_ip,
         'dst_ip': args.dst_ip,
-        'port_line_rate_gbps': round(port_speed_bps / 1e9, 1),
         'results': results,
     }
     if errors:

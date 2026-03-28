@@ -282,6 +282,7 @@ struct ProcRouteEntry {
     destination: u32,  // network-byte-order u32
     gateway: u32,      // network-byte-order u32
     mask: u32,         // network-byte-order u32
+    mtu: u16,          // MTU from /proc/net/route (0 = use default)
 }
 
 /// An entry parsed from `/proc/net/arp`.
@@ -323,7 +324,9 @@ fn parse_proc_route(content: &str) -> Vec<ProcRouteEntry> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        entries.push(ProcRouteEntry { iface, destination, gateway, mask });
+        // MTU is column 8 (0-indexed); 0 means "use interface default"
+        let mtu = fields.get(8).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+        entries.push(ProcRouteEntry { iface, destination, gateway, mask, mtu });
     }
     entries
 }
@@ -446,6 +449,30 @@ pub fn detect_from_os(
     let mut config = NetworkConfig::new(local_ip, local_prefix_len);
     if let Some(gw) = default_gateway {
         config = config.with_gateway(gw);
+    }
+
+    // Detect interface MTU. First try the route table entry, then fall back
+    // to reading /sys/class/net/<iface>/mtu (which reflects the actual NIC MTU,
+    // e.g. 9001 on AWS ENA instances).
+    let mut detected_mtu: u16 = 0;
+    if let Some(ref iface) = local_iface {
+        // Check if any matching route had a non-zero MTU
+        for entry in &routes {
+            if entry.iface == *iface && entry.mtu > 0 {
+                detected_mtu = entry.mtu;
+                break;
+            }
+        }
+        // If route MTU was 0 (inherit from interface), read from sysfs
+        if detected_mtu == 0 {
+            let sysfs_mtu_path = format!("/sys/class/net/{}/mtu", iface);
+            if let Ok(content) = std::fs::read_to_string(&sysfs_mtu_path) {
+                detected_mtu = content.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    if detected_mtu > 0 {
+        config = config.with_mtu(detected_mtu);
     }
 
     // Parse ARP table for gateway/peer MAC entries
