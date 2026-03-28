@@ -727,7 +727,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         &MempoolConfig::new()
             .with_size(8192)
             .with_cache_size(256)
-            .with_data_room_size(9216 + dpdk_sys::RTE_PKTMBUF_HEADROOM),
+            .with_data_room_size(9216 + dpdk_sys::RTE_PKTMBUF_HEADROOM as u16),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
     // Initialize port with 2 TX queues and jumbo MTU (9001 = AWS VPC max):
