@@ -720,18 +720,20 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let eal = dpdk::Eal::init(&eal_args_ref)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
-    // Create mempool
+    // Create mempool with jumbo-frame-capable mbufs (9KB data room).
+    // ENA always supports 9001 MTU; oversized mbufs don't hurt small packets.
     let mempool = Mempool::create_with_config(
         "udp_pool",
         &MempoolConfig::new()
             .with_size(8192)
-            .with_cache_size(256),
+            .with_cache_size(256)
+            .with_data_room_size(9216 + dpdk_sys::RTE_PKTMBUF_HEADROOM),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-    // Initialize port with 2 TX queues:
+    // Initialize port with 2 TX queues and jumbo MTU (9001 = AWS VPC max):
     // - TX queue 0: RX lcore (ARP/ICMP replies, tx_ring drain)
     // - TX queue 1: Application thread (worker-direct TX for send_to)
-    let port_config = PortConfig::default().with_queues(1, 2);
+    let port_config = PortConfig::default().with_queues(1, 2).with_mtu(9001);
     let port = Port::init(port_id, port_config, &mempool)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 
