@@ -890,7 +890,6 @@ IP address       HW type     Flags       HW address            Mask     Device
 
     #[test]
     fn test_detect_from_os_aws_vpc() {
-        use std::io::Write;
 
         // Simulate an AWS VPC instance: ens5 on 10.0.1.100/24, gateway 10.0.1.1
         let route_content = "\
