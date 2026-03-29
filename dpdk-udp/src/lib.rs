@@ -208,9 +208,13 @@ pub fn build_udp_packet(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<()> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -307,9 +311,13 @@ pub fn build_udp_frame(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<Vec<u8>> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -384,9 +392,13 @@ pub fn build_udp_frame_into(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<usize> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -3214,7 +3226,8 @@ mod tests {
 
     #[test]
     fn test_build_udp_frame_payload_too_large() {
-        let large_payload = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+        let large_payload = vec![0u8; max_payload + 1];
         let result = build_udp_frame(
             &[0; 6], &[0; 6],
             Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED,
