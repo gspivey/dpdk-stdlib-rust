@@ -9,7 +9,7 @@ import { Construct } from 'constructs';
  * instance for performance benchmarking of the dpdk-stdlib-rust UDP stack.
  *
  * Architecture:
- *   TRex (c6in.xlarge)  <--UDP-->  DUT (c6in.xlarge)
+ *   TRex (c6in.8xlarge)  <--UDP-->  DUT (c6in.8xlarge)
  *   ENI-0: mgmt/SSM              ENI-0: mgmt/SSM
  *   ENI-1: DPDK traffic           ENI-1: DPDK/kernel traffic
  *
@@ -116,7 +116,7 @@ export class PerfTestStack extends cdk.Stack {
     });
     projectAsset.grantRead(instanceRole);
 
-    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE);
+    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE8);
 
     // ── TRex Instance ────────────────────────────────────────────────────────
 
