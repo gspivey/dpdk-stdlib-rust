@@ -259,6 +259,20 @@ impl RoutingTable {
         self.config.as_ref().map_or(1500, |c| c.mtu)
     }
 
+    /// Override the MTU (e.g. when DPDK port supports jumbo but OS detection
+    /// couldn't determine the correct value because the ENI is on vfio-pci).
+    pub fn set_mtu(&mut self, mtu: u16) {
+        match &mut self.config {
+            Some(config) => config.mtu = mtu,
+            None => {
+                // Create a minimal config just to hold the MTU
+                let mut config = NetworkConfig::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
+                config.mtu = mtu;
+                self.config = Some(config);
+            }
+        }
+    }
+
     /// Get the maximum UDP payload for the configured MTU.
     pub fn max_udp_payload(&self) -> usize {
         self.config.as_ref().map_or(1472, |c| c.max_udp_payload())

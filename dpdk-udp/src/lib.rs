@@ -1302,7 +1302,15 @@ impl UdpSocket {
         // Auto-detect routing from OS if possible (Phase 3).
         // Seeds the ARP cache with gateway MAC from /proc/net/arp.
         // Falls back to passthrough (no routing) if detection fails.
-        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+        let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
+
+        // When using DPDK, the port is configured for jumbo frames (MTU 9001)
+        // but auto-detect may report MTU 1500 because the DPDK ENI has no
+        // kernel interface to read from (it's bound to vfio-pci). Override
+        // the routing table MTU to match the DPDK port configuration.
+        if routing_table.mtu() < 9001 {
+            routing_table.set_mtu(9001);
+        }
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
@@ -1397,7 +1405,13 @@ impl UdpSocket {
             local_mac[3], local_mac[4], local_mac[5]);
 
         // Auto-detect routing from OS if possible (Phase 3).
-        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+        let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
+
+        // DPDK backends have jumbo MTU configured at the port level, but
+        // auto-detect may miss it because the ENI is on vfio-pci (no kernel iface).
+        if backend_name == "dpdk" && routing_table.mtu() < 9001 {
+            routing_table.set_mtu(9001);
+        }
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
