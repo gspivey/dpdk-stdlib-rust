@@ -391,15 +391,9 @@ export class PerfTestStack extends cdk.Stack {
       description: 'DUT data plane interface',
     });
 
-    // Enable ENA Express (SRD) for 25 Gbps single-flow UDP throughput.
-    // The CDK types don't include EnaSrdSpecification yet, so we use
-    // addPropertyOverride to set it directly on the CloudFormation resource.
-    for (const eni of [trexDataEniTx, trexDataEniRx, dutDataEni]) {
-      eni.addPropertyOverride('EnaSrdSpecification', {
-        EnaSrdEnabled: true,
-        EnaSrdUdpSpecification: { EnaSrdUdpEnabled: true },
-      });
-    }
+    // NOTE: ENA Express (SRD) is enabled post-deploy via the run-perf-tests.sh
+    // script using `aws ec2 modify-network-interface-attribute --ena-srd-specification`.
+    // CloudFormation's AWS::EC2::NetworkInterface doesn't support EnaSrdSpecification.
 
     new ec2.CfnNetworkInterfaceAttachment(this, 'TrexDataAttachment', {
       instanceId: trexInstance.instanceId,
