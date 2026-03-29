@@ -373,22 +373,35 @@ export class PerfTestStack extends cdk.Stack {
 
     // TRex needs 2 data ENIs: one for TX, one for RX (TRex requires port pairs).
     // Device index 1 = TX (ens6 / 0000:00:06.0), device index 2 = RX (ens7 / 0000:00:07.0).
+    // ENA Express (SRD) enabled for 25 Gbps single-flow throughput (vs 5 Gbps without).
     const trexDataEniTx = new ec2.CfnNetworkInterface(this, 'TrexDataEni', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane TX interface',
+      enaSrdSpecification: {
+        enaSrdEnabled: true,
+        enaSrdUdpSpecification: { enaSrdUdpEnabled: true },
+      },
     });
 
     const trexDataEniRx = new ec2.CfnNetworkInterface(this, 'TrexDataEniRx', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane RX interface',
+      enaSrdSpecification: {
+        enaSrdEnabled: true,
+        enaSrdUdpSpecification: { enaSrdUdpEnabled: true },
+      },
     });
 
     const dutDataEni = new ec2.CfnNetworkInterface(this, 'DutDataEni', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'DUT data plane interface',
+      enaSrdSpecification: {
+        enaSrdEnabled: true,
+        enaSrdUdpSpecification: { enaSrdUdpEnabled: true },
+      },
     });
 
     new ec2.CfnNetworkInterfaceAttachment(this, 'TrexDataAttachment', {
