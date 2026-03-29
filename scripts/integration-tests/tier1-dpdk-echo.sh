@@ -122,7 +122,7 @@ run_sender() {
     log_info "Test client output will be logged to: $client_log"
     exec > >(tee -a "$client_log") 2>&1
 
-    junit_start_suite "tier1-dpdk-echo" 4
+    junit_start_suite "tier1-dpdk-echo" 6
 
     # Give the listener time to start
     sleep 5
@@ -268,6 +268,76 @@ run_sender() {
         junit_add_pass "payload_integrity" "$CLASSNAME" "$elapsed"
     else
         junit_add_failure "payload_integrity" "$CLASSNAME" "$elapsed" "$payload_err" "$payload_output"
+    fi
+
+    # Clean up DPDK shared memory so the next process can reinitialize EAL
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+
+    # ── Test 5: Jumbo frame diagnostics ──────────────────────────────────
+    log_info "Test: jumbo_diagnostics"
+    start=$(_timer_now)
+    local jumbo_diag_ok=true
+    local jumbo_diag_err=""
+
+    # Collect host-level diagnostics that affect jumbo frame delivery
+    log_info "=== JUMBO FRAME DIAGNOSTICS ==="
+    log_info "Interface MTU:"
+    cat /sys/class/net/*/mtu 2>/dev/null | while read mtu; do echo "  $mtu"; done || true
+    for iface in /sys/class/net/*; do
+        local ifname=$(basename "$iface")
+        local mtu=$(cat "$iface/mtu" 2>/dev/null || echo "?")
+        log_info "  $ifname: MTU=$mtu"
+    done
+    log_info "Routing table MTU column:"
+    cat /proc/net/route 2>/dev/null | head -5 || true
+    log_info "DPDK port config (from echo server log):"
+    grep -i "mtu\|jumbo\|max.*pkt\|data_room\|mempool" /tmp/echo-server.log 2>/dev/null || log_info "  (no MTU info in echo log)"
+    log_info "=== END JUMBO DIAGNOSTICS ==="
+
+    end=$(_timer_now)
+    elapsed=$(_timer_elapsed "$start" "$end")
+    junit_add_pass "jumbo_diagnostics" "$CLASSNAME" "$elapsed"
+
+    # Clean up DPDK shared memory so the next process can reinitialize EAL
+    rm -rf /var/run/dpdk/ 2>/dev/null || true
+
+    # ── Test 6: Jumbo frame echo (8000B payload) ─────────────────────────
+    log_info "Test: jumbo_echo_8000"
+    start=$(_timer_now)
+    local jumbo_ok=true
+    local jumbo_err=""
+    local jumbo_output=""
+
+    # Send 8000-byte payload (fits in 8500B frame with headers)
+    jumbo_output=$(run_with_timeout "$TEST_TIMEOUT" "$TEST_CLIENT_BINARY" \
+        --target "$PEER_IP" --port "$PORT" --bind-ip "$BIND_IP" --payload-size 8000 --count 3 --delay 500 2>&1) || {
+        jumbo_ok=false
+        jumbo_err="Jumbo frame echo timed out or failed"
+    }
+    log_info "Jumbo output: $jumbo_output"
+
+    # Verify we got size-matched responses
+    if [[ "$jumbo_ok" == "true" ]]; then
+        local ok_count
+        ok_count=$(echo "$jumbo_output" | grep -c "OK" || true)
+        if [[ "$ok_count" -ge 2 ]]; then
+            log_info "Jumbo frame echo succeeded: $ok_count/3 responses with correct size"
+        else
+            jumbo_ok=false
+            local recv_count=$(echo "$jumbo_output" | grep -c "Received" || true)
+            local timeout_count=$(echo "$jumbo_output" | grep -c "Timeout" || true)
+            local error_lines=$(echo "$jumbo_output" | grep -i "error\|mismatch\|too large\|payload" || true)
+            jumbo_err="Jumbo echo: only $ok_count/3 OK responses (received=$recv_count, timeouts=$timeout_count). Errors: $error_lines"
+        fi
+    fi
+
+    end=$(_timer_now)
+    elapsed=$(_timer_elapsed "$start" "$end")
+
+    if [[ "$jumbo_ok" == "true" ]]; then
+        junit_add_pass "jumbo_echo_8000" "$CLASSNAME" "$elapsed"
+    else
+        junit_add_failure "jumbo_echo_8000" "$CLASSNAME" "$elapsed" "$jumbo_err" "$jumbo_output"
     fi
 
     # ── Finalize ─────────────────────────────────────────────────────────

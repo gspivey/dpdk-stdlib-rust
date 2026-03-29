@@ -1076,7 +1076,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
 report = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "commit": os.environ.get("GITHUB_SHA", "unknown"),
-    "instance_type": "${DUT_INSTANCE_TYPE:-unknown}",
+    "instance_type": os.environ.get("DUT_INSTANCE_TYPE", "unknown"),
     "configs": configs,
 }
 
@@ -1438,6 +1438,7 @@ $cfn_events
     wait "$dut_wait_pid"  || { log_error "DUT SSM not ready"; exit 2; }
 
     # Query actual instance type from DUT via IMDS
+    export DUT_INSTANCE_TYPE
     DUT_INSTANCE_TYPE=$(ssm_run_command "$DUT_INSTANCE_ID" 15 \
         "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || echo "unknown")
     log_info "DUT instance type: $DUT_INSTANCE_TYPE"

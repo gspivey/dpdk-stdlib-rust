@@ -39,7 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = format!("{}:{}", args.ip, args.port);
 
     let socket = UdpSocket::bind(&bind_addr)?;
-    eprintln!("echo listening on {}", socket.local_addr()?);
+    let rt = socket.routing_table();
+    eprintln!("echo listening on {} (MTU={}, max_udp_payload={})",
+        socket.local_addr()?, rt.mtu(), rt.max_udp_payload());
 
     if args.perf_interval > 0 {
         socket.enable_perf_reporting(Duration::from_secs(args.perf_interval))?;
