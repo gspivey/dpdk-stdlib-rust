@@ -3317,8 +3317,9 @@ mod tests {
         mbuf.set_tx_offload(14, 20, 8); // ETH, IPv4, UDP
         // Verify encoding: l2=14 (bits 0-6), l3=20 (bits 7-15), l4=8 (bits 16-23)
         let expected = 14u64 | (20u64 << 7) | (8u64 << 16);
-        // Read back via raw pointer to verify
-        let raw_tx_offload = unsafe { (*mbuf.as_raw()).tx_offload };
+        // Read back via shim function to verify (tx_offload is in an anonymous
+        // union in real DPDK, so direct field access doesn't work with bindgen)
+        let raw_tx_offload = unsafe { dpdk_sys::mbuf_get_tx_offload(mbuf.as_raw()) };
         assert_eq!(raw_tx_offload, expected);
     }
 
