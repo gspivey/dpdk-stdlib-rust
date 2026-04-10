@@ -31,6 +31,22 @@ pub const RTE_ETH_RX_OFFLOAD_IPV4_CKSUM: u64 = 0x00000002;
 pub const RTE_ETH_RX_OFFLOAD_UDP_CKSUM: u64 = 0x00000004;
 pub const RTE_ETH_RX_OFFLOAD_TCP_CKSUM: u64 = 0x00000008;
 
+// Mbuf TX offload flags (set by application, consumed by NIC)
+pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
+pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
+pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
+
+// Mbuf RX offload flags (set by NIC, consumed by application)
+pub const RTE_MBUF_F_RX_IP_CKSUM_MASK: u64 = (1 << 4) | (1 << 7);
+pub const RTE_MBUF_F_RX_IP_CKSUM_GOOD: u64 = 1 << 7;
+pub const RTE_MBUF_F_RX_IP_CKSUM_BAD: u64 = 1 << 4;
+pub const RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN: u64 = 0;
+
+pub const RTE_MBUF_F_RX_L4_CKSUM_MASK: u64 = (1 << 3) | (1 << 8);
+pub const RTE_MBUF_F_RX_L4_CKSUM_GOOD: u64 = 1 << 8;
+pub const RTE_MBUF_F_RX_L4_CKSUM_BAD: u64 = 1 << 3;
+pub const RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN: u64 = 0;
+
 // Error codes
 pub const RTE_ERRNO_BASE: c_int = 1000;
 

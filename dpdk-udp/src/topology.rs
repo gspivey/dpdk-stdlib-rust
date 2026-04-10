@@ -568,6 +568,15 @@ fn worker_loop(
 
             // Parse UDP packet headers in-place (zero-copy — borrows payload)
             if let Some(parsed) = parse_udp_packet_ref(frame_slice) {
+                // Validate RX checksums before accepting the packet
+                if !crate::verify_ipv4_checksum(frame_slice)
+                    || !crate::verify_udp_checksum(frame_slice)
+                {
+                    perf_inc!(perf_counters.rx_drops_parse_fail);
+                    frame_pool.free(frame_ref.pool_idx);
+                    continue;
+                }
+
                 perf_inc!(perf_counters.worker_packets_processed);
                 perf_inc!(perf_counters.rx_packets);
                 perf_inc!(perf_counters.rx_bytes, parsed.payload.len() as u64);
