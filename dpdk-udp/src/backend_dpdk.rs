@@ -38,16 +38,18 @@ impl DpdkBackend {
         let eal = dpdk::Eal::init(&["-l", "0", "-n", "4", "--no-pci"])
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
-        // Create mempool
+        // Create mempool with jumbo-frame-capable mbufs (9KB data room).
+        // ENA always supports 9001 MTU; oversized mbufs don't hurt small packets.
         let mempool = Mempool::create_with_config(
             "backend_pool",
             &MempoolConfig::new()
                 .with_size(8192)
-                .with_cache_size(256),
+                .with_cache_size(256)
+                .with_data_room_size(crate::JUMBO_DATA_ROOM_SIZE),
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-        // Initialize port
-        let port_config = PortConfig::default();
+        // Initialize port with jumbo MTU (9001 = AWS VPC max)
+        let port_config = PortConfig::default().with_mtu(9001);
         let port = Port::init(port_id, port_config, &mempool)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 

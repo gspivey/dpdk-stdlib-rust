@@ -29,7 +29,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEARDOWN=true
 SKIP_DEPLOY=false
-PACKET_SIZES="64,512,1400"
+PACKET_SIZES="64,512,1400,8500"
 DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
@@ -472,7 +472,7 @@ dut_bind_kernel() {
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
-        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'ena' ]; then echo ALREADY_BOUND_TO_ENA; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; echo BIND_OK; exit 0; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip route del default dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
+        "set +e; CUR_DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo PRE_STATE: driver=\$CUR_DRV; if [ \"\$CUR_DRV\" = 'ena' ]; then echo ALREADY_BOUND_TO_ENA; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip link set \$IFACE mtu 9001 2>/dev/null; echo MTU: \$(cat /sys/class/net/\$IFACE/mtu 2>/dev/null); ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; echo BIND_OK; exit 0; fi; echo UNBINDING...; echo 0000:00:06.0 > /sys/bus/pci/devices/0000:00:06.0/driver/unbind 2>&1 || echo UNBIND_RESULT: \$?; sleep 2; echo CLEARING_OVERRIDE...; echo '' > /sys/bus/pci/devices/0000:00:06.0/driver_override 2>&1 || echo OVERRIDE_RESULT: \$?; echo BINDING_ENA...; echo 0000:00:06.0 > /sys/bus/pci/drivers/ena/bind 2>&1 || echo BIND_RESULT: \$?; sleep 3; IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); echo IFACE: \$IFACE; if [ -n \"\$IFACE\" ]; then ip link set \$IFACE up 2>/dev/null; ip link set \$IFACE mtu 9001 2>/dev/null; echo MTU: \$(cat /sys/class/net/\$IFACE/mtu 2>/dev/null); sleep 2; ip addr add ${DUT_DATA_ENI_IP}/24 dev \$IFACE 2>/dev/null; ip route del default dev \$IFACE 2>/dev/null; ip addr show \$IFACE 2>/dev/null; fi; DRV=\$(readlink /sys/bus/pci/devices/0000:00:06.0/driver 2>/dev/null | xargs basename 2>/dev/null); echo DRIVER: \$DRV; if [ \"\$DRV\" = 'ena' ]; then echo BIND_OK; exit 0; else echo BIND_FAILED; exit 1; fi" 2>&1)
     local bind_exit=$?
     log_info "dut_bind_kernel result (exit=$bind_exit): $bind_out"
     if [[ $bind_exit -ne 0 ]]; then
@@ -504,7 +504,7 @@ dut_stop_all_apps() {
 generate_trex_config() {
     log_info "Generating TRex configuration..."
 
-    # TRex has 3 ENIs on c5n.2xlarge:
+    # TRex has 3 ENIs:
     #   device 0 = ens5 (0000:00:05.0) — Management (kernel, SSM)
     #   device 1 = ens6 (0000:00:06.0) — Data TX (DPDK)
     #   device 2 = ens7 (0000:00:07.0) — Data RX (DPDK)
@@ -627,6 +627,8 @@ generate_trex_config() {
       src_mac:  '${TREX_DATA_MAC}'
     - dest_mac: '${TREX_GATEWAY_MAC}'
       src_mac:  '${TREX_DATA_RX_MAC}'
+  memory:
+    mbuf_9k: 4096
 YAMLEOF
 )
     local yaml_b64
@@ -688,7 +690,7 @@ start_trex_server() {
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.
-    # TRex takes ~15-20s to probe ENA NICs via DPDK on c5n instances.
+    # TRex takes ~15-20s to probe ENA NICs via DPDK.
     log_info "Waiting 45s for TRex to initialize..."
     sleep 45
 
@@ -969,7 +971,7 @@ start_dut_native_dpdk() {
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start > /var/log/testpmd.log 2>&1 &"
+        "nohup /usr/local/bin/dpdk-testpmd -l 0-1 -n 4 --file-prefix testpmd -a 0000:00:06.0 -- --forward-mode=5tswap --port-topology=chained --stats-period 10 --auto-start --max-pkt-len=9100 --mbuf-size=10240 > /var/log/testpmd.log 2>&1 &"
     sleep 15
 
     local status=""
@@ -1074,7 +1076,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
 report = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "commit": os.environ.get("GITHUB_SHA", "unknown"),
-    "instance_type": "c5n.2xlarge",
+    "instance_type": os.environ.get("DUT_INSTANCE_TYPE", "unknown"),
     "configs": configs,
 }
 
@@ -1118,7 +1120,7 @@ else:
         for size_key in cfg_data.get("results", {}).keys():
             all_sizes.add(size_key)
 
-    for pkt_size in sorted(all_sizes):
+    for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
@@ -1199,7 +1201,7 @@ main() {
     if [[ "$SKIP_DEPLOY" == "false" ]]; then
         log_info "Phase 1: Deploying PerfTestStack..."
         post_pr_comment "## [Perf] Stage: Deploy
-Deploying \`PerfTestStack\` (TRex + DUT on c5n.2xlarge)...
+Deploying \`PerfTestStack\`...
 Configs: \`$CONFIGS\`
 Packet sizes: \`$PACKET_SIZES\`"
 
@@ -1435,9 +1437,16 @@ $cfn_events
     wait "$trex_wait_pid" || { log_error "TRex SSM not ready"; exit 2; }
     wait "$dut_wait_pid"  || { log_error "DUT SSM not ready"; exit 2; }
 
+    # Query actual instance type from DUT via IMDS
+    export DUT_INSTANCE_TYPE
+    DUT_INSTANCE_TYPE=$(ssm_run_command "$DUT_INSTANCE_ID" 15 \
+        "TOKEN=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600); curl -s -H \"X-aws-ec2-metadata-token: \$TOKEN\" http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || echo "unknown")
+    log_info "DUT instance type: $DUT_INSTANCE_TYPE"
+
     post_pr_comment "## [Perf] Stage: Instances Ready
 - TRex: \`$TREX_INSTANCE_ID\` (${TREX_DATA_ENI_IP})
-- DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})"
+- DUT: \`$DUT_INSTANCE_ID\` (${DUT_DATA_ENI_IP})
+- Instance type: \`$DUT_INSTANCE_TYPE\`"
 
     # ── Phase 2b: Ensure secondary ENIs are attached and bound ────────────────
     # The ENI attachments are separate CloudFormation resources that may complete

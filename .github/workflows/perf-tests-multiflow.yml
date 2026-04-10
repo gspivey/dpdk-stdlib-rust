@@ -1,0 +1,38 @@
+name: "Performance Tests (Multi-Flow)"
+
+# TODO: Multi-flow performance test variant
+#
+# This workflow will test aggregate throughput using multiple UDP flows
+# (different src/dst port pairs) to saturate the full NIC bandwidth
+# beyond the ENA single-flow 5 Gbps (or 25 Gbps with ENA Express) limit.
+#
+# Key differences from the single-flow perf-tests.yml:
+# - TRex sends N parallel flows with different port pairs
+# - Measures aggregate PPS and bandwidth across all flows
+# - Tests how our stack scales with multiple concurrent sockets
+#
+# Implementation requires:
+# 1. Update run_benchmark.py to support --num-flows parameter
+#    (generate streams with varying src_port per flow)
+# 2. DUT echo server must handle multiple ports or use a single
+#    port with per-flow tracking
+# 3. Results should show per-flow and aggregate metrics
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'This workflow is a placeholder — multi-flow tests are not yet implemented'
+        required: false
+        default: 'TODO'
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Not yet implemented
+        run: |
+          echo "Multi-flow performance tests are not yet implemented."
+          echo "See perf-tests.yml for single-flow tests."
+          echo "Track progress in the PR that adds this workflow."
+          exit 1

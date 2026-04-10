@@ -94,6 +94,12 @@ pub const MAX_UDP_PAYLOAD: usize = 1472;
 /// `set_routing()` changes the MTU after bind.
 const MAX_FRAME_SIZE: usize = ETH_HEADER_LEN + 9001;
 
+/// Mbuf data room size for jumbo frames: 9216 bytes data + headroom.
+/// 9216 accommodates the largest AWS VPC frame (9001 MTU + 14 eth + padding).
+/// Compile-time assertion ensures this fits in u16 (required by DPDK API).
+pub(crate) const JUMBO_DATA_ROOM_SIZE: u16 = 9216 + 128; // 128 = RTE_PKTMBUF_HEADROOM
+const _: () = assert!(JUMBO_DATA_ROOM_SIZE as u32 == 9216 + 128, "JUMBO_DATA_ROOM_SIZE overflow");
+
 /// Ethernet header size
 pub const ETH_HEADER_LEN: usize = 14;
 
@@ -202,9 +208,13 @@ pub fn build_udp_packet(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<()> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -301,9 +311,13 @@ pub fn build_udp_frame(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<Vec<u8>> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -378,9 +392,13 @@ pub fn build_udp_frame_into(
     payload: &[u8],
     ttl: u8,
 ) -> UdpResult<usize> {
-    if payload.len() > MAX_UDP_PAYLOAD {
+    // Absolute frame-size guard. The caller (send_to_addr) enforces the
+    // MTU-specific limit via the routing table; this catches truly oversized
+    // payloads that would exceed the maximum Ethernet frame.
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
         return Err(UdpError::PayloadTooLarge {
-            max: MAX_UDP_PAYLOAD,
+            max: max_payload,
             actual: payload.len(),
         });
     }
@@ -720,18 +738,20 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let eal = dpdk::Eal::init(&eal_args_ref)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
-    // Create mempool
+    // Create mempool with jumbo-frame-capable mbufs (9KB data room).
+    // ENA always supports 9001 MTU; oversized mbufs don't hurt small packets.
     let mempool = Mempool::create_with_config(
         "udp_pool",
         &MempoolConfig::new()
             .with_size(8192)
-            .with_cache_size(256),
+            .with_cache_size(256)
+            .with_data_room_size(JUMBO_DATA_ROOM_SIZE),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-    // Initialize port with 2 TX queues:
+    // Initialize port with 2 TX queues and jumbo MTU (9001 = AWS VPC max):
     // - TX queue 0: RX lcore (ARP/ICMP replies, tx_ring drain)
     // - TX queue 1: Application thread (worker-direct TX for send_to)
-    let port_config = PortConfig::default().with_queues(1, 2);
+    let port_config = PortConfig::default().with_queues(1, 2).with_mtu(9001);
     let port = Port::init(port_id, port_config, &mempool)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 
@@ -1294,7 +1314,15 @@ impl UdpSocket {
         // Auto-detect routing from OS if possible (Phase 3).
         // Seeds the ARP cache with gateway MAC from /proc/net/arp.
         // Falls back to passthrough (no routing) if detection fails.
-        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+        let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
+
+        // When using DPDK, the port is configured for jumbo frames (MTU 9001)
+        // but auto-detect may report MTU 1500 because the DPDK ENI has no
+        // kernel interface to read from (it's bound to vfio-pci). Override
+        // the routing table MTU to match the DPDK port configuration.
+        if routing_table.mtu() < 9001 {
+            routing_table.set_mtu(9001);
+        }
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
@@ -1389,7 +1417,13 @@ impl UdpSocket {
             local_mac[3], local_mac[4], local_mac[5]);
 
         // Auto-detect routing from OS if possible (Phase 3).
-        let routing_table = auto_detect_routing(local_ip, &arp_handler);
+        let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
+
+        // DPDK backends have jumbo MTU configured at the port level, but
+        // auto-detect may miss it because the ENI is on vfio-pci (no kernel iface).
+        if backend_name == "dpdk" && routing_table.mtu() < 9001 {
+            routing_table.set_mtu(9001);
+        }
 
         Ok(UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
@@ -3192,7 +3226,8 @@ mod tests {
 
     #[test]
     fn test_build_udp_frame_payload_too_large() {
-        let large_payload = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+        let large_payload = vec![0u8; max_payload + 1];
         let result = build_udp_frame(
             &[0; 6], &[0; 6],
             Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED,

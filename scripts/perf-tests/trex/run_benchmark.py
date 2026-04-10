@@ -72,7 +72,10 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
 
     # Start traffic with duration — TRex will stop TX after duration_sec.
     # Use TRex 'pps' multiplier format for deterministic rate control.
-    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec)
+    # force=True bypasses TRex's line rate check — ENA PMD reports 16 Gbps
+    # but actual c5n/c6in NICs support 25-30 Gbps. PPS is already capped by
+    # max_pps_for_line_rate() using the real instance bandwidth.
+    client.start(ports=[port], mult=f'{target_pps}pps', duration=duration_sec, force=True)
 
     # Sleep for the duration + drain time, then explicitly stop.
     # We avoid wait_on_traffic() because it can timeout on some setups
@@ -125,6 +128,17 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     return result
 
 
+def max_pps_for_bandwidth(packet_size, bandwidth_gbps):
+    """Calculate the max PPS that stays under a bandwidth limit.
+
+    L1 bits per packet = (packet_size + 20) * 8
+    where 20 = preamble(7) + SFD(1) + FCS(4) + IFG(12).
+    Returns max PPS at 95% of the limit to leave headroom.
+    """
+    l1_bits_per_pkt = (packet_size + 20) * 8
+    return int((bandwidth_gbps * 1e9 * 0.95) / l1_bits_per_pkt)
+
+
 def main():
     parser = argparse.ArgumentParser(description='TRex UDP echo benchmark')
     parser.add_argument('--server', default='localhost', help='TRex server address')
@@ -135,9 +149,11 @@ def main():
     parser.add_argument('--src-mac', default=None, help='Source MAC (auto-detected if omitted)')
     parser.add_argument('--dst-mac', required=True, help='Destination MAC (gateway MAC for AWS VPC)')
     parser.add_argument('--dst-port', type=int, default=9000, help='UDP destination port')
-    parser.add_argument('--packet-sizes', default='64,512,1400', help='Comma-separated packet sizes')
+    parser.add_argument('--packet-sizes', default='64,512,1400,8500', help='Comma-separated packet sizes')
     parser.add_argument('--rate-steps', default='70000,140000,350000,700000', help='Comma-separated target PPS values')
     parser.add_argument('--duration', type=int, default=30, help='Seconds per rate step')
+    parser.add_argument('--bandwidth-cap-gbps', type=float, default=30.0,
+                        help='Max bandwidth in Gbps — rate steps exceeding this are skipped (default: 30)')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     args = parser.parse_args()
 
@@ -157,46 +173,64 @@ def main():
         client.connect()
         client.acquire(ports=[args.port])
 
-        # Get source MAC from port if not specified
-        src_mac = args.src_mac
-        if not src_mac:
-            port_info = client.get_port_info(ports=[args.port])[0]
-            src_mac = port_info.get('hw_mac', '00:00:00:00:00:00')
+        # Get source MAC
+        port_info = client.get_port_info(ports=[args.port])[0]
+        src_mac = args.src_mac or port_info.get('hw_mac', '00:00:00:00:00:00')
         print(f"Source MAC: {src_mac}")
 
         results = {}
 
+        errors = []
         for pkt_size in packet_sizes:
             print(f"\n--- Packet size: {pkt_size}B ---")
-            streams = build_streams(
-                packet_size=pkt_size,
-                src_ip=args.src_ip,
-                dst_ip=args.dst_ip,
-                src_mac=src_mac,
-                dst_mac=args.dst_mac,
-                dst_port=args.dst_port,
-            )
+            try:
+                streams = build_streams(
+                    packet_size=pkt_size,
+                    src_ip=args.src_ip,
+                    dst_ip=args.dst_ip,
+                    src_mac=src_mac,
+                    dst_mac=args.dst_mac,
+                    dst_port=args.dst_port,
+                )
+            except Exception as e:
+                print(f"\n  ERROR: {pkt_size}B stream build failed: {e}", flush=True)
+                errors.append(f'{pkt_size}B: {e}')
+                continue
 
+            # For jumbo frames (>1500B), cap PPS to stay under the instance
+            # bandwidth limit. Standard packets use all rate steps uncapped.
+            pps_cap = max_pps_for_bandwidth(pkt_size, args.bandwidth_cap_gbps) if pkt_size > 1500 else None
+            if pps_cap is not None:
+                print(f"  (jumbo: capping at {pps_cap:,} pps for {args.bandwidth_cap_gbps} Gbps limit)")
             size_results = []
             for target_pps in rate_steps:
-                print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
-                result = run_single_benchmark(
-                    client=client,
-                    port=args.port,
-                    streams=streams,
-                    target_pps=target_pps,
-                    duration_sec=args.duration,
-                )
-                size_results.append(result)
-                print(f"TX: {result['tx_pps']:,} pps, RX: {result['rx_pps']:,} pps, "
-                      f"Drop: {result['drop_pct']}%, Lat avg: {result['lat_avg_us']} us")
+                if pps_cap is not None and target_pps > pps_cap:
+                    print(f"  Target: {target_pps:,} pps ... SKIPPED "
+                          f"(exceeds {args.bandwidth_cap_gbps} Gbps cap)", flush=True)
+                    continue
+                try:
+                    print(f"  Target: {target_pps:,} pps ... ", end='', flush=True)
+                    result = run_single_benchmark(
+                        client=client,
+                        port=args.port,
+                        streams=streams,
+                        target_pps=target_pps,
+                        duration_sec=args.duration,
+                    )
+                    size_results.append(result)
+                    print(f"TX: {result['tx_pps']:,} pps, RX: {result['rx_pps']:,} pps, "
+                          f"Drop: {result['drop_pct']}%, Lat avg: {result['lat_avg_us']} us")
+                except Exception as e:
+                    print(f"\n  ERROR: {pkt_size}B @ {target_pps} pps failed: {e}", flush=True)
+                    errors.append(f'{pkt_size}B@{target_pps}pps: {e}')
 
-            results[f'{pkt_size}B'] = size_results
+            if size_results:
+                results[f'{pkt_size}B'] = size_results
 
     finally:
         client.disconnect()
 
-    # Write output
+    # Write output (including partial results if some packet sizes failed)
     output = {
         'config_name': args.config_name,
         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -207,12 +241,17 @@ def main():
         'dst_ip': args.dst_ip,
         'results': results,
     }
+    if errors:
+        output['errors'] = errors
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(output, f, indent=2)
 
     print(f"\nResults written to {args.output}")
+    if errors:
+        print(f"WARNING: {len(errors)} packet size(s) failed: {errors}")
+        sys.exit(0)  # Still exit 0 — partial results are valid
 
 
 if __name__ == '__main__':
