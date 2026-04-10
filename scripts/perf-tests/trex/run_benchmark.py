@@ -152,8 +152,8 @@ def main():
     parser.add_argument('--packet-sizes', default='64,512,1400,8500', help='Comma-separated packet sizes')
     parser.add_argument('--rate-steps', default='70000,140000,350000,700000', help='Comma-separated target PPS values')
     parser.add_argument('--duration', type=int, default=30, help='Seconds per rate step')
-    parser.add_argument('--bandwidth-cap-gbps', type=float, default=50.0,
-                        help='Max bandwidth in Gbps — rate steps exceeding this are skipped (default: 50)')
+    parser.add_argument('--bandwidth-cap-gbps', type=float, default=30.0,
+                        help='Max bandwidth in Gbps — rate steps exceeding this are skipped (default: 30)')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     args = parser.parse_args()
 

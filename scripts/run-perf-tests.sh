@@ -1425,36 +1425,8 @@ $cfn_events
         --query "Stacks[0].Outputs[?OutputKey=='DutDataEniPrivateIp'].OutputValue" \
         --output text)
 
-    # Resolve ENI IDs for ENA Express enablement
-    local trex_tx_eni_id dut_eni_id trex_rx_eni_id
-    trex_tx_eni_id=$(aws cloudformation describe-stacks \
-        --stack-name "$CDK_STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniId'].OutputValue" \
-        --output text)
-    trex_rx_eni_id=$(aws cloudformation describe-stacks \
-        --stack-name "$CDK_STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniRxId'].OutputValue" \
-        --output text)
-    dut_eni_id=$(aws cloudformation describe-stacks \
-        --stack-name "$CDK_STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='DutDataEniId'].OutputValue" \
-        --output text)
-
     log_info "TRex: $TREX_INSTANCE_ID (TX: $TREX_DATA_ENI_IP, RX: $TREX_DATA_RX_ENI_IP)"
     log_info "DUT:  $DUT_INSTANCE_ID (data IP: $DUT_DATA_ENI_IP)"
-
-    # Enable ENA Express (SRD) on all data plane ENIs for 25 Gbps single-flow.
-    # Must be done post-deploy — CloudFormation doesn't support EnaSrdSpecification.
-    log_info "Enabling ENA Express on data plane ENIs..."
-    for eni_id in "$trex_tx_eni_id" "$trex_rx_eni_id" "$dut_eni_id"; do
-        if [[ -n "$eni_id" && "$eni_id" != "None" ]]; then
-            aws ec2 modify-network-interface-attribute \
-                --network-interface-id "$eni_id" \
-                --ena-srd-specification "EnaSrdEnabled=true,EnaSrdUdpSpecification={EnaSrdUdpEnabled=true}" \
-                2>&1 && log_info "  ENA Express enabled on $eni_id" \
-                || log_warn "  Failed to enable ENA Express on $eni_id (may not be supported)"
-        fi
-    done
 
     # Wait for both instances
     wait_ssm_ready "$TREX_INSTANCE_ID" "TRex" &

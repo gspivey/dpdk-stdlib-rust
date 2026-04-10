@@ -9,7 +9,7 @@ import { Construct } from 'constructs';
  * instance for performance benchmarking of the dpdk-stdlib-rust UDP stack.
  *
  * Architecture:
- *   TRex (c6in.8xlarge)  <--UDP-->  DUT (c6in.8xlarge)
+ *   TRex (c6in.xlarge)  <--UDP-->  DUT (c6in.xlarge)
  *   ENI-0: mgmt/SSM              ENI-0: mgmt/SSM
  *   ENI-1: DPDK traffic           ENI-1: DPDK/kernel traffic
  *
@@ -116,7 +116,7 @@ export class PerfTestStack extends cdk.Stack {
     });
     projectAsset.grantRead(instanceRole);
 
-    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE8);
+    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE);
 
     // ── TRex Instance ────────────────────────────────────────────────────────
 
@@ -391,9 +391,10 @@ export class PerfTestStack extends cdk.Stack {
       description: 'DUT data plane interface',
     });
 
-    // NOTE: ENA Express (SRD) is enabled post-deploy via the run-perf-tests.sh
-    // script using `aws ec2 modify-network-interface-attribute --ena-srd-specification`.
-    // CloudFormation's AWS::EC2::NetworkInterface doesn't support EnaSrdSpecification.
+    // NOTE: ENA Express (SRD) requires MTU ≤ 8900 and c6in.8xlarge+.
+    // Not enabled here — our jumbo MTU 9001 exceeds the ENA Express limit.
+    // Future work: either cap MTU at 8900 or use multi-flow to reach 25+ Gbps.
+    // See: https://github.com/amzn/amzn-ec2-ena-utilities/blob/main/ena-express/check-ena-express-settings.sh
 
     new ec2.CfnNetworkInterfaceAttachment(this, 'TrexDataAttachment', {
       instanceId: trexInstance.instanceId,
