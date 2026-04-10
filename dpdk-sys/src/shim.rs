@@ -40,6 +40,9 @@ extern "C" {
     fn dpdk_shim_rte_mempool_empty(mp: *const rte_mempool) -> libc::c_int;
 
     fn dpdk_shim_rte_errno() -> libc::c_int;
+
+    fn dpdk_shim_set_mbuf_tx_offload(m: *mut rte_mbuf, val: u64);
+    fn dpdk_shim_get_mbuf_tx_offload(m: *const rte_mbuf) -> u64;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +102,20 @@ pub unsafe fn rte_mempool_empty(mp: *const rte_mempool) -> libc::c_int {
 #[inline]
 pub unsafe fn rte_errno() -> libc::c_int {
     dpdk_shim_rte_errno()
+}
+
+// Mbuf tx_offload field access — the field lives inside an anonymous union
+// in rte_mbuf, so we go through C shim wrappers to avoid depending on the
+// bindgen-generated union member name.
+
+#[inline]
+pub unsafe fn mbuf_set_tx_offload(m: *mut rte_mbuf, val: u64) {
+    dpdk_shim_set_mbuf_tx_offload(m, val)
+}
+
+#[inline]
+pub unsafe fn mbuf_get_tx_offload(m: *const rte_mbuf) -> u64 {
+    dpdk_shim_get_mbuf_tx_offload(m)
 }
 
 // ---------------------------------------------------------------------------

@@ -971,6 +971,19 @@ pub extern "C" fn rte_ipv4_udptcp_cksum(
     0 // Stub - would compute checksum
 }
 
+// Mbuf offload field access — same public API as shim.rs so callers are
+// identical regardless of stub vs real DPDK.
+
+#[inline]
+pub unsafe fn mbuf_set_tx_offload(m: *mut rte_mbuf, val: u64) {
+    (*m).tx_offload = val;
+}
+
+#[inline]
+pub unsafe fn mbuf_get_tx_offload(m: *const rte_mbuf) -> u64 {
+    (*m).tx_offload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
