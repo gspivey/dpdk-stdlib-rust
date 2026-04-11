@@ -98,6 +98,16 @@ pub trait AsyncUdpSocket: Send + Sync {
         Ok(())
     }
 
+    /// Stop background performance reporting and flush the final snapshot.
+    ///
+    /// On the DPDK backend this joins the `PerfReporter` thread, which
+    /// triggers emission of the one-shot `[NIC-FINAL]` log line that the
+    /// perf harness pairs with `[NIC-BASELINE]` for the instrumentation
+    /// self-check. Call this before dropping the socket on shutdown so
+    /// the flush is deterministic and not dependent on Arc-refcount timing.
+    /// On the Tokio backend this is a no-op.
+    async fn disable_perf_reporting(&self) {}
+
     /// Snapshot of socket-level RX drops (`SO_RCVBUF`-style backpressure).
     ///
     /// On the DPDK backend this returns the live counter from the underlying

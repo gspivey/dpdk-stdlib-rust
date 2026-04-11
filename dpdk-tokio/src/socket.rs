@@ -221,6 +221,18 @@ impl AsyncUdpSocket for DpdkUdpSocket {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
 
+    async fn disable_perf_reporting(&self) {
+        let socket = self.inner.clone();
+        // spawn_blocking because disable_perf_reporting joins the reporter
+        // thread (blocking), and we must not block the async runtime thread.
+        // The final `[NIC-FINAL]` stderr line is emitted synchronously as
+        // part of PerfReporter::drop() inside this call.
+        let _ = tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.disable_perf_reporting();
+        }).await;
+    }
+
     async fn recv_drops(&self) -> RecvDropsSnapshot {
         let socket = self.inner.clone();
         tokio::task::spawn_blocking(move || {

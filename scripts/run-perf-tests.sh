@@ -1077,11 +1077,19 @@ start_dut_plain_rust() {
     # TRex observed wire loss for plain-rust. Without this, plain-rust's
     # "NIC drops" column is always "—" and we can't tell whether kernel
     # packet loss matches what DPDK sees.
+    # Give the kernel a moment to bring up the freshly-rebound interface —
+    # right after dut_bind_kernel the link may not be fully settled, so
+    # retry ethtool up to 3 times waiting for a result with numeric stats.
+    # The previous implementation had a subtle `[ -n ] && A || B` bash
+    # precedence bug that silently wrote "ethtool unavailable" to the file
+    # on failure, which the Python aggregator then counted as "no data".
     local ethtool_baseline
-    ethtool_baseline=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); [ -n \"\$IFACE\" ] && ethtool -S \$IFACE 2>/dev/null || echo 'ethtool unavailable'" 2>/dev/null || echo "(SSM failed)")
+    ethtool_baseline=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "set -e; for retry in 1 2 3; do IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then OUT=\$(ethtool -S \$IFACE 2>&1); if echo \"\$OUT\" | grep -q ': [0-9]'; then echo \"\$OUT\"; exit 0; fi; fi; sleep 2; done; echo 'ETHTOOL_BASELINE_FAILED iface=\$IFACE'; exit 0" 2>/dev/null || echo "(SSM failed)")
     echo "$ethtool_baseline" > "$LOGS_DIR/dut-plain-rust-ethtool-baseline.txt"
-    log_info "plain-rust ethtool baseline captured ($(echo "$ethtool_baseline" | wc -l) lines)"
+    local base_lines
+    base_lines=$(echo "$ethtool_baseline" | wc -l)
+    log_info "plain-rust ethtool baseline captured ($base_lines lines, head: $(echo "$ethtool_baseline" | head -2 | tr '\n' ' '))"
 
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/plain-echo.log 2>&1 &"
@@ -2102,8 +2110,14 @@ DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 Running \`$config\` benchmark...
 Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$RATE_STEPS\`"
 
-        # Stop any running DUT apps
-        dut_stop_all_apps
+        # Only run dut_stop_all_apps at the top of the FIRST iteration —
+        # this is defensive in case a previous aborted run left echo/testpmd
+        # processes alive. For iterations 2+, the previous iteration already
+        # called dut_stop_all_apps at its tail (so [NIC-FINAL] was captured
+        # in the log) and we don't need to do it again here.
+        if [[ $config_idx -eq 1 ]]; then
+            dut_stop_all_apps
+        fi
         if [[ $config_idx -gt 1 ]]; then
             # Give the DUT time to settle between configs.
             # High-bandwidth benchmarks can overwhelm the kernel network stack
@@ -2175,18 +2189,32 @@ ${dut_diag}
             collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure-${config}"
         fi
 
-        # For plain-rust, capture kernel NIC counters AFTER all rate steps
-        # finish. Paired with the baseline captured in start_dut_plain_rust,
-        # this gives us a total NIC drop delta from the ena driver's
-        # perspective — the only instrumentation available for the kernel
-        # echo path since plain-rust doesn't embed PerfReporter.
+        # For plain-rust, capture kernel NIC counters NOW — before the
+        # process is killed — because ethtool counters live in the kernel
+        # and are independent of the echo process. For DPDK configs we
+        # must defer log collection until AFTER dut_stop_all_apps (see
+        # below) so the `[NIC-FINAL]` line has a chance to be emitted.
         if [[ "$config" == "plain-rust" ]]; then
             local ethtool_final
-            ethtool_final=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-                "IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); [ -n \"\$IFACE\" ] && ethtool -S \$IFACE 2>/dev/null || echo 'ethtool unavailable'" 2>/dev/null || echo "(SSM failed)")
+            ethtool_final=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+                "set -e; for retry in 1 2 3; do IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then OUT=\$(ethtool -S \$IFACE 2>&1); if echo \"\$OUT\" | grep -q ': [0-9]'; then echo \"\$OUT\"; exit 0; fi; fi; sleep 2; done; echo 'ETHTOOL_FINAL_FAILED iface=\$IFACE'; exit 0" 2>/dev/null || echo "(SSM failed)")
             echo "$ethtool_final" > "$LOGS_DIR/dut-plain-rust-ethtool-final.txt"
-            log_info "plain-rust ethtool final captured ($(echo "$ethtool_final" | wc -l) lines)"
+            local final_lines
+            final_lines=$(echo "$ethtool_final" | wc -l)
+            log_info "plain-rust ethtool final captured ($final_lines lines, head: $(echo "$ethtool_final" | head -2 | tr '\n' ' '))"
         fi
+
+        # Stop the DUT BEFORE collecting the app log. This is essential
+        # for DPDK configs: PerfReporter's one-shot `[NIC-FINAL]` line is
+        # only emitted when the reporter thread is joined (either via
+        # `disable_perf_reporting` on clean shutdown or via `Drop` when
+        # the socket is dropped). If we grep the log while the DUT is
+        # still running, `[NIC-FINAL]` won't be there yet and the
+        # instrumentation self-check reports "no FINAL (abnormal shutdown)".
+        # We used to call dut_stop_all_apps at the top of the next
+        # iteration, but that was too late — the current iteration had
+        # already scraped the log.
+        dut_stop_all_apps
 
         # Collect DUT app log for this config
         local log_file
