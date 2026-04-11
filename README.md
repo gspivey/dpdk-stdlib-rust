@@ -237,6 +237,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
 | Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
+| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default |
 | Multicast join/leave | Basic | IPv4 only, simplified group tracking |
 | Connected socket filtering | Complete | Buffers non-matching packets |
 | Socket timeouts | Complete | Read and write deadlines |
@@ -248,7 +249,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
 | **Subnet-aware routing** | Full FIB with longest-prefix match | Subnet-aware with longest-prefix-match, auto-detection from OS | Done |
-| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | None — unbounded buffering until hardware ring fills | Planned |
+| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | Configurable byte-based buffer with atomic drop counters (`recv_drops`, `set_recv_buffer_size`) | Done |
 | **RX checksum validation** | Hardware or software verification on every packet | Software verification on every RX packet | Done |
 | **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | NIC computes when capable, software fallback | Done |
 | **ICMP error handling** | Destination/port unreachable queued to originating socket | Echo reply only — all ICMP errors ignored | Planned |
@@ -289,9 +290,9 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **TX hardware checksum offload** — When the NIC supports `CHECKSUM_PARTIAL` mode (e.g., ENA on AWS), the DPDK backend sets mbuf offload flags (`RTE_MBUF_F_TX_IP_CKSUM`, `RTE_MBUF_F_TX_UDP_CKSUM`) and writes the pseudo-header checksum so the NIC computes final checksums. Falls back to software checksums on NICs without offload or on non-DPDK backends.
 
-### Planned
+**RX backpressure and drop counters** — Socket-level receive buffer accounting with a configurable byte limit (SO_RCVBUF equivalent) and lock-free atomic drop counters. Applications call `set_recv_buffer_size(bytes)` to tune the limit and `recv_drops()` to read a `RecvDropStats { packets, bytes }` snapshot for production monitoring. Drops are also surfaced via the existing `rx_drops_buffer_full` perf counter and rolled into the `rx_drops` rate on the perf reporter. Default is 256 KiB, mirroring Linux `net.core.rmem_default`.
 
-**RX backpressure and drop counters** — Implement socket-level receive buffer accounting with configurable limits and exposed drop counters. Applications need visibility into packet loss. This is the most important gap for production use.
+### Planned
 
 **ICMP error handling** — Process destination unreachable and fragmentation needed messages. Surface errors to the application via the socket error API. Enables path MTU discovery.
 

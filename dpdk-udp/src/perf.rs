@@ -77,6 +77,10 @@ pub struct PerfCounters {
     pub rx_bytes: AtomicU64,
     pub rx_drops_ring_full: AtomicU64,
     pub rx_drops_parse_fail: AtomicU64,
+    /// Packets dropped because the socket-level receive buffer
+    /// (`SO_RCVBUF` equivalent) was full. Distinct from `rx_drops_ring_full`,
+    /// which counts worker ring enqueue failures in multi-core pipelines.
+    pub rx_drops_buffer_full: AtomicU64,
     pub rx_arp_handled: AtomicU64,
     pub rx_icmp_handled: AtomicU64,
     pub rx_bursts: AtomicU64,
@@ -115,6 +119,7 @@ impl PerfCounters {
             rx_bytes: AtomicU64::new(0),
             rx_drops_ring_full: AtomicU64::new(0),
             rx_drops_parse_fail: AtomicU64::new(0),
+            rx_drops_buffer_full: AtomicU64::new(0),
             rx_arp_handled: AtomicU64::new(0),
             rx_icmp_handled: AtomicU64::new(0),
             rx_bursts: AtomicU64::new(0),
@@ -143,6 +148,7 @@ impl PerfCounters {
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             rx_drops_ring_full: self.rx_drops_ring_full.load(Ordering::Relaxed),
             rx_drops_parse_fail: self.rx_drops_parse_fail.load(Ordering::Relaxed),
+            rx_drops_buffer_full: self.rx_drops_buffer_full.load(Ordering::Relaxed),
             rx_arp_handled: self.rx_arp_handled.load(Ordering::Relaxed),
             rx_icmp_handled: self.rx_icmp_handled.load(Ordering::Relaxed),
             rx_bursts: self.rx_bursts.load(Ordering::Relaxed),
@@ -212,6 +218,7 @@ pub struct CounterSnapshot {
     pub rx_bytes: u64,
     pub rx_drops_ring_full: u64,
     pub rx_drops_parse_fail: u64,
+    pub rx_drops_buffer_full: u64,
     pub rx_arp_handled: u64,
     pub rx_icmp_handled: u64,
     pub rx_bursts: u64,
@@ -269,7 +276,10 @@ impl CounterSnapshot {
             rx_bps: delta(self.rx_bytes, prev.rx_bytes) * 8.0,
             tx_pps: delta(self.tx_packets, prev.tx_packets),
             tx_bps: delta(self.tx_bytes, prev.tx_bytes) * 8.0,
-            rx_drops: self.rx_drops_ring_full.saturating_sub(prev.rx_drops_ring_full),
+            rx_drops: self.rx_drops_ring_full.saturating_sub(prev.rx_drops_ring_full)
+                + self
+                    .rx_drops_buffer_full
+                    .saturating_sub(prev.rx_drops_buffer_full),
             tx_fails: self.tx_failures.saturating_sub(prev.tx_failures),
             arp_hits: self.arp_cache_hits.saturating_sub(prev.arp_cache_hits),
             arp_misses: self.arp_cache_misses.saturating_sub(prev.arp_cache_misses),
@@ -685,6 +695,7 @@ mod tests {
     fn counter_snapshot_rates() {
         let prev = CounterSnapshot {
             rx_packets: 0, rx_bytes: 0, rx_drops_ring_full: 0, rx_drops_parse_fail: 0,
+            rx_drops_buffer_full: 0,
             rx_arp_handled: 0, rx_icmp_handled: 0, rx_bursts: 0, rx_burst_sum: 0,
             tx_packets: 0, tx_bytes: 0, tx_failures: 0,
             worker_ring_enqueue_fail: 0, app_ring_enqueue_fail: 0, tx_ring_enqueue_fail: 0,
@@ -695,7 +706,8 @@ mod tests {
 
         let current = CounterSnapshot {
             rx_packets: 350000, rx_bytes: 490_000_000, rx_drops_ring_full: 5,
-            rx_drops_parse_fail: 2, rx_arp_handled: 10, rx_icmp_handled: 3,
+            rx_drops_parse_fail: 2, rx_drops_buffer_full: 7,
+            rx_arp_handled: 10, rx_icmp_handled: 3,
             rx_bursts: 10000, rx_burst_sum: 350000,
             tx_packets: 349000, tx_bytes: 488_600_000, tx_failures: 1,
             worker_ring_enqueue_fail: 3, app_ring_enqueue_fail: 1, tx_ring_enqueue_fail: 1,
@@ -707,7 +719,8 @@ mod tests {
         let rates = current.rates_since(&prev, 10.0);
         assert!((rates.rx_pps - 35000.0).abs() < 1.0);
         assert!((rates.tx_pps - 34900.0).abs() < 1.0);
-        assert_eq!(rates.rx_drops, 5);
+        // rx_drops aggregates both ring-full (5) and buffer-full (7) drops.
+        assert_eq!(rates.rx_drops, 12);
         assert_eq!(rates.tx_fails, 1);
         assert!((rates.burst_avg - 35.0).abs() < 0.1);
         assert!(rates.lat_avg_us > 0.0);

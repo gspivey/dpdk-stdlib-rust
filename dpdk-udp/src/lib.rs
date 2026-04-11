@@ -15,7 +15,7 @@ use std::cell::UnsafeCell;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -1198,32 +1198,75 @@ impl ConnectionState {
     }
 }
 
-/// Receive queue for buffering packets
+/// Default socket-level receive buffer size in bytes.
+///
+/// Mirrors the Linux kernel default for `SO_RCVBUF` (approximately 208 KiB on
+/// modern kernels). Applications that need more headroom can call
+/// [`UdpSocket::set_recv_buffer_size`] after `bind()`.
+pub const DEFAULT_RECV_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Hard upper bound on queued packet count — a secondary safety net against
+/// pathological small-payload floods. Byte accounting is the primary limit.
+pub const DEFAULT_RECV_BUFFER_PACKETS: usize = 4096;
+
+/// Snapshot of socket-level receive drop counters, surfaced via
+/// [`UdpSocket::recv_drops`]. Applications use these to detect when their
+/// receive buffer is too small (`SO_RCVBUF` equivalent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecvDropStats {
+    /// Number of UDP payloads dropped because the socket receive buffer was full.
+    pub packets: u64,
+    /// Total bytes of payload dropped because the socket receive buffer was full.
+    pub bytes: u64,
+}
+
+/// Receive queue for buffering packets.
+///
+/// Tracks both packet count (`max_packets`) and total queued payload bytes
+/// (`max_bytes`). This mirrors the Linux kernel's `sk_rcvbuf`/`sk_rmem_alloc`
+/// accounting: when either limit is exceeded, the incoming packet is dropped
+/// and the caller is expected to bump the socket-level drop counters.
 struct ReceiveQueue {
     /// Buffered packets: (payload, source_addr)
     packets: VecDeque<(Vec<u8>, SocketAddr)>,
-    /// Maximum queue size
-    max_size: usize,
+    /// Maximum number of buffered packets — secondary safety limit.
+    max_packets: usize,
+    /// Maximum queued payload bytes — primary limit (SO_RCVBUF equivalent).
+    max_bytes: usize,
+    /// Current queued payload bytes.
+    current_bytes: usize,
 }
 
 impl ReceiveQueue {
-    fn new(max_size: usize) -> Self {
+    fn with_limits(max_packets: usize, max_bytes: usize) -> Self {
         Self {
-            packets: VecDeque::with_capacity(max_size),
-            max_size,
+            // Pre-allocate with a modest capacity; VecDeque will grow as needed.
+            packets: VecDeque::with_capacity(max_packets.min(1024)),
+            max_packets,
+            max_bytes,
+            current_bytes: 0,
         }
     }
 
-    fn push(&mut self, payload: Vec<u8>, src: SocketAddr) -> bool {
-        if self.packets.len() >= self.max_size {
-            return false; // Queue full
+    /// Try to enqueue a packet. On success returns `Ok(())`. On failure returns
+    /// `Err(payload)` so the caller can inspect the dropped payload length for
+    /// drop-counter accounting (and recover the allocation if desired).
+    fn push(&mut self, payload: Vec<u8>, src: SocketAddr) -> Result<(), Vec<u8>> {
+        let size = payload.len();
+        if self.packets.len() >= self.max_packets
+            || self.current_bytes.saturating_add(size) > self.max_bytes
+        {
+            return Err(payload);
         }
+        self.current_bytes += size;
         self.packets.push_back((payload, src));
-        true
+        Ok(())
     }
 
     fn pop(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
-        self.packets.pop_front()
+        let (payload, src) = self.packets.pop_front()?;
+        self.current_bytes = self.current_bytes.saturating_sub(payload.len());
+        Some((payload, src))
     }
 
     #[allow(dead_code)]
@@ -1233,6 +1276,18 @@ impl ReceiveQueue {
 
     fn len(&self) -> usize {
         self.packets.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
     }
 }
 
@@ -1438,6 +1493,11 @@ pub struct UdpSocket {
     has_connection_state: AtomicBool,
     /// Subnet-aware routing table for next-hop MAC resolution.
     routing_table: RoutingTable,
+    /// Number of UDP payloads dropped because the socket receive buffer was full.
+    /// Lock-free read via `recv_drops()` — mirrors Linux `sk_drops`.
+    rx_dropped_packets: AtomicU64,
+    /// Total bytes of payload dropped due to receive buffer overflow.
+    rx_dropped_bytes: AtomicU64,
 }
 
 impl UdpSocket {
@@ -1507,7 +1567,10 @@ impl UdpSocket {
             arp_handler,
             icmp_handler,
             connection_state: RwLock::new(None),
-            recv_queue: Mutex::new(ReceiveQueue::new(1024)),
+            recv_queue: Mutex::new(ReceiveQueue::with_limits(
+                DEFAULT_RECV_BUFFER_PACKETS,
+                DEFAULT_RECV_BUFFER_BYTES,
+            )),
             auto_arp: true,
             auto_icmp: true,
             read_timeout: Mutex::new(None),
@@ -1526,6 +1589,8 @@ impl UdpSocket {
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
             routing_table,
+            rx_dropped_packets: AtomicU64::new(0),
+            rx_dropped_bytes: AtomicU64::new(0),
         })
     }
 
@@ -1608,7 +1673,10 @@ impl UdpSocket {
             arp_handler,
             icmp_handler,
             connection_state: RwLock::new(None),
-            recv_queue: Mutex::new(ReceiveQueue::new(1024)),
+            recv_queue: Mutex::new(ReceiveQueue::with_limits(
+                DEFAULT_RECV_BUFFER_PACKETS,
+                DEFAULT_RECV_BUFFER_BYTES,
+            )),
             auto_arp: true,
             auto_icmp: true,
             read_timeout: Mutex::new(None),
@@ -1627,6 +1695,8 @@ impl UdpSocket {
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
             routing_table,
+            rx_dropped_packets: AtomicU64::new(0),
+            rx_dropped_bytes: AtomicU64::new(0),
         })
     }
 
@@ -1886,8 +1956,11 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if app_pkt.src_addr != connected {
                             let mut queue = self.recv_queue.lock().unwrap();
-                            queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr);
-                            self.has_buffered_packets.store(true, Ordering::Release);
+                            if queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr).is_err() {
+                                self.record_rx_drop(copy_len);
+                            } else {
+                                self.has_buffered_packets.store(true, Ordering::Release);
+                            }
                             continue;
                         }
                     }
@@ -2139,9 +2212,12 @@ impl UdpSocket {
         // If connected, only accept packets from the connected address
         if let Some(connected) = *self.connected_addr.lock().unwrap() {
             if src_addr != connected {
+                let payload_len = parsed.payload.len();
                 let mut queue = self.recv_queue.lock().unwrap();
                 // Must allocate here — queued packets outlive the frame/mbuf
-                queue.push(parsed.payload.to_vec(), src_addr);
+                if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
+                    self.record_rx_drop(payload_len);
+                }
                 return None;
             }
         }
@@ -2160,8 +2236,11 @@ impl UdpSocket {
             *result = Some((copy_len, src_addr));
         } else {
             // Additional matching packets: must allocate for the queue
+            let payload_len = parsed.payload.len();
             let mut queue = self.recv_queue.lock().unwrap();
-            queue.push(parsed.payload.to_vec(), src_addr);
+            if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
+                self.record_rx_drop(payload_len);
+            }
         }
 
         None
@@ -2361,8 +2440,11 @@ impl UdpSocket {
                                 let src_addr = SocketAddr::V4(
                                     SocketAddrV4::new(parsed.src_ip, parsed.src_port)
                                 );
+                                let payload_len = parsed.payload.len();
                                 let mut queue = self.recv_queue.lock().unwrap();
-                                queue.push(parsed.payload, src_addr);
+                                if queue.push(parsed.payload, src_addr).is_err() {
+                                    self.record_rx_drop(payload_len);
+                                }
                             }
                         }
                     }
@@ -2408,6 +2490,81 @@ impl UdpSocket {
     /// Get the number of packets in the receive queue.
     pub fn recv_queue_len(&self) -> usize {
         self.recv_queue.lock().unwrap().len()
+    }
+
+    // ========================================================================
+    // Receive Buffer Backpressure (SO_RCVBUF equivalent)
+    // ========================================================================
+
+    /// Returns the configured socket receive buffer size in bytes.
+    ///
+    /// Mirrors `getsockopt(SO_RCVBUF)` on a POSIX socket. When the queued
+    /// payload bytes exceed this limit, incoming packets are dropped and the
+    /// drop counters exposed by [`recv_drops`](Self::recv_drops) are bumped.
+    pub fn recv_buffer_size(&self) -> usize {
+        self.recv_queue.lock().unwrap().max_bytes()
+    }
+
+    /// Set the socket receive buffer size in bytes.
+    ///
+    /// Mirrors `setsockopt(SO_RCVBUF)` on a POSIX socket. The new limit is
+    /// applied immediately — subsequent pushes that would exceed it are
+    /// rejected and counted via [`recv_drops`](Self::recv_drops). Already-queued
+    /// packets are not evicted.
+    ///
+    /// Returns `InvalidInput` if `bytes` is zero.
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recv buffer size must be > 0",
+            ));
+        }
+        self.recv_queue.lock().unwrap().set_max_bytes(bytes);
+        Ok(())
+    }
+
+    /// Returns the total bytes of queued payload currently held in the
+    /// receive buffer. Useful for watermark-style monitoring.
+    pub fn recv_buffer_bytes(&self) -> usize {
+        self.recv_queue.lock().unwrap().bytes()
+    }
+
+    /// Returns socket-level receive drop counters.
+    ///
+    /// These increment whenever a UDP payload is rejected because the socket
+    /// receive buffer was full. Applications should periodically diff the
+    /// values to detect receive-side backpressure in production.
+    ///
+    /// Equivalent in spirit to the Linux `sk_drops` counter surfaced via
+    /// `/proc/net/udp` column 13 or `ss -u -a -e`.
+    pub fn recv_drops(&self) -> RecvDropStats {
+        RecvDropStats {
+            packets: self.rx_dropped_packets.load(Ordering::Relaxed),
+            bytes: self.rx_dropped_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset the receive drop counters to zero.
+    ///
+    /// Intended for test harnesses and long-running services that want to
+    /// measure drops over a specific window. Thread-safe.
+    pub fn reset_recv_drops(&self) {
+        self.rx_dropped_packets.store(0, Ordering::Relaxed);
+        self.rx_dropped_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Internal: record a receive-buffer drop (packet + bytes).
+    ///
+    /// Called from every `recv_queue.push()` call site when the push fails
+    /// because either the packet-count or byte limit would be exceeded. Also
+    /// bumps the `rx_drops_buffer_full` perf counter for the perf reporter.
+    #[inline]
+    fn record_rx_drop(&self, payload_len: usize) {
+        self.rx_dropped_packets.fetch_add(1, Ordering::Relaxed);
+        self.rx_dropped_bytes
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+        perf_inc!(self.perf_counters.rx_drops_buffer_full);
     }
 
     // ========================================================================
@@ -3749,5 +3906,218 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0")
             .expect("bind should succeed");
         assert!(socket.is_run_to_completion());
+    }
+
+    // ========================================================================
+    // RX BACKPRESSURE / DROP COUNTER TESTS
+    // ========================================================================
+
+    /// Dummy source address used in all ReceiveQueue tests.
+    fn test_src() -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234))
+    }
+
+    #[test]
+    fn recv_queue_push_accepts_under_byte_limit() {
+        let mut q = ReceiveQueue::with_limits(16, 1024);
+        assert!(q.push(vec![0u8; 512], test_src()).is_ok());
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.bytes(), 512);
+    }
+
+    #[test]
+    fn recv_queue_push_rejects_when_byte_limit_exceeded() {
+        let mut q = ReceiveQueue::with_limits(16, 1024);
+        assert!(q.push(vec![0u8; 900], test_src()).is_ok());
+        // Second push would bring us to 1800 bytes > 1024 limit.
+        let err = q.push(vec![0u8; 900], test_src()).unwrap_err();
+        assert_eq!(err.len(), 900, "push should return the rejected payload");
+        assert_eq!(q.len(), 1, "queue count should not change on reject");
+        assert_eq!(q.bytes(), 900);
+    }
+
+    #[test]
+    fn recv_queue_push_rejects_at_exact_byte_boundary() {
+        let mut q = ReceiveQueue::with_limits(16, 1000);
+        assert!(q.push(vec![0u8; 600], test_src()).is_ok());
+        // 600 + 500 = 1100 > 1000 — reject.
+        assert!(q.push(vec![0u8; 500], test_src()).is_err());
+        // 600 + 400 = 1000 — accept (inclusive).
+        assert!(q.push(vec![0u8; 400], test_src()).is_ok());
+        assert_eq!(q.bytes(), 1000);
+    }
+
+    #[test]
+    fn recv_queue_push_rejects_when_packet_limit_exceeded() {
+        // Small packet count, generous byte budget.
+        let mut q = ReceiveQueue::with_limits(2, 1_000_000);
+        assert!(q.push(vec![0u8; 10], test_src()).is_ok());
+        assert!(q.push(vec![0u8; 10], test_src()).is_ok());
+        assert!(q.push(vec![0u8; 10], test_src()).is_err());
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn recv_queue_pop_decrements_current_bytes() {
+        let mut q = ReceiveQueue::with_limits(16, 1024);
+        q.push(vec![0u8; 300], test_src()).unwrap();
+        q.push(vec![0u8; 400], test_src()).unwrap();
+        assert_eq!(q.bytes(), 700);
+
+        let (payload, _) = q.pop().unwrap();
+        assert_eq!(payload.len(), 300);
+        assert_eq!(q.bytes(), 400);
+
+        let (payload, _) = q.pop().unwrap();
+        assert_eq!(payload.len(), 400);
+        assert_eq!(q.bytes(), 0);
+    }
+
+    #[test]
+    fn recv_queue_pop_then_push_reuses_reclaimed_capacity() {
+        let mut q = ReceiveQueue::with_limits(16, 1000);
+        q.push(vec![0u8; 800], test_src()).unwrap();
+        // Second push would overflow.
+        assert!(q.push(vec![0u8; 500], test_src()).is_err());
+        // Drain one packet, freeing 800 bytes of capacity.
+        q.pop().unwrap();
+        // Same push now succeeds.
+        assert!(q.push(vec![0u8; 500], test_src()).is_ok());
+    }
+
+    #[test]
+    fn recv_queue_set_max_bytes_updates_limit() {
+        let mut q = ReceiveQueue::with_limits(16, 1000);
+        q.push(vec![0u8; 800], test_src()).unwrap();
+        assert!(q.push(vec![0u8; 300], test_src()).is_err());
+
+        // Raise the limit; now the same push fits.
+        q.set_max_bytes(2000);
+        assert_eq!(q.max_bytes(), 2000);
+        assert!(q.push(vec![0u8; 300], test_src()).is_ok());
+    }
+
+    #[test]
+    fn socket_default_recv_buffer_size_matches_constant() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        assert_eq!(socket.recv_buffer_size(), DEFAULT_RECV_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn socket_set_recv_buffer_size_roundtrip() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        socket.set_recv_buffer_size(128 * 1024).unwrap();
+        assert_eq!(socket.recv_buffer_size(), 128 * 1024);
+
+        socket.set_recv_buffer_size(1 * 1024 * 1024).unwrap();
+        assert_eq!(socket.recv_buffer_size(), 1024 * 1024);
+    }
+
+    #[test]
+    fn socket_set_recv_buffer_size_rejects_zero() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let err = socket.set_recv_buffer_size(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn socket_drop_counters_start_at_zero() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let drops = socket.recv_drops();
+        assert_eq!(drops.packets, 0);
+        assert_eq!(drops.bytes, 0);
+    }
+
+    #[test]
+    fn socket_record_rx_drop_bumps_counters() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        socket.record_rx_drop(1400);
+        socket.record_rx_drop(600);
+
+        let drops = socket.recv_drops();
+        assert_eq!(drops.packets, 2);
+        assert_eq!(drops.bytes, 2000);
+    }
+
+    #[test]
+    fn socket_reset_recv_drops_zeros_counters() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        socket.record_rx_drop(512);
+        socket.record_rx_drop(512);
+        assert_eq!(socket.recv_drops().packets, 2);
+
+        socket.reset_recv_drops();
+        let drops = socket.recv_drops();
+        assert_eq!(drops.packets, 0);
+        assert_eq!(drops.bytes, 0);
+    }
+
+    #[test]
+    fn socket_record_rx_drop_also_bumps_perf_counter() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        socket.record_rx_drop(100);
+        socket.record_rx_drop(200);
+        // Perf counter is shared via Arc — the socket holds it directly.
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.rx_drops_buffer_full, 2);
+    }
+
+    #[test]
+    fn recv_buffer_bytes_tracks_queued_payload() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        assert_eq!(socket.recv_buffer_bytes(), 0);
+
+        // Push directly into the queue to simulate buffered packets.
+        {
+            let mut q = socket.recv_queue.lock().unwrap();
+            q.push(vec![0u8; 500], test_src()).unwrap();
+            q.push(vec![0u8; 700], test_src()).unwrap();
+        }
+        assert_eq!(socket.recv_buffer_bytes(), 1200);
+    }
+
+    #[test]
+    fn recv_buffer_overflow_records_drops() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        // Shrink the buffer to a tight 1 KiB budget.
+        socket.set_recv_buffer_size(1024).unwrap();
+
+        // Fill to 900 bytes.
+        {
+            let mut q = socket.recv_queue.lock().unwrap();
+            q.push(vec![0u8; 900], test_src()).unwrap();
+        }
+
+        // Simulate a push attempt that overflows via the helper path.
+        let rejected_len = 300usize;
+        {
+            let mut q = socket.recv_queue.lock().unwrap();
+            if q.push(vec![0u8; rejected_len], test_src()).is_err() {
+                socket.record_rx_drop(rejected_len);
+            }
+        }
+
+        let drops = socket.recv_drops();
+        assert_eq!(drops.packets, 1);
+        assert_eq!(drops.bytes, rejected_len as u64);
+        assert_eq!(socket.recv_buffer_bytes(), 900, "queued bytes unchanged");
+    }
+
+    #[test]
+    fn recv_drop_stats_is_copy_and_comparable() {
+        let a = RecvDropStats { packets: 5, bytes: 1500 };
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_eq!(a.packets, 5);
+        assert_eq!(a.bytes, 1500);
+    }
+
+    #[test]
+    fn default_recv_buffer_bytes_constant_is_reasonable() {
+        // Must be large enough to hold at least ~170 MTU-1500 UDP datagrams —
+        // this keeps the default within one order of magnitude of the Linux
+        // kernel's `net.core.rmem_default`.
+        assert!(DEFAULT_RECV_BUFFER_BYTES >= 200 * 1024);
+        assert!(DEFAULT_RECV_BUFFER_BYTES <= 4 * 1024 * 1024);
     }
 }
