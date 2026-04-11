@@ -40,6 +40,9 @@ extern "C" {
     fn dpdk_shim_rte_mempool_empty(mp: *const rte_mempool) -> libc::c_int;
 
     fn dpdk_shim_rte_errno() -> libc::c_int;
+
+    fn dpdk_shim_set_mbuf_tx_offload(m: *mut rte_mbuf, val: u64);
+    fn dpdk_shim_get_mbuf_tx_offload(m: *const rte_mbuf) -> u64;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +104,20 @@ pub unsafe fn rte_errno() -> libc::c_int {
     dpdk_shim_rte_errno()
 }
 
+// Mbuf tx_offload field access — the field lives inside an anonymous union
+// in rte_mbuf, so we go through C shim wrappers to avoid depending on the
+// bindgen-generated union member name.
+
+#[inline]
+pub unsafe fn mbuf_set_tx_offload(m: *mut rte_mbuf, val: u64) {
+    dpdk_shim_set_mbuf_tx_offload(m, val)
+}
+
+#[inline]
+pub unsafe fn mbuf_get_tx_offload(m: *const rte_mbuf) -> u64 {
+    dpdk_shim_get_mbuf_tx_offload(m)
+}
+
 // ---------------------------------------------------------------------------
 // Constants — C preprocessor macros that bindgen cannot capture.
 // Values match DPDK 22.11 (RTE_BIT64 definitions in rte_ethdev.h).
@@ -117,3 +134,21 @@ pub const RTE_ETH_TX_OFFLOAD_UDP_CKSUM: u64 = 1 << 2;
 pub const RTE_ETH_TX_OFFLOAD_TCP_CKSUM: u64 = 1 << 3;
 
 pub const SOCKET_ID_ANY: libc::c_int = -1;
+
+// Mbuf TX offload flags (set by application, consumed by NIC).
+// These are #define macros in rte_mbuf_core.h that bindgen cannot capture.
+pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
+pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
+pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
+
+// Mbuf RX offload flags (set by NIC, consumed by application).
+// These are #define macros in rte_mbuf_core.h that bindgen cannot capture.
+pub const RTE_MBUF_F_RX_IP_CKSUM_MASK: u64 = (1 << 4) | (1 << 7);
+pub const RTE_MBUF_F_RX_IP_CKSUM_GOOD: u64 = 1 << 7;
+pub const RTE_MBUF_F_RX_IP_CKSUM_BAD: u64 = 1 << 4;
+pub const RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN: u64 = 0;
+
+pub const RTE_MBUF_F_RX_L4_CKSUM_MASK: u64 = (1 << 3) | (1 << 8);
+pub const RTE_MBUF_F_RX_L4_CKSUM_GOOD: u64 = 1 << 8;
+pub const RTE_MBUF_F_RX_L4_CKSUM_BAD: u64 = 1 << 3;
+pub const RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN: u64 = 0;

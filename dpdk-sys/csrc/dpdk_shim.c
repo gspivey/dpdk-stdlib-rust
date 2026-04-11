@@ -52,6 +52,19 @@ int dpdk_shim_rte_mempool_empty(const struct rte_mempool *mp) {
     return rte_mempool_empty(mp);
 }
 
+/* ---- Mbuf offload field access (rte_mbuf.h) ---- */
+/* tx_offload lives inside an anonymous union in rte_mbuf, so bindgen
+   generates it as __bindgen_anon_N.tx_offload.  These shims let Rust
+   access it portably without depending on the bindgen-generated name. */
+
+void dpdk_shim_set_mbuf_tx_offload(struct rte_mbuf *m, uint64_t val) {
+    m->tx_offload = val;
+}
+
+uint64_t dpdk_shim_get_mbuf_tx_offload(const struct rte_mbuf *m) {
+    return m->tx_offload;
+}
+
 /* ---- Errno (rte_errno.h) ---- */
 
 int dpdk_shim_rte_errno(void) {

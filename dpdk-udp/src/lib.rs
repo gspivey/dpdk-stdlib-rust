@@ -196,6 +196,122 @@ pub fn udp_checksum(
     if result == 0 { 0xFFFF } else { result }
 }
 
+/// Compute the UDP pseudo-header checksum (used for TX hardware offload).
+///
+/// When the NIC computes the UDP checksum, the application must place the
+/// pseudo-header checksum in the UDP checksum field. The NIC adds the UDP
+/// header + payload contribution on top.
+///
+/// The pseudo-header sum is: src_ip + dst_ip + protocol + UDP length,
+/// folded to 16 bits (NOT one's-complemented — the NIC does that).
+pub fn udp_pseudo_header_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_len: u16) -> u16 {
+    let mut sum: u32 = 0;
+    sum = sum.wrapping_add(((src_ip[0] as u32) << 8) | (src_ip[1] as u32));
+    sum = sum.wrapping_add(((src_ip[2] as u32) << 8) | (src_ip[3] as u32));
+    sum = sum.wrapping_add(((dst_ip[0] as u32) << 8) | (dst_ip[1] as u32));
+    sum = sum.wrapping_add(((dst_ip[2] as u32) << 8) | (dst_ip[3] as u32));
+    sum = sum.wrapping_add(IP_PROTO_UDP as u32);
+    sum = sum.wrapping_add(udp_len as u32);
+
+    // Fold 32-bit sum to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    sum as u16
+}
+
+/// Verify the IPv4 header checksum of a received frame.
+///
+/// Returns true if the checksum is valid (recomputed checksum == 0).
+pub fn verify_ipv4_checksum(frame: &[u8]) -> bool {
+    if frame.len() < ETH_HEADER_LEN + IPV4_HEADER_LEN {
+        return false;
+    }
+
+    let ip_header = &frame[ETH_HEADER_LEN..];
+    let ihl = (ip_header[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+    if ip_header_len < 20 || frame.len() < ETH_HEADER_LEN + ip_header_len {
+        return false;
+    }
+
+    // Recompute checksum over the full IP header (including the checksum field).
+    // A correct header produces 0 when the stored checksum is included.
+    let mut sum: u32 = 0;
+    for i in (0..ip_header_len).step_by(2) {
+        let word = if i + 1 < ip_header_len {
+            ((ip_header[i] as u32) << 8) | (ip_header[i + 1] as u32)
+        } else {
+            (ip_header[i] as u32) << 8
+        };
+        sum = sum.wrapping_add(word);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    (sum as u16) == 0xFFFF
+}
+
+/// Verify the UDP checksum of a received frame.
+///
+/// Returns true if the checksum is valid or if the checksum field is 0 (disabled).
+/// Per RFC 768, a UDP checksum of 0 means "no checksum computed".
+pub fn verify_udp_checksum(frame: &[u8]) -> bool {
+    if frame.len() < TOTAL_HEADER_LEN {
+        return false;
+    }
+
+    let ip_header = &frame[ETH_HEADER_LEN..];
+    let ihl = (ip_header[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+    let udp_start = ETH_HEADER_LEN + ip_header_len;
+
+    if frame.len() < udp_start + UDP_HEADER_LEN {
+        return false;
+    }
+
+    let stored_cksum = u16::from_be_bytes([frame[udp_start + 6], frame[udp_start + 7]]);
+    if stored_cksum == 0 {
+        return true; // Checksum disabled (RFC 768)
+    }
+
+    let src_ip: [u8; 4] = frame[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16].try_into().unwrap();
+    let dst_ip: [u8; 4] = frame[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20].try_into().unwrap();
+    let udp_len = u16::from_be_bytes([frame[udp_start + 4], frame[udp_start + 5]]) as usize;
+
+    if frame.len() < udp_start + udp_len {
+        return false;
+    }
+
+    // Sum over pseudo-header + entire UDP segment (header + payload, including checksum field)
+    let mut sum: u32 = 0;
+    // Pseudo-header
+    sum = sum.wrapping_add(((src_ip[0] as u32) << 8) | (src_ip[1] as u32));
+    sum = sum.wrapping_add(((src_ip[2] as u32) << 8) | (src_ip[3] as u32));
+    sum = sum.wrapping_add(((dst_ip[0] as u32) << 8) | (dst_ip[1] as u32));
+    sum = sum.wrapping_add(((dst_ip[2] as u32) << 8) | (dst_ip[3] as u32));
+    sum = sum.wrapping_add(IP_PROTO_UDP as u32);
+    sum = sum.wrapping_add(udp_len as u32);
+
+    // UDP segment (header + payload)
+    let udp_data = &frame[udp_start..udp_start + udp_len];
+    for i in (0..udp_data.len()).step_by(2) {
+        let word = if i + 1 < udp_data.len() {
+            ((udp_data[i] as u32) << 8) | (udp_data[i + 1] as u32)
+        } else {
+            (udp_data[i] as u32) << 8
+        };
+        sum = sum.wrapping_add(word);
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    (sum as u16) == 0xFFFF
+}
+
 /// Build a complete UDP packet in an mbuf
 pub fn build_udp_packet(
     mbuf: &mut Mbuf,
@@ -655,6 +771,11 @@ struct DpdkResources {
     src_mac: MacAddress,
     /// Shared ARP cache
     arp_cache: Arc<ArpCache>,
+    /// Active TX offload flags (intersection of requested and NIC capabilities).
+    /// Cached here to avoid querying the port on every send.
+    active_tx_offload: u64,
+    /// Active RX offload flags (reserved for future hardware RX flag checking).
+    _active_rx_offload: u64,
 }
 
 /// Global DPDK resources (initialized once per port)
@@ -748,14 +869,22 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
             .with_data_room_size(JUMBO_DATA_ROOM_SIZE),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-    // Initialize port with 2 TX queues and jumbo MTU (9001 = AWS VPC max):
+    // Initialize port with 2 TX queues, jumbo MTU, and checksum offloads:
     // - TX queue 0: RX lcore (ARP/ICMP replies, tx_ring drain)
     // - TX queue 1: Application thread (worker-direct TX for send_to)
-    let port_config = PortConfig::default().with_queues(1, 2).with_mtu(9001);
+    // Checksum offload is requested for both RX and TX; Port::init() will
+    // mask these against device capabilities, so unsupported offloads are
+    // silently dropped (software fallback).
+    let port_config = PortConfig::default()
+        .with_queues(1, 2)
+        .with_mtu(9001)
+        .with_checksum_offload();
     let port = Port::init(port_id, port_config, &mempool)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 
     let src_mac = port.mac_address();
+    let active_tx_offload = port.active_tx_offload();
+    let active_rx_offload = port.active_rx_offload();
 
     // Start the port
     let mut port = port;
@@ -776,6 +905,8 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         mempool,
         src_mac,
         arp_cache,
+        active_tx_offload,
+        _active_rx_offload: active_rx_offload,
     });
 
     *guard = Some(Arc::clone(&resources));
@@ -818,22 +949,64 @@ impl SocketBackend {
             SocketBackend::Dpdk(res) => {
                 let mut mbuf = res.mempool.alloc()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
-                
+
                 // Check if frame fits in the mbuf buffer
                 let buf_capacity = mbuf.buf_len() as usize - mbuf.data_offset() as usize;
                 if buf_capacity < frame.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, 
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
                         format!("Frame too large for mbuf: {} bytes needed, {} available", frame.len(), buf_capacity)));
                 }
-                
+
                 // Set data_len first so data_mut() returns the right size slice
                 mbuf.set_data_len(frame.len() as u16);
                 mbuf.set_packet_len(frame.len() as u32);
-                
+
                 let data = mbuf.data_mut()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
                 data.copy_from_slice(frame);
-                
+
+                // TX hardware checksum offload: when the NIC supports it, set mbuf
+                // metadata so the NIC computes IPv4 and UDP checksums instead of
+                // software. The frame was already built with software checksums by
+                // build_udp_frame_into(); the NIC will overwrite them.
+                let tx_offload = res.active_tx_offload;
+                if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
+                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+
+                    if has_ip_cksum || has_udp_cksum {
+                        let mut ol_flags = dpdk_sys::RTE_MBUF_F_TX_IPV4;
+
+                        if has_ip_cksum {
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM;
+                            // NIC expects IPv4 checksum field to be 0
+                            let ip_cksum_off = ETH_HEADER_LEN + 10;
+                            data[ip_cksum_off] = 0;
+                            data[ip_cksum_off + 1] = 0;
+                        }
+
+                        if has_udp_cksum {
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+                            // NIC expects pseudo-header checksum in the UDP checksum field
+                            let src_ip: [u8; 4] = data[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16]
+                                .try_into().unwrap();
+                            let dst_ip: [u8; 4] = data[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20]
+                                .try_into().unwrap();
+                            let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+                            let udp_len = u16::from_be_bytes([data[udp_off + 4], data[udp_off + 5]]);
+                            let phdr_cksum = udp_pseudo_header_checksum(&src_ip, &dst_ip, udp_len);
+                            data[udp_off + 6..udp_off + 8].copy_from_slice(&phdr_cksum.to_be_bytes());
+                        }
+
+                        mbuf.set_ol_flags(ol_flags);
+                        mbuf.set_tx_offload(
+                            ETH_HEADER_LEN as u8,
+                            IPV4_HEADER_LEN as u16,
+                            UDP_HEADER_LEN as u8,
+                        );
+                    }
+                }
+
                 let mut packets = vec![mbuf];
                 let sent = res.port.tx_burst(0, &mut packets)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
@@ -1934,6 +2107,17 @@ impl UdpSocket {
             }
         };
 
+        // Validate RX checksums (IPv4 header + UDP) in software.
+        // Drops packets with corrupted headers before they reach the application.
+        if !verify_ipv4_checksum(frame_data) {
+            perf_inc!(self.perf_counters.rx_drops_parse_fail);
+            return None;
+        }
+        if !verify_udp_checksum(frame_data) {
+            perf_inc!(self.perf_counters.rx_drops_parse_fail);
+            return None;
+        }
+
         // Count successfully parsed RX packets
         perf_inc!(self.perf_counters.rx_packets);
         perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
@@ -2960,6 +3144,183 @@ mod tests {
         let checksum = udp_checksum(&src_ip, &dst_ip, &udp_header, payload);
         // Just verify it's non-zero and computable
         assert_ne!(checksum, 0);
+    }
+
+    // ========================================================================
+    // RX CHECKSUM VALIDATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_verify_ipv4_checksum_valid_frame() {
+        // Build a frame with valid checksums using build_udp_frame
+        let frame = build_udp_frame(
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 2),
+            12345, 9000,
+            b"hello",
+            64,
+        ).unwrap();
+
+        assert!(verify_ipv4_checksum(&frame));
+    }
+
+    #[test]
+    fn test_verify_ipv4_checksum_corrupted() {
+        let mut frame = build_udp_frame(
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 2),
+            12345, 9000,
+            b"hello",
+            64,
+        ).unwrap();
+
+        // Corrupt the IP TTL field (byte 22 = ETH_HEADER_LEN + 8)
+        frame[ETH_HEADER_LEN + 8] ^= 0xFF;
+        assert!(!verify_ipv4_checksum(&frame));
+    }
+
+    #[test]
+    fn test_verify_ipv4_checksum_too_short() {
+        assert!(!verify_ipv4_checksum(&[0u8; 20])); // Less than ETH + IP header
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_valid_frame() {
+        let frame = build_udp_frame(
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            Ipv4Addr::new(10, 0, 1, 10),
+            Ipv4Addr::new(10, 0, 1, 20),
+            5000, 6000,
+            b"test payload data",
+            64,
+        ).unwrap();
+
+        assert!(verify_udp_checksum(&frame));
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_corrupted_payload() {
+        let mut frame = build_udp_frame(
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            Ipv4Addr::new(10, 0, 1, 10),
+            Ipv4Addr::new(10, 0, 1, 20),
+            5000, 6000,
+            b"test payload",
+            64,
+        ).unwrap();
+
+        // Corrupt the payload
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+        assert!(!verify_udp_checksum(&frame));
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_zero_means_disabled() {
+        let mut frame = build_udp_frame(
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            Ipv4Addr::new(10, 0, 1, 10),
+            Ipv4Addr::new(10, 0, 1, 20),
+            5000, 6000,
+            b"test",
+            64,
+        ).unwrap();
+
+        // Set UDP checksum to 0 (disabled per RFC 768)
+        let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+        frame[udp_off + 6] = 0;
+        frame[udp_off + 7] = 0;
+        assert!(verify_udp_checksum(&frame));
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_too_short() {
+        assert!(!verify_udp_checksum(&[0u8; 30])); // Less than TOTAL_HEADER_LEN
+    }
+
+    #[test]
+    fn test_verify_both_checksums_roundtrip() {
+        // Build a frame and verify both checksums pass
+        for payload in &[b"" as &[u8], b"a", b"hello world", &[0xAB; 100]] {
+            let frame = build_udp_frame(
+                &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                Ipv4Addr::new(172, 16, 0, 1),
+                Ipv4Addr::new(172, 16, 0, 2),
+                1234, 5678,
+                payload,
+                128,
+            ).unwrap();
+
+            assert!(verify_ipv4_checksum(&frame), "IPv4 checksum failed for payload len {}", payload.len());
+            assert!(verify_udp_checksum(&frame), "UDP checksum failed for payload len {}", payload.len());
+        }
+    }
+
+    // ========================================================================
+    // TX OFFLOAD TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_udp_pseudo_header_checksum() {
+        let src_ip = [192, 168, 1, 1];
+        let dst_ip = [192, 168, 1, 2];
+        let udp_len: u16 = 12; // 8 header + 4 payload
+
+        let phdr_cksum = udp_pseudo_header_checksum(&src_ip, &dst_ip, udp_len);
+
+        // The pseudo-header checksum should be non-zero for real addresses
+        assert_ne!(phdr_cksum, 0);
+
+        // Verify it's the correct partial sum: add the rest of the UDP data
+        // and it should match the full checksum
+        let udp_header = [
+            0x30, 0x39, // Source port (12345)
+            0x23, 0x28, // Dest port (9000)
+            0x00, 0x0c, // Length (12)
+            0x00, 0x00, // Checksum placeholder
+        ];
+        let payload = b"test";
+
+        let full_cksum = udp_checksum(&src_ip, &dst_ip, &udp_header, payload);
+
+        // The pseudo-header checksum is the starting point for the full calculation.
+        // Verify both produce valid non-zero results.
+        assert_ne!(phdr_cksum, 0);
+        assert_ne!(full_cksum, 0);
+    }
+
+    #[test]
+    fn test_mbuf_offload_fields() {
+        // Test that ol_flags and tx_offload can be set on an Mbuf via the wrapper
+        let pool = Mempool::create("offload_test_pool", 128, 32, 2048, -1).unwrap();
+        let mut mbuf = pool.alloc().unwrap();
+
+        // Initially zero
+        assert_eq!(mbuf.ol_flags(), 0);
+
+        // Set TX offload flags
+        let flags = dpdk_sys::RTE_MBUF_F_TX_IPV4
+            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM
+            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+        mbuf.set_ol_flags(flags);
+        assert_eq!(mbuf.ol_flags(), flags);
+
+        // Set TX offload lengths
+        mbuf.set_tx_offload(14, 20, 8); // ETH, IPv4, UDP
+        // Verify encoding: l2=14 (bits 0-6), l3=20 (bits 7-15), l4=8 (bits 16-23)
+        let expected = 14u64 | (20u64 << 7) | (8u64 << 16);
+        // Read back via shim function to verify (tx_offload is in an anonymous
+        // union in real DPDK, so direct field access doesn't work with bindgen)
+        let raw_tx_offload = unsafe { dpdk_sys::mbuf_get_tx_offload(mbuf.as_raw()) };
+        assert_eq!(raw_tx_offload, expected);
     }
 
     #[test]

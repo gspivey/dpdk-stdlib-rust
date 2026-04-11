@@ -110,6 +110,35 @@ impl Mbuf {
             (*self.raw.as_ptr()).pkt_len = len;
         }
     }
+
+    /// Get the ol_flags field (offload flags)
+    pub fn ol_flags(&self) -> u64 {
+        unsafe { (*self.raw.as_ptr()).ol_flags }
+    }
+
+    /// Set the ol_flags field (offload flags)
+    pub fn set_ol_flags(&mut self, flags: u64) {
+        unsafe {
+            (*self.raw.as_ptr()).ol_flags = flags;
+        }
+    }
+
+    /// Set TX offload lengths (l2_len, l3_len, l4_len) in the tx_offload bitfield.
+    ///
+    /// DPDK encodes these as: l2_len (bits 0-6, 7 bits), l3_len (bits 7-15, 9 bits),
+    /// l4_len (bits 16-23, 8 bits).
+    ///
+    /// Uses a C shim wrapper because `tx_offload` lives inside an anonymous union
+    /// in the real DPDK `rte_mbuf` struct, which bindgen represents as
+    /// `__bindgen_anon_N.tx_offload` rather than a direct field.
+    pub fn set_tx_offload(&mut self, l2_len: u8, l3_len: u16, l4_len: u8) {
+        let tx_offload = (l2_len as u64)
+            | ((l3_len as u64) << 7)
+            | ((l4_len as u64) << 16);
+        unsafe {
+            dpdk_sys::mbuf_set_tx_offload(self.raw.as_ptr(), tx_offload);
+        }
+    }
 }
 
 impl Drop for Mbuf {

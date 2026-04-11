@@ -143,7 +143,7 @@ Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` wri
 # Build everything (works without DPDK - uses stubs)
 cargo build
 
-# Run 180+ unit tests (no DPDK required)
+# Run 260+ unit tests (no DPDK required)
 cargo test
 
 # Run specific crate tests
@@ -234,7 +234,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | IPv4 UDP send/receive | Complete | Build and parse Ethernet/IPv4/UDP frames |
 | ARP resolution | Complete | Cache with atomic fast-path, auto-request, kernel ARP seeding |
 | ICMP echo reply | Complete | Auto-responds to ping |
-| Hardware checksum offload | Detected | Capability flags exposed, not yet used on TX path |
+| Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
 | Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
 | Multicast join/leave | Basic | IPv4 only, simplified group tracking |
@@ -249,8 +249,8 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 |---------|--------|-----|--------|
 | **Subnet-aware routing** | Full FIB with longest-prefix match | Subnet-aware with longest-prefix-match, auto-detection from OS | Done |
 | **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | None — unbounded buffering until hardware ring fills | Planned |
-| **RX checksum validation** | Hardware or software verification on every packet | Parsed but not verified | Planned |
-| **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | Always computed in software | Planned |
+| **RX checksum validation** | Hardware or software verification on every packet | Software verification on every RX packet | Done |
+| **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | NIC computes when capable, software fallback | Done |
 | **ICMP error handling** | Destination/port unreachable queued to originating socket | Echo reply only — all ICMP errors ignored | Planned |
 | **Gratuitous ARP** | Announces IP on interface up | None — purely reactive | Planned |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
@@ -285,13 +285,13 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **Jumbo frames** — Configurable MTU via `NetworkConfig` (up to 9001 bytes). `send_to()` rejects payloads exceeding the MTU-derived limit. TxBuffer is always sized for jumbo frames to avoid reallocation.
 
+**RX checksum validation** — IPv4 header and UDP checksums are verified in software on every received packet. Packets with corrupted headers or payloads are silently dropped before reaching the application. Handles UDP checksum-disabled (0) per RFC 768.
+
+**TX hardware checksum offload** — When the NIC supports `CHECKSUM_PARTIAL` mode (e.g., ENA on AWS), the DPDK backend sets mbuf offload flags (`RTE_MBUF_F_TX_IP_CKSUM`, `RTE_MBUF_F_TX_UDP_CKSUM`) and writes the pseudo-header checksum so the NIC computes final checksums. Falls back to software checksums on NICs without offload or on non-DPDK backends.
+
 ### Planned
 
 **RX backpressure and drop counters** — Implement socket-level receive buffer accounting with configurable limits and exposed drop counters. Applications need visibility into packet loss. This is the most important gap for production use.
-
-**RX checksum validation** — Verify IPv4 and UDP checksums on received packets. Currently parsed but not checked. One-line fix with outsized correctness impact.
-
-**TX hardware checksum offload** — Use `CHECKSUM_PARTIAL` mode when the NIC supports it instead of computing checksums in software. Eliminates ~100ns per packet on capable hardware.
 
 **ICMP error handling** — Process destination unreachable and fragmentation needed messages. Surface errors to the application via the socket error API. Enables path MTU discovery.
 
