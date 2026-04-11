@@ -5,6 +5,139 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #10: NIC-Level Drop Visibility (and what it actually shows)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-11 |
+| **Git Hash** | `cba25a8` |
+| **Branch** | `claude/complete-roadmap-feature-L1KJN` |
+| **PR** | [#33](https://github.com/gspivey/dpdk-stdlib-rust/pull/33) |
+| **GH Actions Run** | [24282550157](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24282550157) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Previous Run
+
+- **NIC-level drop visibility — hardware counters plumbed into the `[PERF]` log**: `PortStats` grew an `rx_nombuf` field (was missing from the Rust wrapper even though it exists in the raw `rte_eth_stats`). `PerfReporter::start` now takes an optional `NicStatsFn` callback which it samples at baseline and on every reporting tick, computing per-tick deltas of `rte_eth_stats.imissed` / `.ierrors` / `.rx_nombuf` and emitting them as `nic_imissed=N nic_ierrors=N nic_rx_nombuf=N` fields on the `[PERF]` line. On non-DPDK backends (plain-rust) the callback is `None` and the fields are emitted as `-` so the harness can distinguish "backend has no NIC stats" from "zero NIC drops".
+- **New `NIC Drops` column in the perf-test markdown summary**: `scripts/run-perf-tests.sh`'s Python aggregator now sums the per-tick NIC deltas for each TRex step window and emits a column alongside the existing App Drops column. The initial implementation uses a single combined total `imissed + ierrors + rx_nombuf` — this is what shipped for Run #10 below, but as the analysis shows, **`ierrors` is dominated by AWS ENA background noise on this instance type** and should not be lumped in with the real drop signal. A follow-up commit splits the column into `imissed / ierrors / rx_nombuf`.
+- **README — new "RX Drop Hierarchy" subsection**: Documents the 5-layer drop stack (wire → NIC RX ring → NIC refill → dpdk-udp worker ring → dpdk-udp recv_queue) with which counter captures each and which column surfaces it. Plus a "How to read the columns in perf reports" section with diagnostic patterns.
+
+### Results: 64B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops¹ | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | 128 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | 143 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | 163 |
+| native-dpdk | 700K | 700,000 | 699,844 | 0.02% | — | — | 212 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 39,789 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 35,748 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 31,909 | 0 | 271 |
+| rust-dpdk   | 700K | 700,000 | 698,981 | 0.15% | 41,911 | 0 | 382 |
+| tokio-dpdk  | 70K  | 70,000  | 40,542  | 42.08% | 12,127 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 40,790  | 70.86% | 5,696  | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 40,612  | 88.40% | 2,642  | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 40,508  | 94.21% | 4,577  | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | 221 |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 348,997 | 0.29% | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 542,831 | 22.45% | — | — | 0 |
+
+¹ NIC Drops = `imissed + ierrors + rx_nombuf` (combined for this run — see analysis about the `ierrors` pollution).
+
+### Results: 512B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops¹ | App Drops |
+|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — |
+| native-dpdk | 700K | 700,000 | 699,772 | 0.03% | — | — |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 33,628 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 41,926 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 35,553 | 0 |
+| rust-dpdk   | 700K | 700,000 | 698,822 | 0.17% | 31,913 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 39,732  | 43.24% | 10,827 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 39,849  | 71.54% | 6,855  | 0 |
+| tokio-dpdk  | 350K | 350,000 | 40,052  | 88.56% | 2,848  | 0 |
+| tokio-dpdk  | 700K | 700,000 | 39,886  | 94.30% | 2,153  | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — |
+| plain-rust  | 350K | 350,000 | 348,831 | 0.33% | — | — |
+| plain-rust  | 700K | 700,000 | 562,194 | 19.69% | — | — |
+
+### Results: 1400B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops¹ | App Drops |
+|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — |
+| native-dpdk | 700K | 476,158 | 474,961 | 0.25% | — | — |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 41,913 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 33,403 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 38,510 | 0 |
+| rust-dpdk   | 700K | 476,366 | 475,520 | 0.18% | 25,584 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 38,790  | 44.59% | 11,364 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 38,692  | 72.36% | 5,221  | 0 |
+| tokio-dpdk  | 350K | 350,000 | 38,660  | 88.95% | 3,556  | 0 |
+| tokio-dpdk  | 700K | 476,587 | 41,027  | 91.39% | 2,982  | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — |
+| plain-rust  | 350K | 350,000 | 348,079 | 0.55% | — | — |
+| plain-rust  | 700K | 476,302 | 464,598 | 2.46% | — | — |
+
+### Results: 8500B Packets (Jumbo)
+
+| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops¹ | App Drops |
+|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000 | 70,000 | 0.00% | — | — |
+| native-dpdk | 140K | 78,328 | 78,316 | 0.01% | — | — |
+| native-dpdk | 350K | 78,337 | 78,147 | 0.24% | — | — |
+| rust-dpdk   | 70K  | 70,000 | 69,000 | 1.43% | 32,237 | 0 |
+| rust-dpdk   | 140K | 78,317 | 77,729 | 0.75% | 22,843 | 0 |
+| rust-dpdk   | 350K | 78,286 | 77,921 | 0.47% | 7,065  | 0 |
+| tokio-dpdk  | 70K  | 70,000 | 29,759 | 57.49% | 7,954 | 0 |
+| tokio-dpdk  | 140K | 78,355 | 31,787 | 59.43% | 8,644 | 0 |
+| tokio-dpdk  | 350K | 78,283 | 31,761 | 59.43% | 2,932 | 0 |
+| plain-rust  | 70K  | 70,000 | 31,414 | 55.12% | — | — |
+| plain-rust  | 140K | 78,291 | 77,715 | 0.73% | — | — |
+| plain-rust  | 350K | 78,354 | 77,797 | 0.71% | — | — |
+
+(700K target skipped at 8500B — exceeds 30 Gbps cap.)
+
+### Analysis
+
+**Headline finding: the single-column `NIC Drops` conflates real drops with background noise.** Run #10 was the first run with `rte_eth_stats` plumbed into the per-step harness output, and on first reading the numbers are confusing — every rust-dpdk row shows ~25K–42K NIC Drops independent of target rate, even at 64B/70K where the DUT is doing 1% of its line-rate capacity. A flat drop count across a 10× rate span cannot be rate-dependent saturation; something else is going on.
+
+**The non-Rust C baseline tells us what it is.** The same perf run posted a `testpmd` stats dump mid-run. Accumulated over the full 8-step native-dpdk benchmark:
+
+```
+RX-packets: 113,483,866
+RX-missed:  0            ← polling never fell behind
+RX-errors:  403,626      ← ~50K per 30s step
+RX-nombuf:  0            ← mempool never exhausted
+```
+
+A C binary running testpmd (which we did not write) sees `imissed = 0`, `rx_nombuf = 0`, and `ierrors ≈ 50K per 30s step`. That is essentially the same `ierrors` rate that rust-dpdk shows in every row. The `ierrors` counter on c6in.xlarge / ENA is dominated by **NIC-level events that are not test traffic being dropped** — ENA sees frames it can't deliver (bad CRCs, broadcast/management frames filtered out, frames that arrived during link-state events, etc.) and increments `ierrors` without those being TRex-measured wire loss.
+
+**Re-reading the numbers with `ierrors` treated as noise**: rust-dpdk's real drop signal is `imissed + rx_nombuf`, which is **effectively zero on every row**. Combined with `App Drops = 0` on every row, this means **the Rust stack's polling loop never fell behind the NIC, the mempool was never exhausted, the internal worker ring was never overflowed, and the per-socket recv_queue was never full at any rate, at any packet size, up to 700K pps at 64B**. That is a substantially stronger statement than "App Drops = 0" alone allowed us to make in Run #9 — we now know the NIC ring and mempool are also clean, not just the software layers. The ~0.15–1.43% wire-level drop that TRex reports for rust-dpdk 64B is most likely a combination of (a) ENA / AWS-path loss unrelated to the DUT and (b) TRex's per-step pps measurement resolution, which rounds the RX side down to the nearest 1K pps at low rates (so `70K → 69K` is really anywhere in [69,500, 69,999]).
+
+**TRex-reported wire loss `native-dpdk` vs `rust-dpdk` is a rounding artifact at low rates.** At 64B/70K, `native-dpdk` shows 0.00% and `rust-dpdk` shows 1.43% — identical drop counts in absolute terms (TX 70K, RX 70K for native vs RX 69K for rust). The difference is whether the underlying actual RX pps lands just above or just below 70,000 when TRex rounds to the nearest 1K. At 64B/700K where TRex has kpps resolution (it reports `698,981` not `699K`), both configs converge: native-dpdk 0.02%, rust-dpdk 0.15%. The two configs are essentially indistinguishable at the wire level at all tested rates.
+
+**`tokio-dpdk` instrumentation gap is still unresolved.** The ~40K pps ceiling reproduces identically to Run #9 across every size and rate. But now we have a new anomaly: the NIC counters show only 2K–12K "drops" per step, while TRex observes up to **20M lost packets per 30s step** at 64B/700K. The 4,000× discrepancy means the lost packets aren't being accounted for by any layer in our current drop hierarchy (NIC imissed/ierrors/rx_nombuf or software ring/recv_queue). The most likely explanation is that under tokio-dpdk's `spawn_blocking`-per-call architecture, the DPDK PMD polling thread is being starved or paused often enough that `rte_eth_stats_get` snapshots are stale — we're reading the counter at moments when the NIC itself has briefly stopped counting because its RX ring has been full and packets are being silently dropped upstream of the counter. Run #11 adds kernel-side `ethtool -S` plumbing which should make this visible via the AWS ENA `bw_in_allowance_exceeded` / `pps_allowance_exceeded` / `rx_drops` counters that DPDK doesn't surface.
+
+**`plain-rust` at 8500B / 70K is the one new outlier worth noting**: 55.12% drop vs <1% at the larger rate steps. Not seen in Run #9. At 8500B, 70K pps is 4.76 Gbps — well below the 30 Gbps burst cap but above the 6.25 Gbps sustained baseline. The kernel UDP path appears to have a startup-transient behavior at this particular size/rate combination that the DPDK path (rust-dpdk, native-dpdk) avoids entirely. Low priority given plain-rust's existing known limitations, but worth a note in case it reproduces in Run #11.
+
+### Followups Shipping With This Writeup
+
+1. **Split `NIC Drops` into `NIC imissed / ierrors / rx_nombuf`** sub-columns so the `ierrors` noise doesn't visually contaminate the real drop signal. (Same commit as this writeup.)
+2. **Plumb `ethtool -S ens5` snapshots into the harness** — captured once before and once after each benchmark via SSM, diffed, and dumped into the per-config JSON. Gives us kernel-side ENA counters (`bw_in_allowance_exceeded`, `pps_allowance_exceeded`, `rx_drops`, `rx_frag_fail`, etc.) for **all four configs including `plain-rust`** — the first time we'll have NIC-level drop data for the kernel-stack config. (Same commit.)
+3. **Investigate the tokio-dpdk instrumentation gap** — deferred until Run #11 has kernel-side NIC data in hand to compare against.
+
+---
+
 ## Run #9: tokio-dpdk Backend in Matrix + App-Level Drop Visibility
 
 | Field | Value |

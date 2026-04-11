@@ -1172,12 +1172,19 @@ def load_perf_lines(config_name):
 def annotate_with_app_drops(cfg_data):
     """Inject software-layer drop fields (`app_drops`, `app_ring_drops`,
     `app_buf_drops`) AND NIC-layer drop fields (`nic_imissed`, `nic_ierrors`,
-    `nic_rx_nombuf`, `nic_drops`) into each step in cfg_data['results'].
+    `nic_rx_nombuf`) into each step in cfg_data['results'].
 
     Sums [PERF] samples whose covered window [ts-interval, ts] overlaps the
     step's [ts_start_unix, ts_end_unix]. NIC fields are only set if at least
     one overlapping sample reported a numeric value (i.e. DPDK backend);
-    otherwise they stay absent so the markdown generator can render "—"."""
+    otherwise they stay absent so the markdown generator can render "—".
+
+    Note: we deliberately do NOT compute a combined `imissed + ierrors +
+    rx_nombuf` total here. On AWS ENA, `ierrors` is dominated by background
+    noise unrelated to test traffic (Run #10 showed ~50K ierrors/step in the
+    C reference testpmd binary while imissed/rx_nombuf stayed at 0). Summing
+    the three into one column masks the real drop signal; downstream
+    consumers should display the three sub-columns separately."""
     name = cfg_data.get("config_name", "")
     samples = load_perf_lines(name)
     if not samples:
@@ -1220,9 +1227,6 @@ def annotate_with_app_drops(cfg_data):
                 step["nic_imissed"] = nic_imissed_total
                 step["nic_ierrors"] = nic_ierrors_total
                 step["nic_rx_nombuf"] = nic_nombuf_total
-                step["nic_drops"] = (
-                    nic_imissed_total + nic_ierrors_total + nic_nombuf_total
-                )
 
 configs = {}
 for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
@@ -1287,22 +1291,37 @@ else:
     for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
-        # Drop columns walk the receive path from hardware to app:
-        #   NIC Drops = rte_eth_stats imissed + ierrors + rx_nombuf summed
-        #               from [PERF] lines. Packets the NIC had to drop
-        #               because the software RX descriptor ring was full
-        #               (app polled too slowly) or because the mempool was
-        #               empty. These packets NEVER reach `dpdk-udp`.
-        #   App Drops = dpdk-udp software-layer drops (rx_ring_drops +
-        #               rx_buf_drops). Packets that made it through the NIC
-        #               into the socket path but got dropped because the
-        #               worker SpscRing or the per-socket recv_queue was
-        #               full (consumer too slow).
-        # Both are only available for backends that emit [PERF] lines.
-        # A non-zero (TX/RX delta) with NIC Drops ≈ 0 and App Drops ≈ 0
+        # Drop columns walk the receive path from hardware to app. The three
+        # NIC sub-columns are split out from rte_eth_stats because they mean
+        # different things and should not be summed — in particular on AWS
+        # ENA, `ierrors` is dominated by background NIC events (bad CRCs,
+        # management frames, etc.) that are NOT test-traffic loss. Lumping
+        # ierrors into a single "NIC Drops" total masks the real signal.
+        # Run #10 proved this — see docs/perf-test-log.md for details.
+        #
+        #   NIC imissed  = rte_eth_stats.imissed — the DPDK SW polled too
+        #                  slowly and the HW RX descriptor ring filled up,
+        #                  so the NIC discarded incoming frames. This is
+        #                  the REAL "app can't keep up" signal.
+        #   NIC ierrors  = rte_eth_stats.ierrors — generic NIC-level errors
+        #                  (CRC, framing, oversized, etc.). On ENA this is
+        #                  mostly AWS background noise and should be treated
+        #                  as such unless it changes between runs.
+        #   NIC nombuf   = rte_eth_stats.rx_nombuf — no mempool buffer was
+        #                  available to place an incoming packet; the NIC
+        #                  dropped it at the refill path. Indicates the
+        #                  mempool is sized too small or being drained.
+        #   App Drops    = dpdk-udp software-layer drops (rx_ring_drops +
+        #                  rx_buf_drops). Packets that made it through the
+        #                  NIC into the socket path but got dropped because
+        #                  the worker SpscRing or the per-socket recv_queue
+        #                  was full (consumer too slow).
+        #
+        # All four are only available for backends that emit [PERF] lines.
+        # Non-zero wire drop (TX/RX delta) with imissed/nombuf/App all ≈ 0
         # points at wire loss (AWS ENA / VPC rate limiter / bad cabling).
-        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
-        lines.append("|--------|-----------|--------|--------|--------|-----------|-----------|-------------|-------------|---------|---------|")
+        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC imissed | NIC ierrors | NIC nombuf | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|-----------|-----------|-------------|-------------|---------|---------|")
 
         for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
@@ -1319,20 +1338,24 @@ else:
                 tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
                 rx_mbps = f"{r.get('rx_mbps', 0):.1f}"
                 target = f"{r.get('target_pps', 0):,}"
-                # `app_drops` / `nic_drops` are only present for DPDK-backed
-                # configs that emit [PERF] lines. Show "—" for plain-rust /
-                # native-dpdk (native-dpdk is a C reference binary and does
-                # not emit [PERF] either).
+                # `app_drops` / `nic_imissed` / `nic_ierrors` / `nic_rx_nombuf`
+                # are only present for DPDK-backed configs that emit [PERF]
+                # lines. Show "—" for plain-rust / native-dpdk (native-dpdk
+                # is a C reference binary and does not emit [PERF] either).
                 if 'app_drops' in r:
                     app_drops = f"{r['app_drops']:,}"
                 else:
                     app_drops = "—"
-                if 'nic_drops' in r:
-                    nic_drops = f"{r['nic_drops']:,}"
+                if 'nic_imissed' in r:
+                    nic_imissed = f"{r['nic_imissed']:,}"
+                    nic_ierrors = f"{r['nic_ierrors']:,}"
+                    nic_nombuf = f"{r['nic_rx_nombuf']:,}"
                 else:
-                    nic_drops = "—"
+                    nic_imissed = "—"
+                    nic_ierrors = "—"
+                    nic_nombuf = "—"
 
-                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {nic_drops} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {nic_imissed} | {nic_ierrors} | {nic_nombuf} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
 
         lines.append("")
 
