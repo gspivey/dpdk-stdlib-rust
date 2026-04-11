@@ -544,8 +544,25 @@ impl PerfReporter {
     ) {
         let mut prev_snapshot = counters.snapshot();
         let mut prev_time = Instant::now();
-        let mut prev_nic: Option<NicStatsSnapshot> =
+        let initial_nic: Option<NicStatsSnapshot> =
             nic_stats_fn.as_ref().and_then(|f| f());
+
+        // Emit a one-shot baseline line so the harness can cross-check the
+        // sum of per-tick deltas against (FINAL - BASELINE) as a
+        // self-consistency check on the PerfReporter → aggregator pipeline.
+        // This is the RAW cumulative counter at reporter startup, NOT a
+        // delta. Only emitted when NIC stats are available (DPDK backend).
+        if let Some(ref s) = initial_nic {
+            let ts_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "[NIC-BASELINE] ts_unix={:.3} imissed={} ierrors={} rx_nombuf={}",
+                ts_unix, s.rx_missed, s.rx_errors, s.rx_nombuf,
+            );
+        }
+        let mut prev_nic = initial_nic;
 
         while !shutdown.load(Ordering::Relaxed) {
             thread::sleep(interval);
@@ -624,6 +641,24 @@ impl PerfReporter {
 
             prev_snapshot = counters.snapshot();
             prev_time = now;
+        }
+
+        // Emit a one-shot final line on clean shutdown. Paired with the
+        // [NIC-BASELINE] line above, (FINAL - BASELINE) gives the total
+        // cumulative NIC drops that happened between reporter startup
+        // and shutdown, which the harness can compare against the sum of
+        // per-tick deltas in the [PERF] lines. A mismatch means either the
+        // tick-delta computation is losing data or the aggregator window
+        // logic is wrong.
+        if let Some(s) = nic_stats_fn.as_ref().and_then(|f| f()) {
+            let ts_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "[NIC-FINAL] ts_unix={:.3} imissed={} ierrors={} rx_nombuf={}",
+                ts_unix, s.rx_missed, s.rx_errors, s.rx_nombuf,
+            );
         }
     }
 
@@ -877,15 +912,62 @@ mod tests {
             Some(nic_stats_fn),
         );
 
-        // Wait long enough for at least 2 ticks (first snapshot + one delta).
+        // Wait long enough for at least 2 reporting ticks.
         std::thread::sleep(Duration::from_millis(120));
         reporter.stop();
 
-        // Must have been called at least twice: once at startup for the
-        // baseline, and once per reporting tick.
+        // Must have been called at least three times: once at startup to
+        // capture the [NIC-BASELINE] snapshot, once or more per reporting
+        // tick for per-tick delta computation, and once at shutdown to
+        // capture the [NIC-FINAL] snapshot. The harness uses BASELINE and
+        // FINAL to cross-check the sum-of-deltas against (FINAL-BASELINE).
         assert!(
-            call_count.load(Ordering::Relaxed) >= 2,
-            "nic_stats_fn should be invoked at least twice (baseline + tick)"
+            call_count.load(Ordering::Relaxed) >= 3,
+            "nic_stats_fn should be invoked at least 3 times \
+             (baseline + tick + final), got {}",
+            call_count.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn perf_reporter_final_snapshot_runs_after_shutdown() {
+        // Verify that [NIC-FINAL] is always emitted on clean shutdown even
+        // when the shutdown signal fires BEFORE any reporting tick has run.
+        // This is the scenario where a benchmark exits almost immediately —
+        // we still need the final snapshot to pair with the baseline so the
+        // harness cross-check doesn't lose data.
+        let counters = Arc::new(PerfCounters::new());
+        let sampler = Arc::new(LatencySampler::new(64, 1));
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let nic_stats_fn: NicStatsFn = Box::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            Some(NicStatsSnapshot::default())
+        });
+
+        // Use a very long interval (10s) so no tick runs before we stop.
+        let mut reporter = PerfReporter::start(
+            Arc::clone(&counters),
+            Arc::clone(&sampler),
+            Duration::from_secs(10),
+            Some(nic_stats_fn),
+        );
+
+        // Stop almost immediately — before any tick could fire.
+        std::thread::sleep(Duration::from_millis(5));
+        reporter.stop();
+
+        // Baseline (1) + final (1) must still have been invoked, even
+        // though no reporting tick ran. If FINAL is only emitted from the
+        // tick loop body (e.g. inside the `while` block instead of after
+        // it), this will fail with count == 1.
+        let count = call_count.load(Ordering::Relaxed);
+        assert!(
+            count >= 2,
+            "nic_stats_fn must be called for baseline AND final even \
+             with no ticks; got {}",
+            count
         );
     }
 }
