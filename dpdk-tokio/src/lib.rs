@@ -161,12 +161,19 @@ pub async fn bind_udp_with_config<A: std::net::ToSocketAddrs>(
 
     #[cfg(feature = "dpdk")]
     if config.prefer_dpdk {
-        match DpdkUdpSocket::bind_with_config(addr, &config).await {
-            Ok(socket) => {
-                return Ok(Box::new(socket));
-            }
-            Err(e) => {
-                eprintln!("DPDK init failed ({}), falling back to Tokio", e);
+        // Skip DPDK entirely when linked against the stub backend — a stub
+        // socket would bind successfully but never produce/consume any
+        // packets, so any I/O would silently hang.
+        if dpdk_udp::is_stub() {
+            eprintln!("dpdk-sys is in stub mode, falling back to Tokio");
+        } else {
+            match DpdkUdpSocket::bind_with_config(addr, &config).await {
+                Ok(socket) => {
+                    return Ok(Box::new(socket));
+                }
+                Err(e) => {
+                    eprintln!("DPDK init failed ({}), falling back to Tokio", e);
+                }
             }
         }
     }

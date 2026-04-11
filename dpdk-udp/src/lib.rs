@@ -25,6 +25,17 @@ use dpdk::mbuf::MempoolConfig;
 
 pub use dpdk::port::{RxOffload as HwRxOffload, TxOffload as HwTxOffload};
 
+/// Returns true when this build is linked against the dpdk-sys stub backend
+/// (no real DPDK library found at compile time, or the `bindgen` feature
+/// was not enabled).
+///
+/// Re-exported from `dpdk_sys::is_stub` so callers don't need to take a
+/// direct dependency on `dpdk-sys`.
+#[inline]
+pub fn is_stub() -> bool {
+    dpdk_sys::is_stub()
+}
+
 use thiserror::Error;
 
 // ============================================================================

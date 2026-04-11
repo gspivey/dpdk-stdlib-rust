@@ -324,10 +324,9 @@ export class PerfTestStack extends cdk.Stack {
       'source /root/.cargo/env',
       'cd /opt/dpdk-stdlib',
       'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
-      // Build all binaries including plain-echo (no dpdk feature needed)
+      // Single workspace build with bindgen → produces real-DPDK binaries for echo,
+      // tokio-echo (which has `dpdk` as a default feature), and plain-echo (no dpdk dep).
       'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
-      // tokio-echo needs its `dpdk` feature opted in to pick up the DPDK backend
-      'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release -p tokio-echo --features dpdk',
       'echo "=== Build complete ==="',
       'ls -la target/release/echo target/release/plain-echo target/release/tokio-echo',
       // Collect environment info

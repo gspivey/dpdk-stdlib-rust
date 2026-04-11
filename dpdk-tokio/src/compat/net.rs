@@ -53,15 +53,20 @@ impl UdpSocket {
 
         #[cfg(feature = "dpdk")]
         {
-            // Try DPDK first
-            match dpdk_udp::UdpSocket::bind(addr) {
-                Ok(socket) => {
-                    return Ok(UdpSocket {
-                        inner: UdpSocketInner::Dpdk(socket),
-                    });
-                }
-                Err(e) => {
-                    eprintln!("DPDK bind failed ({}), falling back to std", e);
+            // Skip DPDK entirely when linked against the stub backend — a stub
+            // socket would bind successfully but never produce/consume any
+            // packets, so loopback I/O would silently hang.
+            if !dpdk_udp::is_stub() {
+                // Try DPDK first
+                match dpdk_udp::UdpSocket::bind(addr) {
+                    Ok(socket) => {
+                        return Ok(UdpSocket {
+                            inner: UdpSocketInner::Dpdk(socket),
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("DPDK bind failed ({}), falling back to std", e);
+                    }
                 }
             }
         }
