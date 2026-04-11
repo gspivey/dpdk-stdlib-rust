@@ -61,6 +61,12 @@ struct Args {
     /// Statistics report interval in seconds
     #[arg(long, default_value_t = 10)]
     stats_interval: u64,
+
+    /// Performance reporting interval in seconds (0 = disabled).
+    /// On the DPDK backend this starts the PerfReporter, emitting `[PERF]`
+    /// log lines with rx/tx pps, drop counters, and latency percentiles.
+    #[arg(long, default_value_t = 0)]
+    perf_interval: u64,
 }
 
 /// Statistics tracker
@@ -136,6 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Local address: {}", socket.local_addr()?);
     println!("Max concurrent handlers: {}", args.workers);
     println!("Request timeout: {}ms", args.timeout);
+
+    if args.perf_interval > 0 {
+        socket.enable_perf_reporting(Duration::from_secs(args.perf_interval)).await?;
+        println!("Perf reporting interval: {}s", args.perf_interval);
+    }
+
     println!();
     println!("Echo server running... (Ctrl+C to stop)");
     println!();

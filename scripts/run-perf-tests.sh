@@ -34,13 +34,16 @@ DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="plain-rust,rust-dpdk,native-dpdk"
+CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
 CDK_DIR="$REPO_ROOT/deploy/cdk"
 RESULTS_DIR="$REPO_ROOT/perf-results"
 LOGS_DIR="$REPO_ROOT/instance-logs"
+# Exported so the inline python in aggregate_results / generate_markdown_summary
+# can find both directories without hard-coding paths.
+export RESULTS_DIR LOGS_DIR
 
 SSM_READINESS_TIMEOUT=600
 TREX_START_TIMEOUT=120
@@ -488,7 +491,7 @@ dut_stop_all_apps() {
     # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
     # Only escalate to SIGKILL after 10s if the process won't die.
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/tokio-echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/tokio-echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
     # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
     # the shared memory files persist and can cause the next DPDK app to fail
@@ -965,6 +968,43 @@ start_dut_rust_dpdk_multicore() {
     log_info "rust-dpdk-multicore echo server running"
 }
 
+start_dut_tokio_dpdk() {
+    log_info "Starting DUT: tokio-dpdk (async tokio-echo with DPDK backend)"
+    dut_bind_dpdk || return 1
+
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+
+    # tokio-echo binary is built with --features dpdk in perf-test-stack.ts so
+    # the DPDK backend is selected automatically when DPDK is available.
+    # --perf-interval 10 enables PerfReporter so [PERF] lines (rx_pps, rx_drops,
+    # rx_buf_drops, latencies) appear in the app log every 10s — same as the
+    # rust-dpdk config.
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tokio-echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-tokio-dpdk.log 2>&1 &"
+    sleep 15
+
+    # Verify it's running (retry up to 3 times — SSM can be slow)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/tokio-echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "tokio-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
+    if [[ "$status" != *"running"* ]]; then
+        log_error "tokio-dpdk echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-tokio-dpdk.log 2>/dev/null" || true
+        return 1
+    fi
+    log_info "tokio-dpdk echo server running"
+}
+
 start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd 5tswap)"
     dut_bind_dpdk || return 1
@@ -1058,11 +1098,80 @@ aggregate_results() {
     mkdir -p "$RESULTS_DIR"
 
     python3 - <<'PYEOF'
-import json, glob, os, sys
+import json, glob, os, re, sys
 from datetime import datetime, timezone
 
 results_dir = os.environ.get("RESULTS_DIR", "perf-results")
+logs_dir = os.environ.get("LOGS_DIR", "perf-logs")
 output_file = os.path.join(results_dir, "perf-report.json")
+
+# Regex pulls fields out of:
+#   [PERF] ts_unix=1712.345 interval=10s rx_pps=... rx_drops=N rx_ring_drops=N rx_buf_drops=N ...
+PERF_RE = re.compile(
+    r"^\[PERF\]\s+ts_unix=(?P<ts>[\d.]+).*?\s"
+    r"rx_drops=(?P<rx_drops>\d+).*?\s"
+    r"rx_ring_drops=(?P<rx_ring>\d+).*?\s"
+    r"rx_buf_drops=(?P<rx_buf>\d+)"
+)
+INTERVAL_RE = re.compile(r"interval=(\d+)s")
+
+def load_perf_lines(config_name):
+    """Return list of dicts: {ts, interval, rx_drops, rx_ring, rx_buf}.
+    `interval` is the reporter window in seconds — used to figure out which
+    rate-step a [PERF] sample belongs to (the line's ts_unix marks the END of
+    the window, so the sample covers [ts - interval, ts])."""
+    perf_path = os.path.join(logs_dir, f"dut-{config_name}-perf.log")
+    samples = []
+    if not os.path.exists(perf_path):
+        return samples
+    try:
+        with open(perf_path) as fh:
+            for line in fh:
+                m = PERF_RE.search(line)
+                if not m:
+                    continue
+                im = INTERVAL_RE.search(line)
+                interval = int(im.group(1)) if im else 10
+                samples.append({
+                    "ts": float(m.group("ts")),
+                    "interval": interval,
+                    "rx_drops": int(m.group("rx_drops")),
+                    "rx_ring": int(m.group("rx_ring")),
+                    "rx_buf": int(m.group("rx_buf")),
+                })
+    except Exception as e:
+        print(f"Warning: failed to parse {perf_path}: {e}", file=sys.stderr)
+    return samples
+
+def annotate_with_app_drops(cfg_data):
+    """Inject `app_drops`, `app_ring_drops`, `app_buf_drops` into each step
+    in cfg_data['results']. Sums [PERF] samples whose covered window
+    [ts-interval, ts] overlaps the step's [ts_start_unix, ts_end_unix]."""
+    name = cfg_data.get("config_name", "")
+    samples = load_perf_lines(name)
+    if not samples:
+        return
+    for size_results in cfg_data.get("results", {}).values():
+        for step in size_results:
+            ts_start = step.get("ts_start_unix")
+            ts_end = step.get("ts_end_unix")
+            if ts_start is None or ts_end is None:
+                continue
+            buf_total = 0
+            ring_total = 0
+            drops_total = 0
+            for s in samples:
+                window_start = s["ts"] - s["interval"]
+                window_end = s["ts"]
+                # Attribute the sample if its window overlaps the step window
+                if window_end < ts_start or window_start > ts_end:
+                    continue
+                buf_total += s["rx_buf"]
+                ring_total += s["rx_ring"]
+                drops_total += s["rx_drops"]
+            step["app_drops"] = drops_total
+            step["app_ring_drops"] = ring_total
+            step["app_buf_drops"] = buf_total
 
 configs = {}
 for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
@@ -1072,6 +1181,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
         with open(f) as fh:
             data = json.load(fh)
             name = data.get("config_name", os.path.basename(f).replace(".json", ""))
+            annotate_with_app_drops(data)
             configs[name] = data
     except Exception as e:
         print(f"Warning: failed to read {f}: {e}", file=sys.stderr)
@@ -1126,10 +1236,13 @@ else:
     for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
-        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
-        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
+        # App Drops = DUT-side rx_buf_drops + rx_ring_drops summed from [PERF]
+        # log lines whose reporting window overlaps the rate step. The TX/RX
+        # delta minus App Drops should approximate AWS network loss.
+        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|--------|-----------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {}).get(pkt_size, [])
 
@@ -1144,8 +1257,14 @@ else:
                 tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
                 rx_mbps = f"{r.get('rx_mbps', 0):.1f}"
                 target = f"{r.get('target_pps', 0):,}"
+                # `app_drops` is only present for backends that emit [PERF]
+                # lines (DPDK ones). Show "—" for plain-rust / native-dpdk.
+                if 'app_drops' in r:
+                    app_drops = f"{r['app_drops']:,}"
+                else:
+                    app_drops = "—"
 
-                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
 
         lines.append("")
 
@@ -1604,6 +1723,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
         case "$config" in
             rust-dpdk)           start_dut_rust_dpdk           || start_ok=false ;;
             rust-dpdk-multicore) start_dut_rust_dpdk_multicore || start_ok=false ;;
+            tokio-dpdk)          start_dut_tokio_dpdk          || start_ok=false ;;
             native-dpdk)         start_dut_native_dpdk         || start_ok=false ;;
             rust-stdlib)         start_dut_rust_stdlib          || start_ok=false ;;
             plain-rust)          start_dut_plain_rust           || start_ok=false ;;
@@ -1648,6 +1768,7 @@ ${dut_diag}
         case "$config" in
             rust-dpdk)           log_file="/var/log/echo-rust-dpdk.log" ;;
             rust-dpdk-multicore) log_file="/var/log/echo-rust-dpdk-multicore.log" ;;
+            tokio-dpdk)          log_file="/var/log/echo-tokio-dpdk.log" ;;
             native-dpdk)         log_file="/var/log/testpmd.log" ;;
             rust-stdlib)         log_file="/var/log/echo-rust-stdlib.log" ;;
             plain-rust)          log_file="/var/log/plain-echo.log" ;;
@@ -1657,6 +1778,15 @@ ${dut_diag}
             app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
+
+            # Also pull every [PERF] line from the full log so we can compute
+            # per-step App Drops in aggregate_results. Each [PERF] line is ~300
+            # bytes; even at 30+ lines per config the total is well under SSM's
+            # output cap. Save to a separate file the aggregator reads.
+            local perf_lines
+            perf_lines=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                "grep '^\[PERF\]' $log_file 2>/dev/null || echo ''" 2>/dev/null || echo "")
+            echo "$perf_lines" > "$LOGS_DIR/dut-${config}-perf.log"
             # Post testpmd log to PR for visibility (stats-period output shows RX/TX counters)
             if [[ "$config" == "native-dpdk" ]]; then
                 local testpmd_diag

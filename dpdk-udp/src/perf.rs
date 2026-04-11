@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Feature-gated hot-path macros
@@ -527,12 +527,20 @@ impl PerfReporter {
             let latencies = sampler.percentiles();
 
             let interval_secs = interval.as_secs();
+            // Wall-clock timestamp at the END of this reporting window so the
+            // perf-test harness can bucket [PERF] lines into TRex per-step time
+            // ranges and compute App Drops per step.
+            let ts_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
             eprintln!(
-                "[PERF] interval={}s rx_pps={:.0} rx_bps={:.0} tx_pps={:.0} tx_bps={:.0} \
+                "[PERF] ts_unix={:.3} interval={}s rx_pps={:.0} rx_bps={:.0} tx_pps={:.0} tx_bps={:.0} \
                  rx_drops={} rx_ring_drops={} rx_buf_drops={} tx_fails={} \
                  lat_avg_us={:.0} lat_p50_us={:.0} lat_p95_us={:.0} \
                  lat_p99_us={:.0} lat_max_us={:.0} arp_hits={} arp_misses={} ring_drops={} \
                  worker_idle_pct={:.1} burst_avg={:.1}",
+                ts_unix,
                 interval_secs,
                 rates.rx_pps,
                 rates.rx_bps,

@@ -326,8 +326,10 @@ export class PerfTestStack extends cdk.Stack {
       'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk',
       // Build all binaries including plain-echo (no dpdk feature needed)
       'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release --features dpdk-sys/bindgen',
+      // tokio-echo needs its `dpdk` feature opted in to pick up the DPDK backend
+      'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build --release -p tokio-echo --features dpdk',
       'echo "=== Build complete ==="',
-      'ls -la target/release/echo target/release/plain-echo',
+      'ls -la target/release/echo target/release/plain-echo target/release/tokio-echo',
       // Collect environment info
       'echo "=== DUT Environment ==="',
       'echo "Instance type: $(curl -s -H \"X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)\" http://169.254.169.254/latest/meta-data/instance-type)"',

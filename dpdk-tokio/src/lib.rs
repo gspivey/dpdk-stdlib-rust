@@ -27,6 +27,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -85,6 +86,36 @@ pub trait AsyncUdpSocket: Send + Sync {
 
     /// Returns the name of the backend (for logging/debugging)
     fn backend_name(&self) -> &'static str;
+
+    /// Enable background performance reporting.
+    ///
+    /// On the DPDK backend this starts a `PerfReporter` thread that emits
+    /// `[PERF]` log lines (rx/tx pps, drop counters, latency percentiles)
+    /// to stderr every `interval`. On the Tokio backend this is a no-op
+    /// because `tokio::net::UdpSocket` does not expose internal counters.
+    /// Returns `Ok(())` either way so callers can opt in unconditionally.
+    async fn enable_perf_reporting(&self, _interval: Duration) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot of socket-level RX drops (`SO_RCVBUF`-style backpressure).
+    ///
+    /// On the DPDK backend this returns the live counter from the underlying
+    /// `dpdk_udp::UdpSocket`. On the Tokio backend it returns zeros — the
+    /// kernel manages its own RX buffer and we have no programmatic view of it.
+    async fn recv_drops(&self) -> RecvDropsSnapshot {
+        RecvDropsSnapshot::default()
+    }
+}
+
+/// Backend-agnostic snapshot of socket-level RX drops.
+///
+/// Mirrors `dpdk_udp::RecvDropStats` but lives in `dpdk-tokio` so callers
+/// don't need to depend on `dpdk-udp` directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecvDropsSnapshot {
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 /// Socket configuration options
