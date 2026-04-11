@@ -1106,20 +1106,43 @@ logs_dir = os.environ.get("LOGS_DIR", "perf-logs")
 output_file = os.path.join(results_dir, "perf-report.json")
 
 # Regex pulls fields out of:
-#   [PERF] ts_unix=1712.345 interval=10s rx_pps=... rx_drops=N rx_ring_drops=N rx_buf_drops=N ...
+#   [PERF] ts_unix=1712.345 interval=10s rx_pps=... rx_drops=N rx_ring_drops=N rx_buf_drops=N
+#          nic_imissed=N nic_ierrors=N nic_rx_nombuf=N ...
+# nic_* fields are emitted as "-" on non-DPDK backends, so we parse them as
+# an optional string and treat non-digits as "unavailable".
 PERF_RE = re.compile(
     r"^\[PERF\]\s+ts_unix=(?P<ts>[\d.]+).*?\s"
     r"rx_drops=(?P<rx_drops>\d+).*?\s"
     r"rx_ring_drops=(?P<rx_ring>\d+).*?\s"
     r"rx_buf_drops=(?P<rx_buf>\d+)"
 )
+NIC_IMISSED_RE = re.compile(r"nic_imissed=(\d+|-)")
+NIC_IERRORS_RE = re.compile(r"nic_ierrors=(\d+|-)")
+NIC_RX_NOMBUF_RE = re.compile(r"nic_rx_nombuf=(\d+|-)")
 INTERVAL_RE = re.compile(r"interval=(\d+)s")
 
+def _parse_nic_field(match):
+    """Return int for numeric fields, None for "-" / missing."""
+    if match is None:
+        return None
+    v = match.group(1)
+    if v == "-":
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
 def load_perf_lines(config_name):
-    """Return list of dicts: {ts, interval, rx_drops, rx_ring, rx_buf}.
+    """Return list of dicts with software + NIC drop fields.
     `interval` is the reporter window in seconds — used to figure out which
     rate-step a [PERF] sample belongs to (the line's ts_unix marks the END of
-    the window, so the sample covers [ts - interval, ts])."""
+    the window, so the sample covers [ts - interval, ts]).
+
+    NIC fields (nic_imissed/nic_ierrors/nic_rx_nombuf) are None on non-DPDK
+    backends; the harness propagates None to the report so downstream
+    consumers can distinguish "backend doesn't expose NIC stats" from
+    "zero NIC drops"."""
     perf_path = os.path.join(logs_dir, f"dut-{config_name}-perf.log")
     samples = []
     if not os.path.exists(perf_path):
@@ -1138,15 +1161,23 @@ def load_perf_lines(config_name):
                     "rx_drops": int(m.group("rx_drops")),
                     "rx_ring": int(m.group("rx_ring")),
                     "rx_buf": int(m.group("rx_buf")),
+                    "nic_imissed": _parse_nic_field(NIC_IMISSED_RE.search(line)),
+                    "nic_ierrors": _parse_nic_field(NIC_IERRORS_RE.search(line)),
+                    "nic_rx_nombuf": _parse_nic_field(NIC_RX_NOMBUF_RE.search(line)),
                 })
     except Exception as e:
         print(f"Warning: failed to parse {perf_path}: {e}", file=sys.stderr)
     return samples
 
 def annotate_with_app_drops(cfg_data):
-    """Inject `app_drops`, `app_ring_drops`, `app_buf_drops` into each step
-    in cfg_data['results']. Sums [PERF] samples whose covered window
-    [ts-interval, ts] overlaps the step's [ts_start_unix, ts_end_unix]."""
+    """Inject software-layer drop fields (`app_drops`, `app_ring_drops`,
+    `app_buf_drops`) AND NIC-layer drop fields (`nic_imissed`, `nic_ierrors`,
+    `nic_rx_nombuf`, `nic_drops`) into each step in cfg_data['results'].
+
+    Sums [PERF] samples whose covered window [ts-interval, ts] overlaps the
+    step's [ts_start_unix, ts_end_unix]. NIC fields are only set if at least
+    one overlapping sample reported a numeric value (i.e. DPDK backend);
+    otherwise they stay absent so the markdown generator can render "—"."""
     name = cfg_data.get("config_name", "")
     samples = load_perf_lines(name)
     if not samples:
@@ -1160,6 +1191,10 @@ def annotate_with_app_drops(cfg_data):
             buf_total = 0
             ring_total = 0
             drops_total = 0
+            nic_imissed_total = 0
+            nic_ierrors_total = 0
+            nic_nombuf_total = 0
+            nic_has_data = False
             for s in samples:
                 window_start = s["ts"] - s["interval"]
                 window_end = s["ts"]
@@ -1169,9 +1204,25 @@ def annotate_with_app_drops(cfg_data):
                 buf_total += s["rx_buf"]
                 ring_total += s["rx_ring"]
                 drops_total += s["rx_drops"]
+                if s["nic_imissed"] is not None:
+                    nic_imissed_total += s["nic_imissed"]
+                    nic_has_data = True
+                if s["nic_ierrors"] is not None:
+                    nic_ierrors_total += s["nic_ierrors"]
+                    nic_has_data = True
+                if s["nic_rx_nombuf"] is not None:
+                    nic_nombuf_total += s["nic_rx_nombuf"]
+                    nic_has_data = True
             step["app_drops"] = drops_total
             step["app_ring_drops"] = ring_total
             step["app_buf_drops"] = buf_total
+            if nic_has_data:
+                step["nic_imissed"] = nic_imissed_total
+                step["nic_ierrors"] = nic_ierrors_total
+                step["nic_rx_nombuf"] = nic_nombuf_total
+                step["nic_drops"] = (
+                    nic_imissed_total + nic_ierrors_total + nic_nombuf_total
+                )
 
 configs = {}
 for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
@@ -1236,11 +1287,22 @@ else:
     for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
-        # App Drops = DUT-side rx_buf_drops + rx_ring_drops summed from [PERF]
-        # log lines whose reporting window overlaps the rate step. The TX/RX
-        # delta minus App Drops should approximate AWS network loss.
-        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
-        lines.append("|--------|-----------|--------|--------|--------|-----------|-------------|-------------|---------|---------|")
+        # Drop columns walk the receive path from hardware to app:
+        #   NIC Drops = rte_eth_stats imissed + ierrors + rx_nombuf summed
+        #               from [PERF] lines. Packets the NIC had to drop
+        #               because the software RX descriptor ring was full
+        #               (app polled too slowly) or because the mempool was
+        #               empty. These packets NEVER reach `dpdk-udp`.
+        #   App Drops = dpdk-udp software-layer drops (rx_ring_drops +
+        #               rx_buf_drops). Packets that made it through the NIC
+        #               into the socket path but got dropped because the
+        #               worker SpscRing or the per-socket recv_queue was
+        #               full (consumer too slow).
+        # Both are only available for backends that emit [PERF] lines.
+        # A non-zero (TX/RX delta) with NIC Drops ≈ 0 and App Drops ≈ 0
+        # points at wire loss (AWS ENA / VPC rate limiter / bad cabling).
+        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC Drops | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|--------|-----------|-----------|-------------|-------------|---------|---------|")
 
         for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
@@ -1257,14 +1319,20 @@ else:
                 tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
                 rx_mbps = f"{r.get('rx_mbps', 0):.1f}"
                 target = f"{r.get('target_pps', 0):,}"
-                # `app_drops` is only present for backends that emit [PERF]
-                # lines (DPDK ones). Show "—" for plain-rust / native-dpdk.
+                # `app_drops` / `nic_drops` are only present for DPDK-backed
+                # configs that emit [PERF] lines. Show "—" for plain-rust /
+                # native-dpdk (native-dpdk is a C reference binary and does
+                # not emit [PERF] either).
                 if 'app_drops' in r:
                     app_drops = f"{r['app_drops']:,}"
                 else:
                     app_drops = "—"
+                if 'nic_drops' in r:
+                    nic_drops = f"{r['nic_drops']:,}"
+                else:
+                    nic_drops = "—"
 
-                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {nic_drops} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
 
         lines.append("")
 

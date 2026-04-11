@@ -62,7 +62,9 @@ pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};
 pub use topology::{TopologyConfig, TopologyPlan, TopologySource, MultiCoreTopology, ProcessedPacket, TxFrame};
 pub use frame_pool::{AppPacket, FramePool, FrameRef};
-pub use perf::{PerfCounters, PerfSnapshot, PerfReporter, LatencySampler};
+pub use perf::{
+    LatencySampler, NicStatsFn, NicStatsSnapshot, PerfCounters, PerfReporter, PerfSnapshot,
+};
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
 
 // ============================================================================
@@ -2698,10 +2700,30 @@ impl UdpSocket {
         if reporter_guard.is_some() {
             return Ok(()); // already running
         }
+
+        // Build a NIC stats callback for DPDK-backed sockets so the perf
+        // reporter can emit `nic_imissed`/`nic_ierrors`/`nic_rx_nombuf`
+        // deltas alongside the software-layer counters. Non-DPDK backends
+        // (AF_PACKET, generic) pass `None` and the reporter emits "-".
+        let nic_stats_fn: Option<NicStatsFn> = match &self.socket_backend {
+            SocketBackend::Dpdk(res) => {
+                let res = Arc::clone(res);
+                Some(Box::new(move || {
+                    res.port.stats().ok().map(|s| NicStatsSnapshot {
+                        rx_missed: s.rx_missed,
+                        rx_errors: s.rx_errors,
+                        rx_nombuf: s.rx_nombuf,
+                    })
+                }))
+            }
+            SocketBackend::Generic(_) => None,
+        };
+
         *reporter_guard = Some(PerfReporter::start(
             Arc::clone(&self.perf_counters),
             Arc::clone(&self.latency_sampler),
             interval,
+            nic_stats_fn,
         ));
         Ok(())
     }

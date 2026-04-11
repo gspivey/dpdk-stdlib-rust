@@ -464,6 +464,34 @@ pub struct PerfSnapshot {
 }
 
 // ============================================================================
+// NIC (port-level) stats — optional plumbing from the DPDK driver
+// ============================================================================
+
+/// Point-in-time snapshot of hardware-level NIC counters, read from the DPDK
+/// driver via `rte_eth_stats_get`. These live *below* the software RX path:
+/// packets counted here were dropped before the application ever had a chance
+/// to call `rte_eth_rx_burst`, and they will NOT appear in [`RateSnapshot`]'s
+/// `rx_buf_drops` / `rx_ring_drops` (which only count software-layer drops
+/// inside `dpdk-udp`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NicStatsSnapshot {
+    /// `rte_eth_stats.imissed` — NIC dropped packets because the software RX
+    /// descriptor ring was full (app polled too slowly).
+    pub rx_missed: u64,
+    /// `rte_eth_stats.ierrors` — NIC-reported receive errors (malformed,
+    /// checksum, etc).
+    pub rx_errors: u64,
+    /// `rte_eth_stats.rx_nombuf` — NIC couldn't refill an RX descriptor
+    /// because the mempool was exhausted.
+    pub rx_nombuf: u64,
+}
+
+/// Callback used by [`PerfReporter`] to snapshot NIC-level counters once per
+/// reporting interval. Returns `None` if the backend does not expose port
+/// stats (e.g. AF_PACKET, plain-rust fallback).
+pub type NicStatsFn = Box<dyn Fn() -> Option<NicStatsSnapshot> + Send + Sync>;
+
+// ============================================================================
 // PerfReporter — background reporting thread
 // ============================================================================
 
@@ -479,10 +507,17 @@ impl PerfReporter {
     ///
     /// Emits one log line per `interval` to stderr. The line contains
     /// key=value pairs for easy parsing.
+    ///
+    /// `nic_stats_fn` is an optional callback to snapshot NIC-level counters
+    /// once per interval. When provided (DPDK backend), the log line also
+    /// includes `nic_imissed`, `nic_ierrors`, and `nic_rx_nombuf` fields,
+    /// each reported as a delta over the interval. When `None` (non-DPDK
+    /// backends), those fields are emitted as `nic_imissed=-`.
     pub fn start(
         counters: Arc<PerfCounters>,
         sampler: Arc<LatencySampler>,
         interval: Duration,
+        nic_stats_fn: Option<NicStatsFn>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
@@ -490,7 +525,7 @@ impl PerfReporter {
         let handle = thread::Builder::new()
             .name("dpdk-perf-reporter".to_string())
             .spawn(move || {
-                Self::reporter_loop(counters, sampler, interval, shutdown_clone);
+                Self::reporter_loop(counters, sampler, interval, nic_stats_fn, shutdown_clone);
             })
             .expect("failed to spawn perf reporter thread");
 
@@ -504,10 +539,13 @@ impl PerfReporter {
         counters: Arc<PerfCounters>,
         sampler: Arc<LatencySampler>,
         interval: Duration,
+        nic_stats_fn: Option<NicStatsFn>,
         shutdown: Arc<AtomicBool>,
     ) {
         let mut prev_snapshot = counters.snapshot();
         let mut prev_time = Instant::now();
+        let mut prev_nic: Option<NicStatsSnapshot> =
+            nic_stats_fn.as_ref().and_then(|f| f());
 
         while !shutdown.load(Ordering::Relaxed) {
             thread::sleep(interval);
@@ -526,6 +564,22 @@ impl PerfReporter {
             let rates = current.rates_since(&prev_snapshot, elapsed_secs);
             let latencies = sampler.percentiles();
 
+            // Snapshot NIC counters and compute deltas. If the previous
+            // snapshot is missing (first tick failed) or the current read
+            // fails, emit "-" for the nic_* fields so the harness can tell
+            // the difference between "zero drops" and "no data".
+            let cur_nic = nic_stats_fn.as_ref().and_then(|f| f());
+            let nic_fields: String = match (prev_nic, cur_nic) {
+                (Some(prev), Some(cur)) => format!(
+                    "nic_imissed={} nic_ierrors={} nic_rx_nombuf={}",
+                    cur.rx_missed.saturating_sub(prev.rx_missed),
+                    cur.rx_errors.saturating_sub(prev.rx_errors),
+                    cur.rx_nombuf.saturating_sub(prev.rx_nombuf),
+                ),
+                _ => "nic_imissed=- nic_ierrors=- nic_rx_nombuf=-".to_string(),
+            };
+            prev_nic = cur_nic;
+
             let interval_secs = interval.as_secs();
             // Wall-clock timestamp at the END of this reporting window so the
             // perf-test harness can bucket [PERF] lines into TRex per-step time
@@ -537,6 +591,7 @@ impl PerfReporter {
             eprintln!(
                 "[PERF] ts_unix={:.3} interval={}s rx_pps={:.0} rx_bps={:.0} tx_pps={:.0} tx_bps={:.0} \
                  rx_drops={} rx_ring_drops={} rx_buf_drops={} tx_fails={} \
+                 {} \
                  lat_avg_us={:.0} lat_p50_us={:.0} lat_p95_us={:.0} \
                  lat_p99_us={:.0} lat_max_us={:.0} arp_hits={} arp_misses={} ring_drops={} \
                  worker_idle_pct={:.1} burst_avg={:.1}",
@@ -550,6 +605,7 @@ impl PerfReporter {
                 rates.rx_ring_drops,
                 rates.rx_buf_drops,
                 rates.tx_fails,
+                nic_fields,
                 rates.lat_avg_us,
                 latencies.p50_ns as f64 / 1000.0,
                 latencies.p95_ns as f64 / 1000.0,
@@ -760,6 +816,7 @@ mod tests {
             Arc::clone(&counters),
             Arc::clone(&sampler),
             Duration::from_millis(50),
+            None,
         );
 
         // Let it run briefly
@@ -783,6 +840,7 @@ mod tests {
             Arc::clone(&counters),
             Arc::clone(&sampler),
             Duration::from_millis(50),
+            None,
         );
 
         // Wait for at least one report cycle
@@ -792,5 +850,42 @@ mod tests {
         // If we got here without panic, the reporter ran successfully.
         // The actual output goes to stderr — we can't easily capture it here,
         // but no panics means the formatting and computation succeeded.
+    }
+
+    #[test]
+    fn perf_reporter_invokes_nic_stats_fn() {
+        let counters = Arc::new(PerfCounters::new());
+        let sampler = Arc::new(LatencySampler::new(64, 1));
+
+        // Track how many times the NIC stats callback fires and return a
+        // counter that grows so the reporter sees non-zero deltas.
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let nic_stats_fn: NicStatsFn = Box::new(move || {
+            let n = call_count_clone.fetch_add(1, Ordering::Relaxed);
+            Some(NicStatsSnapshot {
+                rx_missed: n * 10,
+                rx_errors: n,
+                rx_nombuf: 0,
+            })
+        });
+
+        let mut reporter = PerfReporter::start(
+            Arc::clone(&counters),
+            Arc::clone(&sampler),
+            Duration::from_millis(30),
+            Some(nic_stats_fn),
+        );
+
+        // Wait long enough for at least 2 ticks (first snapshot + one delta).
+        std::thread::sleep(Duration::from_millis(120));
+        reporter.stop();
+
+        // Must have been called at least twice: once at startup for the
+        // baseline, and once per reporting tick.
+        assert!(
+            call_count.load(Ordering::Relaxed) >= 2,
+            "nic_stats_fn should be invoked at least twice (baseline + tick)"
+        );
     }
 }
