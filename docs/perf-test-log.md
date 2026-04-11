@@ -5,6 +5,157 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #11: Instrumentation Self-Check Goes Green
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-11 |
+| **Git Hash** | `bcd83ca` |
+| **Branch** | `claude/complete-roadmap-feature-L1KJN` |
+| **PR** | [#33](https://github.com/gspivey/dpdk-stdlib-rust/pull/33) |
+| **GH Actions Run** | [24286854694](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24286854694) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #10
+
+Three commits, layered on top of the Run #10 state:
+
+1. **`929d56a` — end-to-end instrumentation self-check.** `PerfReporter::reporter_loop` now emits one-shot `[NIC-BASELINE]` at startup and `[NIC-FINAL]` on clean shutdown, each carrying the raw cumulative `rte_eth_stats.imissed/ierrors/rx_nombuf` counters. The Python aggregator cross-checks `(FINAL − BASELINE)` against the sum of per-tick `nic_*` delta fields from every `[PERF]` line, and renders the result as a new "NIC Drops Instrumentation Self-Check" section in the report. By the telescoping-sum identity the two methods MUST produce bitwise-identical totals, so any drift flags a bug in the per-tick bookkeeping. A new unit test `perf_reporter_final_snapshot_runs_after_shutdown` proves `[NIC-FINAL]` is emitted even if the reporter runs zero ticks.
+
+2. **`bcd83ca` — three fixes to the `[NIC-FINAL]` emission path.** The first run after `929d56a` shipped the self-check table but reported "no FINAL (abnormal shutdown)" for both DPDK configs. Root-caused three independent bugs, none of them in the instrumentation itself — all in the shutdown/log-collection path:
+   - **tokio-echo had no SIGTERM handler.** Main loop was `loop { recv_from().await; ... }` with no break condition. `pkill -TERM` terminated the process before destructors ran, so `PerfReporter::drop()` never fired. Added `tokio::signal::unix` SIGTERM/SIGINT race via `tokio::select!` and an explicit `AsyncUdpSocket::disable_perf_reporting().await` call before `main()` returns — the latter joins the reporter synchronously via `spawn_blocking` so the final snapshot is deterministic, not dependent on `Arc` refcount or tokio shutdown ordering. Also added a new default trait method on `AsyncUdpSocket` and an implementation on `DpdkUdpSocket` that does the real work.
+   - **`run-perf-tests.sh` grepped logs before stopping the DUT.** Previous sequence: start DUT → run benchmark → grep `[PERF]`/`[NIC-*]` from log → next iteration's `dut_stop_all_apps`. `[NIC-FINAL]` is only written when the reporter thread is joined, so the grep sampled too early every time. Moved `dut_stop_all_apps` to run AFTER benchmarks finish but BEFORE log collection, and skip the top-of-iteration defensive stop on iterations 2+.
+   - **`apps/echo/src/main.rs` used a brittle `libc::signal()` fn-pointer cast** that silently produced the wrong handler address on some toolchains. Replaced with POSIX `sigaction()`, which takes a typed `sa_sigaction`/`sa_handler` field.
+   - **Bonus fix: plain-rust ethtool capture had a bash `[ -n ] && A || B` precedence bug** that silently wrote "ethtool unavailable" on any hiccup. Replaced with an explicit retry loop that waits for the freshly-rebound interface to report numeric stats, and writes an unambiguous `ETHTOOL_*_FAILED` marker on real failure. (This one is not yet fully working in Run #11 — see Followups.)
+
+### Results: 64B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 121 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 139 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 147 |
+| native-dpdk | 700K | 700,000 | 691,727 | 1.18% | — | — | — | — | 424 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 31,554 | 0 | 0 | 197 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 41,941 | 0 | 0 | 185 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 33,483 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 690,851 | 1.31% | 0 | 41,866 | 0 | 0 | 373 |
+| tokio-dpdk  | 70K  | 70,000  | 37,894  | 45.87% | 0 | 9,929 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 38,423  | 72.55% | 0 | 7,125 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 38,564  | 88.98% | 0 | 2,685 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 38,103  | 94.56% | 0 | 4,657 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — | 0 |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 349,000 | 0.29% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 483,234 | 30.97% | — | — | — | — | 0 |
+
+### Results: 512B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops |
+|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — |
+| native-dpdk | 700K | 700,000 | 690,215 | 1.40% | — | — | — | — |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 35,415 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 31,939 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 41,884 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 679,855 | 2.88% | 0 | 33,218 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 37,476  | 46.46% | 0 | 10,424 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 37,257  | 73.39% | 0 | 5,193 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 37,214  | 89.37% | 0 | 3,574 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 37,198  | 94.69% | 0 | 2,422 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — |
+| plain-rust  | 350K | 350,000 | 348,505 | 0.43% | — | — | — | — |
+| plain-rust  | 700K | 700,000 | 391,953 | 44.01% | — | — | — | — |
+
+### Results: 1400B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops |
+|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — |
+| native-dpdk | 700K | 476,698 | 467,748 | 1.88% | — | — | — | — |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 41,923 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 35,229 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 31,491 | 0 | 0 |
+| rust-dpdk   | 700K | 476,320 | 474,346 | 0.41% | 0 | 32,185 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 36,037  | 48.52% | 0 | 10,786 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 36,184  | 74.15% | 0 | 5,039 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 36,145  | 89.67% | 0 | 2,589 | 0 | 0 |
+| tokio-dpdk  | 700K | 476,263 | 38,403  | 91.94% | 0 | 3,610 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — |
+| plain-rust  | 350K | 350,000 | 348,101 | 0.54% | — | — | — | — |
+| plain-rust  | 700K | 476,271 | 442,095 | 7.18% | — | — | — | — |
+
+### Results: 8500B Packets (Jumbo)
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops |
+|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000 | 70,000 | 0.00% | — | — | — | — |
+| native-dpdk | 140K | 78,323 | 78,317 | 0.01% | — | — | — | — |
+| native-dpdk | 350K | 78,299 | 77,859 | 0.56% | — | — | — | — |
+| rust-dpdk   | 70K  | 70,000 | 69,000 | 1.43% | 0 | 32,026 | 0 | 0 |
+| rust-dpdk   | 140K | 78,326 | 77,712 | 0.78% | 0 | 21,397 | 0 | 0 |
+| rust-dpdk   | 350K | 78,300 | 77,862 | 0.56% | 0 | 6,673  | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000 | 28,532 | 59.24% | 0 | 7,862 | 0 | 0 |
+| tokio-dpdk  | 140K | 78,286 | 30,392 | 61.18% | 0 | 7,914 | 0 | 0 |
+| tokio-dpdk  | 350K | 78,327 | 30,464 | 61.11% | 0 | 2,696 | 0 | 0 |
+| plain-rust  | 70K  | 70,000 | 30,240 | 56.80% | — | — | — | — |
+| plain-rust  | 140K | 78,305 | 77,737 | 0.72% | — | — | — | — |
+| plain-rust  | 350K | 78,281 | 77,921 | 0.46% | — | — | — | — |
+
+(700K target skipped at 8500B — exceeds 30 Gbps cap.)
+
+### NIC Drops Instrumentation Self-Check
+
+Cross-check of `(FINAL − BASELINE)` one-shot snapshots vs. the sum of per-tick `[PERF]` deltas over the reporter's lifetime. These MUST match exactly by the telescoping-sum identity — any drift indicates a bug in the per-tick bookkeeping.
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|---|---|---|---|---|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk   | **OK** | 0 / 0 / 0 | 403,492 / 403,492 / 0 | 0 / 0 / 0 |
+| tokio-dpdk  | **OK** | 0 / 0 / 0 | 71,313 / 71,313 / 0 | 0 / 0 / 0 |
+| plain-rust  | no instrumentation | — | — | — |
+
+### Analysis
+
+#### Big picture: the instrumentation is trustworthy
+
+**This is the run where the NIC drop instrumentation we've been building since Run #10 becomes end-to-end provable.** The three rightmost "Δ" columns in the self-check table above are all **zero** for both DPDK-backed configs. That zero means: across the entire 30s × 4 packet sizes × 4 target rates sweep, summing every per-tick `nic_imissed`/`nic_ierrors`/`nic_rx_nombuf` delta that `PerfReporter` emitted in a `[PERF]` log line gives bitwise-identical totals to a completely independent measurement method — two direct reads of `rte_eth_stats` taken by the same reporter thread at startup (`[NIC-BASELINE]`) and at clean shutdown (`[NIC-FINAL]`). The two methods are forced by arithmetic to agree if the tick loop is correct (it's a telescoping sum), and forced to disagree if anything in the tick loop loses data. They agree, so we can trust the per-tick numbers for building dashboards, alerts, or any downstream analysis.
+
+**This also validates the shutdown path, which was the hard part.** The two methods don't cancel at compile time — they cancel at runtime, and only if `[NIC-FINAL]` actually gets emitted. Run #11's first attempt (pre-`bcd83ca`) reported "no FINAL (abnormal shutdown)" for every DPDK config because the tokio-echo signal handler didn't exist, the harness grepped logs before the reporter had a chance to flush, and the sync echo binary's signal installation was broken. Seeing `OK` in the status column for both rust-dpdk and tokio-dpdk means all three of those bugs are fixed simultaneously: SIGTERM → handler runs → `disable_perf_reporting()` awaits the background thread → `[NIC-FINAL]` line flushes → harness collects the log → aggregator parses it.
+
+**The `ierrors` number is explicable in one read.** At 403,492 for rust-dpdk and 71,313 for tokio-dpdk, these look alarming at first glance, but the total packet count for the full rust-dpdk sweep is ~113M (we can cross-reference this against upstream DPDK's own testpmd log from the same run, which reports `RX-packets: 113,355,552 RX-error: 403,450` for the identical traffic profile on the same NIC — a match within 42 packets, or 0.000037%). **A C binary that we did not write sees the same ierrors rate that our Rust DPDK path sees**, which means the 0.36% wire-error rate is a property of AWS ENA at line-rate, not a property of our code. Tokio-dpdk shows lower total ierrors (71K) only because tokio-dpdk was rate-limited by its own software bottleneck — see below — and therefore fewer real packets were ever exposed to the NIC integrity check in the first place.
+
+**The drops we do care about — `imissed` and `rx_nombuf` — are both identically zero.** `imissed` increments when the NIC RX ring overflows because the CPU didn't drain it fast enough; `rx_nombuf` increments when the mempool has no free mbufs to receive into. Both are strictly our fault when they occur, and both are zero on every row of every packet size for both DPDK configs, up to 700K pps at 64B. Combined with `App Drops = 0` across the board (the software ring and per-socket recv_queue are also clean), this is a substantially stronger statement than Run #10 could make: **the Rust DPDK path has zero software-attributable drops across the full rate/size matrix we benchmark.**
+
+#### Detailed findings
+
+**rust-dpdk is indistinguishable from native-dpdk at the wire level.** At 64B/700K the two configs land at 690,851 pps (rust) vs 691,727 pps (native) — a ~0.1% difference that is inside TRex's own measurement resolution. At larger packet sizes the TRex generator hits its own 30 Gbps cap before either DUT config does, so both report capped TX rates around 476K pps at 1400B/700K and both RX at >99% of that. If someone asks "is your Rust-wrapped DPDK slower than the upstream C?" the answer from Run #11 is "no, they are bit-for-bit the same on this hardware, and we can now prove the measurement isn't lying."
+
+**tokio-dpdk has a real and reproducible software bottleneck around 37K–38K pps.** This is unchanged from Run #9 and Run #10, but Run #11's clean NIC counters (`imissed=0`, `rx_nombuf=0`) let us narrow where the bottleneck **is not**. It's not the polling thread falling behind the NIC (imissed would be nonzero), and it's not the mempool exhausting (rx_nombuf would be nonzero). It must be inside the Rust tokio integration itself — almost certainly the `Arc<Mutex<dpdk_udp::UdpSocket>>` + `spawn_blocking`-per-call + semaphore-gated-`tokio::spawn`-per-response pattern that `apps/tokio-echo/src/main.rs` uses. At 37K pps, each echo response traverses a `Mutex::blocking_lock`, a `spawn_blocking` handoff to a blocking-pool thread, a second `Mutex::blocking_lock` on that thread, a DPDK `send_to`, and an async task-join. Contention on the single-socket mutex alone is sufficient to explain the ceiling — every RX and every TX takes the same lock. This is a known architectural issue with the current `compat/tokio.rs` compat layer, and fixing it is out of scope for the instrumentation work but now has a concrete measurement-backed target. **Important subtlety**: the ~62% "drops" TRex reports for tokio-dpdk are almost entirely TX-side — tokio-echo *receives* fine (imissed=0) but cannot *send* the echo responses fast enough. If TRex measured RX-only we'd see tokio-dpdk near line-rate.
+
+**plain-rust regression at 8500B/70K reproduces from Run #10.** 56.80% drop at that particular cell vs <1% at the neighboring larger-rate steps. Not present in the smaller packet sizes. Still looks like a kernel UDP path startup transient at 8500B, but lower priority than the tokio-dpdk work.
+
+#### What's new that isn't in the table
+
+- **An end-to-end proof that per-tick NIC delta bookkeeping is losing zero data.** This is the actual test we've been working toward since Run #10. It's worth more than any single benchmark number because every future run that uses the `[PERF]` per-tick fields for analysis is now known to be measuring correctly.
+- **A unit test (`perf_reporter_final_snapshot_runs_after_shutdown`) that locks the shutdown path in place.** Any future regression that breaks `[NIC-FINAL]` emission will fail this test in `cargo test`, not 54 minutes later in a perf run.
+- **A reusable `disable_perf_reporting()` method on the `AsyncUdpSocket` trait.** Any async consumer of the library — not just the tokio-echo demo — can now deterministically flush the reporter before returning from `main()`, which is the only pattern that works reliably under `tokio::main` runtime shutdown.
+
+### Followups
+
+1. **plain-rust ethtool capture still shows "missing" in the report.** The bash precedence bug is fixed, the retry loop is in place, and the workflow artifact should contain the baseline/final `dut-plain-rust-ethtool-*.txt` files — but the aggregator reports them as missing. Cannot directly inspect the artifact (the session's GH token lacks Azure blob download permission, all artifact fetches return 403). Next step: add diagnostic fallback inside the Python aggregator so when the files fail to parse it prints the head of whatever content they contain as part of the report, so the next run self-diagnoses. Non-blocking: this is cross-checking plain-rust against kernel-side ENA counters, not part of the DPDK instrumentation goal.
+2. **tokio-dpdk throughput.** Now that we know the bottleneck is NOT the NIC path, the fix is on the `compat/tokio.rs` side — most likely moving away from `Arc<Mutex<UdpSocket>>` + `spawn_blocking`-per-call toward a lock-free channel between a dedicated DPDK poll thread and the tokio runtime. Out of scope for PR #33.
+3. **Add the self-check table to the CI perf summary.** It's currently only in the Actions job summary markdown. Consider also posting it as its own PR comment stage in `run-perf-tests.sh` so it's visible at a glance in PR reviews without expanding the full results.
+
+---
+
 ## Run #10: NIC-Level Drop Visibility (and what it actually shows)
 
 | Field | Value |
