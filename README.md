@@ -135,6 +135,31 @@ RX: Backend `recv_frames()` → parse headers → ARP/ICMP inline → UDP payloa
 
 Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` writes directly into DPDK mbufs (zero-copy), while `build_udp_frame() -> Vec<u8>` produces owned bytes for the generic backend path. Both emit identical wire-format frames.
 
+### RX Drop Hierarchy
+
+An incoming packet can be dropped at five distinct layers between the wire and
+the application. When diagnosing loss, narrow down *which* layer is dropping
+before touching code — the fix is different at each one. The perf instrumentation
+(`[PERF]` log lines + perf-test harness) exposes counters at every layer we own,
+and the comparison table surfaces them as **NIC Drops** and **App Drops** columns:
+
+| # | Layer | Dropped because... | Counter | Column |
+|---|---|---|---|---|
+| 1 | Wire / NIC ingress | AWS ENA rate limiter, VPC shaping, bad cabling, upstream congestion | — (not owned by this stack) | inferred: `(TX − RX) − NIC Drops − App Drops` |
+| 2 | NIC RX descriptor ring (HW) | Software polled too slowly → ring fills → NIC has nowhere to DMA new packets | `rte_eth_stats.imissed` | **NIC Drops** |
+| 2b | NIC RX refill (HW) | Mempool exhausted → can't hand a free mbuf to the NIC for the next DMA | `rte_eth_stats.rx_nombuf` | **NIC Drops** |
+| 3 | dpdk-udp worker ring (SW, multi-core) | Internal SpscRing between RX worker thread and app thread is full | `PerfCounters.rx_drops_ring_full` | **App Drops** |
+| 4 | dpdk-udp `recv_queue` (SW, per-socket) | Per-socket `SO_RCVBUF`-equivalent (4096 pkts / 256 KiB) is full — app isn't calling `recv_from` fast enough | `PerfCounters.rx_drops_buffer_full` | **App Drops** |
+
+**How to read the columns in perf reports:**
+
+- **NIC Drops > 0, App Drops ≈ 0** → the poller isn't calling `rte_eth_rx_burst` fast enough to drain the HW ring (layer 2), or the mempool is too small (layer 2b). Fix: faster polling loop, larger mempool, more RX queues.
+- **NIC Drops ≈ 0, App Drops > 0** → the packet made it into the Rust stack but got stuck in the worker ring (layer 3) or the socket buffer (layer 4). Fix: faster consumer / larger `recv_queue` cap / move work off the app thread.
+- **Both ≈ 0 but RX < TX** → loss is at layer 1 (wire), which we can't directly count. Cross-reference with `native-dpdk` at the same rate to confirm it's environmental rather than something the stack is doing.
+- **Both > 0** → backpressure is propagating from app layer down through the stack. Start with layer 4, work down.
+
+For async backends, note that the `tokio-dpdk` compat layer adds a `spawn_blocking` hop per `recv_from`/`send_to` call, which caps throughput around 40K pps and makes layer 2 saturate easily under load. For raw throughput use the sync `dpdk_udp::UdpSocket` directly.
+
 ## Development
 
 ### Build and Test
