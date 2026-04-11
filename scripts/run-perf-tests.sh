@@ -904,8 +904,11 @@ start_dut_rust_dpdk() {
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
+    # --perf-interval 10 enables PerfReporter so [PERF] lines (rx_pps, rx_drops,
+    # rx_buf_drops, latencies) appear in the app log every 10s. The harness tails
+    # this log into the perf PR comment so the numbers can be compared to TRex.
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-rust-dpdk.log 2>&1 &"
     sleep 15
 
     # Verify it's running (retry up to 3 times — SSM can be slow)

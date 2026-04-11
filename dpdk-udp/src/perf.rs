@@ -271,15 +271,21 @@ impl CounterSnapshot {
             0.0
         };
 
+        let rx_ring_drops = self
+            .rx_drops_ring_full
+            .saturating_sub(prev.rx_drops_ring_full);
+        let rx_buf_drops = self
+            .rx_drops_buffer_full
+            .saturating_sub(prev.rx_drops_buffer_full);
+
         RateSnapshot {
             rx_pps: delta(self.rx_packets, prev.rx_packets),
             rx_bps: delta(self.rx_bytes, prev.rx_bytes) * 8.0,
             tx_pps: delta(self.tx_packets, prev.tx_packets),
             tx_bps: delta(self.tx_bytes, prev.tx_bytes) * 8.0,
-            rx_drops: self.rx_drops_ring_full.saturating_sub(prev.rx_drops_ring_full)
-                + self
-                    .rx_drops_buffer_full
-                    .saturating_sub(prev.rx_drops_buffer_full),
+            rx_drops: rx_ring_drops + rx_buf_drops,
+            rx_ring_drops,
+            rx_buf_drops,
             tx_fails: self.tx_failures.saturating_sub(prev.tx_failures),
             arp_hits: self.arp_cache_hits.saturating_sub(prev.arp_cache_hits),
             arp_misses: self.arp_cache_misses.saturating_sub(prev.arp_cache_misses),
@@ -301,7 +307,12 @@ pub struct RateSnapshot {
     pub tx_pps: f64,
     pub rx_bps: f64,
     pub tx_bps: f64,
+    /// Total RX drops in the interval (ring-full + socket buffer-full).
     pub rx_drops: u64,
+    /// Worker/RX-ring enqueue failures in the interval (multi-core pipeline).
+    pub rx_ring_drops: u64,
+    /// Socket-level recv-buffer (`SO_RCVBUF` equivalent) overflows in the interval.
+    pub rx_buf_drops: u64,
     pub tx_fails: u64,
     pub arp_hits: u64,
     pub arp_misses: u64,
@@ -518,7 +529,8 @@ impl PerfReporter {
             let interval_secs = interval.as_secs();
             eprintln!(
                 "[PERF] interval={}s rx_pps={:.0} rx_bps={:.0} tx_pps={:.0} tx_bps={:.0} \
-                 rx_drops={} tx_fails={} lat_avg_us={:.0} lat_p50_us={:.0} lat_p95_us={:.0} \
+                 rx_drops={} rx_ring_drops={} rx_buf_drops={} tx_fails={} \
+                 lat_avg_us={:.0} lat_p50_us={:.0} lat_p95_us={:.0} \
                  lat_p99_us={:.0} lat_max_us={:.0} arp_hits={} arp_misses={} ring_drops={} \
                  worker_idle_pct={:.1} burst_avg={:.1}",
                 interval_secs,
@@ -527,6 +539,8 @@ impl PerfReporter {
                 rates.tx_pps,
                 rates.tx_bps,
                 rates.rx_drops,
+                rates.rx_ring_drops,
+                rates.rx_buf_drops,
                 rates.tx_fails,
                 rates.lat_avg_us,
                 latencies.p50_ns as f64 / 1000.0,
@@ -721,6 +735,8 @@ mod tests {
         assert!((rates.tx_pps - 34900.0).abs() < 1.0);
         // rx_drops aggregates both ring-full (5) and buffer-full (7) drops.
         assert_eq!(rates.rx_drops, 12);
+        assert_eq!(rates.rx_ring_drops, 5);
+        assert_eq!(rates.rx_buf_drops, 7);
         assert_eq!(rates.tx_fails, 1);
         assert!((rates.burst_avg - 35.0).abs() < 0.1);
         assert!(rates.lat_avg_us > 0.0);
