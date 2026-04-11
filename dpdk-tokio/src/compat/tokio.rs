@@ -63,26 +63,31 @@ impl UdpSocket {
 
         #[cfg(feature = "dpdk")]
         {
-            // Try DPDK first (blocking init in spawn_blocking)
-            let dpdk_result = ::tokio::task::spawn_blocking(move || {
-                dpdk_udp::UdpSocket::bind(addr)
-            }).await;
+            // Skip DPDK entirely when linked against the stub backend — a stub
+            // socket would bind successfully but never produce/consume any
+            // packets, so loopback I/O would silently hang.
+            if !dpdk_udp::is_stub() {
+                // Try DPDK first (blocking init in spawn_blocking)
+                let dpdk_result = ::tokio::task::spawn_blocking(move || {
+                    dpdk_udp::UdpSocket::bind(addr)
+                }).await;
 
-            match dpdk_result {
-                Ok(Ok(socket)) => {
-                    let local_addr = socket.local_addr()?;
-                    return Ok(UdpSocket {
-                        inner: UdpSocketInner::Dpdk(DpdkAsyncSocket {
-                            socket: std::sync::Arc::new(::tokio::sync::Mutex::new(socket)),
-                            local_addr,
-                        }),
-                    });
-                }
-                Ok(Err(e)) => {
-                    eprintln!("DPDK bind failed ({}), falling back to tokio", e);
-                }
-                Err(e) => {
-                    eprintln!("DPDK spawn_blocking failed ({}), falling back to tokio", e);
+                match dpdk_result {
+                    Ok(Ok(socket)) => {
+                        let local_addr = socket.local_addr()?;
+                        return Ok(UdpSocket {
+                            inner: UdpSocketInner::Dpdk(DpdkAsyncSocket {
+                                socket: std::sync::Arc::new(::tokio::sync::Mutex::new(socket)),
+                                local_addr,
+                            }),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("DPDK bind failed ({}), falling back to tokio", e);
+                    }
+                    Err(e) => {
+                        eprintln!("DPDK spawn_blocking failed ({}), falling back to tokio", e);
+                    }
                 }
             }
         }

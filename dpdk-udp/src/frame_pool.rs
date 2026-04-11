@@ -168,8 +168,20 @@ impl FramePool {
             return None; // pool exhausted
         }
 
+        // Read the slot. There is a race with `free()` because free advances
+        // `free_head` *before* writing the slot, so we may observe the new
+        // head with the slot still holding its previous sentinel value
+        // (`u32::MAX`). Spin until the producer has finished publishing the
+        // index, and consume it via `swap` so the slot is left in the
+        // sentinel state for the next round.
         let slot = (tail & self.free_mask()) as usize;
-        let idx = self.free_list[slot].load(Ordering::Relaxed);
+        let idx = loop {
+            let v = self.free_list[slot].swap(u32::MAX, Ordering::Acquire);
+            if v != u32::MAX {
+                break v;
+            }
+            std::hint::spin_loop();
+        };
 
         self.free_tail.store(tail + 1, Ordering::Release);
         Some(idx)

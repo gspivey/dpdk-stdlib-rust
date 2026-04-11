@@ -135,6 +135,31 @@ RX: Backend `recv_frames()` → parse headers → ARP/ICMP inline → UDP payloa
 
 Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` writes directly into DPDK mbufs (zero-copy), while `build_udp_frame() -> Vec<u8>` produces owned bytes for the generic backend path. Both emit identical wire-format frames.
 
+### RX Drop Hierarchy
+
+An incoming packet can be dropped at five distinct layers between the wire and
+the application. When diagnosing loss, narrow down *which* layer is dropping
+before touching code — the fix is different at each one. The perf instrumentation
+(`[PERF]` log lines + perf-test harness) exposes counters at every layer we own,
+and the comparison table surfaces them as **NIC Drops** and **App Drops** columns:
+
+| # | Layer | Dropped because... | Counter | Column |
+|---|---|---|---|---|
+| 1 | Wire / NIC ingress | AWS ENA rate limiter, VPC shaping, bad cabling, upstream congestion | — (not owned by this stack) | inferred: `(TX − RX) − NIC Drops − App Drops` |
+| 2 | NIC RX descriptor ring (HW) | Software polled too slowly → ring fills → NIC has nowhere to DMA new packets | `rte_eth_stats.imissed` | **NIC Drops** |
+| 2b | NIC RX refill (HW) | Mempool exhausted → can't hand a free mbuf to the NIC for the next DMA | `rte_eth_stats.rx_nombuf` | **NIC Drops** |
+| 3 | dpdk-udp worker ring (SW, multi-core) | Internal SpscRing between RX worker thread and app thread is full | `PerfCounters.rx_drops_ring_full` | **App Drops** |
+| 4 | dpdk-udp `recv_queue` (SW, per-socket) | Per-socket `SO_RCVBUF`-equivalent (4096 pkts / 256 KiB) is full — app isn't calling `recv_from` fast enough | `PerfCounters.rx_drops_buffer_full` | **App Drops** |
+
+**How to read the columns in perf reports:**
+
+- **NIC Drops > 0, App Drops ≈ 0** → the poller isn't calling `rte_eth_rx_burst` fast enough to drain the HW ring (layer 2), or the mempool is too small (layer 2b). Fix: faster polling loop, larger mempool, more RX queues.
+- **NIC Drops ≈ 0, App Drops > 0** → the packet made it into the Rust stack but got stuck in the worker ring (layer 3) or the socket buffer (layer 4). Fix: faster consumer / larger `recv_queue` cap / move work off the app thread.
+- **Both ≈ 0 but RX < TX** → loss is at layer 1 (wire), which we can't directly count. Cross-reference with `native-dpdk` at the same rate to confirm it's environmental rather than something the stack is doing.
+- **Both > 0** → backpressure is propagating from app layer down through the stack. Start with layer 4, work down.
+
+For async backends, note that the `tokio-dpdk` compat layer adds a `spawn_blocking` hop per `recv_from`/`send_to` call, which caps throughput around 40K pps and makes layer 2 saturate easily under load. For raw throughput use the sync `dpdk_udp::UdpSocket` directly.
+
 ## Development
 
 ### Build and Test
@@ -237,6 +262,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
 | Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
+| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default |
 | Multicast join/leave | Basic | IPv4 only, simplified group tracking |
 | Connected socket filtering | Complete | Buffers non-matching packets |
 | Socket timeouts | Complete | Read and write deadlines |
@@ -248,7 +274,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
 | **Subnet-aware routing** | Full FIB with longest-prefix match | Subnet-aware with longest-prefix-match, auto-detection from OS | Done |
-| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | None — unbounded buffering until hardware ring fills | Planned |
+| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | Configurable byte-based buffer with atomic drop counters (`recv_drops`, `set_recv_buffer_size`) | Done |
 | **RX checksum validation** | Hardware or software verification on every packet | Software verification on every RX packet | Done |
 | **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | NIC computes when capable, software fallback | Done |
 | **ICMP error handling** | Destination/port unreachable queued to originating socket | Echo reply only — all ICMP errors ignored | Planned |
@@ -289,9 +315,9 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **TX hardware checksum offload** — When the NIC supports `CHECKSUM_PARTIAL` mode (e.g., ENA on AWS), the DPDK backend sets mbuf offload flags (`RTE_MBUF_F_TX_IP_CKSUM`, `RTE_MBUF_F_TX_UDP_CKSUM`) and writes the pseudo-header checksum so the NIC computes final checksums. Falls back to software checksums on NICs without offload or on non-DPDK backends.
 
-### Planned
+**RX backpressure and drop counters** — Socket-level receive buffer accounting with a configurable byte limit (SO_RCVBUF equivalent) and lock-free atomic drop counters. Applications call `set_recv_buffer_size(bytes)` to tune the limit and `recv_drops()` to read a `RecvDropStats { packets, bytes }` snapshot for production monitoring. Drops are also surfaced via the existing `rx_drops_buffer_full` perf counter and rolled into the `rx_drops` rate on the perf reporter. Default is 256 KiB, mirroring Linux `net.core.rmem_default`.
 
-**RX backpressure and drop counters** — Implement socket-level receive buffer accounting with configurable limits and exposed drop counters. Applications need visibility into packet loss. This is the most important gap for production use.
+### Planned
 
 **ICMP error handling** — Process destination unreachable and fragmentation needed messages. Surface errors to the application via the socket error API. Enables path MTU discovery.
 

@@ -2,11 +2,13 @@
 
 use crate::AsyncUdpSocket;
 #[cfg(feature = "dpdk")]
-use crate::SocketConfig;
+use crate::{RecvDropsSnapshot, SocketConfig};
 use async_trait::async_trait;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "dpdk")]
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Type alias for boxed async UDP sockets
@@ -208,5 +210,39 @@ impl AsyncUdpSocket for DpdkUdpSocket {
 
     fn backend_name(&self) -> &'static str {
         "dpdk"
+    }
+
+    async fn enable_perf_reporting(&self, interval: Duration) -> io::Result<()> {
+        let socket = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.enable_perf_reporting(interval)
+        }).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
+
+    async fn disable_perf_reporting(&self) {
+        let socket = self.inner.clone();
+        // spawn_blocking because disable_perf_reporting joins the reporter
+        // thread (blocking), and we must not block the async runtime thread.
+        // The final `[NIC-FINAL]` stderr line is emitted synchronously as
+        // part of PerfReporter::drop() inside this call.
+        let _ = tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            socket.disable_perf_reporting();
+        }).await;
+    }
+
+    async fn recv_drops(&self) -> RecvDropsSnapshot {
+        let socket = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let socket = socket.blocking_lock();
+            let stats = socket.recv_drops();
+            RecvDropsSnapshot {
+                packets: stats.packets,
+                bytes: stats.bytes,
+            }
+        }).await
+            .unwrap_or_default()
     }
 }

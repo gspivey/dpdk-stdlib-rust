@@ -6,7 +6,13 @@ description = "Async UDP Echo Server using Tokio with DPDK support"
 publish = false
 
 [features]
-default = []
+# `dpdk` is on by default so a workspace-level build like
+# `cargo build --features dpdk-stdlib-sys/bindgen` produces a binary that
+# actually uses the DPDK backend on machines where DPDK is installed.
+# When DPDK is not present, dpdk-stdlib-sys silently falls back to stubs,
+# so local `cargo build` (no DPDK) still works — it just runs against the
+# stub backend, identical to today's behavior.
+default = ["dpdk"]
 dpdk = ["dpdk-tokio/dpdk"]
 
 [dependencies]

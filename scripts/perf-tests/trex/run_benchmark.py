@@ -70,6 +70,10 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     # Clear stats before starting
     client.clear_stats()
 
+    # Wall-clock window for this rate step. The perf-test harness uses these
+    # to bucket DUT-side `[PERF]` log lines into per-step App Drops counts.
+    ts_start_unix = time.time()
+
     # Start traffic with duration — TRex will stop TX after duration_sec.
     # Use TRex 'pps' multiplier format for deterministic rate control.
     # force=True bypasses TRex's line rate check — ENA PMD reports 16 Gbps
@@ -83,6 +87,7 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     time.sleep(duration_sec + 2)
     client.stop(ports=[port])
     time.sleep(2)
+    ts_end_unix = time.time()
 
     # Collect stats
     stats = client.get_stats()
@@ -102,6 +107,8 @@ def run_single_benchmark(client, port, streams, target_pps, duration_sec):
     result = {
         'target_pps': target_pps,
         'duration_sec': duration_sec,
+        'ts_start_unix': round(ts_start_unix, 3),
+        'ts_end_unix': round(ts_end_unix, 3),
         'tx_pkts': tx_pkts,
         'rx_pkts': rx_pkts,
         'tx_pps': round(tx_pps),

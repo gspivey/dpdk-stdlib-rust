@@ -258,12 +258,17 @@ pub struct PortStats {
     pub rx_bytes: u64,
     /// Total transmitted bytes
     pub tx_bytes: u64,
-    /// Missed packets (no buffer available)
+    /// Missed packets: NIC dropped them because the software RX descriptor
+    /// ring had no free slots (i.e. the app polled too slowly). Corresponds to
+    /// `rte_eth_stats.imissed`.
     pub rx_missed: u64,
-    /// RX errors
+    /// RX errors (corresponds to `rte_eth_stats.ierrors`).
     pub rx_errors: u64,
-    /// TX errors
+    /// TX errors (corresponds to `rte_eth_stats.oerrors`).
     pub tx_errors: u64,
+    /// RX packets dropped because no mbuf was available from the mempool.
+    /// Corresponds to `rte_eth_stats.rx_nombuf`.
+    pub rx_nombuf: u64,
 }
 
 /// Device capability information
@@ -603,6 +608,7 @@ impl Port {
             rx_missed: stats.imissed,
             rx_errors: stats.ierrors,
             tx_errors: stats.oerrors,
+            rx_nombuf: stats.rx_nombuf,
         })
     }
 

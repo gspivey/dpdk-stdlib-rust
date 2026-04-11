@@ -34,13 +34,16 @@ DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="plain-rust,rust-dpdk,native-dpdk"
+CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
 CDK_STACK_NAME="PerfTestStack"
 CDK_DIR="$REPO_ROOT/deploy/cdk"
 RESULTS_DIR="$REPO_ROOT/perf-results"
 LOGS_DIR="$REPO_ROOT/instance-logs"
+# Exported so the inline python in aggregate_results / generate_markdown_summary
+# can find both directories without hard-coding paths.
+export RESULTS_DIR LOGS_DIR
 
 SSM_READINESS_TIMEOUT=600
 TREX_START_TIMEOUT=120
@@ -488,7 +491,7 @@ dut_stop_all_apps() {
     # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
     # Only escalate to SIGKILL after 10s if the process won't die.
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
+        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/tokio-echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/tokio-echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
     # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
     # the shared memory files persist and can cause the next DPDK app to fail
@@ -904,8 +907,11 @@ start_dut_rust_dpdk() {
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
         "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
 
+    # --perf-interval 10 enables PerfReporter so [PERF] lines (rx_pps, rx_drops,
+    # rx_buf_drops, latencies) appear in the app log every 10s. The harness tails
+    # this log into the perf PR comment so the numbers can be compared to TRex.
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/echo-rust-dpdk.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-rust-dpdk.log 2>&1 &"
     sleep 15
 
     # Verify it's running (retry up to 3 times — SSM can be slow)
@@ -960,6 +966,43 @@ start_dut_rust_dpdk_multicore() {
         return 1
     fi
     log_info "rust-dpdk-multicore echo server running"
+}
+
+start_dut_tokio_dpdk() {
+    log_info "Starting DUT: tokio-dpdk (async tokio-echo with DPDK backend)"
+    dut_bind_dpdk || return 1
+
+    # Ensure hugepages are set up (process cleanup already done by dut_bind_dpdk)
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+
+    # tokio-echo binary is built with --features dpdk in perf-test-stack.ts so
+    # the DPDK backend is selected automatically when DPDK is available.
+    # --perf-interval 10 enables PerfReporter so [PERF] lines (rx_pps, rx_drops,
+    # rx_buf_drops, latencies) appear in the app log every 10s — same as the
+    # rust-dpdk config.
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tokio-echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-tokio-dpdk.log 2>&1 &"
+    sleep 15
+
+    # Verify it's running (retry up to 3 times — SSM can be slow)
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/tokio-echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "tokio-dpdk verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
+    if [[ "$status" != *"running"* ]]; then
+        log_error "tokio-dpdk echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-tokio-dpdk.log 2>/dev/null" || true
+        return 1
+    fi
+    log_info "tokio-dpdk echo server running"
 }
 
 start_dut_native_dpdk() {
@@ -1025,6 +1068,29 @@ start_dut_plain_rust() {
     log_info "Starting DUT: plain-rust (minimal std::net echo server)"
     dut_bind_kernel || return 1
 
+    # Capture kernel NIC counters BEFORE starting the echo server. For the
+    # DPDK configs we get per-tick NIC drop deltas straight from the
+    # PerfReporter, but plain-rust doesn't embed that instrumentation — the
+    # closest equivalent is ethtool -S from the kernel side. Baseline now,
+    # finalize after run_benchmark_for_config returns, so (final - baseline)
+    # gives a kernel-level NIC drop total that we can compare against the
+    # TRex observed wire loss for plain-rust. Without this, plain-rust's
+    # "NIC drops" column is always "—" and we can't tell whether kernel
+    # packet loss matches what DPDK sees.
+    # Give the kernel a moment to bring up the freshly-rebound interface —
+    # right after dut_bind_kernel the link may not be fully settled, so
+    # retry ethtool up to 3 times waiting for a result with numeric stats.
+    # The previous implementation had a subtle `[ -n ] && A || B` bash
+    # precedence bug that silently wrote "ethtool unavailable" to the file
+    # on failure, which the Python aggregator then counted as "no data".
+    local ethtool_baseline
+    ethtool_baseline=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+        "set -e; for retry in 1 2 3; do IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then OUT=\$(ethtool -S \$IFACE 2>&1); if echo \"\$OUT\" | grep -q ': [0-9]'; then echo \"\$OUT\"; exit 0; fi; fi; sleep 2; done; echo 'ETHTOOL_BASELINE_FAILED iface=\$IFACE'; exit 0" 2>/dev/null || echo "(SSM failed)")
+    echo "$ethtool_baseline" > "$LOGS_DIR/dut-plain-rust-ethtool-baseline.txt"
+    local base_lines
+    base_lines=$(echo "$ethtool_baseline" | wc -l)
+    log_info "plain-rust ethtool baseline captured ($base_lines lines, head: $(echo "$ethtool_baseline" | head -2 | tr '\n' ' '))"
+
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
         "cd /opt/dpdk-stdlib && nohup ./target/release/plain-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/plain-echo.log 2>&1 &"
     sleep 10
@@ -1055,11 +1121,331 @@ aggregate_results() {
     mkdir -p "$RESULTS_DIR"
 
     python3 - <<'PYEOF'
-import json, glob, os, sys
+import json, glob, os, re, sys
 from datetime import datetime, timezone
 
 results_dir = os.environ.get("RESULTS_DIR", "perf-results")
+logs_dir = os.environ.get("LOGS_DIR", "perf-logs")
 output_file = os.path.join(results_dir, "perf-report.json")
+
+# Regex pulls fields out of:
+#   [PERF] ts_unix=1712.345 interval=10s rx_pps=... rx_drops=N rx_ring_drops=N rx_buf_drops=N
+#          nic_imissed=N nic_ierrors=N nic_rx_nombuf=N ...
+# nic_* fields are emitted as "-" on non-DPDK backends, so we parse them as
+# an optional string and treat non-digits as "unavailable".
+PERF_RE = re.compile(
+    r"^\[PERF\]\s+ts_unix=(?P<ts>[\d.]+).*?\s"
+    r"rx_drops=(?P<rx_drops>\d+).*?\s"
+    r"rx_ring_drops=(?P<rx_ring>\d+).*?\s"
+    r"rx_buf_drops=(?P<rx_buf>\d+)"
+)
+NIC_IMISSED_RE = re.compile(r"nic_imissed=(\d+|-)")
+NIC_IERRORS_RE = re.compile(r"nic_ierrors=(\d+|-)")
+NIC_RX_NOMBUF_RE = re.compile(r"nic_rx_nombuf=(\d+|-)")
+INTERVAL_RE = re.compile(r"interval=(\d+)s")
+
+# [NIC-BASELINE] / [NIC-FINAL] are one-shot lines emitted by PerfReporter at
+# startup and at clean shutdown. They capture the RAW cumulative rte_eth_stats
+# counters, so (FINAL - BASELINE) is the total NIC drops that happened across
+# the reporter's entire lifetime. The harness cross-checks that against the
+# sum of per-tick deltas carried in [PERF] lines. A mismatch means either:
+#   1. the tick-loop delta computation is losing data (reporter bug), or
+#   2. the window-overlap aggregator below is double-counting or skipping
+#      samples, or
+#   3. the NIC counters moved outside the [BASELINE, FINAL] window (e.g. a
+#      race where the nic_stats_fn callback observed stale data).
+# This is our end-to-end self-consistency check on the instrumentation.
+NIC_BASELINE_RE = re.compile(
+    r"^\[NIC-BASELINE\]\s+ts_unix=(?P<ts>[\d.]+)\s+"
+    r"imissed=(?P<imissed>\d+)\s+"
+    r"ierrors=(?P<ierrors>\d+)\s+"
+    r"rx_nombuf=(?P<rx_nombuf>\d+)"
+)
+NIC_FINAL_RE = re.compile(
+    r"^\[NIC-FINAL\]\s+ts_unix=(?P<ts>[\d.]+)\s+"
+    r"imissed=(?P<imissed>\d+)\s+"
+    r"ierrors=(?P<ierrors>\d+)\s+"
+    r"rx_nombuf=(?P<rx_nombuf>\d+)"
+)
+
+def _parse_nic_field(match):
+    """Return int for numeric fields, None for "-" / missing."""
+    if match is None:
+        return None
+    v = match.group(1)
+    if v == "-":
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+def load_perf_lines(config_name):
+    """Return list of dicts with software + NIC drop fields.
+    `interval` is the reporter window in seconds — used to figure out which
+    rate-step a [PERF] sample belongs to (the line's ts_unix marks the END of
+    the window, so the sample covers [ts - interval, ts]).
+
+    NIC fields (nic_imissed/nic_ierrors/nic_rx_nombuf) are None on non-DPDK
+    backends; the harness propagates None to the report so downstream
+    consumers can distinguish "backend doesn't expose NIC stats" from
+    "zero NIC drops"."""
+    perf_path = os.path.join(logs_dir, f"dut-{config_name}-perf.log")
+    samples = []
+    if not os.path.exists(perf_path):
+        return samples
+    try:
+        with open(perf_path) as fh:
+            for line in fh:
+                m = PERF_RE.search(line)
+                if not m:
+                    continue
+                im = INTERVAL_RE.search(line)
+                interval = int(im.group(1)) if im else 10
+                samples.append({
+                    "ts": float(m.group("ts")),
+                    "interval": interval,
+                    "rx_drops": int(m.group("rx_drops")),
+                    "rx_ring": int(m.group("rx_ring")),
+                    "rx_buf": int(m.group("rx_buf")),
+                    "nic_imissed": _parse_nic_field(NIC_IMISSED_RE.search(line)),
+                    "nic_ierrors": _parse_nic_field(NIC_IERRORS_RE.search(line)),
+                    "nic_rx_nombuf": _parse_nic_field(NIC_RX_NOMBUF_RE.search(line)),
+                })
+    except Exception as e:
+        print(f"Warning: failed to parse {perf_path}: {e}", file=sys.stderr)
+    return samples
+
+def load_nic_baseline_final(config_name):
+    """Parse [NIC-BASELINE] and [NIC-FINAL] from the config's perf log.
+    Returns (baseline_dict, final_dict) where each is None if the
+    corresponding line wasn't found (e.g. non-DPDK backend or abnormal
+    shutdown). PerfReporter emits exactly one BASELINE at startup and one
+    FINAL at clean shutdown, so in a healthy run we expect one of each."""
+    perf_path = os.path.join(logs_dir, f"dut-{config_name}-perf.log")
+    baseline = None
+    final = None
+    if not os.path.exists(perf_path):
+        return baseline, final
+    try:
+        with open(perf_path) as fh:
+            for line in fh:
+                m = NIC_BASELINE_RE.search(line)
+                if m:
+                    baseline = {
+                        "ts": float(m.group("ts")),
+                        "imissed": int(m.group("imissed")),
+                        "ierrors": int(m.group("ierrors")),
+                        "rx_nombuf": int(m.group("rx_nombuf")),
+                    }
+                    continue
+                m = NIC_FINAL_RE.search(line)
+                if m:
+                    final = {
+                        "ts": float(m.group("ts")),
+                        "imissed": int(m.group("imissed")),
+                        "ierrors": int(m.group("ierrors")),
+                        "rx_nombuf": int(m.group("rx_nombuf")),
+                    }
+    except Exception as e:
+        print(f"Warning: failed to parse baseline/final from {perf_path}: {e}",
+              file=sys.stderr)
+    return baseline, final
+
+
+def load_ethtool_stats(path):
+    """Parse `ethtool -S <iface>` output into a dict of name→int.
+
+    The output format is one stat per line:
+        NIC statistics:
+             rx_packets: 12345
+             tx_packets: 67890
+             rx_missed_errors: 0
+             ...
+    Leading spaces are stripped. Non-integer values are skipped."""
+    stats = {}
+    if not os.path.exists(path):
+        return stats
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if ":" not in line:
+                    continue
+                key, _, val = line.partition(":")
+                val = val.strip()
+                if not val:
+                    continue
+                try:
+                    stats[key.strip()] = int(val)
+                except ValueError:
+                    # Some ethtool fields are strings (driver name, etc.) —
+                    # we only care about numeric counters for diffing.
+                    pass
+    except Exception as e:
+        print(f"Warning: failed to parse ethtool stats {path}: {e}",
+              file=sys.stderr)
+    return stats
+
+
+def compute_kernel_nic_delta(config_name):
+    """For plain-rust, compute kernel NIC drop delta from pre/post
+    `ethtool -S` snapshots. Returns a dict with selected drop counters
+    (rx_missed_errors, rx_dropped, rx_errors, rx_no_buffer_count) or
+    None if either snapshot is missing.
+
+    On AWS ENA these specific counters are the kernel-visible equivalent
+    of what rte_eth_stats.imissed/ierrors/rx_nombuf expose to DPDK.
+    Using ethtool gives plain-rust parity with the DPDK self-check and
+    lets us cross-reference kernel drops against TRex observed wire loss."""
+    base_path = os.path.join(logs_dir,
+                             f"dut-{config_name}-ethtool-baseline.txt")
+    final_path = os.path.join(logs_dir,
+                              f"dut-{config_name}-ethtool-final.txt")
+    baseline = load_ethtool_stats(base_path)
+    final = load_ethtool_stats(final_path)
+    if not baseline or not final:
+        return None
+
+    # ENA kernel driver exposes these; names may vary slightly across
+    # kernel versions so we look for the most common forms.
+    counters = [
+        "rx_missed_errors",     # HW RX ring full (ENA equivalent of imissed)
+        "rx_dropped",           # Generic RX drops
+        "rx_errors",            # Total rx errors (ENA equivalent of ierrors)
+        "rx_no_buffer_count",   # No sk_buff available (equivalent of rx_nombuf)
+    ]
+    delta = {}
+    for c in counters:
+        if c in baseline and c in final:
+            delta[c] = final[c] - baseline[c]
+    return delta if delta else None
+
+
+def compute_nic_consistency_check(config_name, samples):
+    """Compare (FINAL - BASELINE) against the sum of per-tick [PERF] deltas.
+
+    Returns a dict with:
+      - status: "ok" | "mismatch" | "no_data" | "no_shutdown"
+      - expected: dict with imissed/ierrors/rx_nombuf from FINAL-BASELINE
+      - actual:   dict with the sum of all [PERF] per-tick deltas
+      - delta:    actual - expected (signed; positive = over-count,
+                  negative = under-count / lost data)
+
+    "no_data" means no BASELINE was parsed (non-DPDK backend).
+    "no_shutdown" means BASELINE was found but FINAL was not (reporter
+    probably crashed or the process was killed before clean shutdown).
+    """
+    baseline, final = load_nic_baseline_final(config_name)
+    if baseline is None:
+        return {"status": "no_data"}
+    if final is None:
+        return {"status": "no_shutdown", "baseline": baseline}
+
+    expected = {
+        "imissed": final["imissed"] - baseline["imissed"],
+        "ierrors": final["ierrors"] - baseline["ierrors"],
+        "rx_nombuf": final["rx_nombuf"] - baseline["rx_nombuf"],
+    }
+
+    # Sum per-tick deltas across the ENTIRE run — deliberately no window
+    # filtering; BASELINE→FINAL covers the reporter's whole lifetime. Only
+    # count samples that actually reported numeric values (non-DPDK ticks
+    # would have None, but a DPDK-backed reporter should return numbers
+    # every tick).
+    actual = {"imissed": 0, "ierrors": 0, "rx_nombuf": 0}
+    for s in samples:
+        if s["nic_imissed"] is not None:
+            actual["imissed"] += s["nic_imissed"]
+        if s["nic_ierrors"] is not None:
+            actual["ierrors"] += s["nic_ierrors"]
+        if s["nic_rx_nombuf"] is not None:
+            actual["rx_nombuf"] += s["nic_rx_nombuf"]
+
+    delta = {k: actual[k] - expected[k] for k in expected}
+    # Match when all three counters agree exactly. Any mismatch — even by 1
+    # — is worth flagging, since the deltas are derived from the same
+    # counter reads so drift here means our tick bookkeeping is broken.
+    status = "ok" if all(v == 0 for v in delta.values()) else "mismatch"
+    return {
+        "status": status,
+        "baseline": baseline,
+        "final": final,
+        "expected": expected,
+        "actual": actual,
+        "delta": delta,
+    }
+
+
+def annotate_with_app_drops(cfg_data):
+    """Inject software-layer drop fields (`app_drops`, `app_ring_drops`,
+    `app_buf_drops`) AND NIC-layer drop fields (`nic_imissed`, `nic_ierrors`,
+    `nic_rx_nombuf`) into each step in cfg_data['results'].
+
+    Sums [PERF] samples whose covered window [ts-interval, ts] overlaps the
+    step's [ts_start_unix, ts_end_unix]. NIC fields are only set if at least
+    one overlapping sample reported a numeric value (i.e. DPDK backend);
+    otherwise they stay absent so the markdown generator can render "—".
+
+    Note: we deliberately do NOT compute a combined `imissed + ierrors +
+    rx_nombuf` total here. On AWS ENA, `ierrors` is dominated by background
+    noise unrelated to test traffic (Run #10 showed ~50K ierrors/step in the
+    C reference testpmd binary while imissed/rx_nombuf stayed at 0). Summing
+    the three into one column masks the real drop signal; downstream
+    consumers should display the three sub-columns separately."""
+    name = cfg_data.get("config_name", "")
+    samples = load_perf_lines(name)
+    # Always run the consistency check — even with zero samples, the check
+    # will return "no_data" / "no_shutdown" which the markdown generator
+    # can render as "—" to make it clear which configs lack instrumentation.
+    cfg_data["nic_consistency"] = compute_nic_consistency_check(name, samples)
+    # For plain-rust we also attach kernel ethtool -S deltas captured by
+    # the test harness pre/post. This is the only NIC-level instrumentation
+    # available for the kernel echo path and gives plain-rust parity with
+    # the DPDK configs in the self-check table.
+    kernel_delta = compute_kernel_nic_delta(name)
+    if kernel_delta is not None:
+        cfg_data["kernel_ethtool_delta"] = kernel_delta
+    if not samples:
+        return
+    for size_results in cfg_data.get("results", {}).values():
+        for step in size_results:
+            ts_start = step.get("ts_start_unix")
+            ts_end = step.get("ts_end_unix")
+            if ts_start is None or ts_end is None:
+                continue
+            buf_total = 0
+            ring_total = 0
+            drops_total = 0
+            nic_imissed_total = 0
+            nic_ierrors_total = 0
+            nic_nombuf_total = 0
+            nic_has_data = False
+            for s in samples:
+                window_start = s["ts"] - s["interval"]
+                window_end = s["ts"]
+                # Attribute the sample if its window overlaps the step window
+                if window_end < ts_start or window_start > ts_end:
+                    continue
+                buf_total += s["rx_buf"]
+                ring_total += s["rx_ring"]
+                drops_total += s["rx_drops"]
+                if s["nic_imissed"] is not None:
+                    nic_imissed_total += s["nic_imissed"]
+                    nic_has_data = True
+                if s["nic_ierrors"] is not None:
+                    nic_ierrors_total += s["nic_ierrors"]
+                    nic_has_data = True
+                if s["nic_rx_nombuf"] is not None:
+                    nic_nombuf_total += s["nic_rx_nombuf"]
+                    nic_has_data = True
+            step["app_drops"] = drops_total
+            step["app_ring_drops"] = ring_total
+            step["app_buf_drops"] = buf_total
+            if nic_has_data:
+                step["nic_imissed"] = nic_imissed_total
+                step["nic_ierrors"] = nic_ierrors_total
+                step["nic_rx_nombuf"] = nic_nombuf_total
 
 configs = {}
 for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
@@ -1069,6 +1455,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
         with open(f) as fh:
             data = json.load(fh)
             name = data.get("config_name", os.path.basename(f).replace(".json", ""))
+            annotate_with_app_drops(data)
             configs[name] = data
     except Exception as e:
         print(f"Warning: failed to read {f}: {e}", file=sys.stderr)
@@ -1123,10 +1510,39 @@ else:
     for pkt_size in sorted(all_sizes, key=lambda s: int(s.rstrip('B'))):
         lines.append(f"### {pkt_size} packets")
         lines.append("")
-        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
-        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|---------|---------|")
+        # Drop columns walk the receive path from hardware to app. The three
+        # NIC sub-columns are split out from rte_eth_stats because they mean
+        # different things and should not be summed — in particular on AWS
+        # ENA, `ierrors` is dominated by background NIC events (bad CRCs,
+        # management frames, etc.) that are NOT test-traffic loss. Lumping
+        # ierrors into a single "NIC Drops" total masks the real signal.
+        # Run #10 proved this — see docs/perf-test-log.md for details.
+        #
+        #   NIC imissed  = rte_eth_stats.imissed — the DPDK SW polled too
+        #                  slowly and the HW RX descriptor ring filled up,
+        #                  so the NIC discarded incoming frames. This is
+        #                  the REAL "app can't keep up" signal.
+        #   NIC ierrors  = rte_eth_stats.ierrors — generic NIC-level errors
+        #                  (CRC, framing, oversized, etc.). On ENA this is
+        #                  mostly AWS background noise and should be treated
+        #                  as such unless it changes between runs.
+        #   NIC nombuf   = rte_eth_stats.rx_nombuf — no mempool buffer was
+        #                  available to place an incoming packet; the NIC
+        #                  dropped it at the refill path. Indicates the
+        #                  mempool is sized too small or being drained.
+        #   App Drops    = dpdk-udp software-layer drops (rx_ring_drops +
+        #                  rx_buf_drops). Packets that made it through the
+        #                  NIC into the socket path but got dropped because
+        #                  the worker SpscRing or the per-socket recv_queue
+        #                  was full (consumer too slow).
+        #
+        # All four are only available for backends that emit [PERF] lines.
+        # Non-zero wire drop (TX/RX delta) with imissed/nombuf/App all ≈ 0
+        # points at wire loss (AWS ENA / VPC rate limiter / bad cabling).
+        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC imissed | NIC ierrors | NIC nombuf | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|-----------|-----------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {}).get(pkt_size, [])
 
@@ -1141,9 +1557,135 @@ else:
                 tx_mbps = f"{r.get('tx_mbps', 0):.1f}"
                 rx_mbps = f"{r.get('rx_mbps', 0):.1f}"
                 target = f"{r.get('target_pps', 0):,}"
+                # `app_drops` / `nic_imissed` / `nic_ierrors` / `nic_rx_nombuf`
+                # are only present for DPDK-backed configs that emit [PERF]
+                # lines. Show "—" for plain-rust / native-dpdk (native-dpdk
+                # is a C reference binary and does not emit [PERF] either).
+                if 'app_drops' in r:
+                    app_drops = f"{r['app_drops']:,}"
+                else:
+                    app_drops = "—"
+                if 'nic_imissed' in r:
+                    nic_imissed = f"{r['nic_imissed']:,}"
+                    nic_ierrors = f"{r['nic_ierrors']:,}"
+                    nic_nombuf = f"{r['nic_rx_nombuf']:,}"
+                else:
+                    nic_imissed = "—"
+                    nic_ierrors = "—"
+                    nic_nombuf = "—"
 
-                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {nic_imissed} | {nic_ierrors} | {nic_nombuf} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
 
+        lines.append("")
+
+    # ── NIC drops instrumentation self-check ────────────────────────────
+    # For every config that emitted [NIC-BASELINE]/[NIC-FINAL], compare
+    # (FINAL - BASELINE) to the sum of per-tick [PERF] deltas. If the
+    # reporter pipeline is healthy they MUST match exactly, because both
+    # numbers come from the same counter reads (FINAL-BASELINE is just a
+    # telescoping sum of the tick deltas). A mismatch here is the signal
+    # that our NIC drop instrumentation is losing data — which is the
+    # question that motivated adding this check in the first place.
+    lines.append("### NIC Drops Instrumentation Self-Check")
+    lines.append("")
+    lines.append(
+        "Compares `(NIC-FINAL − NIC-BASELINE)` one-shot snapshots "
+        "against the sum of per-tick `[PERF]` deltas over the reporter's "
+        "lifetime. These MUST match exactly — a mismatch means per-tick "
+        "delta bookkeeping is losing data."
+    )
+    lines.append("")
+    lines.append("| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |")
+    lines.append("|--------|--------|--------------------------------|----------------------------------|-----------------------------------|")
+    for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
+        cfg_data = configs.get(cfg_name, {})
+        check = cfg_data.get("nic_consistency")
+        if check is None:
+            lines.append(f"| {cfg_name} | no data | — | — | — |")
+            continue
+        status = check["status"]
+        if status == "no_data":
+            lines.append(f"| {cfg_name} | no instrumentation | — | — | — |")
+            continue
+        if status == "no_shutdown":
+            # Reporter started but never got a FINAL — abnormal exit.
+            lines.append(
+                f"| {cfg_name} | no FINAL (abnormal shutdown) | — | — | — |"
+            )
+            continue
+        exp = check["expected"]
+        act = check["actual"]
+        delta = check["delta"]
+        status_cell = "**OK**" if status == "ok" else "**MISMATCH**"
+
+        def _fmt(counter):
+            d = delta[counter]
+            d_str = f"+{d:,}" if d > 0 else f"{d:,}"
+            return f"{exp[counter]:,} / {act[counter]:,} / {d_str}"
+
+        lines.append(
+            f"| {cfg_name} | {status_cell} | "
+            f"{_fmt('imissed')} | {_fmt('ierrors')} | {_fmt('rx_nombuf')} |"
+        )
+    lines.append("")
+    lines.append(
+        "*`expected = FINAL − BASELINE` (raw NIC counter delta across reporter "
+        "lifetime). `actual = sum of per-tick [PERF] delta fields`. Any Δ ≠ 0 "
+        "is a bug in the tick loop's bookkeeping.*"
+    )
+    lines.append("")
+
+    # ── Kernel ethtool deltas for plain-rust ────────────────────────────
+    # The self-check above only covers DPDK configs (they embed
+    # PerfReporter). For plain-rust we don't have per-tick NIC counters,
+    # but the harness captures `ethtool -S <iface>` pre- and post-run so
+    # we can at least expose kernel-visible NIC drop totals side-by-side
+    # with the DPDK numbers. This is the non-DPDK baseline the user asked
+    # for: "we could probably get kernel data for the rust native app too".
+    plain_rust_data = configs.get("plain-rust", {})
+    kernel_delta = plain_rust_data.get("kernel_ethtool_delta")
+    if kernel_delta is not None:
+        lines.append("### plain-rust Kernel NIC Drops (ethtool -S delta)")
+        lines.append("")
+        lines.append(
+            "Kernel-visible NIC counters from the ena driver, captured via "
+            "`ethtool -S` before and after the plain-rust rate sweep. "
+            "These are the non-DPDK analogue of the DPDK self-check above "
+            "and let us compare what the kernel sees against what TRex "
+            "observes on the wire."
+        )
+        lines.append("")
+        lines.append("| Counter | Delta | Kernel Meaning |")
+        lines.append("|---------|------:|----------------|")
+        # Human-readable descriptions of each ena counter.
+        descriptions = {
+            "rx_missed_errors":
+                "HW RX ring overflowed — driver didn't drain fast enough "
+                "(equivalent of DPDK `rte_eth_stats.imissed`)",
+            "rx_dropped":
+                "Packets dropped somewhere in the RX path (generic)",
+            "rx_errors":
+                "Total RX errors — CRC, framing, truncation, etc. "
+                "(equivalent of DPDK `rte_eth_stats.ierrors`)",
+            "rx_no_buffer_count":
+                "No sk_buff available to receive incoming packet "
+                "(equivalent of DPDK `rte_eth_stats.rx_nombuf`)",
+        }
+        for counter in ["rx_missed_errors", "rx_dropped",
+                        "rx_errors", "rx_no_buffer_count"]:
+            if counter in kernel_delta:
+                desc = descriptions.get(counter, "")
+                lines.append(
+                    f"| `{counter}` | {kernel_delta[counter]:,} | {desc} |"
+                )
+        lines.append("")
+    elif "plain-rust" in configs:
+        lines.append("### plain-rust Kernel NIC Drops (ethtool -S delta)")
+        lines.append("")
+        lines.append(
+            "*ethtool snapshots not available — baseline or final file "
+            "missing in `$LOGS_DIR/dut-plain-rust-ethtool-*.txt`.*"
+        )
         lines.append("")
 
 md_content = "\n".join(lines)
@@ -1568,8 +2110,14 @@ DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 Running \`$config\` benchmark...
 Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$RATE_STEPS\`"
 
-        # Stop any running DUT apps
-        dut_stop_all_apps
+        # Only run dut_stop_all_apps at the top of the FIRST iteration —
+        # this is defensive in case a previous aborted run left echo/testpmd
+        # processes alive. For iterations 2+, the previous iteration already
+        # called dut_stop_all_apps at its tail (so [NIC-FINAL] was captured
+        # in the log) and we don't need to do it again here.
+        if [[ $config_idx -eq 1 ]]; then
+            dut_stop_all_apps
+        fi
         if [[ $config_idx -gt 1 ]]; then
             # Give the DUT time to settle between configs.
             # High-bandwidth benchmarks can overwhelm the kernel network stack
@@ -1601,6 +2149,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
         case "$config" in
             rust-dpdk)           start_dut_rust_dpdk           || start_ok=false ;;
             rust-dpdk-multicore) start_dut_rust_dpdk_multicore || start_ok=false ;;
+            tokio-dpdk)          start_dut_tokio_dpdk          || start_ok=false ;;
             native-dpdk)         start_dut_native_dpdk         || start_ok=false ;;
             rust-stdlib)         start_dut_rust_stdlib          || start_ok=false ;;
             plain-rust)          start_dut_plain_rust           || start_ok=false ;;
@@ -1640,11 +2189,39 @@ ${dut_diag}
             collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure-${config}"
         fi
 
+        # For plain-rust, capture kernel NIC counters NOW — before the
+        # process is killed — because ethtool counters live in the kernel
+        # and are independent of the echo process. For DPDK configs we
+        # must defer log collection until AFTER dut_stop_all_apps (see
+        # below) so the `[NIC-FINAL]` line has a chance to be emitted.
+        if [[ "$config" == "plain-rust" ]]; then
+            local ethtool_final
+            ethtool_final=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
+                "set -e; for retry in 1 2 3; do IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then OUT=\$(ethtool -S \$IFACE 2>&1); if echo \"\$OUT\" | grep -q ': [0-9]'; then echo \"\$OUT\"; exit 0; fi; fi; sleep 2; done; echo 'ETHTOOL_FINAL_FAILED iface=\$IFACE'; exit 0" 2>/dev/null || echo "(SSM failed)")
+            echo "$ethtool_final" > "$LOGS_DIR/dut-plain-rust-ethtool-final.txt"
+            local final_lines
+            final_lines=$(echo "$ethtool_final" | wc -l)
+            log_info "plain-rust ethtool final captured ($final_lines lines, head: $(echo "$ethtool_final" | head -2 | tr '\n' ' '))"
+        fi
+
+        # Stop the DUT BEFORE collecting the app log. This is essential
+        # for DPDK configs: PerfReporter's one-shot `[NIC-FINAL]` line is
+        # only emitted when the reporter thread is joined (either via
+        # `disable_perf_reporting` on clean shutdown or via `Drop` when
+        # the socket is dropped). If we grep the log while the DUT is
+        # still running, `[NIC-FINAL]` won't be there yet and the
+        # instrumentation self-check reports "no FINAL (abnormal shutdown)".
+        # We used to call dut_stop_all_apps at the top of the next
+        # iteration, but that was too late — the current iteration had
+        # already scraped the log.
+        dut_stop_all_apps
+
         # Collect DUT app log for this config
         local log_file
         case "$config" in
             rust-dpdk)           log_file="/var/log/echo-rust-dpdk.log" ;;
             rust-dpdk-multicore) log_file="/var/log/echo-rust-dpdk-multicore.log" ;;
+            tokio-dpdk)          log_file="/var/log/echo-tokio-dpdk.log" ;;
             native-dpdk)         log_file="/var/log/testpmd.log" ;;
             rust-stdlib)         log_file="/var/log/echo-rust-stdlib.log" ;;
             plain-rust)          log_file="/var/log/plain-echo.log" ;;
@@ -1654,6 +2231,19 @@ ${dut_diag}
             app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
                 "tail -50 $log_file 2>/dev/null || echo '(no log)'" 2>/dev/null || echo "(failed)")
             echo "$app_log" > "$LOGS_DIR/dut-${config}-app.log"
+
+            # Also pull every [PERF] line from the full log so we can compute
+            # per-step App Drops in aggregate_results. Each [PERF] line is ~300
+            # bytes; even at 30+ lines per config the total is well under SSM's
+            # output cap. Save to a separate file the aggregator reads.
+            # Also capture [NIC-BASELINE] / [NIC-FINAL] — one-shot lines the
+            # PerfReporter emits at startup and clean shutdown. They let the
+            # aggregator cross-check sum-of-tick-deltas against the end-minus-
+            # start NIC counter delta (instrumentation self-check).
+            local perf_lines
+            perf_lines=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                "grep -E '^\[PERF\]|^\[NIC-BASELINE\]|^\[NIC-FINAL\]' $log_file 2>/dev/null || echo ''" 2>/dev/null || echo "")
+            echo "$perf_lines" > "$LOGS_DIR/dut-${config}-perf.log"
             # Post testpmd log to PR for visibility (stats-period output shows RX/TX counters)
             if [[ "$config" == "native-dpdk" ]]; then
                 local testpmd_diag

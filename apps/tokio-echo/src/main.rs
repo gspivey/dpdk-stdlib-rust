@@ -61,6 +61,12 @@ struct Args {
     /// Statistics report interval in seconds
     #[arg(long, default_value_t = 10)]
     stats_interval: u64,
+
+    /// Performance reporting interval in seconds (0 = disabled).
+    /// On the DPDK backend this starts the PerfReporter, emitting `[PERF]`
+    /// log lines with rx/tx pps, drop counters, and latency percentiles.
+    #[arg(long, default_value_t = 0)]
+    perf_interval: u64,
 }
 
 /// Statistics tracker
@@ -136,6 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Local address: {}", socket.local_addr()?);
     println!("Max concurrent handlers: {}", args.workers);
     println!("Request timeout: {}ms", args.timeout);
+
+    if args.perf_interval > 0 {
+        socket.enable_perf_reporting(Duration::from_secs(args.perf_interval)).await?;
+        println!("Perf reporting interval: {}s", args.perf_interval);
+    }
+
     println!();
     println!("Echo server running... (Ctrl+C to stop)");
     println!();
@@ -159,20 +171,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Semaphore for limiting concurrent handlers
     let semaphore = Arc::new(Semaphore::new(args.workers));
 
+    // Install a shutdown signal that fires on SIGTERM / SIGINT. Racing
+    // this against recv_from in a tokio::select! lets the main loop exit
+    // cleanly on signal, which drops the Arc<dyn AsyncUdpSocket>, which
+    // drops the underlying UdpSocket, which drops the PerfReporter — and
+    // that Drop impl is what emits the one-shot `[NIC-FINAL]` line the
+    // perf harness cross-checks against per-tick [PERF] deltas. Without
+    // this, the process is killed by pkill -TERM before any destructor
+    // can run and [NIC-FINAL] is never emitted.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt())
+                .expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {},
+                _ = sigint.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    };
+    tokio::pin!(shutdown);
+
     // Main receive loop
     let mut buf = [0u8; 65535];
 
     loop {
-        // Receive a packet
-        let (len, from_addr) = match socket.recv_from(&mut buf).await {
-            Ok(result) => result,
-            Err(e) => {
-                stats.record_error();
-                if args.verbose {
-                    eprintln!("Receive error: {}", e);
-                }
-                continue;
+        // Receive a packet, racing against shutdown. On signal we break
+        // out of the loop, fall through to the `Shutting down` log, and
+        // let main() return so PerfReporter::drop() emits [NIC-FINAL].
+        let (len, from_addr) = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                println!("Received shutdown signal, stopping echo server...");
+                break;
             }
+            recv = socket.recv_from(&mut buf) => match recv {
+                Ok(result) => result,
+                Err(e) => {
+                    stats.record_error();
+                    if args.verbose {
+                        eprintln!("Receive error: {}", e);
+                    }
+                    continue;
+                }
+            },
         };
 
         stats.record_recv(len);
@@ -230,4 +279,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // Explicitly stop the PerfReporter before returning. This joins the
+    // reporter thread synchronously inside a spawn_blocking and triggers
+    // the one-shot `[NIC-FINAL]` stderr line that the perf harness pairs
+    // with `[NIC-BASELINE]` for its instrumentation self-check. Doing this
+    // explicitly (rather than relying on Drop) removes all timing dependence
+    // on Arc refcounts and tokio runtime shutdown ordering.
+    if args.perf_interval > 0 {
+        socket.disable_perf_reporting().await;
+    }
+    println!("Shutting down gracefully...");
+    Ok(())
 }

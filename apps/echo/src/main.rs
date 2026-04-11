@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::io;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -10,6 +11,27 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Install `signal_handler` for SIGTERM and SIGINT via `sigaction`.
+///
+/// The old `libc::signal(sig, fn as *const () as sighandler_t)` cast is
+/// brittle on some toolchains: with certain codegen paths the resulting
+/// `usize` doesn't match the actual function address, leaving the default
+/// handler in place, which means SIGTERM terminates the process without
+/// running any destructors — and in particular without running
+/// `PerfReporter::drop`, so the one-shot `[NIC-FINAL]` log line the perf
+/// harness relies on is never emitted. `sigaction` takes a typed
+/// `sa_sigaction`/`sa_handler` field and avoids the cast entirely.
+fn install_signal_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
+        sa.sa_sigaction = signal_handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
 }
 
 #[derive(Parser)]
@@ -30,10 +52,7 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
-    }
+    install_signal_handlers();
 
     let args = Args::parse();
     let bind_addr = format!("{}:{}", args.ip, args.port);
