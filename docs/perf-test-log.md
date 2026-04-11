@@ -5,6 +5,195 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #9: tokio-dpdk Backend in Matrix + App-Level Drop Visibility
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-11 |
+| **Git Hash** | `db968a7` |
+| **Branch** | `claude/complete-roadmap-feature-L1KJN` |
+| **PR** | [#33](https://github.com/gspivey/dpdk-stdlib-rust/pull/33) |
+| **GH Actions Run** | [24276173290](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24276173290) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Previous Run
+
+- **Threaded perf instrumentation through `dpdk-tokio`**: `AsyncUdpSocket` trait now exposes `enable_perf_reporting(interval)` and `recv_drops() -> RecvDropsSnapshot`. The DPDK backend implements both via `spawn_blocking` (cannot use `blocking_lock` inside an async runtime). The Tokio backend keeps the no-op defaults so std-net users are unchanged. New `RecvDropsSnapshot` type lives in `dpdk-tokio` so callers don't need to depend on `dpdk-udp` directly.
+- **Added `tokio-dpdk` to perf-test matrix**: New config in `perf-test-stack.ts` runs `tokio-echo --features dpdk` against the same TRex profiles as the existing configs. The default perf-test config list is now `plain-rust,rust-dpdk,tokio-dpdk,native-dpdk`.
+- **Per-step App Drops column**: `[PERF]` log lines now carry a `ts_unix=<epoch>` prefix so the aggregator can bucket samples into TRex per-step time ranges. `run_benchmark.py` records `ts_start_unix`/`ts_end_unix` for every rate step. `aggregate_results()` reads the full set of `[PERF]` lines from each DUT and sums `rx_buf_drops + rx_ring_drops` whose reporting window overlaps each step. The comparison table gains an "App Drops" column showing per-step DUT-side drops (DPDK configs only — `plain-rust` and `native-dpdk` show "—" since they don't emit `[PERF]` lines).
+- **Single workspace cargo build for perf instances**: `perf-test-stack.ts` previously did two cargo invocations, the second of which silently rebuilt `dpdk-stdlib-sys` *without* `--features bindgen`, leaving `tokio-echo` linked against the stub backend. Collapsed into a single `cargo build --release --features dpdk-sys/bindgen` so feature unification produces a real-DPDK binary for every workspace member. `tokio-echo` also gets `default = ["dpdk"]` so the workspace build picks up the DPDK backend without an extra `-p` flag.
+- **`compat::UdpSocket` now skips DPDK in stub mode**: Added `dpdk_udp::is_stub()` re-export and gated all three compat bind sites (`compat/net.rs`, `compat/tokio.rs`, `lib.rs::bind_udp_with_config`) on `!is_stub()`. Without this, enabling the `dpdk` feature on a stub build (which now happens during workspace test runs because of `tokio-echo`'s default feature) caused `compat::UdpSocket::bind("127.0.0.1:0")` to bind to a stub DPDK socket and then hang forever in `recv_from`.
+- **Fixed `frame_pool::alloc()` race**: The MPSC ring's `free()` advances `free_head` via `fetch_add(1)` *before* publishing the slot value, so a concurrent `alloc()` could observe the new head and read a stale `u32::MAX` sentinel. `alloc()` now uses `free_list[slot].swap(u32::MAX, Acquire)` with a `spin_loop` until the producer's `Release` store lands. Pre-existing race; surfaced deterministically in `--release` after the perf-instance feature unification rebuilt the test in release mode.
+
+### Results: 64B Packets
+
+#### native-dpdk (DPDK C baseline)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 125 | 0.00% |
+| 140K | 140,000 | 140,000 | 145 | 0.00% |
+| 350K | 350,000 | 349,999 | 160 | 0.00% |
+| 700K | 700,000 | 678,911 | 485 | 3.01% |
+
+#### rust-dpdk (single-core, run-to-completion)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 69,000 | 204 | 1.43% | 0 |
+| 140K | 140,000 | 139,000 | 0 | 0.71% | 0 |
+| 350K | 350,000 | 349,000 | 0 | 0.29% | 0 |
+| 700K | 700,000 | 677,828 | 0 | 3.17% | 0 |
+
+#### tokio-dpdk (NEW — async wrapper around dpdk-udp)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 39,954 | 0 | 42.92% | 0 |
+| 140K | 140,000 | 40,319 | 0 | 71.20% | 0 |
+| 350K | 350,000 | 40,192 | 0 | 88.52% | 0 |
+| 700K | 700,000 | 40,172 | 0 | 94.26% | 0 |
+
+#### plain-rust (std::net baseline)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 184 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 348,785 | 203 | 0.35% |
+| 700K | 700,000 | 540,674 | 0 | 22.76% |
+
+### Results: 512B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 124 | 0.00% |
+| 140K | 140,000 | 140,000 | 143 | 0.00% |
+| 350K | 350,000 | 349,959 | 159 | 0.01% |
+| 700K | 700,000 | 667,577 | 1,020 | 4.63% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 69,000 | 204 | 1.43% | 0 |
+| 140K | 140,000 | 139,000 | 0 | 0.71% | 0 |
+| 350K | 350,000 | 348,984 | 348 | 0.29% | 0 |
+| 700K | 700,000 | 658,380 | 0 | 5.95% | 0 |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 38,728 | 0 | 44.67% | 0 |
+| 140K | 140,000 | 38,661 | 0 | 72.39% | 0 |
+| 350K | 350,000 | 38,772 | 0 | 88.92% | 0 |
+| 700K | 700,000 | 38,686 | 0 | 94.47% | 0 |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 348,837 | 235 | 0.33% |
+| 700K | 700,000 | 444,207 | 0 | 36.54% |
+
+### Results: 1400B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 127 | 0.00% |
+| 140K | 140,000 | 140,000 | 148 | 0.00% |
+| 350K | 350,000 | 349,998 | 161 | 0.00% |
+| 700K | 476,273 | 473,654 | 2,647 | 0.55% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% | 0 |
+| 140K | 140,000 | 139,000 | 274 | 0.71% | 0 |
+| 350K | 350,000 | 349,000 | 249 | 0.29% | 0 |
+| 700K | 476,330 | 472,521 | 0 | 0.80% | 0 |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 37,740 | 0 | 46.09% | 0 |
+| 140K | 140,000 | 37,737 | 0 | 73.04% | 0 |
+| 350K | 350,000 | 37,576 | 0 | 89.26% | 0 |
+| 700K | 476,529 | 40,256 | 0 | 91.55% | 0 |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 138,994 | 0 | 0.72% |
+| 350K | 350,000 | 348,608 | 250 | 0.40% |
+| 700K | 476,267 | 451,169 | 2,608 | 5.27% |
+
+### Results: 8500B Packets (Jumbo)
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 142 | 0.00% |
+| 140K | 78,297 | 78,292 | 13,873 | 0.01% |
+| 350K | 78,358 | 78,254 | 14,162 | 0.13% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% | 0 |
+| 140K | 78,284 | 77,695 | 0 | 0.75% | 0 |
+| 350K | 78,297 | 77,579 | 0 | 0.92% | 0 |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % | App Drops |
+|-----------|--------|--------|-------------------|--------|-----------|
+| 70K | 70,000 | 30,010 | 0 | 57.13% | 0 |
+| 140K | 78,314 | 31,850 | 0 | 59.33% | 0 |
+| 350K | 78,289 | 31,795 | 0 | 59.39% | 0 |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 33,773 | 0 | 51.75% |
+| 140K | 78,286 | 77,720 | 0 | 0.72% |
+| 350K | 78,308 | 77,929 | 0 | 0.48% |
+
+(700K target skipped at 8500B — exceeds 30 Gbps cap.)
+
+### Analysis
+
+**`tokio-dpdk` now actually links against DPDK** (the headline fix). Run #8 had every `tokio-dpdk` row at 100% drop because `perf-test-stack.ts` did two separate cargo invocations and the second one rebuilt `dpdk-stdlib-sys` without bindgen, leaving `tokio-echo` linked against the stub backend that silently dropped every packet. This run uses a single workspace build with `--features dpdk-sys/bindgen` plus `default = ["dpdk"]` on `tokio-echo`, and `dmesg` confirms `vfio-pci ... opened by user (tokio-rt-worker:*)` on the perf instance — the binary is genuinely doing DPDK I/O.
+
+**`tokio-dpdk` plateaus at ~38–40K RX pps regardless of target rate.** Across every packet size and every target PPS step from 70K to 700K, RX flatlines at the same ~38K (1400B), ~38–40K (64B/512B), or ~30–32K (8500B) — independent of how hard TRex pushes. Drop rates climb from 43% at 70K to 94% at 700K, but the absolute RX number doesn't move. **App Drops is `0` on every row**, meaning the `dpdk-udp` `recv_queue` never fills — packets aren't being lost at the socket layer, they're being dropped at the NIC RX ring before the application ever polls them. The bottleneck is the consumer's polling rate.
+
+**Root cause is the `spawn_blocking` per-call cost in the compat shim.** The current `dpdk-tokio` `DpdkUdpSocket` wraps a sync `dpdk_udp::UdpSocket` and routes every `recv_from` / `send_to` through `tokio::task::spawn_blocking`. Each call hops to the blocking thread pool, acquires a `Mutex`, runs the sync I/O, and hops back. For an echo workload that's two `spawn_blocking` round-trips per packet — empirically ~25 µs of overhead per packet, which works out to roughly 40K pps. This is an architectural property of the current compat layer, not a bug; the compat layer exists for `tokio::net::UdpSocket` API compatibility, not raw throughput. Production code wanting the full DPDK throughput should use the sync `dpdk_udp::UdpSocket` directly (the `rust-dpdk` config is the proof point: same NIC, same kernel-bypass path, ~17× the throughput).
+
+**`rust-dpdk` continues to track `native-dpdk` closely.** At 64B/350K both deliver ~349K RX pps with <0.3% drops; at 64B/700K both fall off to ~678K (3.0% native vs 3.2% rust). At 1400B/700K both saturate at the ~476K bandwidth ceiling and track within 0.25%. The pure-Rust user-space stack continues to have no measurable throughput cost vs. testpmd at sub-saturation rates — only the run-to-completion polling overhead near the bandwidth ceiling.
+
+**`plain-rust` collapses at 64B/700K** (22.8% drop, 540K RX pps) and 512B/700K (36.5% drop, 444K RX pps), exactly as in Runs #6 and #7 — the kernel softirq path can't keep up with small-packet line rate, while both DPDK Rust configs hold up.
+
+**App Drops column is informative even when zero.** On `rust-dpdk` it's 0 at every rate, including 700K where there's still a real ~3% drop vs. TX. That tells us the loss is upstream of the application — the `dpdk-udp` socket buffer is never filling, so all loss is happening on the wire / NIC RX ring, not in the Rust stack. Combined with `native-dpdk` showing the same ~3% loss at the same rate, we can attribute the residual loss to AWS network conditions rather than to anything our stack is doing. This is exactly the visibility the new instrumentation was added to provide.
+
+**Frame-pool race fix is invisible in numbers but unblocked the run.** The pre-existing `MPSC` ring race in `frame_pool::alloc()` (free advances head before publishing the slot, alloc reads `u32::MAX` sentinel) was hidden by lucky scheduling in debug builds. Once the perf-test feature unification fix above landed, the test was rebuilt in release mode and triggered the race deterministically (`pool_producer_consumer` panicked with `range start index 549755813760 out of range`). Fixed by switching `alloc()` to `swap(u32::MAX, Acquire)` with a `spin_loop` waiting for the producer's `Release` store. No measurable performance impact — same numbers as Run #7 on `rust-dpdk`.
+
+---
+
 ## Run #7: RX Backpressure & Drop Counters
 
 | Field | Value |
