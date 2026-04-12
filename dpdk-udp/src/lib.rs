@@ -5451,4 +5451,142 @@ mod tests {
         assert_eq!(cfg.mode, VlanMode::Access);
         assert_eq!(cfg.vlan_id, 50);
     }
+
+    // ========================================================================
+    // Synthetic PPS Benchmark: VLAN mode overhead
+    // ========================================================================
+
+    /// Synthetic PPS benchmark measuring process_frame_zerocopy throughput
+    /// across VLAN modes. Run with:
+    ///   cargo test -p dpdk-stdlib-udp -- --nocapture vlan_pps_benchmark
+    ///
+    /// This measures pure CPU overhead of VLAN filtering in the RX hot path,
+    /// independent of NIC speed. Useful for extrapolating the cost of VLAN
+    /// filtering vs the ~600K+ PPS baseline seen in DPDK integration tests.
+    #[test]
+    fn vlan_pps_benchmark() {
+        const ITERATIONS: u64 = 500_000;
+
+        // Scenarios: (label, vlan_config, frame_builder)
+        struct Scenario {
+            label: &'static str,
+            vlan_config: Option<VlanConfig>,
+            use_tagged_frame: bool,
+            tag_vid: u16,
+        }
+
+        let scenarios = vec![
+            Scenario {
+                label: "No VLAN config (baseline, untagged)",
+                vlan_config: None,
+                use_tagged_frame: false,
+                tag_vid: 0,
+            },
+            Scenario {
+                label: "No VLAN config (baseline, tagged frame)",
+                vlan_config: None,
+                use_tagged_frame: true,
+                tag_vid: 100,
+            },
+            Scenario {
+                label: "PortTagging mode (matching VID 100)",
+                vlan_config: Some(VlanConfig::new(100).port_tagging()),
+                use_tagged_frame: true,
+                tag_vid: 100,
+            },
+            Scenario {
+                label: "Access mode (untagged frame)",
+                vlan_config: Some(VlanConfig::new(100).access()),
+                use_tagged_frame: false,
+                tag_vid: 0,
+            },
+            Scenario {
+                label: "Access mode (matching VID 100)",
+                vlan_config: Some(VlanConfig::new(100).access()),
+                use_tagged_frame: true,
+                tag_vid: 100,
+            },
+            Scenario {
+                label: "Trunk mode (VID 100 in allowed set)",
+                vlan_config: Some(VlanConfig::new(100).trunk(vec![100, 200, 300], None)),
+                use_tagged_frame: true,
+                tag_vid: 100,
+            },
+            Scenario {
+                label: "Trunk mode (untagged, native_vlan=100)",
+                vlan_config: Some(VlanConfig::new(100).trunk(vec![100, 200], Some(100))),
+                use_tagged_frame: false,
+                tag_vid: 0,
+            },
+            Scenario {
+                label: "PortTagging mode (DROP: wrong VID)",
+                vlan_config: Some(VlanConfig::new(100).port_tagging()),
+                use_tagged_frame: true,
+                tag_vid: 999,
+            },
+            Scenario {
+                label: "PortTagging mode (DROP: untagged)",
+                vlan_config: Some(VlanConfig::new(100).port_tagging()),
+                use_tagged_frame: false,
+                tag_vid: 0,
+            },
+        ];
+
+        println!("\n=== VLAN PPS Benchmark ({ITERATIONS} iterations per scenario) ===");
+        println!("{:<50} {:>12} {:>10}", "Scenario", "PPS", "ns/pkt");
+        println!("{}", "-".repeat(75));
+
+        let mut baseline_pps: Option<f64> = None;
+
+        for scenario in &scenarios {
+            let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket_local_port(&socket);
+            socket.set_vlan(scenario.vlan_config.clone());
+
+            // Pre-build the frame
+            let frame = if scenario.use_tagged_frame {
+                make_tagged_frame(port, scenario.tag_vid)
+            } else {
+                make_untagged_frame(port)
+            };
+
+            // Warmup
+            let mut buf = [0u8; 1500];
+            for _ in 0..1000 {
+                let mut result = None;
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+            }
+
+            // Timed run
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                let mut result = None;
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+            }
+            let elapsed = start.elapsed();
+
+            let pps = ITERATIONS as f64 / elapsed.as_secs_f64();
+            let ns_per_pkt = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+
+            if baseline_pps.is_none() {
+                baseline_pps = Some(pps);
+            }
+
+            let overhead = if let Some(base) = baseline_pps {
+                let pct = (1.0 - pps / base) * 100.0;
+                if pct.abs() < 0.5 { String::from("  (baseline)") }
+                else { format!("  ({:+.1}%)", -pct) }
+            } else {
+                String::new()
+            };
+
+            println!("{:<50} {:>10.0} K {:>8.0} ns{}",
+                scenario.label,
+                pps / 1000.0,
+                ns_per_pkt,
+                overhead,
+            );
+        }
+        println!("{}", "=".repeat(75));
+    }
 }
