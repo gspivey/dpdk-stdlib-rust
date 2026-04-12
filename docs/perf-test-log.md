@@ -50,7 +50,59 @@ This isolates the pure CPU cost of VLAN tag parsing and mode filtering, independ
 
 ### Results: Hardware (TRex)
 
-*Pending — results will be added when perf-tests workflow completes.*
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,999 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,970 | 0.7% | 138,999 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,902 | 0.3% | 343,462 | 1.9% | 350,000 | 0.0% |
+| 700,000 | 690,665 | 1.3% | 399,705 | 42.9% | 695,040 | 0.7% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,995 | 0.7% | 138,975 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,824 | 0.3% | 325,918 | 6.9% | 349,992 | 0.0% |
+| 700,000 | 692,466 | 1.1% | 381,816 | 45.5% | 686,755 | 1.9% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,991 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,975 | 0.7% | 138,978 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,997 | 0.3% | 312,964 | 10.6% | 349,984 | 0.0% |
+| 700,000 | 474,876 | 0.3% | 403,111 | 15.4% | 475,684 | 0.1% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,999 | 1.4% | 28,786 | 58.9% | 70,000 | 0.0% |
+| 140,000 | 75,357 | 3.7% | 75,495 | 3.6% | 76,211 | 2.7% |
+| 350,000 | 77,517 | 1.0% | 77,568 | 0.9% | 78,190 | 0.2% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 38,565 | 44.9% |
+| 140,000 | 38,165 | 72.7% |
+| 350,000 | 38,101 | 89.1% |
+| 700,000 | 37,792 | 94.6% |
+
+### Analysis
+
+**No performance regression from VLAN changes.** The 802.1Q implementation (modes, RX filtering, TX tagging) had no measurable impact on hardware PPS because integration tests use untagged frames (AWS VPC doesn't support VLANs), and untagged frame processing has zero overhead as confirmed by the synthetic benchmark above.
+
+**rust-dpdk vs native-dpdk parity**: At 700K PPS, our Rust stack delivers 690K RX vs native C DPDK's 695K — within 0.6%. The safe Rust wrapper adds negligible overhead.
+
+**rust-dpdk vs kernel**: At 700K PPS with 64B packets, DPDK delivers 690K (1.3% drop) vs kernel's 399K (42.9% drop) — **1.73x throughput advantage**. At 350K PPS, DPDK has near-zero drops while kernel drops 1.9-10.6% depending on packet size.
+
+**tokio-dpdk**: Caps at ~38K PPS as expected — the `spawn_blocking` hop per `recv_from`/`send_to` call is the bottleneck, not DPDK. This is documented behavior for the async compat layer.
 
 ---
 
