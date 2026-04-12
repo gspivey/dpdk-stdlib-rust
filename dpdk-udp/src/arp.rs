@@ -206,6 +206,27 @@ pub fn build_arp_request(
     build_arp_frame(src_mac, &broadcast_mac, &arp)
 }
 
+/// Build a Gratuitous ARP frame.
+///
+/// A Gratuitous ARP is an unsolicited ARP request where sender IP == target IP
+/// and target MAC is all-zeros. It is broadcast to ff:ff:ff:ff:ff:ff so all
+/// network neighbors learn the sender's MAC/IP mapping immediately, without
+/// waiting for an inbound ARP request.
+///
+/// This is typically sent when an interface comes up (e.g. on `bind()`) to:
+/// - Pre-populate ARP caches on switches and peers
+/// - Detect IP address conflicts (if someone else replies, they hold the IP)
+/// - Speed up failover by immediately updating stale ARP entries
+pub fn build_gratuitous_arp(
+    src_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+) -> [u8; ETH_ARP_FRAME_LEN] {
+    // Gratuitous ARP: sender_ip == target_ip, target_mac is zero
+    let arp = ArpPacket::request(*src_mac, src_ip, src_ip);
+    let broadcast_mac = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    build_arp_frame(src_mac, &broadcast_mac, &arp)
+}
+
 /// Build an ARP reply frame
 pub fn build_arp_reply(
     src_mac: &[u8; 6],
@@ -492,6 +513,14 @@ impl ArpHandler {
         // Use the first local IP as the source
         let src_ip = self.local_ips.first()?;
         Some(build_arp_request(&self.local_mac, *src_ip, target_ip))
+    }
+
+    /// Generate a Gratuitous ARP frame announcing our MAC/IP mapping.
+    ///
+    /// Returns `None` if no local IP is configured.
+    pub fn make_gratuitous_arp(&self) -> Option<[u8; ETH_ARP_FRAME_LEN]> {
+        let src_ip = self.local_ips.first()?;
+        Some(build_gratuitous_arp(&self.local_mac, *src_ip))
     }
 
     /// Get a reference to the ARP cache
@@ -839,5 +868,143 @@ mod tests {
 
         let ones = [0xFF; 6];
         assert_eq!(ones, super::u64_to_mac(super::mac_to_u64(&ones)));
+    }
+
+    // ====================================================================
+    // Gratuitous ARP tests
+    // ====================================================================
+
+    #[test]
+    fn test_build_gratuitous_arp_frame_structure() {
+        let src_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let src_ip = Ipv4Addr::new(192, 168, 1, 10);
+
+        let frame = build_gratuitous_arp(&src_mac, src_ip);
+
+        // Correct frame length
+        assert_eq!(frame.len(), ETH_ARP_FRAME_LEN);
+
+        // Ethernet destination must be broadcast
+        assert_eq!(&frame[0..6], &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        // Ethernet source must be our MAC
+        assert_eq!(&frame[6..12], &src_mac);
+        // Ethertype must be ARP
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), ETH_TYPE_ARP);
+    }
+
+    #[test]
+    fn test_build_gratuitous_arp_sender_eq_target_ip() {
+        let src_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let src_ip = Ipv4Addr::new(10, 0, 1, 42);
+
+        let frame = build_gratuitous_arp(&src_mac, src_ip);
+        let arp = parse_arp_packet(&frame).expect("valid ARP frame");
+
+        // Core GARP property: sender_ip == target_ip
+        assert_eq!(arp.sender_ip, src_ip);
+        assert_eq!(arp.target_ip, src_ip);
+
+        // Must be a request (not a reply)
+        assert!(arp.is_request());
+
+        // Sender MAC is ours
+        assert_eq!(arp.sender_mac, src_mac);
+
+        // Target MAC is zero (we're announcing, not asking for a specific host)
+        assert_eq!(arp.target_mac, [0; 6]);
+    }
+
+    #[test]
+    fn test_build_gratuitous_arp_roundtrip_parse() {
+        let src_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        let src_ip = Ipv4Addr::new(172, 16, 0, 100);
+
+        let frame = build_gratuitous_arp(&src_mac, src_ip);
+        let parsed = parse_arp_packet(&frame);
+
+        assert!(parsed.is_some(), "GARP frame should parse as valid ARP");
+        let arp = parsed.unwrap();
+        assert_eq!(arp.hw_type, ARP_HW_TYPE_ETHERNET);
+        assert_eq!(arp.proto_type, ARP_PROTO_TYPE_IPV4);
+        assert_eq!(arp.hw_len, 6);
+        assert_eq!(arp.proto_len, 4);
+        assert_eq!(arp.operation, ARP_OP_REQUEST);
+    }
+
+    #[test]
+    fn test_handler_make_gratuitous_arp() {
+        let local_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let local_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let handler = ArpHandler::new(local_mac, local_ip);
+
+        let frame = handler.make_gratuitous_arp();
+        assert!(frame.is_some(), "handler should produce a GARP frame");
+
+        let arp = parse_arp_packet(&frame.unwrap()).unwrap();
+        assert!(arp.is_request());
+        assert_eq!(arp.sender_ip, local_ip);
+        assert_eq!(arp.target_ip, local_ip);
+        assert_eq!(arp.sender_mac, local_mac);
+        assert_eq!(arp.target_mac, [0; 6]);
+    }
+
+    #[test]
+    fn test_handler_make_gratuitous_arp_uses_first_ip() {
+        let local_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let ip1 = Ipv4Addr::new(192, 168, 1, 1);
+        let ip2 = Ipv4Addr::new(10, 0, 0, 1);
+
+        let mut handler = ArpHandler::new(local_mac, ip1);
+        handler.add_local_ip(ip2);
+
+        let arp = parse_arp_packet(&handler.make_gratuitous_arp().unwrap()).unwrap();
+        // Should use the first (primary) IP
+        assert_eq!(arp.sender_ip, ip1);
+        assert_eq!(arp.target_ip, ip1);
+    }
+
+    #[test]
+    fn test_process_gratuitous_arp_learns_sender() {
+        // When a node receives a GARP from another host, it should learn
+        // the sender's MAC/IP mapping via opportunistic learning.
+        let local_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let local_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let handler = ArpHandler::new(local_mac, local_ip);
+
+        let other_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let other_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let garp_frame = build_gratuitous_arp(&other_mac, other_ip);
+
+        // Process the GARP — no reply expected (it's for a different IP)
+        let reply = handler.process_arp(&garp_frame);
+        assert!(reply.is_none());
+
+        // But we should have learned the sender's MAC
+        let cached = handler.cache.lookup(&other_ip);
+        assert!(cached.is_some(), "GARP sender should be learned");
+        assert_eq!(cached.unwrap().octets(), other_mac);
+    }
+
+    #[test]
+    fn test_process_gratuitous_arp_for_own_ip_replies() {
+        // If we receive a GARP where target_ip matches OUR IP, it means
+        // there's an IP conflict. Our existing process_arp handler replies
+        // to ARP requests for our IPs, which is the correct behavior.
+        let local_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let local_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let handler = ArpHandler::new(local_mac, local_ip);
+
+        let other_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        // Someone else sends a GARP for OUR IP — IP conflict
+        let garp_frame = build_gratuitous_arp(&other_mac, local_ip);
+
+        let reply = handler.process_arp(&garp_frame);
+        // We should reply (defending our IP)
+        assert!(reply.is_some(), "should defend our IP against GARP conflict");
+
+        let reply_arp = parse_arp_packet(&reply.unwrap()).unwrap();
+        assert!(reply_arp.is_reply());
+        assert_eq!(reply_arp.sender_mac, local_mac);
+        assert_eq!(reply_arp.sender_ip, local_ip);
     }
 }
