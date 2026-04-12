@@ -5,6 +5,127 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #12: Gratuitous ARP Feature — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-12 |
+| **Git Hash** | `d49fc5e` |
+| **Branch** | `claude/roadmap-feature-implementation-F6Cb0` |
+| **PR** | [#34](https://github.com/gspivey/dpdk-stdlib-rust/pull/34) |
+| **GH Actions Run** | [24295398875](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24295398875) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #11
+
+1. **`d49fc5e` — Gratuitous ARP announcement on socket bind.** Added `build_gratuitous_arp()` to the ARP module, `ArpHandler::make_gratuitous_arp()`, and `UdpSocket::send_gratuitous_arp()`. A single broadcast ARP frame (sender_ip == target_ip) is sent once during `bind()` when `auto_garp` is enabled (default). This is a bind-time-only operation — zero impact on the packet processing hot path.
+
+### Results: 64B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 48 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 61 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 76 |
+| native-dpdk | 700K | 700,000 | 700,000 | 0.00% | — | — | — | — | 115 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 30,753 | 0 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 41,922 | 0 | 0 | 221 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 32,659 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 699,000 | 0.14% | 0 | 41,910 | 0 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 39,522  | 43.54% | 0 | 10,988 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 39,837  | 71.54% | 0 | 5,624 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 40,159  | 88.53% | 0 | 3,976 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 40,307  | 94.24% | 0 | 2,568 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — | 172 |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 349,000 | 0.29% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 432,946 | 38.15% | — | — | — | — | 0 |
+
+### Results: 512B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 52 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 64 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 63 |
+| native-dpdk | 700K | 700,000 | 700,000 | 0.00% | — | — | — | — | 128 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 34,589 | 0 | 0 | 139 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 31,908 | 0 | 0 | 152 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 41,909 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 698,581 | 0.20% | 0 | 32,458 | 0 | 0 | 277 |
+| tokio-dpdk  | 70K  | 70,000  | 39,391  | 43.73% | 0 | 11,720 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 39,364  | 71.88% | 0 | 5,412 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 39,135  | 88.82% | 0 | 2,785 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 39,269  | 94.39% | 0 | 4,166 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — | 236 |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 348,828 | 0.33% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 398,006 | 43.14% | — | — | — | — | 0 |
+
+### Results: 1400B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 54 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 63 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 79 |
+| native-dpdk | 700K | 700,000 | 700,000 | 0.00% | — | — | — | — | 176 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 41,929 | 0 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 139,000 | 0.71% | 0 | 34,389 | 0 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 349,000 | 0.29% | 0 | 31,848 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 562,344 | 19.67% | 0 | 35,311 | 0 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 38,384  | 45.17% | 0 | 10,201 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 38,181  | 72.73% | 0 | 6,701 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 38,331  | 89.05% | 0 | 2,621 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 38,079  | 94.56% | 0 | 1,794 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — | 226 |
+| plain-rust  | 140K | 140,000 | 139,000 | 0.71% | — | — | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 348,468 | 0.44% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 408,298 | 41.67% | — | — | — | — | 0 |
+
+### Results: 8500B Packets (Jumbo)
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 55 |
+| native-dpdk | 140K | 125,199 | 125,199 | 0.00% | — | — | — | — | 8821 |
+| native-dpdk | 350K | 125,297 | 124,354 | 0.75% | — | — | — | — | 8735 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 31,872 | 0 | 0 | 487 |
+| rust-dpdk   | 140K | 125,273 | 124,336 | 0.75% | 0 | 33,199 | 0 | 0 | 8838 |
+| rust-dpdk   | 350K | 125,212 | 123,038 | 1.74% | 0 | 10,666 | 0 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 30,393  | 56.58% | 0 | 9,388 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 125,205 | 32,370  | 74.15% | 0 | 7,172 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 125,210 | 32,411  | 74.11% | 0 | 4,068 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 28,973  | 58.61% | — | — | — | — | 0 |
+| plain-rust  | 140K | 125,310 | 124,402 | 0.72% | — | — | — | — | 8665 |
+| plain-rust  | 350K | 125,211 | 124,096 | 0.89% | — | — | — | — | 0 |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | **OK** | 0 / 0 / 0 | 420,870 / 420,870 / 0 | 0 / 0 / 0 |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 75,089 / 75,089 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression from Gratuitous ARP.** As expected — GARP sends a single 42-byte broadcast frame during `bind()`, which is completely outside the packet processing hot path.
+
+Key observations vs Run #11:
+- **rust-dpdk 64B @ 700K**: 699K RX (0.14% drop) vs 690K RX (1.31% drop) in Run #11 — slight improvement, within normal variance for this instance type.
+- **rust-dpdk 512B @ 700K**: 698.5K RX (0.20% drop) vs 679K RX (2.88% drop) — better run-to-run variance.
+- **rust-dpdk 1400B @ 700K**: 562K RX (19.67% drop) vs 474K RX at a lower TX rate in Run #11 — different instance may have hit bandwidth cap differently.
+- **native-dpdk**: Zero drops at all rates up to 700K across 64B/512B/1400B — this run's instance performed better than Run #11's which dropped at 700K. Confirms environmental variance.
+- **tokio-dpdk / plain-rust**: Consistent with Run #11 patterns, no change.
+- **Instrumentation self-check**: All OK, zero drift.
+
+**Conclusion**: The Gratuitous ARP feature is performance-neutral. The one-shot bind-time ARP broadcast adds no measurable overhead to steady-state packet processing.
+
+---
+
 ## Run #11: Instrumentation Self-Check Goes Green
 
 | Field | Value |

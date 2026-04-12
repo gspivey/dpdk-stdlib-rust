@@ -1468,6 +1468,8 @@ pub struct UdpSocket {
     auto_arp: bool,
     /// Whether to automatically respond to ICMP echo requests
     auto_icmp: bool,
+    /// Whether to send a Gratuitous ARP announcement on bind
+    auto_garp: bool,
     /// Read timeout for recv operations (None = block forever)
     read_timeout: Mutex<Option<Duration>>,
     /// Write timeout for send operations (None = block forever)
@@ -1570,7 +1572,7 @@ impl UdpSocket {
             routing_table.set_mtu(9001);
         }
 
-        Ok(UdpSocket {
+        let socket = UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
             connected_addr: Mutex::new(None),
             socket_backend,
@@ -1586,6 +1588,7 @@ impl UdpSocket {
             )),
             auto_arp: true,
             auto_icmp: true,
+            auto_garp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
@@ -1604,7 +1607,12 @@ impl UdpSocket {
             routing_table,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
-        })
+        };
+
+        // Send Gratuitous ARP to announce our MAC/IP mapping on the network
+        socket.send_gratuitous_arp_if_enabled();
+
+        Ok(socket)
     }
 
     /// Creates a UDP socket bound to the given address using a specific packet backend.
@@ -1676,7 +1684,7 @@ impl UdpSocket {
             routing_table.set_mtu(9001);
         }
 
-        Ok(UdpSocket {
+        let socket = UdpSocket {
             local_addr: SocketAddr::V4(local_v4),
             connected_addr: Mutex::new(None),
             socket_backend: SocketBackend::Generic(backend),
@@ -1692,6 +1700,7 @@ impl UdpSocket {
             )),
             auto_arp: true,
             auto_icmp: true,
+            auto_garp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
@@ -1710,7 +1719,12 @@ impl UdpSocket {
             routing_table,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
-        })
+        };
+
+        // Send Gratuitous ARP to announce our MAC/IP mapping on the network
+        socket.send_gratuitous_arp_if_enabled();
+
+        Ok(socket)
     }
 
     /// Get the name of the active packet I/O backend.
@@ -2393,6 +2407,41 @@ impl UdpSocket {
             self.socket_backend.send_frame(&frame)?;
         }
         Ok(())
+    }
+
+    /// Send a Gratuitous ARP announcing this socket's MAC/IP mapping.
+    ///
+    /// Broadcasts an unsolicited ARP request so all network neighbors
+    /// immediately learn our MAC address. This is useful after failover
+    /// or IP migration to update stale ARP caches without waiting for
+    /// the next inbound ARP request.
+    pub fn send_gratuitous_arp(&self) -> io::Result<()> {
+        if let Some(frame) = self.arp_handler.make_gratuitous_arp() {
+            self.socket_backend.send_frame(&frame)?;
+        }
+        Ok(())
+    }
+
+    /// Internal helper: send GARP if auto_garp is enabled.
+    /// Called at the end of bind() / bind_with_backend().
+    /// Failures are silently ignored — GARP is best-effort.
+    fn send_gratuitous_arp_if_enabled(&self) {
+        if self.auto_garp {
+            let _ = self.send_gratuitous_arp();
+        }
+    }
+
+    /// Enable or disable automatic Gratuitous ARP on bind.
+    ///
+    /// When enabled (default), a Gratuitous ARP is broadcast during `bind()`
+    /// to announce this socket's MAC/IP mapping to all network neighbors.
+    pub fn set_auto_garp(&mut self, enable: bool) {
+        self.auto_garp = enable;
+    }
+
+    /// Check if automatic Gratuitous ARP on bind is enabled.
+    pub fn auto_garp(&self) -> bool {
+        self.auto_garp
     }
 
     // ========================================================================
