@@ -128,8 +128,132 @@ pub const TOTAL_HEADER_LEN: usize = ETH_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADE
 /// Ethernet type for IPv4
 pub const ETH_TYPE_IPV4: u16 = 0x0800;
 
+/// Ethernet type for 802.1Q VLAN-tagged frames (TPID)
+pub const ETH_TYPE_VLAN: u16 = 0x8100;
+
+/// 802.1Q VLAN tag length in bytes (TPID + TCI)
+pub const VLAN_TAG_LEN: usize = 4;
+
+/// Total header overhead for VLAN-tagged frames
+pub const TOTAL_HEADER_LEN_VLAN: usize = ETH_HEADER_LEN + VLAN_TAG_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN;
+
 /// IP protocol number for UDP
 pub const IP_PROTO_UDP: u8 = 17;
+
+// ============================================================================
+// VLAN (802.1Q) Support
+// ============================================================================
+
+/// VLAN configuration for 802.1Q frame tagging.
+///
+/// When configured on a socket, outgoing frames are tagged with the specified
+/// VLAN ID and priority. Incoming VLAN-tagged frames are accepted and stripped
+/// transparently (the VLAN tag is not visible to the application).
+///
+/// # Wire format
+///
+/// A VLAN-tagged Ethernet frame inserts 4 bytes between the source MAC and the
+/// original EtherType:
+///
+/// ```text
+/// | dst_mac (6) | src_mac (6) | TPID 0x8100 (2) | TCI (2) | EtherType (2) | payload... |
+/// ```
+///
+/// The TCI (Tag Control Information) encodes:
+/// - PCP (bits 15-13): Priority Code Point (0-7)
+/// - DEI (bit 12): Drop Eligible Indicator
+/// - VID (bits 11-0): VLAN Identifier (0-4094)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VlanConfig {
+    /// VLAN Identifier (12 bits, 0-4094). VID 0 means priority-only tagging.
+    /// VID 4095 is reserved.
+    pub vlan_id: u16,
+    /// Priority Code Point (3 bits, 0-7). Higher values = higher priority.
+    pub priority: u8,
+    /// Drop Eligible Indicator. When set, the frame may be dropped under congestion.
+    pub dei: bool,
+}
+
+impl VlanConfig {
+    /// Create a VLAN config with the given VLAN ID, default priority (0), no DEI.
+    pub fn new(vlan_id: u16) -> Self {
+        assert!(vlan_id <= 4094, "VLAN ID must be 0-4094");
+        Self { vlan_id, priority: 0, dei: false }
+    }
+
+    /// Set the priority code point (0-7).
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        assert!(priority <= 7, "PCP must be 0-7");
+        self.priority = priority;
+        self
+    }
+
+    /// Set the Drop Eligible Indicator.
+    pub fn with_dei(mut self, dei: bool) -> Self {
+        self.dei = dei;
+        self
+    }
+
+    /// Encode the 16-bit TCI (Tag Control Information) for the wire.
+    pub fn encode_tci(&self) -> u16 {
+        let pcp = (self.priority as u16 & 0x07) << 13;
+        let dei = if self.dei { 1u16 << 12 } else { 0 };
+        let vid = self.vlan_id & 0x0FFF;
+        pcp | dei | vid
+    }
+
+    /// Decode a TCI value from the wire into a VlanConfig.
+    pub fn from_tci(tci: u16) -> Self {
+        Self {
+            vlan_id: tci & 0x0FFF,
+            priority: ((tci >> 13) & 0x07) as u8,
+            dei: (tci >> 12) & 1 != 0,
+        }
+    }
+}
+
+/// Result of detecting whether an Ethernet frame carries a VLAN tag.
+///
+/// Used internally to compute the correct L3 header offset for both
+/// tagged and untagged frames.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameLayout {
+    /// The "inner" EtherType (e.g. 0x0800 for IPv4, 0x0806 for ARP).
+    pub(crate) ethertype: u16,
+    /// Byte offset where the L3 header (IP or ARP) starts.
+    pub(crate) l3_offset: usize,
+    /// If VLAN-tagged, the TCI value; otherwise None.
+    pub(crate) vlan_tci: Option<u16>,
+}
+
+/// Detect whether a frame is 802.1Q VLAN-tagged and return the layout.
+///
+/// For untagged frames: ethertype from bytes 12-13, L3 starts at byte 14.
+/// For VLAN-tagged frames: ethertype from bytes 16-17, L3 starts at byte 18.
+pub(crate) fn detect_vlan(frame: &[u8]) -> Option<FrameLayout> {
+    if frame.len() < ETH_HEADER_LEN {
+        return None;
+    }
+    let outer_ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if outer_ethertype == ETH_TYPE_VLAN {
+        if frame.len() < ETH_HEADER_LEN + VLAN_TAG_LEN {
+            return None;
+        }
+        let tci = u16::from_be_bytes([frame[14], frame[15]]);
+        let inner_ethertype = u16::from_be_bytes([frame[16], frame[17]]);
+        Some(FrameLayout {
+            ethertype: inner_ethertype,
+            l3_offset: ETH_HEADER_LEN + VLAN_TAG_LEN,
+            vlan_tci: Some(tci),
+        })
+    } else {
+        Some(FrameLayout {
+            ethertype: outer_ethertype,
+            l3_offset: ETH_HEADER_LEN,
+            vlan_tci: None,
+        })
+    }
+}
 
 // ============================================================================
 // Packet Building
@@ -237,20 +361,25 @@ pub fn udp_pseudo_header_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_len: u
 /// Verify the IPv4 header checksum of a received frame.
 ///
 /// Returns true if the checksum is valid (recomputed checksum == 0).
+/// Handles both untagged and 802.1Q VLAN-tagged frames.
 pub fn verify_ipv4_checksum(frame: &[u8]) -> bool {
-    if frame.len() < ETH_HEADER_LEN + IPV4_HEADER_LEN {
+    let layout = match detect_vlan(frame) {
+        Some(l) => l,
+        None => return false,
+    };
+    let l3 = layout.l3_offset;
+
+    if frame.len() < l3 + IPV4_HEADER_LEN {
         return false;
     }
 
-    let ip_header = &frame[ETH_HEADER_LEN..];
+    let ip_header = &frame[l3..];
     let ihl = (ip_header[0] & 0x0F) as usize;
     let ip_header_len = ihl * 4;
-    if ip_header_len < 20 || frame.len() < ETH_HEADER_LEN + ip_header_len {
+    if ip_header_len < 20 || frame.len() < l3 + ip_header_len {
         return false;
     }
 
-    // Recompute checksum over the full IP header (including the checksum field).
-    // A correct header produces 0 when the stored checksum is included.
     let mut sum: u32 = 0;
     for i in (0..ip_header_len).step_by(2) {
         let word = if i + 1 < ip_header_len {
@@ -270,15 +399,22 @@ pub fn verify_ipv4_checksum(frame: &[u8]) -> bool {
 ///
 /// Returns true if the checksum is valid or if the checksum field is 0 (disabled).
 /// Per RFC 768, a UDP checksum of 0 means "no checksum computed".
+/// Handles both untagged and 802.1Q VLAN-tagged frames.
 pub fn verify_udp_checksum(frame: &[u8]) -> bool {
-    if frame.len() < TOTAL_HEADER_LEN {
+    let layout = match detect_vlan(frame) {
+        Some(l) => l,
+        None => return false,
+    };
+    let l3 = layout.l3_offset;
+
+    if frame.len() < l3 + IPV4_HEADER_LEN + UDP_HEADER_LEN {
         return false;
     }
 
-    let ip_header = &frame[ETH_HEADER_LEN..];
+    let ip_header = &frame[l3..];
     let ihl = (ip_header[0] & 0x0F) as usize;
     let ip_header_len = ihl * 4;
-    let udp_start = ETH_HEADER_LEN + ip_header_len;
+    let udp_start = l3 + ip_header_len;
 
     if frame.len() < udp_start + UDP_HEADER_LEN {
         return false;
@@ -289,8 +425,8 @@ pub fn verify_udp_checksum(frame: &[u8]) -> bool {
         return true; // Checksum disabled (RFC 768)
     }
 
-    let src_ip: [u8; 4] = frame[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16].try_into().unwrap();
-    let dst_ip: [u8; 4] = frame[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20].try_into().unwrap();
+    let src_ip: [u8; 4] = frame[l3 + 12..l3 + 16].try_into().unwrap();
+    let dst_ip: [u8; 4] = frame[l3 + 16..l3 + 20].try_into().unwrap();
     let udp_len = u16::from_be_bytes([frame[udp_start + 4], frame[udp_start + 5]]) as usize;
 
     if frame.len() < udp_start + udp_len {
@@ -585,6 +721,84 @@ pub fn build_udp_frame_into(
     Ok(total_len)
 }
 
+/// Build a UDP frame with an 802.1Q VLAN tag into a caller-provided buffer.
+///
+/// Identical to `build_udp_frame_into` but inserts a 4-byte VLAN tag between
+/// the source MAC and the EtherType, producing a frame 4 bytes longer.
+pub fn build_udp_frame_into_vlan(
+    out: &mut Vec<u8>,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    ttl: u8,
+    vlan: &VlanConfig,
+) -> UdpResult<usize> {
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN_VLAN;
+    if payload.len() > max_payload {
+        return Err(UdpError::PayloadTooLarge {
+            max: max_payload,
+            actual: payload.len(),
+        });
+    }
+
+    let total_len = TOTAL_HEADER_LEN_VLAN + payload.len();
+    let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+    out.resize(total_len, 0);
+
+    let src_ip_bytes = src_ip.octets();
+    let dst_ip_bytes = dst_ip.octets();
+
+    // === Ethernet Header (14 bytes) + VLAN Tag (4 bytes) = 18 bytes ===
+    out[0..6].copy_from_slice(dst_mac);
+    out[6..12].copy_from_slice(src_mac);
+    out[12..14].copy_from_slice(&ETH_TYPE_VLAN.to_be_bytes()); // TPID
+    out[14..16].copy_from_slice(&vlan.encode_tci().to_be_bytes()); // TCI
+    out[16..18].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes()); // Inner EtherType
+
+    // === IPv4 Header (20 bytes) — starts at offset 18 ===
+    let ip = ETH_HEADER_LEN + VLAN_TAG_LEN;
+    out[ip] = 0x45;
+    out[ip + 1] = 0x00;
+    out[ip + 2..ip + 4].copy_from_slice(&ip_total_len.to_be_bytes());
+    out[ip + 4..ip + 6].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 6..ip + 8].copy_from_slice(&[0x40, 0x00]);
+    out[ip + 8] = ttl;
+    out[ip + 9] = IP_PROTO_UDP;
+    out[ip + 10..ip + 12].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 12..ip + 16].copy_from_slice(&src_ip_bytes);
+    out[ip + 16..ip + 20].copy_from_slice(&dst_ip_bytes);
+
+    let ip_cksum = ipv4_checksum(&out[ip..ip + IPV4_HEADER_LEN]);
+    out[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // === UDP Header (8 bytes) — starts at offset 38 ===
+    let udp_off = ip + IPV4_HEADER_LEN;
+    out[udp_off..udp_off + 2].copy_from_slice(&src_port.to_be_bytes());
+    out[udp_off + 2..udp_off + 4].copy_from_slice(&dst_port.to_be_bytes());
+    out[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === Payload ===
+    out[TOTAL_HEADER_LEN_VLAN..].copy_from_slice(payload);
+
+    // UDP checksum (computed over IP pseudo-header + UDP header + payload — VLAN tag not included)
+    let udp_cksum = udp_checksum(
+        &src_ip_bytes,
+        &dst_ip_bytes,
+        &out[udp_off..udp_off + UDP_HEADER_LEN],
+        payload,
+    );
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
+    Ok(total_len)
+}
+
 // ============================================================================
 // Packet Parsing
 // ============================================================================
@@ -606,6 +820,8 @@ pub struct ParsedUdpPacket {
     pub dst_port: u16,
     /// Payload data
     pub payload: Vec<u8>,
+    /// VLAN ID if the frame was 802.1Q tagged (None for untagged frames).
+    pub vlan_id: Option<u16>,
 }
 
 /// Zero-copy parsed UDP packet that borrows payload from the frame slice.
@@ -620,105 +836,37 @@ pub struct ParsedUdpPacketRef<'a> {
     pub dst_port: u16,
     /// Payload borrowed from the original frame — no heap allocation.
     pub payload: &'a [u8],
+    /// VLAN ID if the frame was 802.1Q tagged (None for untagged frames).
+    pub vlan_id: Option<u16>,
 }
 
-/// Parse a raw Ethernet frame containing a UDP packet
+/// Parse a raw Ethernet frame containing a UDP packet.
 ///
-/// Returns None if the packet is not a valid UDP/IPv4 packet
+/// Handles both untagged and 802.1Q VLAN-tagged frames. For tagged frames,
+/// the VLAN tag is stripped and the `vlan_id` field is populated.
+///
+/// Returns None if the packet is not a valid UDP/IPv4 packet.
 pub fn parse_udp_packet(frame: &[u8]) -> Option<ParsedUdpPacket> {
-    // Minimum size check
-    if frame.len() < TOTAL_HEADER_LEN {
+    // Detect VLAN tag and determine L3 offset
+    let layout = detect_vlan(frame)?;
+    let l3 = layout.l3_offset;
+
+    // Minimum size: L3 offset + IP header + UDP header
+    if frame.len() < l3 + IPV4_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+
+    // Only handle IPv4
+    if layout.ethertype != ETH_TYPE_IPV4 {
         return None;
     }
 
     // Parse Ethernet header
     let dst_mac: [u8; 6] = frame[0..6].try_into().ok()?;
     let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-
-    // Only handle IPv4
-    if ethertype != ETH_TYPE_IPV4 {
-        return None;
-    }
 
     // Parse IPv4 header
-    let ip_header = &frame[ETH_HEADER_LEN..];
-
-    // Check IP version (should be 4)
-    let version = (ip_header[0] >> 4) & 0x0F;
-    if version != 4 {
-        return None;
-    }
-
-    // Get IP header length (in 32-bit words)
-    let ihl = (ip_header[0] & 0x0F) as usize;
-    let ip_header_len = ihl * 4;
-    if ip_header_len < 20 {
-        return None;
-    }
-
-    // Check protocol (should be UDP = 17)
-    let protocol = ip_header[9];
-    if protocol != IP_PROTO_UDP {
-        return None;
-    }
-
-    // Extract IP addresses
-    let src_ip = Ipv4Addr::new(
-        ip_header[12], ip_header[13], ip_header[14], ip_header[15]
-    );
-    let dst_ip = Ipv4Addr::new(
-        ip_header[16], ip_header[17], ip_header[18], ip_header[19]
-    );
-
-    // Parse UDP header (starts after IP header)
-    let udp_start = ETH_HEADER_LEN + ip_header_len;
-    if frame.len() < udp_start + UDP_HEADER_LEN {
-        return None;
-    }
-
-    let udp_header = &frame[udp_start..];
-    let src_port = u16::from_be_bytes([udp_header[0], udp_header[1]]);
-    let dst_port = u16::from_be_bytes([udp_header[2], udp_header[3]]);
-    let udp_len = u16::from_be_bytes([udp_header[4], udp_header[5]]) as usize;
-
-    // Validate UDP length
-    if udp_len < UDP_HEADER_LEN || frame.len() < udp_start + udp_len {
-        return None;
-    }
-
-    // Extract payload
-    let payload_start = udp_start + UDP_HEADER_LEN;
-    let payload_len = udp_len - UDP_HEADER_LEN;
-    let payload = frame[payload_start..payload_start + payload_len].to_vec();
-
-    Some(ParsedUdpPacket {
-        src_mac,
-        dst_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        payload,
-    })
-}
-
-/// Zero-copy UDP packet parser that borrows payload from the frame slice.
-///
-/// Identical validation to `parse_udp_packet` but returns a reference into the
-/// original frame data, eliminating the per-packet `Vec<u8>` heap allocation.
-pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
-    if frame.len() < TOTAL_HEADER_LEN {
-        return None;
-    }
-
-    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != ETH_TYPE_IPV4 {
-        return None;
-    }
-
-    let ip_header = &frame[ETH_HEADER_LEN..];
+    let ip_header = &frame[l3..];
     let version = (ip_header[0] >> 4) & 0x0F;
     if version != 4 {
         return None;
@@ -735,7 +883,75 @@ pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
     let src_ip = Ipv4Addr::new(ip_header[12], ip_header[13], ip_header[14], ip_header[15]);
     let dst_ip = Ipv4Addr::new(ip_header[16], ip_header[17], ip_header[18], ip_header[19]);
 
-    let udp_start = ETH_HEADER_LEN + ip_header_len;
+    // Parse UDP header
+    let udp_start = l3 + ip_header_len;
+    if frame.len() < udp_start + UDP_HEADER_LEN {
+        return None;
+    }
+
+    let udp_header = &frame[udp_start..];
+    let src_port = u16::from_be_bytes([udp_header[0], udp_header[1]]);
+    let dst_port = u16::from_be_bytes([udp_header[2], udp_header[3]]);
+    let udp_len = u16::from_be_bytes([udp_header[4], udp_header[5]]) as usize;
+
+    if udp_len < UDP_HEADER_LEN || frame.len() < udp_start + udp_len {
+        return None;
+    }
+
+    let payload_start = udp_start + UDP_HEADER_LEN;
+    let payload_len = udp_len - UDP_HEADER_LEN;
+    let payload = frame[payload_start..payload_start + payload_len].to_vec();
+
+    let vlan_id = layout.vlan_tci.map(|tci| tci & 0x0FFF);
+
+    Some(ParsedUdpPacket {
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        payload,
+        vlan_id,
+    })
+}
+
+/// Zero-copy UDP packet parser that borrows payload from the frame slice.
+///
+/// Identical validation to `parse_udp_packet` but returns a reference into the
+/// original frame data, eliminating the per-packet `Vec<u8>` heap allocation.
+/// Handles both untagged and 802.1Q VLAN-tagged frames.
+pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
+    let layout = detect_vlan(frame)?;
+    let l3 = layout.l3_offset;
+
+    if frame.len() < l3 + IPV4_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+    if layout.ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+
+    let ip_header = &frame[l3..];
+    let version = (ip_header[0] >> 4) & 0x0F;
+    if version != 4 {
+        return None;
+    }
+    let ihl = (ip_header[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+    if ip_header_len < 20 {
+        return None;
+    }
+    if ip_header[9] != IP_PROTO_UDP {
+        return None;
+    }
+
+    let src_ip = Ipv4Addr::new(ip_header[12], ip_header[13], ip_header[14], ip_header[15]);
+    let dst_ip = Ipv4Addr::new(ip_header[16], ip_header[17], ip_header[18], ip_header[19]);
+
+    let udp_start = l3 + ip_header_len;
     if frame.len() < udp_start + UDP_HEADER_LEN {
         return None;
     }
@@ -752,6 +968,8 @@ pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
     let payload_start = udp_start + UDP_HEADER_LEN;
     let payload_len = udp_len - UDP_HEADER_LEN;
 
+    let vlan_id = layout.vlan_tci.map(|tci| tci & 0x0FFF);
+
     Some(ParsedUdpPacketRef {
         src_mac,
         src_ip,
@@ -759,6 +977,7 @@ pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
         src_port,
         dst_port,
         payload: &frame[payload_start..payload_start + payload_len],
+        vlan_id,
     })
 }
 
@@ -1508,6 +1727,8 @@ pub struct UdpSocket {
     has_connection_state: AtomicBool,
     /// Subnet-aware routing table for next-hop MAC resolution.
     routing_table: RoutingTable,
+    /// Optional 802.1Q VLAN configuration. When set, outgoing frames are tagged.
+    vlan_config: Option<VlanConfig>,
     /// Number of UDP payloads dropped because the socket receive buffer was full.
     /// Lock-free read via `recv_drops()` — mirrors Linux `sk_drops`.
     rx_dropped_packets: AtomicU64,
@@ -1611,6 +1832,7 @@ impl UdpSocket {
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
             routing_table,
+            vlan_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -1725,6 +1947,7 @@ impl UdpSocket {
             has_buffered_packets: AtomicBool::new(false),
             has_connection_state: AtomicBool::new(false),
             routing_table,
+            vlan_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -1863,15 +2086,28 @@ impl UdpSocket {
         let src_mac = self.socket_backend.mac_address();
 
         // Build frame into reusable buffer (zero-alloc) and send.
+        // If VLAN is configured, insert the 802.1Q tag into the frame.
         let mut tx_buf = self.tx_buf.borrow_mut();
-        build_udp_frame_into(
-            &mut tx_buf,
-            &src_mac,
-            &dst_mac.octets(),
-            src_ip, dst_ip,
-            src_port, dst_port,
-            buf, self.ttl,
-        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+        if let Some(ref vlan) = self.vlan_config {
+            build_udp_frame_into_vlan(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+                vlan,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+        } else {
+            build_udp_frame_into(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+        }
 
         // P3.5: Worker-direct TX uses cached send function (no topology.lock()).
         if let Some(ref direct_send) = self.cached_direct_send {
@@ -2181,14 +2417,14 @@ impl UdpSocket {
         buf: &mut [u8],
         result: &mut Option<(usize, SocketAddr)>,
     ) -> Option<(usize, SocketAddr)> {
-        if frame_data.len() < 14 {
-            return None;
-        }
+        // Detect VLAN tag and determine the inner ethertype + L3 offset.
+        let layout = match detect_vlan(frame_data) {
+            Some(l) => l,
+            None => return None,
+        };
 
-        let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
-
-        // Handle ARP
-        if ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
+        // Handle ARP (both tagged and untagged)
+        if layout.ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
                 let _ = self.socket_backend.send_frame(&reply_frame);
             }
@@ -2197,8 +2433,8 @@ impl UdpSocket {
         }
 
         // Handle ICMP (echo replies + error messages)
-        if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
-            let protocol = frame_data[ETH_HEADER_LEN + 9];
+        if layout.ethertype == ETH_TYPE_IPV4 && frame_data.len() > layout.l3_offset + 9 {
+            let protocol = frame_data[layout.l3_offset + 9];
             if protocol == icmp::IP_PROTO_ICMP {
                 if let Some(action) = self.icmp_handler.process_icmp_full(frame_data) {
                     match action {
@@ -2208,7 +2444,6 @@ impl UdpSocket {
                             }
                         }
                         icmp::IcmpAction::Error(error_info) => {
-                            // Match against our socket's local port
                             let local_port = match self.local_addr {
                                 SocketAddr::V4(v4) => v4.port(),
                                 _ => 0,
@@ -2224,7 +2459,8 @@ impl UdpSocket {
             }
         }
 
-        // Zero-copy UDP parse — payload borrows from frame_data
+        // Zero-copy UDP parse — payload borrows from frame_data.
+        // Handles both tagged and untagged frames via detect_vlan internally.
         let parsed = match parse_udp_packet_ref(frame_data) {
             Some(p) => p,
             None => {
@@ -2234,7 +2470,7 @@ impl UdpSocket {
         };
 
         // Validate RX checksums (IPv4 header + UDP) in software.
-        // Drops packets with corrupted headers before they reach the application.
+        // Both verifiers handle VLAN-tagged frames via detect_vlan internally.
         if !verify_ipv4_checksum(frame_data) {
             perf_inc!(self.perf_counters.rx_drops_parse_fail);
             return None;
@@ -2396,6 +2632,33 @@ impl UdpSocket {
     /// 8973. Payloads larger than this limit will be rejected by `send_to()`.
     pub fn max_udp_payload(&self) -> usize {
         self.routing_table.max_udp_payload()
+    }
+
+    // ========================================================================
+    // VLAN Configuration
+    // ========================================================================
+
+    /// Configure 802.1Q VLAN tagging on this socket.
+    ///
+    /// When set, all outgoing frames will include a VLAN tag with the specified
+    /// VLAN ID and priority. Incoming VLAN-tagged frames are always accepted
+    /// regardless of this setting (the tag is stripped transparently).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use dpdk_udp::{UdpSocket, VlanConfig};
+    ///
+    /// let mut socket = UdpSocket::bind("0.0.0.0:9000")?;
+    /// socket.set_vlan(Some(VlanConfig::new(100).with_priority(3)));
+    /// ```
+    pub fn set_vlan(&mut self, config: Option<VlanConfig>) {
+        self.vlan_config = config;
+    }
+
+    /// Returns the current VLAN configuration, if any.
+    pub fn vlan(&self) -> Option<&VlanConfig> {
+        self.vlan_config.as_ref()
     }
 
     // ========================================================================
@@ -3139,8 +3402,9 @@ impl UdpSocketBuilder {
         // Create the socket using the standard bind path
         let mut socket = UdpSocket::bind(addr)?;
 
-        // Apply routing configuration if provided
+        // Apply routing and VLAN configuration if provided
         if let Some(net_config) = self.network_config {
+            socket.vlan_config = net_config.vlan;
             socket.routing_table = RoutingTable::with_config(net_config);
         }
 
@@ -4486,5 +4750,280 @@ mod tests {
         frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cksum.to_be_bytes());
 
         frame
+    }
+
+    // ========================================================================
+    // VLAN (802.1Q) Tests
+    // ========================================================================
+
+    #[test]
+    fn vlan_config_encode_decode_tci() {
+        let config = VlanConfig::new(100).with_priority(3).with_dei(true);
+        let tci = config.encode_tci();
+        let decoded = VlanConfig::from_tci(tci);
+        assert_eq!(decoded.vlan_id, 100);
+        assert_eq!(decoded.priority, 3);
+        assert!(decoded.dei);
+    }
+
+    #[test]
+    fn vlan_config_tci_encoding() {
+        // VID 100, PCP 5, DEI 0
+        let config = VlanConfig { vlan_id: 100, priority: 5, dei: false };
+        let tci = config.encode_tci();
+        assert_eq!(tci & 0x0FFF, 100);           // VID
+        assert_eq!((tci >> 13) & 0x07, 5);        // PCP
+        assert_eq!((tci >> 12) & 1, 0);            // DEI
+
+        // VID 4094 (max), PCP 7, DEI 1
+        let config = VlanConfig { vlan_id: 4094, priority: 7, dei: true };
+        let tci = config.encode_tci();
+        assert_eq!(tci & 0x0FFF, 4094);
+        assert_eq!((tci >> 13) & 0x07, 7);
+        assert_eq!((tci >> 12) & 1, 1);
+    }
+
+    #[test]
+    fn vlan_config_new_sets_defaults() {
+        let config = VlanConfig::new(42);
+        assert_eq!(config.vlan_id, 42);
+        assert_eq!(config.priority, 0);
+        assert!(!config.dei);
+    }
+
+    #[test]
+    fn build_and_parse_vlan_tagged_frame() {
+        let src_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let src_ip = Ipv4Addr::new(10, 0, 1, 10);
+        let dst_ip = Ipv4Addr::new(10, 0, 2, 20);
+        let payload = b"hello vlan";
+        let vlan = VlanConfig::new(100).with_priority(3);
+
+        let mut buf = Vec::new();
+        let len = build_udp_frame_into_vlan(
+            &mut buf, &src_mac, &dst_mac, src_ip, dst_ip, 5000, 9000,
+            payload, 64, &vlan,
+        ).unwrap();
+
+        assert_eq!(len, TOTAL_HEADER_LEN_VLAN + payload.len());
+        assert_eq!(buf.len(), len);
+
+        // Verify VLAN tag is present
+        let tpid = u16::from_be_bytes([buf[12], buf[13]]);
+        assert_eq!(tpid, ETH_TYPE_VLAN);
+        let tci = u16::from_be_bytes([buf[14], buf[15]]);
+        assert_eq!(tci & 0x0FFF, 100);             // VID
+        assert_eq!((tci >> 13) & 0x07, 3);          // PCP
+        let inner_ethertype = u16::from_be_bytes([buf[16], buf[17]]);
+        assert_eq!(inner_ethertype, ETH_TYPE_IPV4);
+
+        // Parse it back
+        let parsed = parse_udp_packet(&buf).expect("should parse VLAN-tagged UDP");
+        assert_eq!(parsed.src_ip, src_ip);
+        assert_eq!(parsed.dst_ip, dst_ip);
+        assert_eq!(parsed.src_port, 5000);
+        assert_eq!(parsed.dst_port, 9000);
+        assert_eq!(parsed.payload, payload);
+        assert_eq!(parsed.vlan_id, Some(100));
+    }
+
+    #[test]
+    fn parse_untagged_frame_has_no_vlan_id() {
+        let frame = build_udp_frame(
+            &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 10), Ipv4Addr::new(10, 0, 2, 20),
+            5000, 9000, b"hello", 64,
+        ).unwrap();
+
+        let parsed = parse_udp_packet(&frame).unwrap();
+        assert!(parsed.vlan_id.is_none());
+    }
+
+    #[test]
+    fn parse_udp_packet_ref_handles_vlan() {
+        let vlan = VlanConfig::new(200).with_priority(5).with_dei(true);
+        let mut buf = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut buf, &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 10), Ipv4Addr::new(10, 0, 2, 20),
+            1234, 5678, b"zerocopy vlan", 64, &vlan,
+        ).unwrap();
+
+        let parsed = parse_udp_packet_ref(&buf).expect("should parse VLAN-tagged ref");
+        assert_eq!(parsed.payload, b"zerocopy vlan");
+        assert_eq!(parsed.src_port, 1234);
+        assert_eq!(parsed.dst_port, 5678);
+        assert_eq!(parsed.vlan_id, Some(200));
+    }
+
+    #[test]
+    fn verify_checksums_on_vlan_tagged_frame() {
+        let vlan = VlanConfig::new(42);
+        let mut buf = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut buf, &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2),
+            3000, 4000, b"checksum test", 128, &vlan,
+        ).unwrap();
+
+        assert!(verify_ipv4_checksum(&buf), "IPv4 checksum should be valid on VLAN frame");
+        assert!(verify_udp_checksum(&buf), "UDP checksum should be valid on VLAN frame");
+    }
+
+    #[test]
+    fn verify_checksums_on_corrupted_vlan_frame() {
+        let vlan = VlanConfig::new(42);
+        let mut buf = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut buf, &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2),
+            3000, 4000, b"corrupt me", 128, &vlan,
+        ).unwrap();
+
+        // Corrupt a payload byte
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+
+        assert!(verify_ipv4_checksum(&buf), "IP checksum should still be valid");
+        assert!(!verify_udp_checksum(&buf), "UDP checksum should fail after payload corruption");
+    }
+
+    #[test]
+    fn detect_vlan_on_untagged_frame() {
+        let frame = build_udp_frame(
+            &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2),
+            1000, 2000, b"test", 64,
+        ).unwrap();
+
+        let layout = detect_vlan(&frame).unwrap();
+        assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
+        assert_eq!(layout.l3_offset, ETH_HEADER_LEN);
+        assert!(layout.vlan_tci.is_none());
+    }
+
+    #[test]
+    fn detect_vlan_on_tagged_frame() {
+        let vlan = VlanConfig::new(500).with_priority(2);
+        let mut buf = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut buf, &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2),
+            1000, 2000, b"test", 64, &vlan,
+        ).unwrap();
+
+        let layout = detect_vlan(&buf).unwrap();
+        assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
+        assert_eq!(layout.l3_offset, ETH_HEADER_LEN + VLAN_TAG_LEN);
+        let tci = layout.vlan_tci.unwrap();
+        assert_eq!(tci & 0x0FFF, 500);
+        assert_eq!((tci >> 13) & 0x07, 2);
+    }
+
+    #[test]
+    fn detect_vlan_returns_none_on_too_short_frame() {
+        assert!(detect_vlan(&[]).is_none());
+        assert!(detect_vlan(&[0u8; 13]).is_none());
+    }
+
+    #[test]
+    fn socket_set_and_get_vlan() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(socket.vlan().is_none());
+
+        socket.set_vlan(Some(VlanConfig::new(100)));
+        let vlan = socket.vlan().unwrap();
+        assert_eq!(vlan.vlan_id, 100);
+
+        socket.set_vlan(None);
+        assert!(socket.vlan().is_none());
+    }
+
+    #[test]
+    fn vlan_frame_is_4_bytes_longer_than_untagged() {
+        let src_mac = [0x11; 6];
+        let dst_mac = [0xaa; 6];
+        let src_ip = Ipv4Addr::new(10, 0, 1, 1);
+        let dst_ip = Ipv4Addr::new(10, 0, 1, 2);
+        let payload = b"size test";
+
+        let untagged = build_udp_frame(
+            &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, 64,
+        ).unwrap();
+
+        let mut tagged = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut tagged, &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000,
+            payload, 64, &VlanConfig::new(1),
+        ).unwrap();
+
+        assert_eq!(tagged.len(), untagged.len() + VLAN_TAG_LEN);
+    }
+
+    #[test]
+    fn vlan_tagged_and_untagged_have_same_payload() {
+        let payload = b"identity test with longer payload data";
+
+        let untagged = build_udp_frame(
+            &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 2, 2),
+            5000, 9000, payload, 64,
+        ).unwrap();
+
+        let mut tagged = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut tagged, &[0x11; 6], &[0xaa; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 2, 2),
+            5000, 9000, payload, 64, &VlanConfig::new(100),
+        ).unwrap();
+
+        let parsed_untagged = parse_udp_packet(&untagged).unwrap();
+        let parsed_tagged = parse_udp_packet(&tagged).unwrap();
+
+        assert_eq!(parsed_untagged.payload, parsed_tagged.payload);
+        assert_eq!(parsed_untagged.src_ip, parsed_tagged.src_ip);
+        assert_eq!(parsed_untagged.dst_ip, parsed_tagged.dst_ip);
+        assert_eq!(parsed_untagged.src_port, parsed_tagged.src_port);
+        assert_eq!(parsed_untagged.dst_port, parsed_tagged.dst_port);
+    }
+
+    #[test]
+    fn network_config_with_vlan() {
+        let config = NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 10), 24)
+            .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
+            .with_vlan(VlanConfig::new(100).with_priority(3));
+
+        assert_eq!(config.vlan.unwrap().vlan_id, 100);
+        assert_eq!(config.vlan.unwrap().priority, 3);
+    }
+
+    #[test]
+    fn process_frame_zerocopy_handles_vlan_tagged_udp() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = match socket.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            _ => panic!("expected v4"),
+        };
+
+        // Build a VLAN-tagged UDP frame addressed to our port
+        let vlan = VlanConfig::new(100);
+        let mut frame = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(127, 0, 0, 1),
+            8000, local_port,
+            b"vlan payload", 64, &vlan,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+
+        // Should have received the UDP payload
+        let (len, src_addr) = result.expect("should receive VLAN-tagged UDP packet");
+        assert_eq!(&buf[..len], b"vlan payload");
+        assert_eq!(src_addr.port(), 8000);
     }
 }

@@ -267,20 +267,22 @@ impl IcmpErrorInfo {
 ///
 /// Returns `None` if the frame is not a valid ICMP error for a UDP datagram.
 pub fn parse_icmp_error(frame: &[u8]) -> Option<IcmpErrorInfo> {
-    // We need at least: Eth(14) + outer IP(20) + ICMP header(8) + original IP(20) + original UDP ports(8)
-    let min_len = ETH_HEADER_LEN + IPV4_HEADER_LEN + ICMP_HEADER_LEN + MIN_ICMP_ERROR_PAYLOAD;
+    // Detect VLAN tag and determine L3 offset.
+    let layout = crate::detect_vlan(frame)?;
+    let l3 = layout.l3_offset;
+
+    if layout.ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    // Minimum: L3 + outer IP(20) + ICMP header(8) + original IP(20) + original UDP ports(8)
+    let min_len = l3 + IPV4_HEADER_LEN + ICMP_HEADER_LEN + MIN_ICMP_ERROR_PAYLOAD;
     if frame.len() < min_len {
         return None;
     }
 
-    // Verify ethertype
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != ETH_TYPE_IPV4 {
-        return None;
-    }
-
     // Parse outer IP header
-    let outer_ip = &frame[ETH_HEADER_LEN..];
+    let outer_ip = &frame[l3..];
     let version = (outer_ip[0] >> 4) & 0x0F;
     if version != 4 {
         return None;
@@ -296,7 +298,7 @@ pub fn parse_icmp_error(frame: &[u8]) -> Option<IcmpErrorInfo> {
     let error_source = Ipv4Addr::new(outer_ip[12], outer_ip[13], outer_ip[14], outer_ip[15]);
 
     // Parse ICMP header
-    let icmp_start = ETH_HEADER_LEN + outer_ihl;
+    let icmp_start = l3 + outer_ihl;
     if frame.len() < icmp_start + ICMP_HEADER_LEN + MIN_ICMP_ERROR_PAYLOAD {
         return None;
     }
@@ -401,40 +403,33 @@ pub fn icmp_checksum(icmp_header_and_data: &[u8]) -> u16 {
 ///
 /// Returns None if the frame is not a valid ICMP packet
 pub fn parse_icmp_packet(frame: &[u8]) -> Option<IcmpPacket> {
-    // Minimum size check
-    if frame.len() < MIN_ICMP_PACKET_LEN {
+    // Detect VLAN tag and determine L3 offset.
+    let layout = crate::detect_vlan(frame)?;
+    let l3 = layout.l3_offset;
+
+    if layout.ethertype != ETH_TYPE_IPV4 {
         return None;
     }
 
-    // Parse Ethernet header
+    // Minimum size: L3 + IP header + ICMP header
+    if frame.len() < l3 + IPV4_HEADER_LEN + ICMP_HEADER_LEN {
+        return None;
+    }
+
     let dst_mac: [u8; 6] = frame[0..6].try_into().ok()?;
     let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
 
-    // Only handle IPv4
-    if ethertype != ETH_TYPE_IPV4 {
-        return None;
-    }
-
-    // Parse IPv4 header
-    let ip_header = &frame[ETH_HEADER_LEN..];
-
-    // Check IP version
+    let ip_header = &frame[l3..];
     let version = (ip_header[0] >> 4) & 0x0F;
     if version != 4 {
         return None;
     }
-
-    // Get IP header length
     let ihl = (ip_header[0] & 0x0F) as usize;
     let ip_header_len = ihl * 4;
     if ip_header_len < 20 {
         return None;
     }
-
-    // Check protocol
-    let protocol = ip_header[9];
-    if protocol != IP_PROTO_ICMP {
+    if ip_header[9] != IP_PROTO_ICMP {
         return None;
     }
 
@@ -442,8 +437,7 @@ pub fn parse_icmp_packet(frame: &[u8]) -> Option<IcmpPacket> {
     let src_ip = Ipv4Addr::new(ip_header[12], ip_header[13], ip_header[14], ip_header[15]);
     let dst_ip = Ipv4Addr::new(ip_header[16], ip_header[17], ip_header[18], ip_header[19]);
 
-    // Parse ICMP header
-    let icmp_start = ETH_HEADER_LEN + ip_header_len;
+    let icmp_start = l3 + ip_header_len;
     if frame.len() < icmp_start + ICMP_HEADER_LEN {
         return None;
     }
@@ -455,7 +449,6 @@ pub fn parse_icmp_packet(frame: &[u8]) -> Option<IcmpPacket> {
     let identifier = u16::from_be_bytes([icmp[4], icmp[5]]);
     let sequence = u16::from_be_bytes([icmp[6], icmp[7]]);
 
-    // Extract payload
     let payload = if frame.len() > icmp_start + ICMP_HEADER_LEN {
         frame[icmp_start + ICMP_HEADER_LEN..].to_vec()
     } else {

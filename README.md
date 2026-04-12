@@ -281,7 +281,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **ICMP error handling** | Destination/port unreachable queued to originating socket | Parsed and queued per-socket via `take_error()` | Done |
 | **Gratuitous ARP** | Announces IP on interface up | Broadcast on bind, configurable | Done |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Planned |
+| **VLAN (802.1q)** | Full tag insert/strip | Insert and strip VLAN tags, configurable per-socket | Done |
 | **Jumbo frames** | Configurable MTU | Configurable MTU via NetworkConfig, send_to() guard | Done |
 | **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
@@ -322,11 +322,11 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **ICMP error handling** — ICMP error messages (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem) are parsed and matched back to the originating socket using the embedded original datagram header. Errors are queued per-socket and surfaced via `take_error()`, mirroring Linux `SO_ERROR` behavior. Supported error types: Port/Host/Network Unreachable (`ConnectionRefused`), Fragmentation Needed with Next-Hop MTU (`Other`), TTL Exceeded (`TimedOut`), Admin Prohibited (`PermissionDenied`), and Parameter Problem (`InvalidData`). The error queue is bounded (16 entries) to prevent ICMP flood amplification.
 
+**VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip support. Outgoing frames are tagged with a configurable VLAN ID (0-4094), Priority Code Point (PCP 0-7), and Drop Eligible Indicator (DEI). Incoming VLAN-tagged frames are transparently accepted and stripped by the packet parser. Configured per-socket via `set_vlan(Some(VlanConfig::new(100).with_priority(3)))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
+
 ### Planned
 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
-
-**VLAN (802.1q)** — Insert and strip VLAN tags in the socket layer. Required for physical networks with segmented L2 domains. DPDK NICs support VLAN offload, but the socket layer needs to handle tagging for backends that don't.
 
 **UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
 
