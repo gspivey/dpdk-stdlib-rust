@@ -3,6 +3,10 @@
 Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
+**Standard benchmarks** (include in every run entry):
+1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
+2. **Synthetic PPS** — `cargo test -- --nocapture vlan_pps_benchmark` (measures pure CPU overhead of RX processing pipeline, independent of NIC speed; ~5s to run)
+
 ---
 
 ## Run #14: VLAN 802.1Q Modes (Access, Trunk, PortTagging)
