@@ -281,7 +281,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **ICMP error handling** | Destination/port unreachable queued to originating socket | Parsed and queued per-socket via `take_error()` | Done |
 | **Gratuitous ARP** | Announces IP on interface up | Broadcast on bind, configurable | Done |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **VLAN (802.1q)** | Full tag insert/strip | Insert and strip VLAN tags, configurable per-socket | Done |
+| **VLAN (802.1q)** | Full tag insert/strip with mode-based filtering | Insert/strip VLAN tags with Access, Trunk, and PortTagging modes (Linux 8021q semantics). RX filtering and TX tagging per mode. | Done |
 | **Jumbo frames** | Configurable MTU | Configurable MTU via NetworkConfig, send_to() guard | Done |
 | **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
@@ -299,7 +299,7 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 - AWS VPC is **L3-routed, not L2-switched** — all traffic (even same-subnet) transits a virtual router
 - ARP always resolves to the **VPC gateway MAC**, never the peer's actual MAC
-- No VLANs, no broadcast domains, no real L2 switching
+- No VLANs at the VPC level (our VLAN support is for non-AWS environments), no broadcast domains, no real L2 switching
 - Gateway is always at `subnet_base + 1` (e.g., `10.0.1.1`)
 
 **On physical hardware**, the subnet-aware routing table handles L2/L3 routing decisions automatically. On Linux, `UdpSocket::bind()` auto-detects the subnet, gateway, and ARP entries from `/proc/net/route` and `/proc/net/arp`. For non-standard topologies, use `NetworkConfig` to configure routing explicitly. See `docs/routing.md`.
@@ -322,7 +322,7 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **ICMP error handling** — ICMP error messages (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem) are parsed and matched back to the originating socket using the embedded original datagram header. Errors are queued per-socket and surfaced via `take_error()`, mirroring Linux `SO_ERROR` behavior. Supported error types: Port/Host/Network Unreachable (`ConnectionRefused`), Fragmentation Needed with Next-Hop MTU (`Other`), TTL Exceeded (`TimedOut`), Admin Prohibited (`PermissionDenied`), and Parameter Problem (`InvalidData`). The error queue is bounded (16 entries) to prevent ICMP flood amplification.
 
-**VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip support. Outgoing frames are tagged with a configurable VLAN ID (0-4094), Priority Code Point (PCP 0-7), and Drop Eligible Indicator (DEI). Incoming VLAN-tagged frames are transparently accepted and stripped by the packet parser. Configured per-socket via `set_vlan(Some(VlanConfig::new(100).with_priority(3)))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
+**VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip with three operating modes matching Linux 8021q subinterface semantics. **Access mode**: RX accepts untagged + matching VID (strips tag), TX sends untagged. **Trunk mode**: RX accepts frames tagged with any VID in an allowed set (optional native VLAN for untagged), TX tags. **PortTagging mode** (default): RX only accepts matching VID (strips tag, drops untagged), TX always tags. Configurable per-socket via `set_vlan(Some(VlanConfig::new(100).access()))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
 
 ### Planned
 

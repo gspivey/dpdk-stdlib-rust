@@ -144,11 +144,54 @@ pub const IP_PROTO_UDP: u8 = 17;
 // VLAN (802.1Q) Support
 // ============================================================================
 
+/// VLAN operating mode, matching Linux 8021q subinterface semantics.
+///
+/// Each mode defines how inbound (RX) frames are filtered and how outbound
+/// (TX) frames are tagged or left untagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VlanMode {
+    /// Access mode: the port belongs to exactly one VLAN.
+    ///
+    /// - **RX**: accept untagged frames AND frames tagged with the configured VID
+    ///   (strip tag before delivery). Drop frames tagged with any other VID.
+    /// - **TX**: send frames untagged (no 802.1Q tag inserted).
+    Access,
+
+    /// Trunk mode: carry multiple VLANs on a single port.
+    ///
+    /// - **RX**: accept frames tagged with any VID in `allowed_vlans`.
+    ///   If `native_vlan` is set, also accept untagged frames (treated as
+    ///   the native VLAN). Drop all other frames.
+    /// - **TX**: tag frames with the configured VID.
+    Trunk {
+        /// Set of allowed VLAN IDs on this trunk.
+        allowed_vlans: Vec<u16>,
+        /// If set, untagged frames are accepted and treated as this VLAN.
+        native_vlan: Option<u16>,
+    },
+
+    /// Port tagging (strict VLAN subinterface) mode.
+    ///
+    /// - **RX**: only accept frames tagged with the configured VID (strip tag).
+    ///   Drop untagged frames and frames with any other VID.
+    /// - **TX**: always tag frames with the configured VID.
+    PortTagging,
+}
+
+impl Default for VlanMode {
+    fn default() -> Self {
+        VlanMode::PortTagging
+    }
+}
+
 /// VLAN configuration for 802.1Q frame tagging.
 ///
-/// When configured on a socket, outgoing frames are tagged with the specified
-/// VLAN ID and priority. Incoming VLAN-tagged frames are accepted and stripped
-/// transparently (the VLAN tag is not visible to the application).
+/// When configured on a socket, outgoing and incoming frames are handled
+/// according to the configured [`VlanMode`]:
+///
+/// - **Access**: RX accepts untagged + matching VID (strips tag); TX sends untagged.
+/// - **Trunk**: RX accepts allowed VIDs (optionally untagged via native_vlan); TX tags.
+/// - **PortTagging** (default): RX only accepts matching VID (strips tag); TX always tags.
 ///
 /// # Wire format
 ///
@@ -163,7 +206,7 @@ pub const IP_PROTO_UDP: u8 = 17;
 /// - PCP (bits 15-13): Priority Code Point (0-7)
 /// - DEI (bit 12): Drop Eligible Indicator
 /// - VID (bits 11-0): VLAN Identifier (0-4094)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VlanConfig {
     /// VLAN Identifier (12 bits, 0-4094). VID 0 means priority-only tagging.
     /// VID 4095 is reserved.
@@ -172,13 +215,16 @@ pub struct VlanConfig {
     pub priority: u8,
     /// Drop Eligible Indicator. When set, the frame may be dropped under congestion.
     pub dei: bool,
+    /// VLAN operating mode (Access, Trunk, or PortTagging).
+    pub mode: VlanMode,
 }
 
 impl VlanConfig {
-    /// Create a VLAN config with the given VLAN ID, default priority (0), no DEI.
+    /// Create a VLAN config with the given VLAN ID, default priority (0), no DEI,
+    /// and default mode (PortTagging).
     pub fn new(vlan_id: u16) -> Self {
         assert!(vlan_id <= 4094, "VLAN ID must be 0-4094");
-        Self { vlan_id, priority: 0, dei: false }
+        Self { vlan_id, priority: 0, dei: false, mode: VlanMode::default() }
     }
 
     /// Set the priority code point (0-7).
@@ -194,6 +240,56 @@ impl VlanConfig {
         self
     }
 
+    /// Set the VLAN operating mode.
+    pub fn with_mode(mut self, mode: VlanMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Configure as access port: RX accepts untagged + matching VID; TX sends untagged.
+    pub fn access(mut self) -> Self {
+        self.mode = VlanMode::Access;
+        self
+    }
+
+    /// Configure as trunk port with the given allowed VLANs and optional native VLAN.
+    pub fn trunk(mut self, allowed_vlans: Vec<u16>, native_vlan: Option<u16>) -> Self {
+        self.mode = VlanMode::Trunk { allowed_vlans, native_vlan };
+        self
+    }
+
+    /// Configure as port tagging (strict): RX only matching VID; TX always tags.
+    pub fn port_tagging(mut self) -> Self {
+        self.mode = VlanMode::PortTagging;
+        self
+    }
+
+    /// Returns true if outbound frames should be VLAN-tagged in the current mode.
+    pub fn tags_on_tx(&self) -> bool {
+        !matches!(self.mode, VlanMode::Access)
+    }
+
+    /// Check whether an inbound frame should be accepted based on the VLAN mode.
+    ///
+    /// `frame_vid` is the VID extracted from the frame (None if untagged).
+    /// Returns `true` if the frame should be accepted, `false` if it should be dropped.
+    pub fn accepts_frame(&self, frame_vid: Option<u16>) -> bool {
+        match &self.mode {
+            VlanMode::Access => match frame_vid {
+                None => true,                             // untagged: accepted
+                Some(vid) => vid == self.vlan_id,         // matching VID: accepted; other: drop
+            },
+            VlanMode::Trunk { allowed_vlans, native_vlan } => match frame_vid {
+                Some(vid) => allowed_vlans.contains(&vid), // VID must be in allowed set
+                None => native_vlan.is_some(),              // untagged only if native_vlan set
+            },
+            VlanMode::PortTagging => match frame_vid {
+                Some(vid) => vid == self.vlan_id,          // only matching VID
+                None => false,                             // drop untagged
+            },
+        }
+    }
+
     /// Encode the 16-bit TCI (Tag Control Information) for the wire.
     pub fn encode_tci(&self) -> u16 {
         let pcp = (self.priority as u16 & 0x07) << 13;
@@ -202,12 +298,13 @@ impl VlanConfig {
         pcp | dei | vid
     }
 
-    /// Decode a TCI value from the wire into a VlanConfig.
+    /// Decode a TCI value from the wire into a VlanConfig (PortTagging mode by default).
     pub fn from_tci(tci: u16) -> Self {
         Self {
             vlan_id: tci & 0x0FFF,
             priority: ((tci >> 13) & 0x07) as u8,
             dei: (tci >> 12) & 1 != 0,
+            mode: VlanMode::default(),
         }
     }
 }
@@ -2086,9 +2183,14 @@ impl UdpSocket {
         let src_mac = self.socket_backend.mac_address();
 
         // Build frame into reusable buffer (zero-alloc) and send.
-        // If VLAN is configured, insert the 802.1Q tag into the frame.
+        // VLAN TX behavior depends on mode:
+        //   Access  -> send untagged (no 802.1Q tag)
+        //   Trunk   -> send tagged with configured VID
+        //   PortTag -> send tagged with configured VID
+        //   None    -> send untagged
         let mut tx_buf = self.tx_buf.borrow_mut();
-        if let Some(ref vlan) = self.vlan_config {
+        let should_tag = self.vlan_config.as_ref().map_or(false, |v| v.tags_on_tx());
+        if should_tag {
             build_udp_frame_into_vlan(
                 &mut tx_buf,
                 &src_mac,
@@ -2096,7 +2198,7 @@ impl UdpSocket {
                 src_ip, dst_ip,
                 src_port, dst_port,
                 buf, self.ttl,
-                vlan,
+                self.vlan_config.as_ref().unwrap(),
             ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
         } else {
             build_udp_frame_into(
@@ -2423,6 +2525,14 @@ impl UdpSocket {
             None => return None,
         };
 
+        // VLAN RX filtering: drop frames that don't match our VLAN mode.
+        if let Some(ref vlan_cfg) = self.vlan_config {
+            let frame_vid = layout.vlan_tci.map(|tci| tci & 0x0FFF);
+            if !vlan_cfg.accepts_frame(frame_vid) {
+                return None;
+            }
+        }
+
         // Handle ARP (both tagged and untagged)
         if layout.ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
@@ -2638,19 +2748,30 @@ impl UdpSocket {
     // VLAN Configuration
     // ========================================================================
 
-    /// Configure 802.1Q VLAN tagging on this socket.
+    /// Configure 802.1Q VLAN tagging and filtering on this socket.
     ///
-    /// When set, all outgoing frames will include a VLAN tag with the specified
-    /// VLAN ID and priority. Incoming VLAN-tagged frames are always accepted
-    /// regardless of this setting (the tag is stripped transparently).
+    /// The [`VlanMode`] on the config determines both TX tagging and RX filtering:
     ///
-    /// # Example
+    /// - **Access**: RX accepts untagged + matching VID (strips tag). TX sends untagged.
+    /// - **Trunk**: RX accepts allowed VIDs (optional native_vlan for untagged). TX tags.
+    /// - **PortTagging** (default): RX only accepts matching VID (strips tag). TX tags.
+    ///
+    /// Set to `None` to disable VLAN processing (accept all frames, send untagged).
+    ///
+    /// # Examples
     ///
     /// ```rust,ignore
     /// use dpdk_udp::{UdpSocket, VlanConfig};
     ///
     /// let mut socket = UdpSocket::bind("0.0.0.0:9000")?;
+    /// // Port tagging (default): strict VID match on RX, tag on TX
     /// socket.set_vlan(Some(VlanConfig::new(100).with_priority(3)));
+    ///
+    /// // Access mode: accept untagged + VID 100, send untagged
+    /// socket.set_vlan(Some(VlanConfig::new(100).access()));
+    ///
+    /// // Trunk mode: accept VIDs 100, 200, 300; untagged treated as VID 100
+    /// socket.set_vlan(Some(VlanConfig::new(100).trunk(vec![100, 200, 300], Some(100))));
     /// ```
     pub fn set_vlan(&mut self, config: Option<VlanConfig>) {
         self.vlan_config = config;
@@ -3402,9 +3523,10 @@ impl UdpSocketBuilder {
         // Create the socket using the standard bind path
         let mut socket = UdpSocket::bind(addr)?;
 
-        // Apply routing and VLAN configuration if provided
-        if let Some(net_config) = self.network_config {
-            socket.vlan_config = net_config.vlan;
+        // Apply routing and VLAN configuration if provided.
+        // Extract vlan before moving net_config into RoutingTable.
+        if let Some(mut net_config) = self.network_config {
+            socket.vlan_config = net_config.vlan.take();
             socket.routing_table = RoutingTable::with_config(net_config);
         }
 
@@ -4769,14 +4891,14 @@ mod tests {
     #[test]
     fn vlan_config_tci_encoding() {
         // VID 100, PCP 5, DEI 0
-        let config = VlanConfig { vlan_id: 100, priority: 5, dei: false };
+        let config = VlanConfig { vlan_id: 100, priority: 5, dei: false, mode: VlanMode::default() };
         let tci = config.encode_tci();
         assert_eq!(tci & 0x0FFF, 100);           // VID
         assert_eq!((tci >> 13) & 0x07, 5);        // PCP
         assert_eq!((tci >> 12) & 1, 0);            // DEI
 
         // VID 4094 (max), PCP 7, DEI 1
-        let config = VlanConfig { vlan_id: 4094, priority: 7, dei: true };
+        let config = VlanConfig { vlan_id: 4094, priority: 7, dei: true, mode: VlanMode::default() };
         let tci = config.encode_tci();
         assert_eq!(tci & 0x0FFF, 4094);
         assert_eq!((tci >> 13) & 0x07, 7);
@@ -4994,8 +5116,9 @@ mod tests {
             .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
             .with_vlan(VlanConfig::new(100).with_priority(3));
 
-        assert_eq!(config.vlan.unwrap().vlan_id, 100);
-        assert_eq!(config.vlan.unwrap().priority, 3);
+        let vlan = config.vlan.as_ref().unwrap();
+        assert_eq!(vlan.vlan_id, 100);
+        assert_eq!(vlan.priority, 3);
     }
 
     #[test]
@@ -5025,5 +5148,307 @@ mod tests {
         let (len, src_addr) = result.expect("should receive VLAN-tagged UDP packet");
         assert_eq!(&buf[..len], b"vlan payload");
         assert_eq!(src_addr.port(), 8000);
+    }
+
+    // ========================================================================
+    // VLAN Mode Tests
+    // ========================================================================
+
+    /// Helper: build a tagged UDP frame destined for the given port.
+    fn make_tagged_frame(dst_port: u16, vid: u16) -> Vec<u8> {
+        let vlan = VlanConfig::new(vid);
+        let mut frame = Vec::new();
+        build_udp_frame_into_vlan(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(127, 0, 0, 1),
+            8000, dst_port,
+            b"test payload", 64, &vlan,
+        ).unwrap();
+        frame
+    }
+
+    /// Helper: build an untagged UDP frame destined for the given port.
+    fn make_untagged_frame(dst_port: u16) -> Vec<u8> {
+        build_udp_frame(
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(127, 0, 0, 1),
+            8000, dst_port,
+            b"test payload", 64,
+        ).unwrap()
+    }
+
+    fn socket_local_port(socket: &UdpSocket) -> u16 {
+        match socket.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            _ => panic!("expected v4"),
+        }
+    }
+
+    // ── accepts_frame unit tests ──
+
+    #[test]
+    fn vlan_mode_access_accepts_untagged() {
+        let cfg = VlanConfig::new(100).access();
+        assert!(cfg.accepts_frame(None));
+    }
+
+    #[test]
+    fn vlan_mode_access_accepts_matching_vid() {
+        let cfg = VlanConfig::new(100).access();
+        assert!(cfg.accepts_frame(Some(100)));
+    }
+
+    #[test]
+    fn vlan_mode_access_drops_wrong_vid() {
+        let cfg = VlanConfig::new(100).access();
+        assert!(!cfg.accepts_frame(Some(200)));
+    }
+
+    #[test]
+    fn vlan_mode_port_tagging_drops_untagged() {
+        let cfg = VlanConfig::new(100).port_tagging();
+        assert!(!cfg.accepts_frame(None));
+    }
+
+    #[test]
+    fn vlan_mode_port_tagging_accepts_matching_vid() {
+        let cfg = VlanConfig::new(100).port_tagging();
+        assert!(cfg.accepts_frame(Some(100)));
+    }
+
+    #[test]
+    fn vlan_mode_port_tagging_drops_wrong_vid() {
+        let cfg = VlanConfig::new(100).port_tagging();
+        assert!(!cfg.accepts_frame(Some(200)));
+    }
+
+    #[test]
+    fn vlan_mode_trunk_accepts_allowed_vid() {
+        let cfg = VlanConfig::new(100).trunk(vec![100, 200, 300], None);
+        assert!(cfg.accepts_frame(Some(100)));
+        assert!(cfg.accepts_frame(Some(200)));
+        assert!(cfg.accepts_frame(Some(300)));
+    }
+
+    #[test]
+    fn vlan_mode_trunk_drops_disallowed_vid() {
+        let cfg = VlanConfig::new(100).trunk(vec![100, 200], None);
+        assert!(!cfg.accepts_frame(Some(999)));
+    }
+
+    #[test]
+    fn vlan_mode_trunk_drops_untagged_without_native() {
+        let cfg = VlanConfig::new(100).trunk(vec![100], None);
+        assert!(!cfg.accepts_frame(None));
+    }
+
+    #[test]
+    fn vlan_mode_trunk_accepts_untagged_with_native() {
+        let cfg = VlanConfig::new(100).trunk(vec![100, 200], Some(100));
+        assert!(cfg.accepts_frame(None));
+    }
+
+    // ── tags_on_tx tests ──
+
+    #[test]
+    fn vlan_tags_on_tx_access_is_false() {
+        let cfg = VlanConfig::new(100).access();
+        assert!(!cfg.tags_on_tx());
+    }
+
+    #[test]
+    fn vlan_tags_on_tx_trunk_is_true() {
+        let cfg = VlanConfig::new(100).trunk(vec![100], None);
+        assert!(cfg.tags_on_tx());
+    }
+
+    #[test]
+    fn vlan_tags_on_tx_port_tagging_is_true() {
+        let cfg = VlanConfig::new(100).port_tagging();
+        assert!(cfg.tags_on_tx());
+    }
+
+    // ── process_frame_zerocopy RX filtering tests ──
+
+    #[test]
+    fn vlan_access_mode_rx_accepts_untagged_frame() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).access()));
+
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "Access mode should accept untagged frames");
+    }
+
+    #[test]
+    fn vlan_access_mode_rx_accepts_matching_tagged_frame() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).access()));
+
+        let frame = make_tagged_frame(port, 100);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "Access mode should accept matching VID");
+    }
+
+    #[test]
+    fn vlan_access_mode_rx_drops_wrong_vid() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).access()));
+
+        let frame = make_tagged_frame(port, 200);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_none(), "Access mode should drop wrong VID");
+    }
+
+    #[test]
+    fn vlan_port_tagging_rx_drops_untagged() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).port_tagging()));
+
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_none(), "PortTagging mode should drop untagged frames");
+    }
+
+    #[test]
+    fn vlan_port_tagging_rx_accepts_matching_vid() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).port_tagging()));
+
+        let frame = make_tagged_frame(port, 100);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "PortTagging mode should accept matching VID");
+    }
+
+    #[test]
+    fn vlan_port_tagging_rx_drops_wrong_vid() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).port_tagging()));
+
+        let frame = make_tagged_frame(port, 999);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_none(), "PortTagging mode should drop wrong VID");
+    }
+
+    #[test]
+    fn vlan_trunk_rx_accepts_allowed_vid() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).trunk(vec![100, 200, 300], None)));
+
+        let frame = make_tagged_frame(port, 200);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "Trunk mode should accept allowed VID 200");
+    }
+
+    #[test]
+    fn vlan_trunk_rx_drops_disallowed_vid() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).trunk(vec![100, 200], None)));
+
+        let frame = make_tagged_frame(port, 999);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_none(), "Trunk mode should drop disallowed VID");
+    }
+
+    #[test]
+    fn vlan_trunk_rx_drops_untagged_without_native() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).trunk(vec![100], None)));
+
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_none(), "Trunk mode should drop untagged without native_vlan");
+    }
+
+    #[test]
+    fn vlan_trunk_rx_accepts_untagged_with_native() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).trunk(vec![100, 200], Some(100))));
+
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "Trunk mode should accept untagged with native_vlan");
+    }
+
+    #[test]
+    fn vlan_no_config_accepts_all_frames() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+
+        // No VLAN config: accept tagged
+        let frame = make_tagged_frame(port, 42);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        assert!(result.is_some(), "No VLAN config should accept tagged frames");
+
+        // No VLAN config: accept untagged
+        let frame = make_untagged_frame(port);
+        let mut result2 = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result2);
+        assert!(result2.is_some(), "No VLAN config should accept untagged frames");
+    }
+
+    // ── VlanConfig builder tests ──
+
+    #[test]
+    fn vlan_config_default_mode_is_port_tagging() {
+        let cfg = VlanConfig::new(100);
+        assert_eq!(cfg.mode, VlanMode::PortTagging);
+    }
+
+    #[test]
+    fn vlan_config_access_builder() {
+        let cfg = VlanConfig::new(100).with_priority(3).access();
+        assert_eq!(cfg.mode, VlanMode::Access);
+        assert_eq!(cfg.priority, 3);
+        assert_eq!(cfg.vlan_id, 100);
+    }
+
+    #[test]
+    fn vlan_config_trunk_builder() {
+        let cfg = VlanConfig::new(100).trunk(vec![100, 200, 300], Some(100));
+        assert_eq!(cfg.mode, VlanMode::Trunk {
+            allowed_vlans: vec![100, 200, 300],
+            native_vlan: Some(100),
+        });
+    }
+
+    #[test]
+    fn vlan_config_with_mode_builder() {
+        let cfg = VlanConfig::new(50).with_mode(VlanMode::Access);
+        assert_eq!(cfg.mode, VlanMode::Access);
+        assert_eq!(cfg.vlan_id, 50);
     }
 }
