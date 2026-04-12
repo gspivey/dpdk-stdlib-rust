@@ -1,10 +1,16 @@
 //! ICMP (Internet Control Message Protocol) implementation
 //!
-//! Handles ICMP echo request/reply (ping) functionality.
+//! Handles ICMP echo request/reply (ping) and ICMP error processing.
+//!
+//! ICMP error messages (Destination Unreachable, Time Exceeded, etc.) carry the
+//! IP header + first 8 bytes of the original datagram that triggered the error.
+//! For UDP, those 8 bytes are the source and destination ports, which lets us
+//! match errors back to the originating socket and surface them via `take_error()`.
 
+use std::io;
 use std::net::Ipv4Addr;
 
-use crate::{ETH_HEADER_LEN, ETH_TYPE_IPV4, IPV4_HEADER_LEN, ipv4_checksum};
+use crate::{ETH_HEADER_LEN, ETH_TYPE_IPV4, IPV4_HEADER_LEN, UDP_HEADER_LEN, ipv4_checksum};
 
 // ============================================================================
 // Constants
@@ -13,20 +19,60 @@ use crate::{ETH_HEADER_LEN, ETH_TYPE_IPV4, IPV4_HEADER_LEN, ipv4_checksum};
 /// IP protocol number for ICMP
 pub const IP_PROTO_ICMP: u8 = 1;
 
+/// IP protocol number for UDP (used when parsing original datagram in ICMP errors)
+pub const IP_PROTO_UDP: u8 = 17;
+
 /// ICMP type: Echo Reply
 pub const ICMP_TYPE_ECHO_REPLY: u8 = 0;
+
+/// ICMP type: Destination Unreachable
+pub const ICMP_TYPE_DEST_UNREACHABLE: u8 = 3;
+
+/// ICMP type: Redirect
+pub const ICMP_TYPE_REDIRECT: u8 = 5;
 
 /// ICMP type: Echo Request
 pub const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
 
+/// ICMP type: Time Exceeded
+pub const ICMP_TYPE_TIME_EXCEEDED: u8 = 11;
+
+/// ICMP type: Parameter Problem
+pub const ICMP_TYPE_PARAMETER_PROBLEM: u8 = 12;
+
 /// ICMP code for echo messages
 pub const ICMP_CODE_ECHO: u8 = 0;
 
-/// ICMP header size (type + code + checksum + identifier + sequence)
+// Destination Unreachable codes (RFC 792 + RFC 1122)
+/// Network Unreachable
+pub const ICMP_CODE_NET_UNREACHABLE: u8 = 0;
+/// Host Unreachable
+pub const ICMP_CODE_HOST_UNREACHABLE: u8 = 1;
+/// Protocol Unreachable
+pub const ICMP_CODE_PROTO_UNREACHABLE: u8 = 2;
+/// Port Unreachable
+pub const ICMP_CODE_PORT_UNREACHABLE: u8 = 3;
+/// Fragmentation Needed and DF Set (carries Next-Hop MTU in bytes 6-7)
+pub const ICMP_CODE_FRAG_NEEDED: u8 = 4;
+/// Source Route Failed
+pub const ICMP_CODE_SOURCE_ROUTE_FAILED: u8 = 5;
+/// Communication Administratively Prohibited (RFC 1812)
+pub const ICMP_CODE_ADMIN_PROHIBITED: u8 = 13;
+
+// Time Exceeded codes
+/// TTL Exceeded in Transit
+pub const ICMP_CODE_TTL_EXCEEDED: u8 = 0;
+/// Fragment Reassembly Time Exceeded
+pub const ICMP_CODE_FRAG_REASSEMBLY_EXCEEDED: u8 = 1;
+
+/// ICMP header size (type + code + checksum + identifier/unused + sequence/mtu)
 pub const ICMP_HEADER_LEN: usize = 8;
 
-/// Minimum ICMP packet size
+/// Minimum ICMP packet size (echo)
 pub const MIN_ICMP_PACKET_LEN: usize = ETH_HEADER_LEN + IPV4_HEADER_LEN + ICMP_HEADER_LEN;
+
+/// Minimum ICMP error packet size: outer headers + ICMP header + original IP header + 8 bytes of original transport
+pub const MIN_ICMP_ERROR_PAYLOAD: usize = IPV4_HEADER_LEN + UDP_HEADER_LEN;
 
 // ============================================================================
 // ICMP Packet Structure
@@ -70,6 +116,17 @@ impl IcmpPacket {
         self.icmp_type == ICMP_TYPE_ECHO_REPLY && self.icmp_code == ICMP_CODE_ECHO
     }
 
+    /// Check if this is an ICMP error message (carries original datagram info).
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self.icmp_type,
+            ICMP_TYPE_DEST_UNREACHABLE
+                | ICMP_TYPE_TIME_EXCEEDED
+                | ICMP_TYPE_REDIRECT
+                | ICMP_TYPE_PARAMETER_PROBLEM
+        )
+    }
+
     /// Create an echo reply for this echo request
     pub fn make_echo_reply(&self, reply_src_mac: [u8; 6]) -> Option<IcmpPacket> {
         if !self.is_echo_request() {
@@ -90,6 +147,220 @@ impl IcmpPacket {
             payload: self.payload.clone(),
         })
     }
+}
+
+// ============================================================================
+// ICMP Error Handling
+// ============================================================================
+
+/// Parsed ICMP error with context from the original datagram.
+///
+/// ICMP error messages (types 3, 5, 11, 12) carry the IP header + first 8
+/// bytes of the original packet that triggered the error. For UDP, those 8
+/// bytes contain the source and destination ports.
+#[derive(Debug, Clone)]
+pub struct IcmpErrorInfo {
+    /// ICMP error type (3 = Dest Unreachable, 11 = Time Exceeded, etc.)
+    pub icmp_type: u8,
+    /// ICMP error code (sub-type within the error category)
+    pub icmp_code: u8,
+    /// IP address of the router/host that generated the error
+    pub error_source: Ipv4Addr,
+    /// Original destination IP from the packet that triggered the error
+    pub original_dst_ip: Ipv4Addr,
+    /// Original source IP from the packet that triggered the error
+    pub original_src_ip: Ipv4Addr,
+    /// Original destination port (from the UDP header in the ICMP payload)
+    pub original_dst_port: u16,
+    /// Original source port (from the UDP header in the ICMP payload)
+    pub original_src_port: u16,
+    /// Next-Hop MTU (only valid for Fragmentation Needed, type 3 code 4)
+    pub next_hop_mtu: u16,
+}
+
+impl IcmpErrorInfo {
+    /// Convert this ICMP error into an `io::Error` matching Linux kernel behavior.
+    ///
+    /// Linux maps ICMP errors to errno values which are surfaced via `SO_ERROR`
+    /// / `take_error()`. We replicate that mapping here.
+    pub fn to_io_error(&self) -> io::Error {
+        match (self.icmp_type, self.icmp_code) {
+            (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE) => io::Error::new(
+                io::ErrorKind::Other,
+                format!("ICMP: network unreachable (from {})", self.error_source),
+            ),
+            (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_HOST_UNREACHABLE) => io::Error::new(
+                io::ErrorKind::Other,
+                format!("ICMP: host unreachable (from {})", self.error_source),
+            ),
+            (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_PROTO_UNREACHABLE)
+            | (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE) => io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!(
+                    "ICMP: {} unreachable (from {})",
+                    if self.icmp_code == ICMP_CODE_PORT_UNREACHABLE {
+                        "port"
+                    } else {
+                        "protocol"
+                    },
+                    self.error_source,
+                ),
+            ),
+            (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_FRAG_NEEDED) => io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "ICMP: fragmentation needed, next-hop MTU {} (from {})",
+                    self.next_hop_mtu, self.error_source
+                ),
+            ),
+            (ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_ADMIN_PROHIBITED) => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "ICMP: communication administratively prohibited (from {})",
+                    self.error_source
+                ),
+            ),
+            (ICMP_TYPE_DEST_UNREACHABLE, code) => io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "ICMP: destination unreachable code {} (from {})",
+                    code, self.error_source
+                ),
+            ),
+            (ICMP_TYPE_TIME_EXCEEDED, ICMP_CODE_TTL_EXCEEDED) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ICMP: TTL exceeded in transit (from {})", self.error_source),
+            ),
+            (ICMP_TYPE_TIME_EXCEEDED, ICMP_CODE_FRAG_REASSEMBLY_EXCEEDED) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "ICMP: fragment reassembly time exceeded (from {})",
+                    self.error_source
+                ),
+            ),
+            (ICMP_TYPE_REDIRECT, _) => io::Error::new(
+                io::ErrorKind::Other,
+                format!("ICMP: redirect (from {})", self.error_source),
+            ),
+            (ICMP_TYPE_PARAMETER_PROBLEM, _) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ICMP: parameter problem (from {})", self.error_source),
+            ),
+            (typ, code) => io::Error::new(
+                io::ErrorKind::Other,
+                format!("ICMP error type {} code {} (from {})", typ, code, self.error_source),
+            ),
+        }
+    }
+}
+
+/// Parse an ICMP error message and extract the original datagram context.
+///
+/// ICMP error messages have this structure:
+/// ```text
+/// [Ethernet 14B][Outer IP 20B][ICMP Header 8B][Original IP Header 20B+][Original Transport 8B]
+/// ```
+///
+/// We extract the original IP src/dst and the original UDP src/dst ports from
+/// the embedded datagram, so the socket layer can match the error to the right
+/// socket.
+///
+/// Returns `None` if the frame is not a valid ICMP error for a UDP datagram.
+pub fn parse_icmp_error(frame: &[u8]) -> Option<IcmpErrorInfo> {
+    // We need at least: Eth(14) + outer IP(20) + ICMP header(8) + original IP(20) + original UDP ports(8)
+    let min_len = ETH_HEADER_LEN + IPV4_HEADER_LEN + ICMP_HEADER_LEN + MIN_ICMP_ERROR_PAYLOAD;
+    if frame.len() < min_len {
+        return None;
+    }
+
+    // Verify ethertype
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    // Parse outer IP header
+    let outer_ip = &frame[ETH_HEADER_LEN..];
+    let version = (outer_ip[0] >> 4) & 0x0F;
+    if version != 4 {
+        return None;
+    }
+    let outer_ihl = (outer_ip[0] & 0x0F) as usize * 4;
+    if outer_ihl < 20 {
+        return None;
+    }
+    let protocol = outer_ip[9];
+    if protocol != IP_PROTO_ICMP {
+        return None;
+    }
+    let error_source = Ipv4Addr::new(outer_ip[12], outer_ip[13], outer_ip[14], outer_ip[15]);
+
+    // Parse ICMP header
+    let icmp_start = ETH_HEADER_LEN + outer_ihl;
+    if frame.len() < icmp_start + ICMP_HEADER_LEN + MIN_ICMP_ERROR_PAYLOAD {
+        return None;
+    }
+    let icmp = &frame[icmp_start..];
+    let icmp_type = icmp[0];
+    let icmp_code = icmp[1];
+
+    // Only process error types
+    if !matches!(
+        icmp_type,
+        ICMP_TYPE_DEST_UNREACHABLE
+            | ICMP_TYPE_TIME_EXCEEDED
+            | ICMP_TYPE_REDIRECT
+            | ICMP_TYPE_PARAMETER_PROBLEM
+    ) {
+        return None;
+    }
+
+    // For Fragmentation Needed (type 3, code 4), bytes 6-7 contain the Next-Hop MTU
+    let next_hop_mtu = if icmp_type == ICMP_TYPE_DEST_UNREACHABLE && icmp_code == ICMP_CODE_FRAG_NEEDED {
+        u16::from_be_bytes([icmp[6], icmp[7]])
+    } else {
+        0
+    };
+
+    // Parse the original IP header embedded in the ICMP payload
+    let orig_ip_start = icmp_start + ICMP_HEADER_LEN;
+    let orig_ip = &frame[orig_ip_start..];
+    let orig_version = (orig_ip[0] >> 4) & 0x0F;
+    if orig_version != 4 {
+        return None;
+    }
+    let orig_ihl = (orig_ip[0] & 0x0F) as usize * 4;
+    if orig_ihl < 20 {
+        return None;
+    }
+
+    // Check that the original packet was UDP
+    let orig_protocol = orig_ip[9];
+    if orig_protocol != IP_PROTO_UDP {
+        return None;
+    }
+
+    let original_src_ip = Ipv4Addr::new(orig_ip[12], orig_ip[13], orig_ip[14], orig_ip[15]);
+    let original_dst_ip = Ipv4Addr::new(orig_ip[16], orig_ip[17], orig_ip[18], orig_ip[19]);
+
+    // Extract original UDP ports (first 4 bytes of the original transport header)
+    let orig_udp_start = orig_ip_start + orig_ihl;
+    if frame.len() < orig_udp_start + 4 {
+        return None;
+    }
+    let original_src_port = u16::from_be_bytes([frame[orig_udp_start], frame[orig_udp_start + 1]]);
+    let original_dst_port = u16::from_be_bytes([frame[orig_udp_start + 2], frame[orig_udp_start + 3]]);
+
+    Some(IcmpErrorInfo {
+        icmp_type,
+        icmp_code,
+        error_source,
+        original_dst_ip,
+        original_src_ip,
+        original_dst_port,
+        original_src_port,
+        next_hop_mtu,
+    })
 }
 
 // ============================================================================
@@ -315,6 +586,15 @@ pub fn build_echo_reply(
 // ICMP Handler
 // ============================================================================
 
+/// Result of processing an ICMP packet: either a reply frame to send, or
+/// an error to queue on the matching socket.
+pub enum IcmpAction {
+    /// An echo reply frame that should be transmitted back.
+    Reply(Vec<u8>),
+    /// An ICMP error that should be queued on the originating socket.
+    Error(IcmpErrorInfo),
+}
+
 /// Handles ICMP protocol operations
 pub struct IcmpHandler {
     /// Our MAC address
@@ -339,7 +619,7 @@ impl IcmpHandler {
         }
     }
 
-    /// Process an incoming ICMP packet
+    /// Process an incoming ICMP packet (legacy API — echo only).
     ///
     /// Returns an echo reply frame if this was an echo request for our IP,
     /// or None if no response is needed.
@@ -350,6 +630,31 @@ impl IcmpHandler {
         if packet.is_echo_request() && self.local_ips.contains(&packet.dst_ip) {
             let reply = packet.make_echo_reply(self.local_mac)?;
             return Some(build_icmp_frame(&reply));
+        }
+
+        None
+    }
+
+    /// Process an incoming ICMP packet, handling both echo requests and error messages.
+    ///
+    /// Returns `Some(IcmpAction::Reply(frame))` for echo requests addressed to us,
+    /// or `Some(IcmpAction::Error(info))` for ICMP errors that reference a UDP
+    /// datagram originating from one of our local IPs.
+    pub fn process_icmp_full(&self, frame: &[u8]) -> Option<IcmpAction> {
+        // Try echo request first (most common in-bound ICMP)
+        if let Some(packet) = parse_icmp_packet(frame) {
+            if packet.is_echo_request() && self.local_ips.contains(&packet.dst_ip) {
+                let reply = packet.make_echo_reply(self.local_mac)?;
+                return Some(IcmpAction::Reply(build_icmp_frame(&reply)));
+            }
+        }
+
+        // Try ICMP error (type 3, 5, 11, 12 with embedded original datagram)
+        if let Some(error_info) = parse_icmp_error(frame) {
+            // Only accept errors about datagrams that originated from us
+            if self.local_ips.contains(&error_info.original_src_ip) {
+                return Some(IcmpAction::Error(error_info));
+            }
         }
 
         None
@@ -691,5 +996,273 @@ mod tests {
             requester_mac, local_mac, requester_ip, local_ip2, 2, 1, b"",
         );
         assert!(handler.process_icmp(&request2).is_some());
+    }
+
+    // ========================================================================
+    // ICMP Error Parsing Tests
+    // ========================================================================
+
+    /// Build a synthetic ICMP error frame embedding an original UDP datagram header.
+    ///
+    /// Layout: [Eth 14][Outer IP 20][ICMP Hdr 8][Original IP 20][Original UDP 8]
+    fn build_test_icmp_error_frame(
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        error_src_ip: Ipv4Addr,
+        error_dst_ip: Ipv4Addr,
+        icmp_type: u8,
+        icmp_code: u8,
+        next_hop_mtu: u16,
+        orig_src_ip: Ipv4Addr,
+        orig_dst_ip: Ipv4Addr,
+        orig_src_port: u16,
+        orig_dst_port: u16,
+    ) -> Vec<u8> {
+        // Total: Eth(14) + outer IP(20) + ICMP(8) + orig IP(20) + orig UDP(8) = 70
+        let total = 14 + 20 + 8 + 20 + 8;
+        let mut frame = vec![0u8; total];
+
+        // Ethernet header
+        frame[0..6].copy_from_slice(&dst_mac);
+        frame[6..12].copy_from_slice(&src_mac);
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+        // Outer IP header
+        let ip = 14;
+        frame[ip] = 0x45;
+        let outer_total_len = (20 + 8 + 20 + 8) as u16;
+        frame[ip + 2..ip + 4].copy_from_slice(&outer_total_len.to_be_bytes());
+        frame[ip + 8] = 64; // TTL
+        frame[ip + 9] = IP_PROTO_ICMP;
+        frame[ip + 12..ip + 16].copy_from_slice(&error_src_ip.octets());
+        frame[ip + 16..ip + 20].copy_from_slice(&error_dst_ip.octets());
+
+        // ICMP header
+        let icmp = 34;
+        frame[icmp] = icmp_type;
+        frame[icmp + 1] = icmp_code;
+        // bytes 4-5: unused (or pointer for param problem)
+        // bytes 6-7: next-hop MTU for frag needed
+        frame[icmp + 6..icmp + 8].copy_from_slice(&next_hop_mtu.to_be_bytes());
+
+        // Original IP header (embedded in ICMP payload)
+        let orig_ip = 42;
+        frame[orig_ip] = 0x45;
+        let orig_total_len = (20 + 8) as u16;
+        frame[orig_ip + 2..orig_ip + 4].copy_from_slice(&orig_total_len.to_be_bytes());
+        frame[orig_ip + 8] = 64;
+        frame[orig_ip + 9] = IP_PROTO_UDP;
+        frame[orig_ip + 12..orig_ip + 16].copy_from_slice(&orig_src_ip.octets());
+        frame[orig_ip + 16..orig_ip + 20].copy_from_slice(&orig_dst_ip.octets());
+
+        // Original UDP header (first 8 bytes)
+        let orig_udp = 62;
+        frame[orig_udp..orig_udp + 2].copy_from_slice(&orig_src_port.to_be_bytes());
+        frame[orig_udp + 2..orig_udp + 4].copy_from_slice(&orig_dst_port.to_be_bytes());
+
+        // Compute ICMP checksum
+        let cksum = icmp_checksum(&frame[icmp..]);
+        frame[icmp + 2..icmp + 4].copy_from_slice(&cksum.to_be_bytes());
+
+        frame
+    }
+
+    #[test]
+    fn test_parse_icmp_error_port_unreachable() {
+        let router_ip = Ipv4Addr::new(10, 0, 1, 1);
+        let our_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let peer_ip = Ipv4Addr::new(10, 0, 2, 200);
+
+        let frame = build_test_icmp_error_frame(
+            [0xaa; 6], [0xbb; 6],
+            router_ip, our_ip,
+            ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0,
+            our_ip, peer_ip, 12345, 9000,
+        );
+
+        let err = parse_icmp_error(&frame).expect("should parse");
+        assert_eq!(err.icmp_type, ICMP_TYPE_DEST_UNREACHABLE);
+        assert_eq!(err.icmp_code, ICMP_CODE_PORT_UNREACHABLE);
+        assert_eq!(err.error_source, router_ip);
+        assert_eq!(err.original_src_ip, our_ip);
+        assert_eq!(err.original_dst_ip, peer_ip);
+        assert_eq!(err.original_src_port, 12345);
+        assert_eq!(err.original_dst_port, 9000);
+        assert_eq!(err.next_hop_mtu, 0);
+    }
+
+    #[test]
+    fn test_parse_icmp_error_frag_needed_with_mtu() {
+        let router_ip = Ipv4Addr::new(10, 0, 1, 1);
+        let our_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let peer_ip = Ipv4Addr::new(10, 0, 2, 200);
+
+        let frame = build_test_icmp_error_frame(
+            [0xaa; 6], [0xbb; 6],
+            router_ip, our_ip,
+            ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_FRAG_NEEDED, 1280,
+            our_ip, peer_ip, 12345, 9000,
+        );
+
+        let err = parse_icmp_error(&frame).expect("should parse");
+        assert_eq!(err.icmp_code, ICMP_CODE_FRAG_NEEDED);
+        assert_eq!(err.next_hop_mtu, 1280);
+    }
+
+    #[test]
+    fn test_parse_icmp_error_ttl_exceeded() {
+        let router_ip = Ipv4Addr::new(10, 0, 1, 1);
+        let our_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let peer_ip = Ipv4Addr::new(10, 0, 2, 200);
+
+        let frame = build_test_icmp_error_frame(
+            [0xaa; 6], [0xbb; 6],
+            router_ip, our_ip,
+            ICMP_TYPE_TIME_EXCEEDED, ICMP_CODE_TTL_EXCEEDED, 0,
+            our_ip, peer_ip, 5000, 8080,
+        );
+
+        let err = parse_icmp_error(&frame).expect("should parse");
+        assert_eq!(err.icmp_type, ICMP_TYPE_TIME_EXCEEDED);
+        assert_eq!(err.icmp_code, ICMP_CODE_TTL_EXCEEDED);
+        assert_eq!(err.original_src_port, 5000);
+        assert_eq!(err.original_dst_port, 8080);
+    }
+
+    #[test]
+    fn test_parse_icmp_error_rejects_echo() {
+        // Echo request should not be parsed as an error
+        let frame = build_echo_request(
+            [0xaa; 6], [0xbb; 6],
+            Ipv4Addr::new(1, 2, 3, 4),
+            Ipv4Addr::new(5, 6, 7, 8),
+            1, 1, b"hello",
+        );
+        assert!(parse_icmp_error(&frame).is_none());
+    }
+
+    #[test]
+    fn test_parse_icmp_error_rejects_non_udp() {
+        // Build an ICMP error whose original datagram is TCP (proto 6), not UDP
+        let router_ip = Ipv4Addr::new(10, 0, 1, 1);
+        let our_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let peer_ip = Ipv4Addr::new(10, 0, 2, 200);
+
+        let mut frame = build_test_icmp_error_frame(
+            [0xaa; 6], [0xbb; 6],
+            router_ip, our_ip,
+            ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0,
+            our_ip, peer_ip, 12345, 9000,
+        );
+
+        // Overwrite the original IP protocol from UDP(17) to TCP(6)
+        frame[42 + 9] = 6;
+        assert!(parse_icmp_error(&frame).is_none());
+    }
+
+    #[test]
+    fn test_parse_icmp_error_too_short() {
+        // Frame shorter than minimum ICMP error size
+        let short = [0u8; 50];
+        assert!(parse_icmp_error(&short).is_none());
+    }
+
+    #[test]
+    fn test_icmp_error_to_io_error_types() {
+        let base = IcmpErrorInfo {
+            icmp_type: ICMP_TYPE_DEST_UNREACHABLE,
+            icmp_code: ICMP_CODE_PORT_UNREACHABLE,
+            error_source: Ipv4Addr::new(10, 0, 1, 1),
+            original_dst_ip: Ipv4Addr::new(10, 0, 2, 200),
+            original_src_ip: Ipv4Addr::new(10, 0, 1, 100),
+            original_dst_port: 9000,
+            original_src_port: 12345,
+            next_hop_mtu: 0,
+        };
+
+        // Port unreachable -> ConnectionRefused
+        let err = base.to_io_error();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+
+        // Host unreachable -> Other (EHOSTUNREACH)
+        let mut info = base.clone();
+        info.icmp_code = ICMP_CODE_HOST_UNREACHABLE;
+        assert_eq!(info.to_io_error().kind(), io::ErrorKind::Other);
+
+        // Admin prohibited -> PermissionDenied
+        let mut info = base.clone();
+        info.icmp_code = ICMP_CODE_ADMIN_PROHIBITED;
+        assert_eq!(info.to_io_error().kind(), io::ErrorKind::PermissionDenied);
+
+        // TTL exceeded -> TimedOut
+        let mut info = base.clone();
+        info.icmp_type = ICMP_TYPE_TIME_EXCEEDED;
+        info.icmp_code = ICMP_CODE_TTL_EXCEEDED;
+        assert_eq!(info.to_io_error().kind(), io::ErrorKind::TimedOut);
+
+        // Parameter problem -> InvalidData
+        let mut info = base.clone();
+        info.icmp_type = ICMP_TYPE_PARAMETER_PROBLEM;
+        info.icmp_code = 0;
+        assert_eq!(info.to_io_error().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_handler_process_icmp_full_echo() {
+        let local_mac = [0x11; 6];
+        let local_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let handler = IcmpHandler::new(local_mac, local_ip);
+
+        let frame = build_echo_request(
+            [0xaa; 6], local_mac,
+            Ipv4Addr::new(192, 168, 1, 100), local_ip,
+            1, 1, b"ping",
+        );
+
+        match handler.process_icmp_full(&frame) {
+            Some(IcmpAction::Reply(_)) => {} // expected
+            other => panic!("expected Reply, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_handler_process_icmp_full_error() {
+        let local_mac = [0x11; 6];
+        let local_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let handler = IcmpHandler::new(local_mac, local_ip);
+
+        let frame = build_test_icmp_error_frame(
+            [0xaa; 6], local_mac,
+            Ipv4Addr::new(10, 0, 1, 1), local_ip,
+            ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_HOST_UNREACHABLE, 0,
+            local_ip, Ipv4Addr::new(10, 0, 2, 200), 5000, 9000,
+        );
+
+        match handler.process_icmp_full(&frame) {
+            Some(IcmpAction::Error(info)) => {
+                assert_eq!(info.icmp_type, ICMP_TYPE_DEST_UNREACHABLE);
+                assert_eq!(info.icmp_code, ICMP_CODE_HOST_UNREACHABLE);
+                assert_eq!(info.original_src_port, 5000);
+            }
+            other => panic!("expected Error, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_handler_process_icmp_full_ignores_error_for_other_ip() {
+        let local_mac = [0x11; 6];
+        let local_ip = Ipv4Addr::new(10, 0, 1, 100);
+        let other_ip = Ipv4Addr::new(10, 0, 1, 200);
+        let handler = IcmpHandler::new(local_mac, local_ip);
+
+        // Error about a datagram originating from other_ip, not us
+        let frame = build_test_icmp_error_frame(
+            [0xaa; 6], local_mac,
+            Ipv4Addr::new(10, 0, 1, 1), local_ip,
+            ICMP_TYPE_DEST_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0,
+            other_ip, Ipv4Addr::new(10, 0, 2, 200), 5000, 9000,
+        );
+
+        assert!(handler.process_icmp_full(&frame).is_none());
     }
 }

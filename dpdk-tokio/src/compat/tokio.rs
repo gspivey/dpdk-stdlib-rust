@@ -558,11 +558,15 @@ impl UdpSocket {
     }
 
     /// Gets the value of the `SO_ERROR` option on this socket.
+    ///
+    /// Returns the first pending ICMP error (Destination Unreachable, Time
+    /// Exceeded, etc.) and removes it from the queue, or `Ok(None)` if no
+    /// errors are pending.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         match &self.inner {
             UdpSocketInner::Tokio(s) => s.take_error(),
             #[cfg(feature = "dpdk")]
-            UdpSocketInner::Dpdk(_) => Ok(None),
+            UdpSocketInner::Dpdk(s) => s.socket.blocking_lock().take_error(),
         }
     }
 

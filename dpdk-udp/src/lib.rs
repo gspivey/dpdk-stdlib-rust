@@ -55,7 +55,7 @@ pub mod perf;
 pub mod frame_pool;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
-pub use icmp::{IcmpHandler, IcmpPacket};
+pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
 pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
@@ -1513,6 +1513,12 @@ pub struct UdpSocket {
     rx_dropped_packets: AtomicU64,
     /// Total bytes of payload dropped due to receive buffer overflow.
     rx_dropped_bytes: AtomicU64,
+    /// Socket error queue — populated by ICMP error messages that match this socket.
+    /// Drained via `take_error()`, mirroring Linux `SO_ERROR` / `sk_err` behavior.
+    error_queue: Mutex<VecDeque<io::Error>>,
+    /// Fast-path flag: true when `error_queue` has entries. Avoids locking the
+    /// mutex on every `take_error()` call when there are no errors (common case).
+    has_pending_error: AtomicBool,
 }
 
 impl UdpSocket {
@@ -1607,6 +1613,8 @@ impl UdpSocket {
             routing_table,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
+            error_queue: Mutex::new(VecDeque::new()),
+            has_pending_error: AtomicBool::new(false),
         };
 
         // Send Gratuitous ARP to announce our MAC/IP mapping on the network
@@ -1719,6 +1727,8 @@ impl UdpSocket {
             routing_table,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
+            error_queue: Mutex::new(VecDeque::new()),
+            has_pending_error: AtomicBool::new(false),
         };
 
         // Send Gratuitous ARP to announce our MAC/IP mapping on the network
@@ -2186,12 +2196,28 @@ impl UdpSocket {
             return None;
         }
 
-        // Handle ICMP
+        // Handle ICMP (echo replies + error messages)
         if ethertype == ETH_TYPE_IPV4 && frame_data.len() > ETH_HEADER_LEN + 9 {
             let protocol = frame_data[ETH_HEADER_LEN + 9];
-            if protocol == icmp::IP_PROTO_ICMP && self.auto_icmp {
-                if let Some(reply_frame) = self.icmp_handler.process_icmp(frame_data) {
-                    let _ = self.socket_backend.send_frame(&reply_frame);
+            if protocol == icmp::IP_PROTO_ICMP {
+                if let Some(action) = self.icmp_handler.process_icmp_full(frame_data) {
+                    match action {
+                        icmp::IcmpAction::Reply(reply_frame) => {
+                            if self.auto_icmp {
+                                let _ = self.socket_backend.send_frame(&reply_frame);
+                            }
+                        }
+                        icmp::IcmpAction::Error(error_info) => {
+                            // Match against our socket's local port
+                            let local_port = match self.local_addr {
+                                SocketAddr::V4(v4) => v4.port(),
+                                _ => 0,
+                            };
+                            if error_info.original_src_port == local_port {
+                                self.queue_icmp_error(error_info.to_io_error());
+                            }
+                        }
+                    }
                 }
                 perf_inc!(self.perf_counters.rx_icmp_handled);
                 return None;
@@ -2627,6 +2653,53 @@ impl UdpSocket {
         self.rx_dropped_bytes
             .fetch_add(payload_len as u64, Ordering::Relaxed);
         perf_inc!(self.perf_counters.rx_drops_buffer_full);
+    }
+
+    // ========================================================================
+    // Socket Error Queue (ICMP Error Handling)
+    // ========================================================================
+
+    /// Gets the value of the `SO_ERROR` option on this socket.
+    ///
+    /// Returns the first pending error and removes it from the queue, or
+    /// `Ok(None)` if no errors are pending. This mirrors Linux `getsockopt(SO_ERROR)`
+    /// which dequeues errors one at a time.
+    ///
+    /// Errors are queued when ICMP error messages (Destination Unreachable,
+    /// Time Exceeded, etc.) are received that reference a UDP datagram
+    /// originating from this socket.
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        // Fast path: no errors pending (common case)
+        if !self.has_pending_error.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut queue = self.error_queue.lock().unwrap();
+        let err = queue.pop_front();
+        if queue.is_empty() {
+            self.has_pending_error.store(false, Ordering::Release);
+        }
+        Ok(err)
+    }
+
+    /// Returns the number of pending errors in the socket error queue.
+    pub fn pending_errors(&self) -> usize {
+        self.error_queue.lock().unwrap().len()
+    }
+
+    /// Internal: queue an ICMP error on this socket.
+    ///
+    /// Called from the receive path when an ICMP error message references a
+    /// UDP datagram originating from this socket's local IP and port.
+    /// The error queue is bounded (max 16 entries) to prevent unbounded growth
+    /// from ICMP floods.
+    fn queue_icmp_error(&self, error: io::Error) {
+        const MAX_ERROR_QUEUE: usize = 16;
+        let mut queue = self.error_queue.lock().unwrap();
+        if queue.len() < MAX_ERROR_QUEUE {
+            queue.push_back(error);
+            self.has_pending_error.store(true, Ordering::Release);
+        }
+        // Silently drop if queue is full (matches Linux behavior under ICMP flood)
     }
 
     // ========================================================================
@@ -4201,5 +4274,217 @@ mod tests {
         // kernel's `net.core.rmem_default`.
         assert!(DEFAULT_RECV_BUFFER_BYTES >= 200 * 1024);
         assert!(DEFAULT_RECV_BUFFER_BYTES <= 4 * 1024 * 1024);
+    }
+
+    // ========================================================================
+    // ICMP Error Queue / take_error() Tests
+    // ========================================================================
+
+    #[test]
+    fn take_error_returns_none_when_empty() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(socket.take_error().unwrap().is_none());
+        assert_eq!(socket.pending_errors(), 0);
+    }
+
+    #[test]
+    fn take_error_returns_queued_errors_in_order() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Queue two errors
+        socket.queue_icmp_error(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "ICMP: port unreachable",
+        ));
+        socket.queue_icmp_error(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ICMP: TTL exceeded",
+        ));
+
+        assert_eq!(socket.pending_errors(), 2);
+
+        // First error
+        let err1 = socket.take_error().unwrap().expect("should have error");
+        assert_eq!(err1.kind(), io::ErrorKind::ConnectionRefused);
+
+        // Second error
+        let err2 = socket.take_error().unwrap().expect("should have error");
+        assert_eq!(err2.kind(), io::ErrorKind::TimedOut);
+
+        // Queue is now empty
+        assert!(socket.take_error().unwrap().is_none());
+        assert_eq!(socket.pending_errors(), 0);
+    }
+
+    #[test]
+    fn take_error_queue_is_bounded() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Queue more than the max (16)
+        for i in 0..20 {
+            socket.queue_icmp_error(io::Error::new(
+                io::ErrorKind::Other,
+                format!("error {}", i),
+            ));
+        }
+
+        // Only 16 should be stored
+        assert_eq!(socket.pending_errors(), 16);
+
+        // Drain them all
+        let mut count = 0;
+        while socket.take_error().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 16);
+    }
+
+    #[test]
+    fn has_pending_error_flag_tracks_queue_state() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Initially no errors
+        assert!(!socket.has_pending_error.load(Ordering::Acquire));
+
+        // Queue one
+        socket.queue_icmp_error(io::Error::new(io::ErrorKind::Other, "test"));
+        assert!(socket.has_pending_error.load(Ordering::Acquire));
+
+        // Drain it
+        socket.take_error().unwrap();
+        assert!(!socket.has_pending_error.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn process_frame_zerocopy_queues_icmp_port_unreachable() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = match socket.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            _ => panic!("expected v4"),
+        };
+
+        // Build an ICMP Destination Unreachable (port unreachable) frame
+        // that references a UDP packet from our socket
+        let our_ip = match socket.local_addr {
+            SocketAddr::V4(v4) => *v4.ip(),
+            _ => panic!("expected v4"),
+        };
+
+        let frame = build_icmp_error_frame_for_test(
+            Ipv4Addr::new(10, 0, 1, 1), // router
+            our_ip,
+            icmp::ICMP_TYPE_DEST_UNREACHABLE,
+            icmp::ICMP_CODE_PORT_UNREACHABLE,
+            0, // no MTU
+            our_ip,
+            Ipv4Addr::new(10, 0, 2, 200),
+            local_port,
+            9000,
+        );
+
+        // Process the frame
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+
+        // Should NOT produce a UDP result
+        assert!(result.is_none());
+
+        // Should have queued an ICMP error
+        let err = socket.take_error().unwrap().expect("should have ICMP error");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(err.to_string().contains("port unreachable"));
+    }
+
+    #[test]
+    fn process_frame_zerocopy_ignores_icmp_error_for_wrong_port() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = match socket.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            _ => panic!("expected v4"),
+        };
+
+        let our_ip = match socket.local_addr {
+            SocketAddr::V4(v4) => *v4.ip(),
+            _ => panic!("expected v4"),
+        };
+
+        // Build ICMP error referencing a DIFFERENT source port
+        let frame = build_icmp_error_frame_for_test(
+            Ipv4Addr::new(10, 0, 1, 1),
+            our_ip,
+            icmp::ICMP_TYPE_DEST_UNREACHABLE,
+            icmp::ICMP_CODE_PORT_UNREACHABLE,
+            0,
+            our_ip,
+            Ipv4Addr::new(10, 0, 2, 200),
+            local_port.wrapping_add(1), // different port
+            9000,
+        );
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+
+        // No error should be queued
+        assert!(socket.take_error().unwrap().is_none());
+    }
+
+    /// Helper: build an ICMP error frame for use in lib.rs tests.
+    fn build_icmp_error_frame_for_test(
+        error_src_ip: Ipv4Addr,
+        error_dst_ip: Ipv4Addr,
+        icmp_type: u8,
+        icmp_code: u8,
+        next_hop_mtu: u16,
+        orig_src_ip: Ipv4Addr,
+        orig_dst_ip: Ipv4Addr,
+        orig_src_port: u16,
+        orig_dst_port: u16,
+    ) -> Vec<u8> {
+        let total = 14 + 20 + 8 + 20 + 8;
+        let mut frame = vec![0u8; total];
+
+        // Ethernet
+        frame[0..6].copy_from_slice(&[0xbb; 6]);
+        frame[6..12].copy_from_slice(&[0xaa; 6]);
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+        // Outer IP
+        let ip = 14;
+        frame[ip] = 0x45;
+        let outer_total_len = (20 + 8 + 20 + 8) as u16;
+        frame[ip + 2..ip + 4].copy_from_slice(&outer_total_len.to_be_bytes());
+        frame[ip + 8] = 64;
+        frame[ip + 9] = icmp::IP_PROTO_ICMP;
+        frame[ip + 12..ip + 16].copy_from_slice(&error_src_ip.octets());
+        frame[ip + 16..ip + 20].copy_from_slice(&error_dst_ip.octets());
+
+        // ICMP header
+        let icmp_off = 34;
+        frame[icmp_off] = icmp_type;
+        frame[icmp_off + 1] = icmp_code;
+        frame[icmp_off + 6..icmp_off + 8].copy_from_slice(&next_hop_mtu.to_be_bytes());
+
+        // Original IP header
+        let orig_ip = 42;
+        frame[orig_ip] = 0x45;
+        let orig_total = (20 + 8) as u16;
+        frame[orig_ip + 2..orig_ip + 4].copy_from_slice(&orig_total.to_be_bytes());
+        frame[orig_ip + 8] = 64;
+        frame[orig_ip + 9] = 17; // UDP
+        frame[orig_ip + 12..orig_ip + 16].copy_from_slice(&orig_src_ip.octets());
+        frame[orig_ip + 16..orig_ip + 20].copy_from_slice(&orig_dst_ip.octets());
+
+        // Original UDP ports
+        let orig_udp = 62;
+        frame[orig_udp..orig_udp + 2].copy_from_slice(&orig_src_port.to_be_bytes());
+        frame[orig_udp + 2..orig_udp + 4].copy_from_slice(&orig_dst_port.to_be_bytes());
+
+        // ICMP checksum
+        let cksum = icmp::icmp_checksum(&frame[icmp_off..]);
+        frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cksum.to_be_bytes());
+
+        frame
     }
 }

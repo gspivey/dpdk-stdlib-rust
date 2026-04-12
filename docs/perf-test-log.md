@@ -5,6 +5,126 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #13: ICMP Error Handling Feature — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-12 |
+| **Git Hash** | `2c6822b` |
+| **Branch** | `claude/roadmap-feature-implementation-dcC8h` |
+| **PR** | [#35](https://github.com/gspivey/dpdk-stdlib-rust/pull/35) |
+| **GH Actions Run** | [24308053506](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24308053506) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #12
+
+1. **`2c6822b` — ICMP error handling with socket error queue and `take_error()`.** Added full ICMP error message parsing (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem), extraction of original datagram context (src/dst IP + ports), mapping to `io::Error` kinds matching Linux errno conventions, and a bounded (16-entry) per-socket error queue with `AtomicBool` fast-path flag. The ICMP error processing is wired into `process_frame_zerocopy()` but only fires on received ICMP error packets matching the socket's local port — zero impact on the UDP hot path (send/recv of normal data packets).
+
+### Results: 64B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 49 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 66 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 76 |
+| native-dpdk | 700K | 700,000 | 695,157 | 0.69% | — | — | — | — | 101 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 39,808 | 0 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 138,997 | 0.72% | 0 | 35,767 | 0 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 348,806 | 0.34% | 0 | 31,907 | 0 | 0 | 120 |
+| rust-dpdk   | 700K | 700,000 | 693,708 | 0.90% | 0 | 41,874 | 0 | 0 | 195 |
+| tokio-dpdk  | 70K  | 70,000  | 38,769  | 44.62% | 0 | 11,597 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 38,150  | 72.75% | 0 | 5,412 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 38,407  | 89.03% | 0 | 2,621 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 38,333  | 94.52% | 0 | 4,264 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 69,000  | 1.43% | — | — | — | — | 0 |
+| plain-rust  | 140K | 140,000 | 138,938 | 0.76% | — | — | — | — | 0 |
+| plain-rust  | 350K | 350,000 | 304,839 | 12.90% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 484,800 | 30.74% | — | — | — | — | 398 |
+
+### Results: 512B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 54 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 70 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 83 |
+| native-dpdk | 700K | 700,000 | 697,735 | 0.32% | — | — | — | — | 112 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 33,655 | 0 | 0 | 0 |
+| rust-dpdk   | 140K | 140,000 | 138,952 | 0.75% | 0 | 41,913 | 0 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 348,971 | 0.29% | 0 | 35,556 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 692,044 | 1.14% | 0 | 31,866 | 0 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 37,291  | 46.73% | 0 | 10,170 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 37,504  | 73.21% | 0 | 6,399 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 37,218  | 89.37% | 0 | 2,641 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 37,158  | 94.69% | 0 | 2,044 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 68,993  | 1.44% | — | — | — | — | 0 |
+| plain-rust  | 140K | 140,000 | 138,988 | 0.72% | — | — | — | — | 201 |
+| plain-rust  | 350K | 350,000 | 322,711 | 7.80% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 458,671 | 34.48% | — | — | — | — | 0 |
+
+### Results: 1400B Packets
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 54 |
+| native-dpdk | 140K | 140,000 | 140,000 | 0.00% | — | — | — | — | 75 |
+| native-dpdk | 350K | 350,000 | 350,000 | 0.00% | — | — | — | — | 80 |
+| native-dpdk | 700K | 700,000 | 682,490 | 2.50% | — | — | — | — | 539 |
+| rust-dpdk   | 70K  | 70,000  | 69,000  | 1.43% | 0 | 41,916 | 0 | 0 | 183 |
+| rust-dpdk   | 140K | 140,000 | 138,943 | 0.75% | 0 | 33,413 | 0 | 0 | 0 |
+| rust-dpdk   | 350K | 350,000 | 348,941 | 0.30% | 0 | 40,061 | 0 | 0 | 0 |
+| rust-dpdk   | 700K | 700,000 | 564,881 | 19.30% | 0 | 29,181 | 0 | 0 | 0 |
+| tokio-dpdk  | 70K  | 70,000  | 36,209  | 48.27% | 0 | 10,628 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 140,000 | 36,059  | 74.24% | 0 | 4,895 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 350,000 | 36,183  | 89.66% | 0 | 3,095 | 0 | 0 | 0 |
+| tokio-dpdk  | 700K | 700,000 | 36,044  | 94.85% | 0 | 2,741 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 68,999  | 1.43% | — | — | — | — | 147 |
+| plain-rust  | 140K | 140,000 | 138,996 | 0.72% | — | — | — | — | 200 |
+| plain-rust  | 350K | 350,000 | 288,771 | 17.49% | — | — | — | — | 0 |
+| plain-rust  | 700K | 700,000 | 437,879 | 37.45% | — | — | — | — | 0 |
+
+### Results: 8500B Packets (Jumbo)
+
+| Config | Target PPS | TX pps | RX pps | Drop % | imissed | ierrors | rx_nombuf | App Drops | Lat Avg (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| native-dpdk | 70K  | 70,000  | 70,000  | 0.00% | — | — | — | — | 57 |
+| native-dpdk | 140K | 125,216 | 125,216 | 0.00% | — | — | — | — | 8926 |
+| native-dpdk | 350K | 125,212 | 124,723 | 0.39% | — | — | — | — | 8979 |
+| rust-dpdk   | 70K  | 70,000  | 68,997  | 1.43% | 0 | 31,577 | 0 | 0 | 0 |
+| rust-dpdk   | 140K | 125,210 | 124,024 | 0.95% | 0 | 33,719 | 0 | 0 | 0 |
+| rust-dpdk   | 350K | 125,320 | 122,873 | 1.95% | 0 | 11,170 | 0 | 0 | 8784 |
+| tokio-dpdk  | 70K  | 70,000  | 29,250  | 58.21% | 0 | 7,721 | 0 | 0 | 0 |
+| tokio-dpdk  | 140K | 125,235 | 31,018  | 75.23% | 0 | 8,516 | 0 | 0 | 0 |
+| tokio-dpdk  | 350K | 125,227 | 31,123  | 75.15% | 0 | 2,802 | 0 | 0 | 0 |
+| plain-rust  | 70K  | 70,000  | 34,589  | 50.59% | — | — | — | — | 0 |
+| plain-rust  | 140K | 125,220 | 124,234 | 0.79% | — | — | — | — | 0 |
+| plain-rust  | 350K | 125,205 | 124,115 | 0.87% | — | — | — | — | 0 |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | **OK** | 0 / 0 / 0 | 421,004 / 421,004 / 0 | 0 / 0 / 0 |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 71,709 / 71,709 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression from ICMP error handling.** The new code path only activates when an ICMP error packet is received that matches the socket's local port — this never fires during normal UDP echo benchmarks, so the hot path is completely unaffected.
+
+Key observations vs Run #12:
+- **rust-dpdk 64B @ 700K**: 693.7K RX (0.90% drop) vs 699K RX (0.14% drop) in Run #12 — within normal instance-to-instance variance.
+- **rust-dpdk 512B @ 700K**: 692K RX (1.14% drop) vs 698.5K RX (0.20% drop) — slightly worse, consistent with different instance allocation.
+- **rust-dpdk 1400B @ 700K**: 565K RX (19.30% drop) vs 562K RX (19.67% drop) — virtually identical, confirms bandwidth cap behavior.
+- **native-dpdk 64B @ 700K**: 695K RX (0.69% drop) vs 700K (0.00% drop) in Run #12 — first time native-dpdk shows drops at 700K, likely different instance/placement. Still <1%.
+- **tokio-dpdk / plain-rust**: Consistent with Run #12 patterns, no change.
+
+**Conclusion**: The ICMP error handling feature is performance-neutral. The error parsing logic and socket error queue add no overhead to the normal UDP send/receive hot path. The `AtomicBool` fast-path flag in `take_error()` ensures zero mutex contention in the common case (no errors queued).
+
+---
+
 ## Run #12: Gratuitous ARP Feature — No Regression
 
 | Field | Value |
