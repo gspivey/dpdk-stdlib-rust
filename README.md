@@ -259,6 +259,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | IPv4 UDP send/receive | Complete | Build and parse Ethernet/IPv4/UDP frames |
 | ARP resolution | Complete | Cache with atomic fast-path, auto-request, kernel ARP seeding, gratuitous ARP on bind |
 | ICMP echo reply | Complete | Auto-responds to ping |
+| ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. queued via `take_error()` |
 | Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
 | Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
@@ -277,7 +278,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | Configurable byte-based buffer with atomic drop counters (`recv_drops`, `set_recv_buffer_size`) | Done |
 | **RX checksum validation** | Hardware or software verification on every packet | Software verification on every RX packet | Done |
 | **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | NIC computes when capable, software fallback | Done |
-| **ICMP error handling** | Destination/port unreachable queued to originating socket | Echo reply only — all ICMP errors ignored | Planned |
+| **ICMP error handling** | Destination/port unreachable queued to originating socket | Parsed and queued per-socket via `take_error()` | Done |
 | **Gratuitous ARP** | Announces IP on interface up | Broadcast on bind, configurable | Done |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
 | **VLAN (802.1q)** | Full tag insert/strip | Not implemented in socket layer | Planned |
@@ -319,9 +320,9 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **Gratuitous ARP** — Broadcasts an unsolicited ARP announcement on `bind()` so switches and routers learn the socket's MAC/IP mapping immediately, without waiting for inbound ARP requests. Configurable via `set_auto_garp(bool)` (enabled by default). Also available on-demand via `send_gratuitous_arp()` for failover or IP migration scenarios.
 
-### Planned
+**ICMP error handling** — ICMP error messages (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem) are parsed and matched back to the originating socket using the embedded original datagram header. Errors are queued per-socket and surfaced via `take_error()`, mirroring Linux `SO_ERROR` behavior. Supported error types: Port/Host/Network Unreachable (`ConnectionRefused`), Fragmentation Needed with Next-Hop MTU (`Other`), TTL Exceeded (`TimedOut`), Admin Prohibited (`PermissionDenied`), and Parameter Problem (`InvalidData`). The error queue is bounded (16 entries) to prevent ICMP flood amplification.
 
-**ICMP error handling** — Process destination unreachable and fragmentation needed messages. Surface errors to the application via the socket error API. Enables path MTU discovery.
+### Planned
 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
 

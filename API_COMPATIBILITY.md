@@ -150,6 +150,12 @@ The compat layer delegates to the underlying DPDK implementation. Here's the sta
 | Echo request/reply | ✅ | Full ping support |
 | ICMP checksum | ✅ | `icmp_checksum()` |
 | ICMP handler | ✅ | `IcmpHandler` - automatic echo reply |
+| ICMP error parsing | ✅ | `parse_icmp_error()` — extracts original datagram context |
+| ICMP error types | ✅ | Dest Unreachable (all codes), Time Exceeded, Redirect, Parameter Problem |
+| Error → io::Error mapping | ✅ | `IcmpErrorInfo::to_io_error()` — matches Linux errno mapping |
+| Socket error queue | ✅ | `take_error()` / `pending_errors()` — bounded queue (16 entries) |
+| Port matching | ✅ | Errors matched to socket via original UDP src port |
+| Frag Needed MTU | ✅ | Next-Hop MTU extracted from type 3 code 4 errors |
 
 ### Connection Tracking
 
