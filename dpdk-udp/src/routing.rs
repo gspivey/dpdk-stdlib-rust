@@ -72,6 +72,9 @@ pub struct NetworkConfig {
     pub static_routes: Vec<RouteEntry>,
     /// Interface MTU in bytes (default 1500). Affects `MAX_UDP_PAYLOAD`.
     pub mtu: u16,
+    /// Optional 802.1Q VLAN configuration. When set, outgoing frames are tagged
+    /// with the specified VLAN ID and priority.
+    pub vlan: Option<crate::VlanConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -82,6 +85,7 @@ impl Default for NetworkConfig {
             default_gateway: None,
             static_routes: Vec::new(),
             mtu: 1500,
+            vlan: None,
         }
     }
 }
@@ -111,6 +115,12 @@ impl NetworkConfig {
     /// Set the interface MTU.
     pub fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = mtu;
+        self
+    }
+
+    /// Configure 802.1Q VLAN tagging.
+    pub fn with_vlan(mut self, vlan: crate::VlanConfig) -> Self {
+        self.vlan = Some(vlan);
         self
     }
 

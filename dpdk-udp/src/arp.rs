@@ -121,19 +121,31 @@ impl ArpPacket {
 ///
 /// Returns None if the frame is not a valid ARP packet
 pub fn parse_arp_packet(frame: &[u8]) -> Option<ArpPacket> {
-    // Minimum size check
-    if frame.len() < ETH_ARP_FRAME_LEN {
+    // Detect VLAN tag and determine ARP header offset.
+    // Untagged: ethertype at [12..13], ARP at byte 14.
+    // VLAN-tagged: TPID 0x8100 at [12..13], inner ethertype at [16..17], ARP at byte 18.
+    let (ethertype, arp_offset) = if frame.len() >= 14 {
+        let outer = u16::from_be_bytes([frame[12], frame[13]]);
+        if outer == crate::ETH_TYPE_VLAN && frame.len() >= 18 {
+            let inner = u16::from_be_bytes([frame[16], frame[17]]);
+            (inner, 18usize)
+        } else {
+            (outer, 14usize)
+        }
+    } else {
         return None;
-    }
+    };
 
-    // Check Ethernet type
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     if ethertype != ETH_TYPE_ARP {
         return None;
     }
 
-    // Parse ARP header (starts at byte 14)
-    let arp = &frame[14..];
+    // Minimum size: arp_offset + 28 bytes ARP payload
+    if frame.len() < arp_offset + 28 {
+        return None;
+    }
+
+    let arp = &frame[arp_offset..];
 
     let hw_type = u16::from_be_bytes([arp[0], arp[1]]);
     let proto_type = u16::from_be_bytes([arp[2], arp[3]]);

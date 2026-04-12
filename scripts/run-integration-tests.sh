@@ -853,6 +853,56 @@ run_tier3() {
     log_info "Tier 3 execution complete"
 }
 
+run_tier4() {
+    log_section "Tier 4: Jumbo frame echo test"
+
+    # Bind ENIs on both instances (same as tier 1 — both DPDK)
+    log_info "Binding ENIs for Tier 4..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "tier4-jumbo-echo" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier4-jumbo-echo" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    # Warm ARP cache
+    warm_arp_cache
+
+    # Start listener on receiver in background
+    log_info "Starting jumbo echo listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier4-jumbo-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start listener"
+        generate_failure_xml "tier4-jumbo-echo" "Failed to start listener on receiver"
+        return 1
+    fi
+
+    # Give listener time to start
+    sleep 10
+
+    # Run sender on sender instance
+    log_info "Starting jumbo echo sender on sender..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier4-jumbo-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier4-jumbo-echo.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Sender test execution failed"
+        generate_failure_xml "tier4-jumbo-echo" "Sender test execution failed or timed out"
+    fi
+
+    # Wait for listener to finish
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 4 execution complete"
+}
+
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
@@ -1547,6 +1597,15 @@ Infrastructure ready.
 
     if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "3" ]]; then
         run_tier3 || true
+    fi
+
+    # Unbind ENIs between tier 3 and tier 4
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "4" ]]; then
+        run_tier4 || true
     fi
 
     # Step 6: Collect results
