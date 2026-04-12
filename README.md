@@ -89,6 +89,74 @@ let backend = BackendConfig {
 let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", backend)?;
 ```
 
+### NIC Port Detection
+
+When you call `UdpSocket::bind()` (the simple API), the library uses **DPDK port 0** — the first NIC that DPDK enumerated during EAL initialization. DPDK discovers NICs by scanning the PCI bus for devices bound to a DPDK-compatible driver (`vfio-pci`, `igb_uio`, or `uio_pci_generic`). The order is deterministic: ports are numbered by PCI bus address, so the NIC at the lowest PCI address becomes port 0.
+
+On most deployments this is the right choice — you bind one NIC to DPDK (leaving management traffic on a kernel-managed NIC), and port 0 is that NIC. On AWS EC2 with dual ENIs, the DPDK setup script binds only the secondary ENI to `vfio-pci`, so port 0 is always the data-plane NIC.
+
+For multi-NIC DPDK setups (multiple NICs bound to DPDK drivers), use `BackendConfig` to select the port explicitly:
+
+```rust
+use dpdk_udp::{UdpSocket, BackendConfig};
+
+// Use the second DPDK-managed NIC (port 1)
+let backend = BackendConfig::new().with_dpdk(1);
+let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", backend)?;
+```
+
+You can query how many DPDK ports are available at runtime:
+
+```rust
+use dpdk::port::Port;
+
+let count = Port::count_available();
+println!("DPDK manages {} NIC ports", count);
+```
+
+### Advanced Backend Examples
+
+NIC and backend selection is configured via `BackendConfig` in code. There is no CLI flag or environment variable for this — it is an API-level concern so that applications have full control over which NIC and backend they use.
+
+```rust
+use dpdk_udp::{UdpSocket, BackendConfig};
+
+// DPDK on a specific port (e.g., second NIC)
+let socket = UdpSocket::bind_with_backend(
+    "0.0.0.0:9000",
+    BackendConfig::new().with_dpdk(1),
+)?;
+
+// AF_PACKET raw socket on a named interface
+let socket = UdpSocket::bind_with_backend(
+    "0.0.0.0:9000",
+    BackendConfig::new().with_raw_socket("eth1"),
+)?;
+
+// AF_PACKET with MMAP zero-copy ring buffers
+let socket = UdpSocket::bind_with_backend(
+    "0.0.0.0:9000",
+    BackendConfig::new().with_raw_socket_mmap("eth1"),
+)?;
+
+// Combine routing, VLAN, and topology via the builder
+use dpdk_udp::{NetworkConfig, VlanConfig};
+use std::net::Ipv4Addr;
+
+let socket = UdpSocket::builder()
+    .network(
+        NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 50), 24)
+            .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
+            .with_vlan(VlanConfig::new(100).access())
+            .with_mtu(9001)
+    )
+    .bind("10.0.1.50:9000")?;
+
+// Configure VLAN directly on an existing socket
+let mut socket = UdpSocket::bind("0.0.0.0:9000")?;
+socket.set_vlan(Some(VlanConfig::new(200).trunk(vec![100, 200], None)));
+```
+
 ## Architecture
 
 ```
@@ -283,6 +351,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
 | **VLAN (802.1q)** | Full tag insert/strip with mode-based filtering | Insert/strip VLAN tags with Access, Trunk, and PortTagging modes (Linux 8021q semantics). RX filtering and TX tagging per mode. | Done |
 | **Jumbo frames** | Configurable MTU | Configurable MTU via NetworkConfig, send_to() guard | Done |
+| **Hardware VLAN offload** | NIC inserts/strips VLAN tags | Software insert/strip only | Planned |
 | **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
 | **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
@@ -329,6 +398,8 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
 
 **UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
+
+**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, similar to the existing checksum offload pattern. Query NIC capabilities at port init (`DEV_TX_OFFLOAD_VLAN_INSERT`, `DEV_RX_OFFLOAD_VLAN_STRIP`), set mbuf offload flags when capable, and fall back to software insert/strip on NICs without support. Configurable via `VlanConfig` to force software mode even when hardware offload is available. The current software VLAN implementation adds ~10% CPU overhead on tagged frames — hardware offload would eliminate this entirely.
 
 ### Not Currently Planned
 
