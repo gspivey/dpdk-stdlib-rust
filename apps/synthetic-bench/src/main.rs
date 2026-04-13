@@ -18,11 +18,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 // Label for the async implementation being benchmarked
-const ASYNC_LABEL: &str = "async (std::sync::Mutex + spin-poll try_recv_from)";
-
-/// Number of empty polls before yielding to the Tokio scheduler.
-/// Matches the constant in dpdk-tokio/src/socket.rs DpdkUdpSocket::recv_from.
-const RECV_SPIN_COUNT: u32 = 64;
+const ASYNC_LABEL: &str = "async (std::sync::Mutex + try_recv_from)";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -346,16 +342,13 @@ async fn bench_async_rx(payload_size: usize) -> u64 {
     let socket = Arc::new(std::sync::Mutex::new(sync_socket));
     let mut buf = [0u8; 2048];
 
-    // Warmup — using spin-poll pattern matching DpdkUdpSocket::recv_from
+    // Warmup
     let warmup_end = Instant::now() + WARMUP_DURATION;
-    'warmup: while Instant::now() < warmup_end {
-        for _ in 0..RECV_SPIN_COUNT {
-            match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
-                Some(_) => continue 'warmup,
-                None => std::hint::spin_loop(),
-            }
+    while Instant::now() < warmup_end {
+        match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
+            Some(_) => {}
+            None => tokio::task::yield_now().await,
         }
-        tokio::task::yield_now().await;
         if backend.rx_queue_len() < RX_REFILL_BATCH {
             backend.prefill_rx(RX_REFILL_BATCH, payload_size, LOCAL_IP, LOCAL_PORT);
         }
@@ -363,21 +356,14 @@ async fn bench_async_rx(payload_size: usize) -> u64 {
 
     let mut count: u64 = 0;
 
-    // Timed run — spin-poll pattern matching DpdkUdpSocket::recv_from:
-    // try RECV_SPIN_COUNT polls before yielding to the Tokio scheduler.
+    // Timed run — direct lock + try_recv_from + yield, no spawn_blocking, no buf clone
     let start = Instant::now();
     let deadline = start + BENCH_DURATION;
-    'bench: while Instant::now() < deadline {
-        for _ in 0..RECV_SPIN_COUNT {
-            match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
-                Some(_) => {
-                    count += 1;
-                    continue 'bench;
-                }
-                None => std::hint::spin_loop(),
-            }
+    while Instant::now() < deadline {
+        match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
+            Some(_) => count += 1,
+            None => tokio::task::yield_now().await,
         }
-        tokio::task::yield_now().await;
         if backend.rx_queue_len() < RX_REFILL_BATCH {
             backend.prefill_rx(RX_REFILL_BATCH, payload_size, LOCAL_IP, LOCAL_PORT);
         }

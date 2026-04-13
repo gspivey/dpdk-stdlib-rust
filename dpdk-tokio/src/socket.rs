@@ -128,25 +128,14 @@ impl DpdkUdpSocket {
 #[async_trait]
 impl AsyncUdpSocket for DpdkUdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        // Spin-poll up to RECV_SPIN_COUNT times before yielding to the Tokio
-        // scheduler. This mirrors how real Tokio's reactor keeps the task
-        // on-CPU while the fd is readable — since DPDK has no fd, we spin
-        // instead. At high packet rates (>350K pps) this prevents NIC ring
-        // overflow that occurs when yield_now() puts us at the back of the
-        // scheduler queue after every empty poll.
-        const RECV_SPIN_COUNT: u32 = 64;
         loop {
-            for _ in 0..RECV_SPIN_COUNT {
-                // try_recv_from does a single non-blocking poll.
-                // Scope the lock so MutexGuard is dropped before the await point.
-                let result = self.inner.lock().unwrap().try_recv_from(buf)?;
-                if let Some(r) = result {
-                    return Ok(r);
-                }
-                std::hint::spin_loop();
+            // try_recv_from does a single non-blocking poll — no sleep, no spawn_blocking.
+            // Scope the lock so MutexGuard is dropped before the await point.
+            let result = self.inner.lock().unwrap().try_recv_from(buf)?;
+            match result {
+                Some(r) => return Ok(r),
+                None => tokio::task::yield_now().await,
             }
-            // Yield after RECV_SPIN_COUNT empty polls to let other Tokio tasks run.
-            tokio::task::yield_now().await;
         }
     }
 
