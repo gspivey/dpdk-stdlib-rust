@@ -203,6 +203,61 @@ RX: Backend `recv_frames()` → parse headers → ARP/ICMP inline → UDP payloa
 
 Two packet construction paths exist by design: `build_udp_packet(&mut Mbuf)` writes directly into DPDK mbufs (zero-copy), while `build_udp_frame() -> Vec<u8>` produces owned bytes for the generic backend path. Both emit identical wire-format frames.
 
+### NIC Hardware Offloads
+
+DPDK represents every in-flight packet as an `rte_mbuf` — a metadata header that sits in front of the packet data in a contiguous memory region:
+
+```
+┌─────────────────────────────────────────────┐
+│  rte_mbuf (metadata header)                 │
+│  ├─ ol_flags:     u64  (offload flags)      │
+│  ├─ vlan_tci:     u16  (VLAN tag)           │
+│  ├─ tx_offload:   u64  (packed bit-field)   │
+│  │   ├─ l2_len:   7 bits  (Ethernet hdr)    │
+│  │   ├─ l3_len:   9 bits  (IP hdr)          │
+│  │   └─ l4_len:   8 bits  (UDP/TCP hdr)     │
+│  ├─ data_len:     u16                       │
+│  └─ ...                                     │
+├─────────────────────────────────────────────┤
+│  Packet data (frame bytes)                  │
+│  [dst MAC | src MAC | ethertype | IP | UDP  │
+│   | payload ...]                            │
+└─────────────────────────────────────────────┘
+```
+
+Hardware offloads work by reading/writing mbuf metadata fields instead of modifying packet bytes. The NIC performs the actual work at line rate in hardware, driven entirely by what the software writes to these metadata fields.
+
+**Checksum offload (TX):** The software builds the frame with a zeroed IPv4 checksum field and a pseudo-header checksum in the UDP checksum field, then sets mbuf metadata telling the NIC where each header starts:
+
+```
+mbuf.tx_offload  = l2_len=14, l3_len=20, l4_len=8
+mbuf.ol_flags   |= RTE_MBUF_F_TX_IPV4           (this is an IPv4 packet)
+                 | RTE_MBUF_F_TX_IP_CKSUM        (compute IPv4 header checksum)
+                 | RTE_MBUF_F_TX_UDP_CKSUM       (compute UDP checksum)
+```
+
+The NIC reads `tx_offload` to locate the checksum fields in the packet data, computes the correct values, and writes them directly into the frame as it goes out on the wire. Software never touches the final checksum — it's computed in hardware at line rate.
+
+**VLAN offload (TX):** The software builds an **untagged** frame (no 0x8100 tag in the bytes) and sets the VLAN TCI in mbuf metadata:
+
+```
+mbuf.vlan_tci    = 100                           (VID=100, PCP=0, DEI=0)
+mbuf.ol_flags   |= RTE_MBUF_F_TX_VLAN           (insert 802.1Q tag)
+```
+
+The NIC inserts the 4-byte VLAN tag (`[0x8100 | TCI]`) between the source MAC and ethertype as the frame leaves the wire. The packet data buffer is never modified.
+
+**VLAN offload (RX):** When the NIC receives a VLAN-tagged frame, it strips the 4-byte tag before writing the frame to memory and stores the tag in mbuf metadata:
+
+```
+mbuf.vlan_tci    = 100                           (stripped VID)
+mbuf.ol_flags   |= RTE_MBUF_F_RX_VLAN_STRIPPED  (tag was removed from frame)
+```
+
+The packet data in the buffer is untagged (ethertype is `0x0800` for IPv4, not `0x8100`), but the VLAN ID is available from `mbuf.vlan_tci`. Our RX path passes this directly to the VLAN filtering logic — no frame reconstruction or extra allocation needed.
+
+Both offloads fall back to software automatically when the NIC doesn't support them. Query support at runtime via `has_tx_ipv4_cksum_offload()`, `has_tx_vlan_offload()`, etc.
+
 ### RX Drop Hierarchy
 
 An incoming packet can be dropped at five distinct layers between the wire and
@@ -236,7 +291,7 @@ For async backends, note that the `tokio-dpdk` compat layer adds a `spawn_blocki
 # Build everything (works without DPDK - uses stubs)
 cargo build
 
-# Run 260+ unit tests (no DPDK required)
+# Run 360+ unit tests (no DPDK required)
 cargo test
 
 # Run specific crate tests
@@ -385,7 +440,7 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip with three operating modes matching Linux 8021q subinterface semantics. **Access mode**: RX accepts untagged + matching VID (strips tag), TX sends untagged. **Trunk mode**: RX accepts frames tagged with any VID in an allowed set (optional native VLAN for untagged), TX tags. **PortTagging mode** (default): RX only accepts matching VID (strips tag, drops untagged), TX always tags. Configurable per-socket via `set_vlan(Some(VlanConfig::new(100).access()))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
 
-**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the software stack re-inserts it for uniform VLAN filtering. Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
+**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the hardware TCI is passed directly to `detect_vlan()` for zero-allocation VLAN filtering (see [NIC Hardware Offloads](#nic-hardware-offloads)). Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
 
 ### Planned
 
