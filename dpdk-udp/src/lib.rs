@@ -1316,9 +1316,9 @@ impl SocketBackend {
                 // borrow to satisfy the borrow checker. The NIC reads vlan_tci
                 // from the mbuf metadata, not from the frame data.
                 if let Some(tci) = hw_vlan_tci {
-                    if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0 {
+                    if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0 {
                         mbuf.set_vlan_tci(tci);
-                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_VLAN;
+                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_VLAN as u64;
                     }
                 }
 
@@ -1331,14 +1331,14 @@ impl SocketBackend {
                 // software. The frame was already built with software checksums by
                 // build_udp_frame_into(); the NIC will overwrite them.
                 if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
-                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0;
+                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
 
                     if has_ip_cksum || has_udp_cksum {
-                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV4;
+                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV4 as u64;
 
                         if has_ip_cksum {
-                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM;
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64;
                             // NIC expects IPv4 checksum field to be 0
                             let ip_cksum_off = ETH_HEADER_LEN + 10;
                             data[ip_cksum_off] = 0;
@@ -1346,7 +1346,7 @@ impl SocketBackend {
                         }
 
                         if has_udp_cksum {
-                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64;
                             // NIC expects pseudo-header checksum in the UDP checksum field
                             let src_ip: [u8; 4] = data[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16]
                                 .try_into().unwrap();
@@ -1364,8 +1364,8 @@ impl SocketBackend {
                 // through the &mut [u8] data slice, so they don't conflict.
                 let _ = data;
                 if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
-                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0;
+                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
                     if has_ip_cksum || has_udp_cksum {
                         mbuf.set_tx_offload(
                             ETH_HEADER_LEN as u8,
@@ -1411,7 +1411,7 @@ impl SocketBackend {
                         // software VLAN filtering (detect_vlan / accepts_frame)
                         // works identically to the non-offload path.
                         let ol_flags = mbuf.ol_flags();
-                        let vlan_stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED) != 0;
+                        let vlan_stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED as u64) != 0;
                         if vlan_stripped && actual_len >= ETH_HEADER_LEN {
                             let tci = mbuf.vlan_tci();
                             // Reconstruct: [dst(6) | src(6) | 0x8100(2) | TCI(2) | original ethertype + payload]
@@ -3406,7 +3406,7 @@ impl UdpSocket {
     /// eliminating the CPU overhead of software tag insertion (~10% on tagged
     /// frames). To take effect, a `VlanConfig` must also be set on the socket.
     pub fn has_tx_vlan_offload(&self) -> bool {
-        (self.resources.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+        (self.resources.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0
     }
 
     /// Check if hardware VLAN tag stripping is active on the NIC for RX.
@@ -3414,7 +3414,7 @@ impl UdpSocket {
     /// When active, the NIC strips 802.1Q VLAN tags and stores the TCI in
     /// `mbuf.vlan_tci`, delivering untagged frames to software.
     pub fn has_rx_vlan_offload(&self) -> bool {
-        (self.resources.active_rx_offload & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP) != 0
+        (self.resources.active_rx_offload & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP as u64) != 0
     }
 
     /// Internal helper: returns true when hardware VLAN insert is available
@@ -3423,7 +3423,7 @@ impl UdpSocket {
     fn has_hw_vlan_insert(&self) -> bool {
         match &self.socket_backend {
             SocketBackend::Dpdk(res) => {
-                (res.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+                (res.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0
             }
             SocketBackend::Generic(_) => false,
         }
@@ -3740,9 +3740,9 @@ impl UdpSocketBuilder {
                     // Hardware VLAN insert: set mbuf VLAN TCI so the NIC tags on wire
                     if let Some(tci) = hw_vlan_tci {
                         let tx_offload = resources_for_direct.active_tx_offload;
-                        if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0 {
+                        if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0 {
                             mbuf.set_vlan_tci(tci);
-                            mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN);
+                            mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64);
                         }
                     }
 
@@ -4133,9 +4133,9 @@ mod tests {
         assert_eq!(mbuf.ol_flags(), 0);
 
         // Set TX offload flags
-        let flags = dpdk_sys::RTE_MBUF_F_TX_IPV4
-            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM
-            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+        let flags = dpdk_sys::RTE_MBUF_F_TX_IPV4 as u64
+            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64
+            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64;
         mbuf.set_ol_flags(flags);
         assert_eq!(mbuf.ol_flags(), flags);
 
@@ -4165,8 +4165,8 @@ mod tests {
         assert_eq!((tci >> 13) & 0x07, 3); // PCP
 
         // Set TX VLAN offload flag
-        mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN);
-        assert_eq!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN, dpdk_sys::RTE_MBUF_F_TX_VLAN);
+        mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64);
+        assert_eq!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN as u64, dpdk_sys::RTE_MBUF_F_TX_VLAN as u64);
     }
 
     #[test]
@@ -4175,10 +4175,10 @@ mod tests {
         let mut mbuf = pool.alloc().unwrap();
 
         // Combine VLAN insert + checksum offload flags (both can be active simultaneously)
-        let ol_flags = dpdk_sys::RTE_MBUF_F_TX_VLAN
-            | dpdk_sys::RTE_MBUF_F_TX_IPV4
-            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM
-            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+        let ol_flags = dpdk_sys::RTE_MBUF_F_TX_VLAN as u64
+            | dpdk_sys::RTE_MBUF_F_TX_IPV4 as u64
+            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64
+            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64;
 
         mbuf.set_vlan_tci(0x0064); // VID 100
         mbuf.set_ol_flags(ol_flags);
@@ -4186,9 +4186,9 @@ mod tests {
         assert_eq!(mbuf.vlan_tci(), 0x0064);
         assert_eq!(mbuf.ol_flags(), ol_flags);
         // Verify individual flags are set
-        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN, 0);
-        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM, 0);
-        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM, 0);
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN as u64, 0);
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64, 0);
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64, 0);
     }
 
     #[test]
@@ -4221,15 +4221,15 @@ mod tests {
     #[test]
     fn test_hw_vlan_offload_constants() {
         // Verify VLAN offload constants are defined and non-zero
-        assert_ne!(dpdk_sys::RTE_MBUF_F_TX_VLAN, 0);
-        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN, 0);
-        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED, 0);
-        assert_ne!(dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT, 0);
-        assert_ne!(dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP, 0);
+        assert_ne!(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64, 0);
+        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN as u64, 0);
+        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED as u64, 0);
+        assert_ne!(dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64, 0);
+        assert_ne!(dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP as u64, 0);
 
         // TX VLAN flag should not overlap with checksum flags
-        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM, 0);
-        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM, 0);
+        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64 & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64, 0);
+        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64 & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64, 0);
     }
 
     #[test]
@@ -4250,12 +4250,12 @@ mod tests {
 
         // Flags encode correctly
         let rx_flags = config.rx_offload.to_flags();
-        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP, 0);
-        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM, 0);
+        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP as u64, 0);
+        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM as u64, 0);
 
         let tx_flags = config.tx_offload.to_flags();
-        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT, 0);
-        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM, 0);
+        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64, 0);
+        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64, 0);
     }
 
     #[test]
