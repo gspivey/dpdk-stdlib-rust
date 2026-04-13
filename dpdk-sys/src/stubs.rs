@@ -36,6 +36,13 @@ pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
 pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
 pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
 
+// Mbuf TX VLAN offload flag: tells the NIC to insert a VLAN tag from mbuf.vlan_tci
+pub const RTE_MBUF_F_TX_VLAN: u64 = 1 << 57;
+
+// Mbuf RX VLAN offload flag: NIC has stripped the VLAN tag into mbuf.vlan_tci
+pub const RTE_MBUF_F_RX_VLAN: u64 = 1 << 0;
+pub const RTE_MBUF_F_RX_VLAN_STRIPPED: u64 = 1 << 6;
+
 // Mbuf RX offload flags (set by NIC, consumed by application)
 pub const RTE_MBUF_F_RX_IP_CKSUM_MASK: u64 = (1 << 4) | (1 << 7);
 pub const RTE_MBUF_F_RX_IP_CKSUM_GOOD: u64 = 1 << 7;
@@ -853,6 +860,16 @@ pub extern "C" fn rte_eth_dev_info_get(
         unsafe {
             (*dev_info).max_rx_queues = 16;
             (*dev_info).max_tx_queues = 16;
+            // Report VLAN offload capabilities so the HW VLAN code path is
+            // exercised in tests (alongside existing checksum offload support).
+            (*dev_info).rx_offload_capa = RTE_ETH_RX_OFFLOAD_VLAN_STRIP
+                | RTE_ETH_RX_OFFLOAD_IPV4_CKSUM
+                | RTE_ETH_RX_OFFLOAD_UDP_CKSUM
+                | RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+            (*dev_info).tx_offload_capa = RTE_ETH_TX_OFFLOAD_VLAN_INSERT
+                | RTE_ETH_TX_OFFLOAD_IPV4_CKSUM
+                | RTE_ETH_TX_OFFLOAD_UDP_CKSUM
+                | RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
         }
     }
     0

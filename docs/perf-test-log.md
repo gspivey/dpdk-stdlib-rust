@@ -6,6 +6,130 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 2. **Synthetic PPS** — `cargo test -- --nocapture vlan_pps_benchmark` (measures pure CPU overhead of RX processing pipeline, independent of NIC speed; ~5s to run)
+3. **HW VLAN Strip** — `cargo test -- --nocapture hw_vlan_strip_benchmark` (measures cost of frame reconstruction vs direct hw_vlan_tci passthrough; regression guard for the RX VLAN offload path)
+
+---
+
+## Run #16: Eliminate HW VLAN Frame Reconstruction
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | `b8ded40` |
+| **Branch** | `claude/implement-roadmap-feature-umHZq` |
+| **PR** | [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+
+### Changes Since Run #15
+
+1. **Refactor `detect_vlan()` to accept `hw_vlan_tci` parameter.** When the NIC strips the VLAN tag, the hardware TCI from mbuf metadata is passed directly to `detect_vlan()` instead of reconstructing the tagged frame. Eliminates per-packet `Vec` allocation and memcpy on the RX hot path.
+2. **Remove frame reconstruction from `recv_frames()`.** The DPDK backend no longer rebuilds tagged frames from untagged bytes + mbuf metadata. Frame bytes are passed through as-is.
+3. **Thread `hw_vlan_tci` through DPDK fast path.** `recv_from_inline()` reads `mbuf.ol_flags()` and `mbuf.vlan_tci()`, passing the TCI to `process_frame_zerocopy()` which forwards it to `detect_vlan()`.
+
+### HW VLAN Strip Benchmark (CPU-only, no NIC)
+
+Measures the cost of VLAN-aware RX processing when the NIC has stripped the tag (500K iterations, warmed up).
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | 780 | 1,283 | Legacy: Vec alloc + memcpy per packet |
+| B: Direct hw_vlan_tci (no reconstruction) | 980 | 1,020 | Current: zero-alloc TCI passthrough |
+
+**Speedup: 1.26x (262 ns saved per packet).** At 600K PPS, reconstruction would waste ~158 ms/sec of CPU time. The savings come from eliminating the per-packet `Vec::with_capacity()` + three `extend_from_slice()` calls that were immediately re-parsed by `detect_vlan()`.
+
+### Synthetic PPS Benchmark (CPU-only, no NIC)
+
+Measures `process_frame_zerocopy()` throughput on stub backend (500K iterations, warmed up).
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 1,012 | 988 | — |
+| No VLAN config (baseline, tagged frame) | 903 | 1,107 | -10.8% |
+| PortTagging mode (matching VID) | 902 | 1,108 | -10.9% |
+| Access mode (untagged frame) | 1,008 | 992 | baseline |
+| Access mode (matching VID) | 905 | 1,105 | -10.6% |
+| Trunk mode (VID in allowed set) | 893 | 1,119 | -11.8% |
+| Trunk mode (untagged, native_vlan) | 1,000 | 1,000 | -1.2% |
+| PortTagging DROP (wrong VID) | 13,796 | 72 | — |
+| PortTagging DROP (untagged) | 23,960 | 42 | — |
+
+**No regression from the refactor.** Numbers are consistent with Run #14 and #15 — the software VLAN tagging path is unchanged. The refactor only affects the HW VLAN strip path (NIC-stripped frames processed via `hw_vlan_tci` parameter).
+
+---
+
+## Run #15: Hardware VLAN Offload (NIC-Assisted Tag Insert/Strip)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | `a44728b` |
+| **Branch** | `claude/implement-roadmap-feature-umHZq` |
+| **PR** | [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+| **GH Actions Run** | [24321361567](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24321361567) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #14
+
+1. **`140fc02` — Hardware VLAN offload for NIC-assisted 802.1Q tag insert/strip.** Adds mbuf-level VLAN TCI metadata, TX path sets `RTE_MBUF_F_TX_VLAN` flag for NIC-assisted tag insertion, RX path reconstructs stripped VLAN tags from mbuf metadata. Per-socket `force_software` option. Port config enables VLAN offloads alongside existing checksum offloads. 8 new unit tests.
+2. **`a44728b` — Cast DPDK offload constants to u64 for bindgen compatibility.** Fixes CI build failure where bindgen generates some DPDK constants as `u32` from anonymous C enums, while `ol_flags` and offload capability fields are `u64`.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,955 | 0.7% | 138,985 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,614 | 0.4% | 319,812 | 8.6% | 350,000 | 0.0% |
+| 700,000 | 665,692 | 4.9% | 344,251 | 50.8% | 685,259 | 2.1% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,972 | 0.7% | 138,979 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,768 | 0.4% | 332,089 | 5.1% | 349,987 | 0.0% |
+| 700,000 | 657,380 | 6.1% | 319,268 | 54.4% | 686,081 | 2.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,997 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,968 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,848 | 0.3% | 319,140 | 8.8% | 350,000 | 0.0% |
+| 700,000 | 470,522 | 1.3% | 339,628 | 28.7% | 459,298 | 3.3% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 36,158 | 48.3% | 70,000 | 0.0% |
+| 140,000 | 77,678 | 0.8% | 77,715 | 0.8% | 78,294 | 0.0% |
+| 350,000 | 77,203 | 1.4% | 77,667 | 0.8% | 78,127 | 0.3% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 37,867 | 45.9% |
+| 140,000 | 37,261 | 73.4% |
+| 350,000 | 37,373 | 89.3% |
+| 700,000 | 37,239 | 94.7% |
+
+### Analysis
+
+**No performance regression from hardware VLAN offload changes.** The HW VLAN offload feature adds mbuf metadata handling (vlan_tci, ol_flags) and RX tag reconstruction paths, but since integration tests use untagged frames (AWS VPC doesn't support VLANs), these code paths are not exercised during benchmarks. The results confirm zero measurable impact.
+
+**rust-dpdk vs native-dpdk parity**: At 700K PPS with 64B packets, our Rust stack delivers 665K RX vs native C DPDK's 685K — within 2.9%. At 1400B near-MTU, Rust actually beats native C (470K vs 459K) likely due to measurement variance at the line-rate cap.
+
+**rust-dpdk vs kernel**: At 700K PPS with 64B packets, DPDK delivers 665K (4.9% drop) vs kernel's 344K (50.8% drop) — **1.93x throughput advantage**. At 350K PPS, DPDK drops 0.4% while kernel drops 8.6%.
+
+**tokio-dpdk**: Caps at ~37K PPS as expected — consistent with Run #14. The `spawn_blocking` hop is the known bottleneck.
+
+**Note on ENA VLAN support**: The echo server logs show `Warning: Some RX/TX offloads not supported by device (flags: 0x1)` — this is the VLAN strip/insert offload being requested but not supported by the ENA NIC. The code correctly falls back to software VLAN handling. Hardware VLAN offload would activate on NICs that support it (e.g., Intel XL710, Mellanox ConnectX).
 
 ---
 

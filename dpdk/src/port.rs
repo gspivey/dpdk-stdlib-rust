@@ -32,16 +32,16 @@ impl RxOffload {
     pub fn to_flags(&self) -> u64 {
         let mut flags = 0u64;
         if self.vlan_strip {
-            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP as u64;
         }
         if self.ipv4_cksum {
-            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM as u64;
         }
         if self.udp_cksum {
-            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM as u64;
         }
         if self.tcp_cksum {
-            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_RX_OFFLOAD_TCP_CKSUM as u64;
         }
         flags
     }
@@ -65,16 +65,16 @@ impl TxOffload {
     pub fn to_flags(&self) -> u64 {
         let mut flags = 0u64;
         if self.vlan_insert {
-            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT;
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64;
         }
         if self.ipv4_cksum {
-            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64;
         }
         if self.udp_cksum {
-            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64;
         }
         if self.tcp_cksum {
-            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+            flags |= dpdk_sys::RTE_ETH_TX_OFFLOAD_TCP_CKSUM as u64;
         }
         flags
     }
@@ -162,18 +162,23 @@ impl PortConfig {
 
     /// Enable all checksum offloads (RX and TX)
     pub fn with_checksum_offload(mut self) -> Self {
-        self.rx_offload = RxOffload {
-            ipv4_cksum: true,
-            udp_cksum: true,
-            tcp_cksum: true,
-            ..Default::default()
-        };
-        self.tx_offload = TxOffload {
-            ipv4_cksum: true,
-            udp_cksum: true,
-            tcp_cksum: true,
-            ..Default::default()
-        };
+        self.rx_offload.ipv4_cksum = true;
+        self.rx_offload.udp_cksum = true;
+        self.rx_offload.tcp_cksum = true;
+        self.tx_offload.ipv4_cksum = true;
+        self.tx_offload.udp_cksum = true;
+        self.tx_offload.tcp_cksum = true;
+        self
+    }
+
+    /// Enable hardware VLAN offloads (RX strip + TX insert).
+    ///
+    /// When the NIC supports it, VLAN tags are stripped on RX (TCI stored in
+    /// mbuf.vlan_tci) and inserted on TX (from mbuf.vlan_tci). Falls back to
+    /// software tag handling if the NIC doesn't support it.
+    pub fn with_vlan_offload(mut self) -> Self {
+        self.rx_offload.vlan_strip = true;
+        self.tx_offload.vlan_insert = true;
         self
     }
 }
@@ -287,32 +292,32 @@ pub struct DeviceCapabilities {
 impl DeviceCapabilities {
     /// Check if RX IPv4 checksum offload is supported
     pub fn supports_rx_ipv4_cksum(&self) -> bool {
-        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM) != 0
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM as u64) != 0
     }
 
     /// Check if RX UDP checksum offload is supported
     pub fn supports_rx_udp_cksum(&self) -> bool {
-        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM) != 0
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_UDP_CKSUM as u64) != 0
     }
 
     /// Check if TX IPv4 checksum offload is supported
     pub fn supports_tx_ipv4_cksum(&self) -> bool {
-        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0
     }
 
     /// Check if TX UDP checksum offload is supported
     pub fn supports_tx_udp_cksum(&self) -> bool {
-        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0
     }
 
     /// Check if VLAN stripping is supported
     pub fn supports_vlan_strip(&self) -> bool {
-        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP) != 0
+        (self.rx_offload_capa & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP as u64) != 0
     }
 
     /// Check if VLAN insertion is supported
     pub fn supports_vlan_insert(&self) -> bool {
-        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+        (self.tx_offload_capa & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0
     }
 }
 
