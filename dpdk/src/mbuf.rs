@@ -123,6 +123,25 @@ impl Mbuf {
         }
     }
 
+    /// Get the VLAN Tag Control Information (TCI) field.
+    ///
+    /// On RX, the NIC populates this when `RTE_MBUF_F_RX_VLAN_STRIPPED` is set
+    /// in ol_flags. On TX, the application sets this and the NIC inserts the
+    /// VLAN tag when `RTE_MBUF_F_TX_VLAN` is set.
+    pub fn vlan_tci(&self) -> u16 {
+        unsafe { (*self.raw.as_ptr()).vlan_tci }
+    }
+
+    /// Set the VLAN TCI field for hardware VLAN insertion on TX.
+    ///
+    /// Must be combined with `set_ol_flags(RTE_MBUF_F_TX_VLAN)` for the NIC
+    /// to actually insert the VLAN tag.
+    pub fn set_vlan_tci(&mut self, tci: u16) {
+        unsafe {
+            (*self.raw.as_ptr()).vlan_tci = tci;
+        }
+    }
+
     /// Set TX offload lengths (l2_len, l3_len, l4_len) in the tx_offload bitfield.
     ///
     /// DPDK encodes these as: l2_len (bits 0-6, 7 bits), l3_len (bits 7-15, 9 bits),

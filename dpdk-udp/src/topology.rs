@@ -164,7 +164,8 @@ pub struct MultiCoreTopology {
     /// Direct send function for the application thread.
     /// When set, `send_to()` calls this instead of enqueuing to `tx_ring`,
     /// sending on TX queue 1 to avoid contention with the RX dispatcher's queue 0.
-    pub direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
+    /// The optional `u16` is the VLAN TCI for hardware VLAN insert (None = no HW VLAN).
+    pub direct_send_fn: Option<Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync>>,
 
     /// Shutdown signal — set to `true` to stop all pipeline threads.
     pub shutdown: Arc<AtomicBool>,
@@ -253,7 +254,7 @@ pub fn start_pipeline<R, S>(
     config: PipelineConfig,
     recv_fn: R,
     send_fn: S,
-    direct_send_fn: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
+    direct_send_fn: Option<Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync>>,
 ) -> Option<MultiCoreTopology>
 where
     R: Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>> + Send + Sync + 'static,

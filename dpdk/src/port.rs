@@ -162,18 +162,23 @@ impl PortConfig {
 
     /// Enable all checksum offloads (RX and TX)
     pub fn with_checksum_offload(mut self) -> Self {
-        self.rx_offload = RxOffload {
-            ipv4_cksum: true,
-            udp_cksum: true,
-            tcp_cksum: true,
-            ..Default::default()
-        };
-        self.tx_offload = TxOffload {
-            ipv4_cksum: true,
-            udp_cksum: true,
-            tcp_cksum: true,
-            ..Default::default()
-        };
+        self.rx_offload.ipv4_cksum = true;
+        self.rx_offload.udp_cksum = true;
+        self.rx_offload.tcp_cksum = true;
+        self.tx_offload.ipv4_cksum = true;
+        self.tx_offload.udp_cksum = true;
+        self.tx_offload.tcp_cksum = true;
+        self
+    }
+
+    /// Enable hardware VLAN offloads (RX strip + TX insert).
+    ///
+    /// When the NIC supports it, VLAN tags are stripped on RX (TCI stored in
+    /// mbuf.vlan_tci) and inserted on TX (from mbuf.vlan_tci). Falls back to
+    /// software tag handling if the NIC doesn't support it.
+    pub fn with_vlan_offload(mut self) -> Self {
+        self.rx_offload.vlan_strip = true;
+        self.tx_offload.vlan_insert = true;
         self
     }
 }

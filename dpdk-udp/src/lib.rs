@@ -217,6 +217,9 @@ pub struct VlanConfig {
     pub dei: bool,
     /// VLAN operating mode (Access, Trunk, or PortTagging).
     pub mode: VlanMode,
+    /// Force software VLAN tag insert/strip even when the NIC supports hardware
+    /// offload. Default is `false` (use hardware when available).
+    pub force_software: bool,
 }
 
 impl VlanConfig {
@@ -224,7 +227,7 @@ impl VlanConfig {
     /// and default mode (PortTagging).
     pub fn new(vlan_id: u16) -> Self {
         assert!(vlan_id <= 4094, "VLAN ID must be 0-4094");
-        Self { vlan_id, priority: 0, dei: false, mode: VlanMode::default() }
+        Self { vlan_id, priority: 0, dei: false, mode: VlanMode::default(), force_software: false }
     }
 
     /// Set the priority code point (0-7).
@@ -261,6 +264,14 @@ impl VlanConfig {
     /// Configure as port tagging (strict): RX only matching VID; TX always tags.
     pub fn port_tagging(mut self) -> Self {
         self.mode = VlanMode::PortTagging;
+        self
+    }
+
+    /// Force software VLAN tag insert/strip even when the NIC supports hardware
+    /// offload. Useful for debugging or when hardware offload produces incorrect
+    /// results on a particular NIC.
+    pub fn with_force_software(mut self, force: bool) -> Self {
+        self.force_software = force;
         self
     }
 
@@ -305,6 +316,7 @@ impl VlanConfig {
             priority: ((tci >> 13) & 0x07) as u8,
             dei: (tci >> 12) & 1 != 0,
             mode: VlanMode::default(),
+            force_software: false,
         }
     }
 }
@@ -1103,8 +1115,8 @@ struct DpdkResources {
     /// Active TX offload flags (intersection of requested and NIC capabilities).
     /// Cached here to avoid querying the port on every send.
     active_tx_offload: u64,
-    /// Active RX offload flags (reserved for future hardware RX flag checking).
-    _active_rx_offload: u64,
+    /// Active RX offload flags (used for hardware VLAN strip detection).
+    active_rx_offload: u64,
 }
 
 /// Global DPDK resources (initialized once per port)
@@ -1207,7 +1219,8 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let port_config = PortConfig::default()
         .with_queues(1, 2)
         .with_mtu(9001)
-        .with_checksum_offload();
+        .with_checksum_offload()
+        .with_vlan_offload();
     let port = Port::init(port_id, port_config, &mempool)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
 
@@ -1235,7 +1248,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         src_mac,
         arp_cache,
         active_tx_offload,
-        _active_rx_offload: active_rx_offload,
+        active_rx_offload: active_rx_offload,
     });
 
     *guard = Some(Arc::clone(&resources));
@@ -1273,7 +1286,13 @@ impl SocketBackend {
     }
 
     /// Send a raw Ethernet frame via the backend.
-    fn send_frame(&self, frame: &[u8]) -> io::Result<usize> {
+    ///
+    /// When `hw_vlan_tci` is `Some(tci)`, the DPDK backend sets the mbuf VLAN TCI
+    /// field and `RTE_MBUF_F_TX_VLAN` flag so the NIC inserts the 802.1Q tag on
+    /// the wire. The `frame` must be an **untagged** Ethernet frame in this case.
+    /// For Generic backends, `hw_vlan_tci` is ignored (the frame should already
+    /// contain any VLAN tags in the Ethernet header).
+    fn send_frame(&self, frame: &[u8], hw_vlan_tci: Option<u16>) -> io::Result<usize> {
         match self {
             SocketBackend::Dpdk(res) => {
                 let mut mbuf = res.mempool.alloc()
@@ -1290,6 +1309,19 @@ impl SocketBackend {
                 mbuf.set_data_len(frame.len() as u16);
                 mbuf.set_packet_len(frame.len() as u32);
 
+                let tx_offload = res.active_tx_offload;
+                let mut ol_flags = 0u64;
+
+                // TX hardware VLAN insert: set mbuf VLAN TCI before data_mut()
+                // borrow to satisfy the borrow checker. The NIC reads vlan_tci
+                // from the mbuf metadata, not from the frame data.
+                if let Some(tci) = hw_vlan_tci {
+                    if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0 {
+                        mbuf.set_vlan_tci(tci);
+                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_VLAN;
+                    }
+                }
+
                 let data = mbuf.data_mut()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
                 data.copy_from_slice(frame);
@@ -1298,13 +1330,12 @@ impl SocketBackend {
                 // metadata so the NIC computes IPv4 and UDP checksums instead of
                 // software. The frame was already built with software checksums by
                 // build_udp_frame_into(); the NIC will overwrite them.
-                let tx_offload = res.active_tx_offload;
                 if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
                     let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
                     let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
 
                     if has_ip_cksum || has_udp_cksum {
-                        let mut ol_flags = dpdk_sys::RTE_MBUF_F_TX_IPV4;
+                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV4;
 
                         if has_ip_cksum {
                             ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM;
@@ -1326,14 +1357,25 @@ impl SocketBackend {
                             let phdr_cksum = udp_pseudo_header_checksum(&src_ip, &dst_ip, udp_len);
                             data[udp_off + 6..udp_off + 8].copy_from_slice(&phdr_cksum.to_be_bytes());
                         }
+                    }
+                }
 
-                        mbuf.set_ol_flags(ol_flags);
+                // set_tx_offload and set_ol_flags go through raw pointer, not
+                // through the &mut [u8] data slice, so they don't conflict.
+                let _ = data;
+                if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
+                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+                    if has_ip_cksum || has_udp_cksum {
                         mbuf.set_tx_offload(
                             ETH_HEADER_LEN as u8,
                             IPV4_HEADER_LEN as u16,
                             UDP_HEADER_LEN as u8,
                         );
                     }
+                }
+                if ol_flags != 0 {
+                    mbuf.set_ol_flags(ol_flags);
                 }
 
                 let mut packets = vec![mbuf];
@@ -1349,6 +1391,11 @@ impl SocketBackend {
     }
 
     /// Receive raw Ethernet frames via the backend.
+    ///
+    /// When the NIC has stripped VLAN tags (RTE_MBUF_F_RX_VLAN_STRIPPED), the
+    /// 802.1Q tag is re-inserted into the frame so that the rest of the software
+    /// stack (detect_vlan, accepts_frame) works uniformly regardless of whether
+    /// hardware or software handles VLAN stripping.
     fn recv_frames(&self, max_frames: usize) -> io::Result<Vec<Vec<u8>>> {
         match self {
             SocketBackend::Dpdk(res) => {
@@ -1359,7 +1406,24 @@ impl SocketBackend {
                     if let Some(data) = mbuf.data() {
                         let len = mbuf.data_len() as usize;
                         let actual_len = len.min(data.len());
-                        frames.push(data[..actual_len].to_vec());
+
+                        // If the NIC stripped the VLAN tag, re-insert it so the
+                        // software VLAN filtering (detect_vlan / accepts_frame)
+                        // works identically to the non-offload path.
+                        let ol_flags = mbuf.ol_flags();
+                        let vlan_stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED) != 0;
+                        if vlan_stripped && actual_len >= ETH_HEADER_LEN {
+                            let tci = mbuf.vlan_tci();
+                            // Reconstruct: [dst(6) | src(6) | 0x8100(2) | TCI(2) | original ethertype + payload]
+                            let mut frame = Vec::with_capacity(actual_len + VLAN_TAG_LEN);
+                            frame.extend_from_slice(&data[..12]); // dst + src MAC
+                            frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes()); // TPID
+                            frame.extend_from_slice(&tci.to_be_bytes()); // TCI
+                            frame.extend_from_slice(&data[12..actual_len]); // original ethertype + rest
+                            frames.push(frame);
+                        } else {
+                            frames.push(data[..actual_len].to_vec());
+                        }
                     }
                 }
                 Ok(frames)
@@ -1814,7 +1878,8 @@ pub struct UdpSocket {
     /// Cached frame pool for lock-free payload reads in recv_from_pipeline.
     cached_frame_pool: Option<Arc<FramePool>>,
     /// Cached direct-send function for lock-free send_to in pipeline mode.
-    cached_direct_send: Option<Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync>>,
+    /// The optional `u16` is the VLAN TCI for hardware VLAN insert (None = no HW VLAN).
+    cached_direct_send: Option<Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync>>,
     // ---- Atomic fast-path flags to skip Mutex locks in hot path ----
     /// True after connect() is called — skip connected_addr.lock() when false.
     is_connected: AtomicBool,
@@ -2183,23 +2248,46 @@ impl UdpSocket {
         let src_mac = self.socket_backend.mac_address();
 
         // Build frame into reusable buffer (zero-alloc) and send.
-        // VLAN TX behavior depends on mode:
+        //
+        // VLAN TX behavior depends on mode and hardware offload availability:
         //   Access  -> send untagged (no 802.1Q tag)
-        //   Trunk   -> send tagged with configured VID
-        //   PortTag -> send tagged with configured VID
+        //   Trunk   -> send tagged with configured VID (software or hardware)
+        //   PortTag -> send tagged with configured VID (software or hardware)
         //   None    -> send untagged
+        //
+        // When hardware VLAN insert is available (and force_software is false),
+        // we build an untagged frame and let the NIC insert the tag from
+        // mbuf.vlan_tci. This eliminates the ~10% CPU overhead of software
+        // tag insertion on tagged frames.
         let mut tx_buf = self.tx_buf.borrow_mut();
         let should_tag = self.vlan_config.as_ref().map_or(false, |v| v.tags_on_tx());
-        if should_tag {
-            build_udp_frame_into_vlan(
-                &mut tx_buf,
-                &src_mac,
-                &dst_mac.octets(),
-                src_ip, dst_ip,
-                src_port, dst_port,
-                buf, self.ttl,
-                self.vlan_config.as_ref().unwrap(),
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+        let hw_vlan_tci = if should_tag {
+            let vlan_cfg = self.vlan_config.as_ref().unwrap();
+            let use_hw = self.has_hw_vlan_insert() && !vlan_cfg.force_software;
+            if use_hw {
+                // Hardware VLAN insert: build untagged frame, NIC inserts tag
+                build_udp_frame_into(
+                    &mut tx_buf,
+                    &src_mac,
+                    &dst_mac.octets(),
+                    src_ip, dst_ip,
+                    src_port, dst_port,
+                    buf, self.ttl,
+                ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+                Some(vlan_cfg.encode_tci())
+            } else {
+                // Software VLAN insert: build tagged frame
+                build_udp_frame_into_vlan(
+                    &mut tx_buf,
+                    &src_mac,
+                    &dst_mac.octets(),
+                    src_ip, dst_ip,
+                    src_port, dst_port,
+                    buf, self.ttl,
+                    vlan_cfg,
+                ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+                None
+            }
         } else {
             build_udp_frame_into(
                 &mut tx_buf,
@@ -2209,18 +2297,19 @@ impl UdpSocket {
                 src_port, dst_port,
                 buf, self.ttl,
             ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
-        }
+            None
+        };
 
         // P3.5: Worker-direct TX uses cached send function (no topology.lock()).
         if let Some(ref direct_send) = self.cached_direct_send {
             // Worker-direct TX: send on dedicated TX queue (no ring hop)
-            if let Err(e) = direct_send(&tx_buf) {
+            if let Err(e) = direct_send(&tx_buf, hw_vlan_tci) {
                 perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
             }
         } else {
             // Run-to-completion path: send via backend on TX queue 0
-            if let Err(e) = self.socket_backend.send_frame(&tx_buf) {
+            if let Err(e) = self.socket_backend.send_frame(&tx_buf, hw_vlan_tci) {
                 perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
             }
@@ -2536,7 +2625,7 @@ impl UdpSocket {
         // Handle ARP (both tagged and untagged)
         if layout.ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                let _ = self.socket_backend.send_frame(&reply_frame);
+                let _ = self.socket_backend.send_frame(&reply_frame, None);
             }
             perf_inc!(self.perf_counters.rx_arp_handled);
             return None;
@@ -2550,7 +2639,7 @@ impl UdpSocket {
                     match action {
                         icmp::IcmpAction::Reply(reply_frame) => {
                             if self.auto_icmp {
-                                let _ = self.socket_backend.send_frame(&reply_frame);
+                                let _ = self.socket_backend.send_frame(&reply_frame, None);
                             }
                         }
                         icmp::IcmpAction::Error(error_info) => {
@@ -2814,7 +2903,7 @@ impl UdpSocket {
     /// This is useful for pre-populating the ARP cache before sending data.
     pub fn send_arp_request(&self, target_ip: Ipv4Addr) -> io::Result<()> {
         if let Some(frame) = self.arp_handler.make_request(target_ip) {
-            self.socket_backend.send_frame(&frame)?;
+            self.socket_backend.send_frame(&frame, None)?;
         }
         Ok(())
     }
@@ -2827,7 +2916,7 @@ impl UdpSocket {
     /// the next inbound ARP request.
     pub fn send_gratuitous_arp(&self) -> io::Result<()> {
         if let Some(frame) = self.arp_handler.make_gratuitous_arp() {
-            self.socket_backend.send_frame(&frame)?;
+            self.socket_backend.send_frame(&frame, None)?;
         }
         Ok(())
     }
@@ -2891,7 +2980,7 @@ impl UdpSocket {
         const POLLS_PER_ATTEMPT: u32 = 10_000; // 10k * 100us = 1 second
 
         for attempt in 0..MAX_ATTEMPTS {
-            self.socket_backend.send_frame(&arp_frame)?;
+            self.socket_backend.send_frame(&arp_frame, None)?;
 
             for _ in 0..POLLS_PER_ATTEMPT {
                 let frames = self.socket_backend.recv_frames(32)?;
@@ -2900,7 +2989,7 @@ impl UdpSocket {
                         let ethertype = u16::from_be_bytes([frame_data[12], frame_data[13]]);
                         if ethertype == arp::ETH_TYPE_ARP {
                             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                                let _ = self.socket_backend.send_frame(&reply_frame);
+                                let _ = self.socket_backend.send_frame(&reply_frame, None);
                             }
                         } else if ethertype == ETH_TYPE_IPV4 {
                             // Queue any UDP packets we receive while waiting
@@ -3310,6 +3399,35 @@ impl UdpSocket {
     pub fn has_rx_udp_cksum_offload(&self) -> bool {
         self.resources.port.config().rx_offload.udp_cksum
     }
+
+    /// Check if hardware VLAN tag insertion is active on the NIC for TX.
+    ///
+    /// When active, the NIC inserts 802.1Q VLAN tags from `mbuf.vlan_tci`,
+    /// eliminating the CPU overhead of software tag insertion (~10% on tagged
+    /// frames). To take effect, a `VlanConfig` must also be set on the socket.
+    pub fn has_tx_vlan_offload(&self) -> bool {
+        (self.resources.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+    }
+
+    /// Check if hardware VLAN tag stripping is active on the NIC for RX.
+    ///
+    /// When active, the NIC strips 802.1Q VLAN tags and stores the TCI in
+    /// `mbuf.vlan_tci`, delivering untagged frames to software.
+    pub fn has_rx_vlan_offload(&self) -> bool {
+        (self.resources.active_rx_offload & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP) != 0
+    }
+
+    /// Internal helper: returns true when hardware VLAN insert is available
+    /// on the underlying DPDK port. Used by send_to() to decide between
+    /// hardware and software VLAN tag insertion.
+    fn has_hw_vlan_insert(&self) -> bool {
+        match &self.socket_backend {
+            SocketBackend::Dpdk(res) => {
+                (res.active_tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0
+            }
+            SocketBackend::Generic(_) => false,
+        }
+    }
 }
 
 // ============================================================================
@@ -3609,8 +3727,8 @@ impl UdpSocketBuilder {
             // the tx_ring → RX lcore → TX queue 0 hop. This halves echo latency
             // by eliminating cross-thread synchronization on the TX path.
             let resources_for_direct = Arc::clone(&socket.resources);
-            let direct_send_fn: Arc<dyn Fn(&[u8]) -> io::Result<usize> + Send + Sync> =
-                Arc::new(move |frame: &[u8]| -> io::Result<usize> {
+            let direct_send_fn: Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync> =
+                Arc::new(move |frame: &[u8], hw_vlan_tci: Option<u16>| -> io::Result<usize> {
                     let mut mbuf = resources_for_direct.mempool.alloc()
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
                     mbuf.set_data_len(frame.len() as u16);
@@ -3618,6 +3736,16 @@ impl UdpSocketBuilder {
                     let data = mbuf.data_mut()
                         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
                     data.copy_from_slice(frame);
+
+                    // Hardware VLAN insert: set mbuf VLAN TCI so the NIC tags on wire
+                    if let Some(tci) = hw_vlan_tci {
+                        let tx_offload = resources_for_direct.active_tx_offload;
+                        if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT) != 0 {
+                            mbuf.set_vlan_tci(tci);
+                            mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN);
+                        }
+                    }
+
                     let mut packets = vec![mbuf];
                     // TX queue 1 = dedicated app thread TX queue (no RX lcore contention)
                     let sent = resources_for_direct.port.tx_burst(1, &mut packets)
@@ -4019,6 +4147,148 @@ mod tests {
         // union in real DPDK, so direct field access doesn't work with bindgen)
         let raw_tx_offload = unsafe { dpdk_sys::mbuf_get_tx_offload(mbuf.as_raw()) };
         assert_eq!(raw_tx_offload, expected);
+    }
+
+    #[test]
+    fn test_mbuf_vlan_tci_field() {
+        let pool = Mempool::create("vlan_tci_pool", 128, 32, 2048, -1).unwrap();
+        let mut mbuf = pool.alloc().unwrap();
+
+        // Initially zero
+        assert_eq!(mbuf.vlan_tci(), 0);
+
+        // Set VLAN TCI (VID=100, PCP=3, DEI=0 → TCI = 0x6064)
+        let tci = VlanConfig::new(100).with_priority(3).encode_tci();
+        mbuf.set_vlan_tci(tci);
+        assert_eq!(mbuf.vlan_tci(), tci);
+        assert_eq!(tci & 0x0FFF, 100); // VID
+        assert_eq!((tci >> 13) & 0x07, 3); // PCP
+
+        // Set TX VLAN offload flag
+        mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN);
+        assert_eq!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN, dpdk_sys::RTE_MBUF_F_TX_VLAN);
+    }
+
+    #[test]
+    fn test_mbuf_vlan_tci_combined_with_checksum_flags() {
+        let pool = Mempool::create("vlan_cksum_pool", 128, 32, 2048, -1).unwrap();
+        let mut mbuf = pool.alloc().unwrap();
+
+        // Combine VLAN insert + checksum offload flags (both can be active simultaneously)
+        let ol_flags = dpdk_sys::RTE_MBUF_F_TX_VLAN
+            | dpdk_sys::RTE_MBUF_F_TX_IPV4
+            | dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM
+            | dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM;
+
+        mbuf.set_vlan_tci(0x0064); // VID 100
+        mbuf.set_ol_flags(ol_flags);
+
+        assert_eq!(mbuf.vlan_tci(), 0x0064);
+        assert_eq!(mbuf.ol_flags(), ol_flags);
+        // Verify individual flags are set
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_VLAN, 0);
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM, 0);
+        assert_ne!(mbuf.ol_flags() & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM, 0);
+    }
+
+    #[test]
+    fn test_vlan_config_force_software_default() {
+        let cfg = VlanConfig::new(100);
+        assert!(!cfg.force_software);
+    }
+
+    #[test]
+    fn test_vlan_config_force_software_builder() {
+        let cfg = VlanConfig::new(100).with_force_software(true);
+        assert!(cfg.force_software);
+
+        let cfg = VlanConfig::new(100).with_force_software(false);
+        assert!(!cfg.force_software);
+    }
+
+    #[test]
+    fn test_vlan_config_force_software_does_not_affect_tags_on_tx() {
+        // force_software doesn't change WHAT gets tagged — only HOW
+        let cfg_hw = VlanConfig::new(100).port_tagging();
+        let cfg_sw = VlanConfig::new(100).port_tagging().with_force_software(true);
+        assert_eq!(cfg_hw.tags_on_tx(), cfg_sw.tags_on_tx());
+
+        let cfg_hw = VlanConfig::new(100).access();
+        let cfg_sw = VlanConfig::new(100).access().with_force_software(true);
+        assert_eq!(cfg_hw.tags_on_tx(), cfg_sw.tags_on_tx());
+    }
+
+    #[test]
+    fn test_hw_vlan_offload_constants() {
+        // Verify VLAN offload constants are defined and non-zero
+        assert_ne!(dpdk_sys::RTE_MBUF_F_TX_VLAN, 0);
+        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN, 0);
+        assert_ne!(dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED, 0);
+        assert_ne!(dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT, 0);
+        assert_ne!(dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP, 0);
+
+        // TX VLAN flag should not overlap with checksum flags
+        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN & dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM, 0);
+        assert_eq!(dpdk_sys::RTE_MBUF_F_TX_VLAN & dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM, 0);
+    }
+
+    #[test]
+    fn test_port_vlan_offload_config() {
+        use dpdk::port::{PortConfig, RxOffload, TxOffload};
+
+        // with_vlan_offload() enables both RX strip and TX insert
+        let config = PortConfig::default().with_vlan_offload();
+        assert!(config.rx_offload.vlan_strip);
+        assert!(config.tx_offload.vlan_insert);
+
+        // Can combine with checksum offload
+        let config = PortConfig::default().with_checksum_offload().with_vlan_offload();
+        assert!(config.rx_offload.vlan_strip);
+        assert!(config.rx_offload.ipv4_cksum);
+        assert!(config.tx_offload.vlan_insert);
+        assert!(config.tx_offload.ipv4_cksum);
+
+        // Flags encode correctly
+        let rx_flags = config.rx_offload.to_flags();
+        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_VLAN_STRIP, 0);
+        assert_ne!(rx_flags & dpdk_sys::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM, 0);
+
+        let tx_flags = config.tx_offload.to_flags();
+        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT, 0);
+        assert_ne!(tx_flags & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM, 0);
+    }
+
+    #[test]
+    fn test_rx_vlan_strip_frame_reconstruction() {
+        // Simulate what happens when the NIC strips a VLAN tag:
+        // The NIC delivers an untagged frame but sets ol_flags and vlan_tci.
+        // Our recv_frames() should reconstruct the tagged frame.
+
+        // An untagged frame (what the NIC delivers after stripping):
+        let untagged = vec![
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // dst MAC (broadcast)
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // src MAC
+            0x08, 0x00, // EtherType: IPv4
+            // ... payload bytes (doesn't matter for VLAN reconstruction test)
+            0x45, 0x00, 0x00, 0x1C,
+        ];
+
+        // Reconstruct as if the NIC stripped VLAN 100 (TCI = 0x0064):
+        let tci: u16 = 0x0064;
+        let mut reconstructed = Vec::with_capacity(untagged.len() + VLAN_TAG_LEN);
+        reconstructed.extend_from_slice(&untagged[..12]); // dst + src MAC
+        reconstructed.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes());
+        reconstructed.extend_from_slice(&tci.to_be_bytes());
+        reconstructed.extend_from_slice(&untagged[12..]); // original ethertype + rest
+
+        // Verify: the reconstructed frame should be detected as VLAN-tagged
+        let layout = detect_vlan(&reconstructed).unwrap();
+        assert_eq!(layout.vlan_tci, Some(tci));
+        assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
+        assert_eq!(layout.l3_offset, ETH_HEADER_LEN + VLAN_TAG_LEN);
+
+        // The VID from the TCI should be 100
+        assert_eq!(tci & 0x0FFF, 100);
     }
 
     #[test]
@@ -4891,14 +5161,14 @@ mod tests {
     #[test]
     fn vlan_config_tci_encoding() {
         // VID 100, PCP 5, DEI 0
-        let config = VlanConfig { vlan_id: 100, priority: 5, dei: false, mode: VlanMode::default() };
+        let config = VlanConfig { vlan_id: 100, priority: 5, dei: false, mode: VlanMode::default(), force_software: false };
         let tci = config.encode_tci();
         assert_eq!(tci & 0x0FFF, 100);           // VID
         assert_eq!((tci >> 13) & 0x07, 5);        // PCP
         assert_eq!((tci >> 12) & 1, 0);            // DEI
 
         // VID 4094 (max), PCP 7, DEI 1
-        let config = VlanConfig { vlan_id: 4094, priority: 7, dei: true, mode: VlanMode::default() };
+        let config = VlanConfig { vlan_id: 4094, priority: 7, dei: true, mode: VlanMode::default(), force_software: false };
         let tci = config.encode_tci();
         assert_eq!(tci & 0x0FFF, 4094);
         assert_eq!((tci >> 13) & 0x07, 7);

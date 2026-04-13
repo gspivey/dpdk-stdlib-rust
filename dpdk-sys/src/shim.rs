@@ -141,6 +141,13 @@ pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
 pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
 pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
 
+// Mbuf TX VLAN offload flag: tells the NIC to insert a VLAN tag from mbuf.vlan_tci
+pub const RTE_MBUF_F_TX_VLAN: u64 = 1 << 57;
+
+// Mbuf RX VLAN offload flags (set by NIC when it strips the VLAN tag)
+pub const RTE_MBUF_F_RX_VLAN: u64 = 1 << 0;
+pub const RTE_MBUF_F_RX_VLAN_STRIPPED: u64 = 1 << 6;
+
 // Mbuf RX offload flags (set by NIC, consumed by application).
 // These are #define macros in rte_mbuf_core.h that bindgen cannot capture.
 pub const RTE_MBUF_F_RX_IP_CKSUM_MASK: u64 = (1 << 4) | (1 << 7);

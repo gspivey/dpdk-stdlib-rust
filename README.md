@@ -329,6 +329,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | ICMP echo reply | Complete | Auto-responds to ping |
 | ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. queued via `take_error()` |
 | Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
+| Hardware VLAN offload | Complete | NIC inserts/strips 802.1Q tags, software fallback, force-software option |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
 | Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
 | RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default |
@@ -342,16 +343,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
-| **Subnet-aware routing** | Full FIB with longest-prefix match | Subnet-aware with longest-prefix-match, auto-detection from OS | Done |
-| **RX backpressure and drop counters** | `sk_rmem_alloc` / `sk_rcvbuf` with per-socket drop counters | Configurable byte-based buffer with atomic drop counters (`recv_drops`, `set_recv_buffer_size`) | Done |
-| **RX checksum validation** | Hardware or software verification on every packet | Software verification on every RX packet | Done |
-| **TX hardware checksum offload** | `CHECKSUM_PARTIAL` — NIC computes checksum | NIC computes when capable, software fallback | Done |
-| **ICMP error handling** | Destination/port unreachable queued to originating socket | Parsed and queued per-socket via `take_error()` | Done |
-| **Gratuitous ARP** | Announces IP on interface up | Broadcast on bind, configurable | Done |
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **VLAN (802.1q)** | Full tag insert/strip with mode-based filtering | Insert/strip VLAN tags with Access, Trunk, and PortTagging modes (Linux 8021q semantics). RX filtering and TX tagging per mode. | Done |
-| **Jumbo frames** | Configurable MTU | Configurable MTU via NetworkConfig, send_to() guard | Done |
-| **Hardware VLAN offload** | NIC inserts/strips VLAN tags | Software insert/strip only | Planned |
 | **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
 | **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
@@ -393,13 +385,13 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip with three operating modes matching Linux 8021q subinterface semantics. **Access mode**: RX accepts untagged + matching VID (strips tag), TX sends untagged. **Trunk mode**: RX accepts frames tagged with any VID in an allowed set (optional native VLAN for untagged), TX tags. **PortTagging mode** (default): RX only accepts matching VID (strips tag, drops untagged), TX always tags. Configurable per-socket via `set_vlan(Some(VlanConfig::new(100).access()))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
 
+**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the software stack re-inserts it for uniform VLAN filtering. Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
+
 ### Planned
 
 **IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
 
 **UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
-
-**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, similar to the existing checksum offload pattern. Query NIC capabilities at port init (`DEV_TX_OFFLOAD_VLAN_INSERT`, `DEV_RX_OFFLOAD_VLAN_STRIP`), set mbuf offload flags when capable, and fall back to software insert/strip on NICs without support. Configurable via `VlanConfig` to force software mode even when hardware offload is available. The current software VLAN implementation adds ~10% CPU overhead on tagged frames — hardware offload would eliminate this entirely.
 
 ### Not Currently Planned
 
