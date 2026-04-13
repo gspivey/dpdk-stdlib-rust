@@ -25,6 +25,72 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  # ── Synthetic performance test (no AWS credentials needed) ─────────────────
+  # Measures framework overhead of the Tokio async wrapper vs sync dpdk_udp.
+  # Uses a mock PacketBackend so no real NIC is needed — runs in ~20 seconds.
+  # Posts results as a PR comment for fast regression detection.
+  synthetic-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-synth-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-synth-
+
+      - name: Run synthetic benchmark
+        id: bench
+        run: |
+          cargo build --release -p synthetic-bench
+          # stdout = markdown, stderr = progress + JSON
+          cargo run --release -p synthetic-bench > /tmp/bench-results.md 2>/tmp/bench-stderr.log
+          cat /tmp/bench-stderr.log >&2
+          cat /tmp/bench-results.md
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number, skipping comment"
+            exit 0
+          fi
+
+          REPORT="/tmp/synth-perf-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "## Synthetic Performance Results ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          cat /tmp/bench-results.md >> "$REPORT"
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post synthetic perf PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-bench-results
+          path: /tmp/bench-results.md
+          retention-days: 30
+          if-no-files-found: ignore
+
   # ── Fast pre-flight validation (no AWS credentials needed) ──────────────────
   # Synthesizes the CDK template locally and validates infrastructure invariants
   # in seconds. Blocks the expensive integration-tests job if anything is wrong.

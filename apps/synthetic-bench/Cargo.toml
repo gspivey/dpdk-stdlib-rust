@@ -1,0 +1,16 @@
+[package]
+name = "synthetic-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "synthetic-bench"
+path = "src/main.rs"
+
+[dependencies]
+dpdk-udp = { path = "../../dpdk-udp", package = "dpdk-stdlib-udp" }
+dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio", features = ["dpdk"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
