@@ -6,6 +6,53 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 2. **Synthetic PPS** — `cargo test -- --nocapture vlan_pps_benchmark` (measures pure CPU overhead of RX processing pipeline, independent of NIC speed; ~5s to run)
+3. **HW VLAN Strip** — `cargo test -- --nocapture hw_vlan_strip_benchmark` (measures cost of frame reconstruction vs direct hw_vlan_tci passthrough; regression guard for the RX VLAN offload path)
+
+---
+
+## Run #16: Eliminate HW VLAN Frame Reconstruction
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | (pending commit) |
+| **Branch** | `claude/implement-roadmap-feature-umHZq` |
+| **PR** | [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+
+### Changes Since Run #15
+
+1. **Refactor `detect_vlan()` to accept `hw_vlan_tci` parameter.** When the NIC strips the VLAN tag, the hardware TCI from mbuf metadata is passed directly to `detect_vlan()` instead of reconstructing the tagged frame. Eliminates per-packet `Vec` allocation and memcpy on the RX hot path.
+2. **Remove frame reconstruction from `recv_frames()`.** The DPDK backend no longer rebuilds tagged frames from untagged bytes + mbuf metadata. Frame bytes are passed through as-is.
+3. **Thread `hw_vlan_tci` through DPDK fast path.** `recv_from_inline()` reads `mbuf.ol_flags()` and `mbuf.vlan_tci()`, passing the TCI to `process_frame_zerocopy()` which forwards it to `detect_vlan()`.
+
+### HW VLAN Strip Benchmark (CPU-only, no NIC)
+
+Measures the cost of VLAN-aware RX processing when the NIC has stripped the tag (500K iterations, warmed up).
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | 780 | 1,283 | Legacy: Vec alloc + memcpy per packet |
+| B: Direct hw_vlan_tci (no reconstruction) | 980 | 1,020 | Current: zero-alloc TCI passthrough |
+
+**Speedup: 1.26x (262 ns saved per packet).** At 600K PPS, reconstruction would waste ~158 ms/sec of CPU time. The savings come from eliminating the per-packet `Vec::with_capacity()` + three `extend_from_slice()` calls that were immediately re-parsed by `detect_vlan()`.
+
+### Synthetic PPS Benchmark (CPU-only, no NIC)
+
+Measures `process_frame_zerocopy()` throughput on stub backend (500K iterations, warmed up).
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 1,012 | 988 | — |
+| No VLAN config (baseline, tagged frame) | 903 | 1,107 | -10.8% |
+| PortTagging mode (matching VID) | 902 | 1,108 | -10.9% |
+| Access mode (untagged frame) | 1,008 | 992 | baseline |
+| Access mode (matching VID) | 905 | 1,105 | -10.6% |
+| Trunk mode (VID in allowed set) | 893 | 1,119 | -11.8% |
+| Trunk mode (untagged, native_vlan) | 1,000 | 1,000 | -1.2% |
+| PortTagging DROP (wrong VID) | 13,796 | 72 | — |
+| PortTagging DROP (untagged) | 23,960 | 42 | — |
+
+**No regression from the refactor.** Numbers are consistent with Run #14 and #15 — the software VLAN tagging path is unchanged. The refactor only affects the HW VLAN strip path (NIC-stripped frames processed via `hw_vlan_tci` parameter).
 
 ---
 

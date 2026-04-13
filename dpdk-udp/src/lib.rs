@@ -339,7 +339,12 @@ pub(crate) struct FrameLayout {
 ///
 /// For untagged frames: ethertype from bytes 12-13, L3 starts at byte 14.
 /// For VLAN-tagged frames: ethertype from bytes 16-17, L3 starts at byte 18.
-pub(crate) fn detect_vlan(frame: &[u8]) -> Option<FrameLayout> {
+///
+/// When `hw_vlan_tci` is `Some(tci)`, the NIC has already stripped the VLAN tag
+/// from the frame bytes. The frame is physically untagged (L3 at byte 14) but
+/// the returned `FrameLayout` will carry the hardware-provided TCI so that VLAN
+/// filtering works correctly without reconstructing the frame.
+pub(crate) fn detect_vlan(frame: &[u8], hw_vlan_tci: Option<u16>) -> Option<FrameLayout> {
     if frame.len() < ETH_HEADER_LEN {
         return None;
     }
@@ -359,7 +364,9 @@ pub(crate) fn detect_vlan(frame: &[u8]) -> Option<FrameLayout> {
         Some(FrameLayout {
             ethertype: outer_ethertype,
             l3_offset: ETH_HEADER_LEN,
-            vlan_tci: None,
+            // If the NIC stripped the VLAN tag, use the hardware TCI;
+            // otherwise this is a genuinely untagged frame.
+            vlan_tci: hw_vlan_tci,
         })
     }
 }
@@ -472,7 +479,7 @@ pub fn udp_pseudo_header_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_len: u
 /// Returns true if the checksum is valid (recomputed checksum == 0).
 /// Handles both untagged and 802.1Q VLAN-tagged frames.
 pub fn verify_ipv4_checksum(frame: &[u8]) -> bool {
-    let layout = match detect_vlan(frame) {
+    let layout = match detect_vlan(frame, None) {
         Some(l) => l,
         None => return false,
     };
@@ -510,7 +517,7 @@ pub fn verify_ipv4_checksum(frame: &[u8]) -> bool {
 /// Per RFC 768, a UDP checksum of 0 means "no checksum computed".
 /// Handles both untagged and 802.1Q VLAN-tagged frames.
 pub fn verify_udp_checksum(frame: &[u8]) -> bool {
-    let layout = match detect_vlan(frame) {
+    let layout = match detect_vlan(frame, None) {
         Some(l) => l,
         None => return false,
     };
@@ -957,7 +964,7 @@ pub struct ParsedUdpPacketRef<'a> {
 /// Returns None if the packet is not a valid UDP/IPv4 packet.
 pub fn parse_udp_packet(frame: &[u8]) -> Option<ParsedUdpPacket> {
     // Detect VLAN tag and determine L3 offset
-    let layout = detect_vlan(frame)?;
+    let layout = detect_vlan(frame, None)?;
     let l3 = layout.l3_offset;
 
     // Minimum size: L3 offset + IP header + UDP header
@@ -1031,7 +1038,7 @@ pub fn parse_udp_packet(frame: &[u8]) -> Option<ParsedUdpPacket> {
 /// original frame data, eliminating the per-packet `Vec<u8>` heap allocation.
 /// Handles both untagged and 802.1Q VLAN-tagged frames.
 pub fn parse_udp_packet_ref(frame: &[u8]) -> Option<ParsedUdpPacketRef<'_>> {
-    let layout = detect_vlan(frame)?;
+    let layout = detect_vlan(frame, None)?;
     let l3 = layout.l3_offset;
 
     if frame.len() < l3 + IPV4_HEADER_LEN + UDP_HEADER_LEN {
@@ -1392,10 +1399,10 @@ impl SocketBackend {
 
     /// Receive raw Ethernet frames via the backend.
     ///
-    /// When the NIC has stripped VLAN tags (RTE_MBUF_F_RX_VLAN_STRIPPED), the
-    /// 802.1Q tag is re-inserted into the frame so that the rest of the software
-    /// stack (detect_vlan, accepts_frame) works uniformly regardless of whether
-    /// hardware or software handles VLAN stripping.
+    /// Returns raw frame bytes as-is. When the NIC has stripped VLAN tags, the
+    /// frame bytes are untagged — the VLAN TCI is available via mbuf metadata
+    /// and is passed to `detect_vlan()` / `process_frame_zerocopy()` separately.
+    /// This avoids per-packet Vec allocation for frame reconstruction.
     fn recv_frames(&self, max_frames: usize) -> io::Result<Vec<Vec<u8>>> {
         match self {
             SocketBackend::Dpdk(res) => {
@@ -1406,24 +1413,7 @@ impl SocketBackend {
                     if let Some(data) = mbuf.data() {
                         let len = mbuf.data_len() as usize;
                         let actual_len = len.min(data.len());
-
-                        // If the NIC stripped the VLAN tag, re-insert it so the
-                        // software VLAN filtering (detect_vlan / accepts_frame)
-                        // works identically to the non-offload path.
-                        let ol_flags = mbuf.ol_flags();
-                        let vlan_stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED as u64) != 0;
-                        if vlan_stripped && actual_len >= ETH_HEADER_LEN {
-                            let tci = mbuf.vlan_tci();
-                            // Reconstruct: [dst(6) | src(6) | 0x8100(2) | TCI(2) | original ethertype + payload]
-                            let mut frame = Vec::with_capacity(actual_len + VLAN_TAG_LEN);
-                            frame.extend_from_slice(&data[..12]); // dst + src MAC
-                            frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes()); // TPID
-                            frame.extend_from_slice(&tci.to_be_bytes()); // TCI
-                            frame.extend_from_slice(&data[12..actual_len]); // original ethertype + rest
-                            frames.push(frame);
-                        } else {
-                            frames.push(data[..actual_len].to_vec());
-                        }
+                        frames.push(data[..actual_len].to_vec());
                     }
                 }
                 Ok(frames)
@@ -2518,7 +2508,14 @@ impl UdpSocket {
                         let len = mbuf.data_len() as usize;
                         let frame_data = &data[..len.min(data.len())];
 
-                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result) {
+                        // Extract hardware VLAN TCI from mbuf if NIC stripped the tag
+                        let hw_vlan_tci = {
+                            let ol_flags = mbuf.ol_flags();
+                            let stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED as u64) != 0;
+                            if stripped { Some(mbuf.vlan_tci()) } else { None }
+                        };
+
+                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, hw_vlan_tci) {
                             // Record latency sample if applicable
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
@@ -2565,7 +2562,7 @@ impl UdpSocket {
                     let mut result: Option<(usize, SocketAddr)> = None;
 
                     for frame_data in &frames {
-                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result) {
+                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, None) {
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
                                 self.latency_sampler.record(latency_ns);
@@ -2607,9 +2604,12 @@ impl UdpSocket {
         local_port: u16,
         buf: &mut [u8],
         result: &mut Option<(usize, SocketAddr)>,
+        hw_vlan_tci: Option<u16>,
     ) -> Option<(usize, SocketAddr)> {
         // Detect VLAN tag and determine the inner ethertype + L3 offset.
-        let layout = match detect_vlan(frame_data) {
+        // When the NIC has stripped the VLAN tag (hw_vlan_tci is Some), the frame
+        // bytes are untagged but the layout carries the hardware TCI for filtering.
+        let layout = match detect_vlan(frame_data, hw_vlan_tci) {
             Some(l) => l,
             None => return None,
         };
@@ -4259,36 +4259,37 @@ mod tests {
     }
 
     #[test]
-    fn test_rx_vlan_strip_frame_reconstruction() {
+    fn test_rx_hw_vlan_strip_direct_tci() {
         // Simulate what happens when the NIC strips a VLAN tag:
-        // The NIC delivers an untagged frame but sets ol_flags and vlan_tci.
-        // Our recv_frames() should reconstruct the tagged frame.
+        // The NIC delivers an untagged frame but sets ol_flags and vlan_tci
+        // in the mbuf metadata. detect_vlan() receives the hw_vlan_tci directly
+        // and returns the correct FrameLayout without frame reconstruction.
 
         // An untagged frame (what the NIC delivers after stripping):
         let untagged = vec![
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // dst MAC (broadcast)
             0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // src MAC
             0x08, 0x00, // EtherType: IPv4
-            // ... payload bytes (doesn't matter for VLAN reconstruction test)
+            // ... payload bytes
             0x45, 0x00, 0x00, 0x1C,
         ];
 
-        // Reconstruct as if the NIC stripped VLAN 100 (TCI = 0x0064):
-        let tci: u16 = 0x0064;
-        let mut reconstructed = Vec::with_capacity(untagged.len() + VLAN_TAG_LEN);
-        reconstructed.extend_from_slice(&untagged[..12]); // dst + src MAC
-        reconstructed.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes());
-        reconstructed.extend_from_slice(&tci.to_be_bytes());
-        reconstructed.extend_from_slice(&untagged[12..]); // original ethertype + rest
+        let hw_tci: u16 = 0x0064; // VID=100, PCP=0, DEI=0
 
-        // Verify: the reconstructed frame should be detected as VLAN-tagged
-        let layout = detect_vlan(&reconstructed).unwrap();
-        assert_eq!(layout.vlan_tci, Some(tci));
-        assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
-        assert_eq!(layout.l3_offset, ETH_HEADER_LEN + VLAN_TAG_LEN);
+        // With hw_vlan_tci=None: untagged frame, no VLAN detected
+        let layout_no_hw = detect_vlan(&untagged, None).unwrap();
+        assert!(layout_no_hw.vlan_tci.is_none());
+        assert_eq!(layout_no_hw.ethertype, ETH_TYPE_IPV4);
+        assert_eq!(layout_no_hw.l3_offset, ETH_HEADER_LEN);
 
+        // With hw_vlan_tci=Some(tci): untagged frame, but VLAN TCI from hardware
+        let layout_hw = detect_vlan(&untagged, Some(hw_tci)).unwrap();
+        assert_eq!(layout_hw.vlan_tci, Some(hw_tci));
+        assert_eq!(layout_hw.ethertype, ETH_TYPE_IPV4);
+        // L3 offset is still 14 (frame bytes are untagged)
+        assert_eq!(layout_hw.l3_offset, ETH_HEADER_LEN);
         // The VID from the TCI should be 100
-        assert_eq!(tci & 0x0FFF, 100);
+        assert_eq!(hw_tci & 0x0FFF, 100);
     }
 
     #[test]
@@ -5041,7 +5042,7 @@ mod tests {
         // Process the frame
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
 
         // Should NOT produce a UDP result
         assert!(result.is_none());
@@ -5080,7 +5081,7 @@ mod tests {
 
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
 
         // No error should be queued
         assert!(socket.take_error().unwrap().is_none());
@@ -5289,7 +5290,7 @@ mod tests {
             1000, 2000, b"test", 64,
         ).unwrap();
 
-        let layout = detect_vlan(&frame).unwrap();
+        let layout = detect_vlan(&frame, None).unwrap();
         assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
         assert_eq!(layout.l3_offset, ETH_HEADER_LEN);
         assert!(layout.vlan_tci.is_none());
@@ -5305,7 +5306,7 @@ mod tests {
             1000, 2000, b"test", 64, &vlan,
         ).unwrap();
 
-        let layout = detect_vlan(&buf).unwrap();
+        let layout = detect_vlan(&buf, None).unwrap();
         assert_eq!(layout.ethertype, ETH_TYPE_IPV4);
         assert_eq!(layout.l3_offset, ETH_HEADER_LEN + VLAN_TAG_LEN);
         let tci = layout.vlan_tci.unwrap();
@@ -5315,8 +5316,8 @@ mod tests {
 
     #[test]
     fn detect_vlan_returns_none_on_too_short_frame() {
-        assert!(detect_vlan(&[]).is_none());
-        assert!(detect_vlan(&[0u8; 13]).is_none());
+        assert!(detect_vlan(&[], None).is_none());
+        assert!(detect_vlan(&[0u8; 13], None).is_none());
     }
 
     #[test]
@@ -5412,12 +5413,39 @@ mod tests {
 
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
 
         // Should have received the UDP payload
         let (len, src_addr) = result.expect("should receive VLAN-tagged UDP packet");
         assert_eq!(&buf[..len], b"vlan payload");
         assert_eq!(src_addr.port(), 8000);
+    }
+
+    #[test]
+    fn process_frame_zerocopy_hw_vlan_tci_filters_correctly() {
+        // Simulate HW VLAN strip: untagged frame bytes + hw_vlan_tci from mbuf.
+        // PortTagging mode should accept matching VID and reject wrong VID.
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(100).port_tagging()));
+
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+
+        // Matching VID via hw_vlan_tci: should accept
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, Some(100));
+        assert!(result.is_some(), "hw_vlan_tci=100 should be accepted by PortTagging(100)");
+
+        // Wrong VID via hw_vlan_tci: should drop
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, Some(999));
+        assert!(result.is_none(), "hw_vlan_tci=999 should be rejected by PortTagging(100)");
+
+        // No hw_vlan_tci (genuinely untagged): should drop (PortTagging requires a tag)
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "untagged frame should be rejected by PortTagging(100)");
     }
 
     // ========================================================================
@@ -5550,7 +5578,7 @@ mod tests {
         let frame = make_untagged_frame(port);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "Access mode should accept untagged frames");
     }
 
@@ -5563,7 +5591,7 @@ mod tests {
         let frame = make_tagged_frame(port, 100);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "Access mode should accept matching VID");
     }
 
@@ -5576,7 +5604,7 @@ mod tests {
         let frame = make_tagged_frame(port, 200);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_none(), "Access mode should drop wrong VID");
     }
 
@@ -5589,7 +5617,7 @@ mod tests {
         let frame = make_untagged_frame(port);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_none(), "PortTagging mode should drop untagged frames");
     }
 
@@ -5602,7 +5630,7 @@ mod tests {
         let frame = make_tagged_frame(port, 100);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "PortTagging mode should accept matching VID");
     }
 
@@ -5615,7 +5643,7 @@ mod tests {
         let frame = make_tagged_frame(port, 999);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_none(), "PortTagging mode should drop wrong VID");
     }
 
@@ -5628,7 +5656,7 @@ mod tests {
         let frame = make_tagged_frame(port, 200);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "Trunk mode should accept allowed VID 200");
     }
 
@@ -5641,7 +5669,7 @@ mod tests {
         let frame = make_tagged_frame(port, 999);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_none(), "Trunk mode should drop disallowed VID");
     }
 
@@ -5654,7 +5682,7 @@ mod tests {
         let frame = make_untagged_frame(port);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_none(), "Trunk mode should drop untagged without native_vlan");
     }
 
@@ -5667,7 +5695,7 @@ mod tests {
         let frame = make_untagged_frame(port);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "Trunk mode should accept untagged with native_vlan");
     }
 
@@ -5680,13 +5708,13 @@ mod tests {
         let frame = make_tagged_frame(port, 42);
         let mut buf = [0u8; 1500];
         let mut result = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
         assert!(result.is_some(), "No VLAN config should accept tagged frames");
 
         // No VLAN config: accept untagged
         let frame = make_untagged_frame(port);
         let mut result2 = None;
-        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result2);
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result2, None);
         assert!(result2.is_some(), "No VLAN config should accept untagged frames");
     }
 
@@ -5824,14 +5852,14 @@ mod tests {
             let mut buf = [0u8; 1500];
             for _ in 0..1000 {
                 let mut result = None;
-                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
             }
 
             // Timed run
             let start = Instant::now();
             for _ in 0..ITERATIONS {
                 let mut result = None;
-                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
             }
             let elapsed = start.elapsed();
 
@@ -5864,15 +5892,18 @@ mod tests {
     // Synthetic PPS Benchmark: HW VLAN strip reconstruction vs direct TCI
     // ========================================================================
 
-    /// Compares the performance of two approaches for handling NIC-stripped VLAN tags:
+    /// Measures performance of hw_vlan_tci passthrough in process_frame_zerocopy.
     ///
-    /// 1. **Reconstruction (current)**: recv_frames rebuilds the tagged frame by
-    ///    inserting [0x8100 | TCI] into the byte stream, then process_frame_zerocopy
-    ///    calls detect_vlan() which parses those bytes back out.
+    /// Compares two code paths for VLAN-aware RX processing:
     ///
-    /// 2. **Direct TCI (proposed)**: Skip reconstruction entirely. Pass the
-    ///    hw_vlan_tci from mbuf metadata directly, letting detect_vlan() return
-    ///    the correct FrameLayout without frame modification.
+    /// 1. **Reconstruction (legacy)**: Rebuild a tagged frame from untagged bytes +
+    ///    TCI, then pass to process_frame_zerocopy with hw_vlan_tci=None. This
+    ///    forces detect_vlan() to parse the VLAN tag from frame bytes and allocates
+    ///    a new Vec per packet.
+    ///
+    /// 2. **Direct TCI (current)**: Pass the untagged frame as-is with
+    ///    hw_vlan_tci=Some(tci). detect_vlan() returns the correct FrameLayout
+    ///    with zero allocation.
     ///
     /// Run with:
     ///   cargo test -p dpdk-stdlib-udp -- --nocapture hw_vlan_strip_benchmark
@@ -5887,35 +5918,34 @@ mod tests {
         socket.set_vlan(Some(VlanConfig::new(VID).port_tagging()));
         let untagged_frame = make_untagged_frame(port);
 
-        // Pre-build the reconstructed frame (what recv_frames currently does)
-        let reconstructed_frame = {
-            let tci: u16 = VID; // VID only, PCP=0, DEI=0
-            let mut frame = Vec::with_capacity(untagged_frame.len() + VLAN_TAG_LEN);
-            frame.extend_from_slice(&untagged_frame[..12]); // dst + src MAC
-            frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes()); // TPID
-            frame.extend_from_slice(&tci.to_be_bytes()); // TCI
-            frame.extend_from_slice(&untagged_frame[12..]); // original ethertype + rest
-            frame
-        };
-
         println!("\n=== HW VLAN Strip Benchmark ({ITERATIONS} iterations) ===");
         println!("{:<55} {:>12} {:>10}", "Approach", "PPS", "ns/pkt");
         println!("{}", "-".repeat(80));
 
-        // ── Approach A: Reconstruction (current code path) ──
-        // Simulates: recv_frames reconstructs tagged frame → process_frame_zerocopy
-        // parses it back with detect_vlan().
+        // ── Approach A: Reconstruction (legacy, removed) ──
+        // Simulates what recv_frames USED to do: allocate a Vec, copy MACs,
+        // insert [0x8100|TCI], copy rest, then pass to process_frame_zerocopy
+        // which re-parses the tag via detect_vlan.
+        let mut buf = [0u8; 1500];
         {
-            let mut buf = [0u8; 1500];
-            // Warmup
+            // Warmup with a pre-built reconstructed frame
+            let reconstructed = {
+                let tci: u16 = VID;
+                let mut frame = Vec::with_capacity(untagged_frame.len() + VLAN_TAG_LEN);
+                frame.extend_from_slice(&untagged_frame[..12]);
+                frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes());
+                frame.extend_from_slice(&tci.to_be_bytes());
+                frame.extend_from_slice(&untagged_frame[12..]);
+                frame
+            };
             for _ in 0..1000 {
                 let mut result = None;
-                socket.process_frame_zerocopy(&reconstructed_frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&reconstructed, port, &mut buf, &mut result, None);
             }
 
             let start = Instant::now();
             for _ in 0..ITERATIONS {
-                // Simulate what recv_frames does: reconstruct the tagged frame each time
+                // Per-packet allocation + copy (the old hot-path cost)
                 let tci: u16 = VID;
                 let mut frame = Vec::with_capacity(untagged_frame.len() + VLAN_TAG_LEN);
                 frame.extend_from_slice(&untagged_frame[..12]);
@@ -5924,63 +5954,36 @@ mod tests {
                 frame.extend_from_slice(&untagged_frame[12..]);
 
                 let mut result = None;
-                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
             }
             let elapsed_a = start.elapsed();
             let pps_a = ITERATIONS as f64 / elapsed_a.as_secs_f64();
             let ns_a = elapsed_a.as_nanos() as f64 / ITERATIONS as f64;
 
-            println!("{:<55} {:>10.0} K {:>8.0} ns  (current)",
+            println!("{:<55} {:>10.0} K {:>8.0} ns  (legacy)",
                 "A: Reconstruct frame + detect_vlan parse",
                 pps_a / 1000.0, ns_a);
 
-            // ── Approach B: Direct TCI passthrough (proposed) ──
-            // Simulates: no reconstruction, detect_vlan receives hw_vlan_tci directly.
-            // Uses the untagged frame as-is, then manually builds the FrameLayout
-            // with the TCI from "hardware metadata".
+            // ── Approach B: Direct TCI passthrough (current implementation) ──
+            // Passes untagged frame bytes + hw_vlan_tci to process_frame_zerocopy.
+            // detect_vlan() returns the TCI from the parameter, zero allocation.
 
             // Warmup
             for _ in 0..1000 {
                 let mut result = None;
-                // In the proposed approach, process_frame_zerocopy would call
-                // detect_vlan(frame, Some(hw_tci)) and get the right layout without
-                // the frame needing reconstruction. We simulate this by calling
-                // detect_vlan on the untagged frame, then overriding vlan_tci.
-                let layout = detect_vlan(&untagged_frame);
-                if let Some(mut l) = layout {
-                    l.vlan_tci = Some(VID);
-                    // The rest of process_frame_zerocopy uses layout.vlan_tci for filtering
-                    if let Some(ref vlan_cfg) = socket.vlan_config {
-                        let frame_vid = l.vlan_tci.map(|tci| tci & 0x0FFF);
-                        let _ = vlan_cfg.accepts_frame(frame_vid);
-                    }
-                }
-                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result, Some(VID));
             }
 
             let start = Instant::now();
             for _ in 0..ITERATIONS {
-                // Simulate the proposed path: detect_vlan on untagged frame + hw TCI overlay
-                let mut layout = detect_vlan(&untagged_frame).unwrap();
-                layout.vlan_tci = Some(VID);
-
-                // VLAN filtering with the direct TCI
-                if let Some(ref vlan_cfg) = socket.vlan_config {
-                    let frame_vid = layout.vlan_tci.map(|tci| tci & 0x0FFF);
-                    if !vlan_cfg.accepts_frame(frame_vid) {
-                        continue;
-                    }
-                }
-
-                // Parse UDP from the untagged frame (no extra 4 bytes to skip)
                 let mut result = None;
-                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result);
+                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result, Some(VID));
             }
             let elapsed_b = start.elapsed();
             let pps_b = ITERATIONS as f64 / elapsed_b.as_secs_f64();
             let ns_b = elapsed_b.as_nanos() as f64 / ITERATIONS as f64;
 
-            println!("{:<55} {:>10.0} K {:>8.0} ns  (proposed)",
+            println!("{:<55} {:>10.0} K {:>8.0} ns  (current)",
                 "B: Direct hw_vlan_tci (no reconstruction)",
                 pps_b / 1000.0, ns_b);
 
@@ -5989,7 +5992,7 @@ mod tests {
             let speedup = pps_b / pps_a;
             let saved_ns = ns_a - ns_b;
             println!("Speedup:  {:.2}x  ({:.0} ns saved per packet)", speedup, saved_ns);
-            println!("At 600K PPS: reconstruction wastes ~{:.1} ms/sec of CPU",
+            println!("At 600K PPS: reconstruction would waste ~{:.1} ms/sec of CPU",
                 saved_ns * 600_000.0 / 1_000_000.0);
             println!("{}", "=".repeat(80));
         }

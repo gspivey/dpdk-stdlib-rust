@@ -268,7 +268,7 @@ impl IcmpErrorInfo {
 /// Returns `None` if the frame is not a valid ICMP error for a UDP datagram.
 pub fn parse_icmp_error(frame: &[u8]) -> Option<IcmpErrorInfo> {
     // Detect VLAN tag and determine L3 offset.
-    let layout = crate::detect_vlan(frame)?;
+    let layout = crate::detect_vlan(frame, None)?;
     let l3 = layout.l3_offset;
 
     if layout.ethertype != ETH_TYPE_IPV4 {
@@ -404,7 +404,7 @@ pub fn icmp_checksum(icmp_header_and_data: &[u8]) -> u16 {
 /// Returns None if the frame is not a valid ICMP packet
 pub fn parse_icmp_packet(frame: &[u8]) -> Option<IcmpPacket> {
     // Detect VLAN tag and determine L3 offset.
-    let layout = crate::detect_vlan(frame)?;
+    let layout = crate::detect_vlan(frame, None)?;
     let l3 = layout.l3_offset;
 
     if layout.ethertype != ETH_TYPE_IPV4 {
