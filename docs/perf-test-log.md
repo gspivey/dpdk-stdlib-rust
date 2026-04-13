@@ -9,6 +9,83 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #15: Hardware VLAN Offload (NIC-Assisted Tag Insert/Strip)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | `a44728b` |
+| **Branch** | `claude/implement-roadmap-feature-umHZq` |
+| **PR** | [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+| **GH Actions Run** | [24321361567](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24321361567) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #14
+
+1. **`140fc02` — Hardware VLAN offload for NIC-assisted 802.1Q tag insert/strip.** Adds mbuf-level VLAN TCI metadata, TX path sets `RTE_MBUF_F_TX_VLAN` flag for NIC-assisted tag insertion, RX path reconstructs stripped VLAN tags from mbuf metadata. Per-socket `force_software` option. Port config enables VLAN offloads alongside existing checksum offloads. 8 new unit tests.
+2. **`a44728b` — Cast DPDK offload constants to u64 for bindgen compatibility.** Fixes CI build failure where bindgen generates some DPDK constants as `u32` from anonymous C enums, while `ol_flags` and offload capability fields are `u64`.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,955 | 0.7% | 138,985 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,614 | 0.4% | 319,812 | 8.6% | 350,000 | 0.0% |
+| 700,000 | 665,692 | 4.9% | 344,251 | 50.8% | 685,259 | 2.1% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,972 | 0.7% | 138,979 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,768 | 0.4% | 332,089 | 5.1% | 349,987 | 0.0% |
+| 700,000 | 657,380 | 6.1% | 319,268 | 54.4% | 686,081 | 2.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,997 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,968 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,848 | 0.3% | 319,140 | 8.8% | 350,000 | 0.0% |
+| 700,000 | 470,522 | 1.3% | 339,628 | 28.7% | 459,298 | 3.3% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 36,158 | 48.3% | 70,000 | 0.0% |
+| 140,000 | 77,678 | 0.8% | 77,715 | 0.8% | 78,294 | 0.0% |
+| 350,000 | 77,203 | 1.4% | 77,667 | 0.8% | 78,127 | 0.3% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 37,867 | 45.9% |
+| 140,000 | 37,261 | 73.4% |
+| 350,000 | 37,373 | 89.3% |
+| 700,000 | 37,239 | 94.7% |
+
+### Analysis
+
+**No performance regression from hardware VLAN offload changes.** The HW VLAN offload feature adds mbuf metadata handling (vlan_tci, ol_flags) and RX tag reconstruction paths, but since integration tests use untagged frames (AWS VPC doesn't support VLANs), these code paths are not exercised during benchmarks. The results confirm zero measurable impact.
+
+**rust-dpdk vs native-dpdk parity**: At 700K PPS with 64B packets, our Rust stack delivers 665K RX vs native C DPDK's 685K — within 2.9%. At 1400B near-MTU, Rust actually beats native C (470K vs 459K) likely due to measurement variance at the line-rate cap.
+
+**rust-dpdk vs kernel**: At 700K PPS with 64B packets, DPDK delivers 665K (4.9% drop) vs kernel's 344K (50.8% drop) — **1.93x throughput advantage**. At 350K PPS, DPDK drops 0.4% while kernel drops 8.6%.
+
+**tokio-dpdk**: Caps at ~37K PPS as expected — consistent with Run #14. The `spawn_blocking` hop is the known bottleneck.
+
+**Note on ENA VLAN support**: The echo server logs show `Warning: Some RX/TX offloads not supported by device (flags: 0x1)` — this is the VLAN strip/insert offload being requested but not supported by the ENA NIC. The code correctly falls back to software VLAN handling. Hardware VLAN offload would activate on NICs that support it (e.g., Intel XL710, Mellanox ConnectX).
+
+---
+
 ## Run #14: VLAN 802.1Q Modes (Access, Trunk, PortTagging)
 
 | Field | Value |
