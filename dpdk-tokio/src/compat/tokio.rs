@@ -39,9 +39,14 @@ enum UdpSocketInner {
     Dpdk(DpdkAsyncSocket),
 }
 
+/// DPDK socket wrapper using std::sync::Mutex for fast direct-call hot path.
+///
+/// The underlying operations are CPU-only (no kernel I/O), so holding a
+/// std::sync::Mutex briefly is safe in async context. This eliminates the
+/// ~20μs spawn_blocking overhead and per-packet buf.to_vec() allocations.
 #[cfg(feature = "dpdk")]
 struct DpdkAsyncSocket {
-    socket: std::sync::Arc<::tokio::sync::Mutex<dpdk_udp::UdpSocket>>,
+    socket: std::sync::Arc<std::sync::Mutex<dpdk_udp::UdpSocket>>,
     local_addr: SocketAddr,
 }
 
@@ -77,7 +82,7 @@ impl UdpSocket {
                         let local_addr = socket.local_addr()?;
                         return Ok(UdpSocket {
                             inner: UdpSocketInner::Dpdk(DpdkAsyncSocket {
-                                socket: std::sync::Arc::new(::tokio::sync::Mutex::new(socket)),
+                                socket: std::sync::Arc::new(std::sync::Mutex::new(socket)),
                                 local_addr,
                             }),
                         });
@@ -136,8 +141,7 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.peer_addr(),
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                let socket = s.socket.blocking_lock();
-                socket.peer_addr()
+                s.socket.lock().unwrap().peer_addr()
             }
         }
     }
@@ -153,8 +157,7 @@ impl UdpSocket {
             UdpSocketInner::Dpdk(s) => {
                 let socket = s.socket.clone();
                 ::tokio::task::spawn_blocking(move || {
-                    let mut socket = socket.blocking_lock();
-                    socket.connect(addr)
+                    socket.lock().unwrap().connect(addr)
                 }).await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             }
@@ -167,13 +170,8 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.send(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                let socket = s.socket.clone();
-                let buf = buf.to_vec();
-                ::tokio::task::spawn_blocking(move || {
-                    let socket = socket.blocking_lock();
-                    socket.send(&buf)
-                }).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                // Direct call — send is CPU-only on connected socket.
+                s.socket.lock().unwrap().send(buf)
             }
         }
     }
@@ -185,27 +183,11 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.recv(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
+                // Non-blocking poll loop using try_recv_from.
                 loop {
-                    let socket = s.socket.clone();
-                    let mut buf_owned = buf.to_vec();
-                    let result = ::tokio::task::spawn_blocking(move || {
-                        let socket = socket.blocking_lock();
-                        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                        let res = socket.recv(&mut buf_owned).map(|len| (len, buf_owned));
-                        let _ = socket.set_read_timeout(None);
-                        res
-                    }).await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                    match result {
-                        Ok((len, received_buf)) => {
-                            buf[..len].copy_from_slice(&received_buf[..len]);
-                            return Ok(len);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            ::tokio::task::yield_now().await;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                    match s.socket.lock().unwrap().try_recv_from(buf)? {
+                        Some((len, _addr)) => return Ok(len),
+                        None => ::tokio::task::yield_now().await,
                     }
                 }
             }
@@ -221,13 +203,8 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.send_to(buf, addr).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                let socket = s.socket.clone();
-                let buf = buf.to_vec();
-                ::tokio::task::spawn_blocking(move || {
-                    let socket = socket.blocking_lock();
-                    socket.send_to(&buf, addr)
-                }).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                // Direct call — send_to is CPU-only (frame build + backend.send_frame).
+                s.socket.lock().unwrap().send_to(buf, addr)
             }
         }
     }
@@ -238,32 +215,12 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.recv_from(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                // Loop with a short read timeout so spawn_blocking always returns,
-                // allowing tokio::time::timeout and cancellation to work correctly.
+                // Non-blocking poll loop using try_recv_from — no spawn_blocking,
+                // no buf.to_vec(), no 1-second timeout.
                 loop {
-                    let socket = s.socket.clone();
-                    let mut buf_owned = buf.to_vec();
-                    let result = ::tokio::task::spawn_blocking(move || {
-                        let socket = socket.blocking_lock();
-                        // Set a 1-second read timeout so this thread releases the lock
-                        // promptly, allowing the async runtime to handle cancellation.
-                        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                        let res = socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned));
-                        let _ = socket.set_read_timeout(None);
-                        res
-                    }).await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                    match result {
-                        Ok((len, addr, received_buf)) => {
-                            buf[..len].copy_from_slice(&received_buf[..len]);
-                            return Ok((len, addr));
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Timeout expired, yield to async runtime and retry
-                            ::tokio::task::yield_now().await;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                    match s.socket.lock().unwrap().try_recv_from(buf)? {
+                        Some(result) => return Ok(result),
+                        None => ::tokio::task::yield_now().await,
                     }
                 }
             }
@@ -357,7 +314,10 @@ impl UdpSocket {
             UdpSocketInner::Dpdk(s) => {
                 let socket = s.socket.try_lock()
                     .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "socket locked"))?;
-                socket.recv_from(buf)
+                match socket.try_recv_from(buf)? {
+                    Some(result) => Ok(result),
+                    None => Err(io::Error::new(io::ErrorKind::WouldBlock, "no data available")),
+                }
             }
         }
     }
@@ -385,7 +345,10 @@ impl UdpSocket {
             UdpSocketInner::Dpdk(s) => {
                 let socket = s.socket.try_lock()
                     .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "socket locked"))?;
-                socket.recv(buf)
+                match socket.try_recv_from(buf)? {
+                    Some((len, _addr)) => Ok(len),
+                    None => Err(io::Error::new(io::ErrorKind::WouldBlock, "no data available")),
+                }
             }
         }
     }
@@ -566,7 +529,7 @@ impl UdpSocket {
         match &self.inner {
             UdpSocketInner::Tokio(s) => s.take_error(),
             #[cfg(feature = "dpdk")]
-            UdpSocketInner::Dpdk(s) => s.socket.blocking_lock().take_error(),
+            UdpSocketInner::Dpdk(s) => s.socket.lock().unwrap().take_error(),
         }
     }
 

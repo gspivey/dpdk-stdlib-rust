@@ -71,9 +71,24 @@ impl AsyncUdpSocket for TokioUdpSocket {
 }
 
 // DPDK-based async UDP socket implementation
+//
+// Performance design: uses std::sync::Mutex (not tokio::sync::Mutex) and
+// direct calls (not spawn_blocking) for the hot path. This eliminates three
+// sources of overhead that previously capped throughput at ~50K ops/sec:
+//
+//   1. spawn_blocking dispatch (~10-20μs per call)
+//   2. tokio::sync::Mutex async locking overhead
+//   3. buf.to_vec() heap allocation on every send/recv
+//
+// The underlying dpdk_udp::UdpSocket operations are CPU-only (no kernel I/O):
+//   - send_to: builds frame + calls backend.send_frame (non-blocking)
+//   - try_recv_from: single poll of backend.recv_frames (non-blocking)
+//
+// Holding a std::sync::Mutex briefly for these operations is safe in async
+// context because the critical section is short and never awaits.
 #[cfg(feature = "dpdk")]
 pub struct DpdkUdpSocket {
-    inner: Arc<Mutex<dpdk_udp::UdpSocket>>,
+    inner: Arc<std::sync::Mutex<dpdk_udp::UdpSocket>>,
     local_addr: SocketAddr,
     connected_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
@@ -93,7 +108,7 @@ impl DpdkUdpSocket {
 
         Ok(Self {
             local_addr: socket.local_addr()?,
-            inner: Arc::new(Mutex::new(socket)),
+            inner: Arc::new(std::sync::Mutex::new(socket)),
             connected_addr: Arc::new(Mutex::new(None)),
         })
     }
@@ -114,41 +129,20 @@ impl DpdkUdpSocket {
 impl AsyncUdpSocket for DpdkUdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
-            let socket = self.inner.clone();
-            let mut buf_owned = buf.to_vec();
-
-            let result = tokio::task::spawn_blocking(move || {
-                let socket = socket.blocking_lock();
-                let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                let res = socket.recv_from(&mut buf_owned).map(|(len, addr)| (len, addr, buf_owned));
-                let _ = socket.set_read_timeout(None);
-                res
-            }).await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+            // try_recv_from does a single non-blocking poll — no sleep, no spawn_blocking.
+            // Scope the lock so MutexGuard is dropped before the await point.
+            let result = self.inner.lock().unwrap().try_recv_from(buf)?;
             match result {
-                Ok((len, addr, received_buf)) => {
-                    buf[..len].copy_from_slice(&received_buf[..len]);
-                    return Ok((len, addr));
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(e) => return Err(e),
+                Some(r) => return Ok(r),
+                None => tokio::task::yield_now().await,
             }
         }
     }
 
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        let socket = self.inner.clone();
-        let buf_owned = buf.to_vec();
-
-        tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.send_to(&buf_owned, addr)
-        }).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        // Direct call — send_to is CPU-only (frame build + backend.send_frame).
+        // No spawn_blocking, no buf.to_vec().
+        self.inner.lock().unwrap().send_to(buf, addr)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -156,11 +150,11 @@ impl AsyncUdpSocket for DpdkUdpSocket {
     }
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        // connect may trigger ARP resolution (brief block on first call).
+        // Use spawn_blocking for safety since ARP waits for a reply.
         let socket = self.inner.clone();
-
         tokio::task::spawn_blocking(move || {
-            let mut socket = socket.blocking_lock();
-            socket.connect(addr)
+            socket.lock().unwrap().connect(addr)
         }).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
 
@@ -170,42 +164,13 @@ impl AsyncUdpSocket for DpdkUdpSocket {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let socket = self.inner.clone();
-            let mut buf_owned = buf.to_vec();
-
-            let result = tokio::task::spawn_blocking(move || {
-                let socket = socket.blocking_lock();
-                let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                let res = socket.recv(&mut buf_owned).map(|len| (len, buf_owned));
-                let _ = socket.set_read_timeout(None);
-                res
-            }).await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            match result {
-                Ok((len, received_buf)) => {
-                    buf[..len].copy_from_slice(&received_buf[..len]);
-                    return Ok(len);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let (len, _addr) = self.recv_from(buf).await?;
+        Ok(len)
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let socket = self.inner.clone();
-        let buf_owned = buf.to_vec();
-
-        tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.send(&buf_owned)
-        }).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        // Direct call — send is CPU-only on connected socket.
+        self.inner.lock().unwrap().send(buf)
     }
 
     fn backend_name(&self) -> &'static str {
@@ -213,36 +178,25 @@ impl AsyncUdpSocket for DpdkUdpSocket {
     }
 
     async fn enable_perf_reporting(&self, interval: Duration) -> io::Result<()> {
-        let socket = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.enable_perf_reporting(interval)
-        }).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        // enable_perf_reporting spawns a thread internally — brief call.
+        self.inner.lock().unwrap().enable_perf_reporting(interval)
     }
 
     async fn disable_perf_reporting(&self) {
+        // disable_perf_reporting joins the reporter thread (blocking).
+        // Use spawn_blocking so we don't block the async runtime.
         let socket = self.inner.clone();
-        // spawn_blocking because disable_perf_reporting joins the reporter
-        // thread (blocking), and we must not block the async runtime thread.
-        // The final `[NIC-FINAL]` stderr line is emitted synchronously as
-        // part of PerfReporter::drop() inside this call.
         let _ = tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            socket.disable_perf_reporting();
+            socket.lock().unwrap().disable_perf_reporting();
         }).await;
     }
 
     async fn recv_drops(&self) -> RecvDropsSnapshot {
-        let socket = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let socket = socket.blocking_lock();
-            let stats = socket.recv_drops();
-            RecvDropsSnapshot {
-                packets: stats.packets,
-                bytes: stats.bytes,
-            }
-        }).await
-            .unwrap_or_default()
+        let socket = self.inner.lock().unwrap();
+        let stats = socket.recv_drops();
+        RecvDropsSnapshot {
+            packets: stats.packets,
+            bytes: stats.bytes,
+        }
     }
 }

@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+// Label for the async implementation being benchmarked
+const ASYNC_LABEL: &str = "async (std::sync::Mutex + try_recv_from)";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -239,7 +242,7 @@ fn bench_sync_tx(payload_size: usize) -> u64 {
     (count as f64 / elapsed.as_secs_f64()) as u64
 }
 
-/// Run an async send_to benchmark (Tokio wrapper) and return packets-per-second.
+/// Run an async send_to benchmark (new pattern: std::sync::Mutex, direct call) and return PPS.
 async fn bench_async_tx(payload_size: usize) -> u64 {
     let backend = Arc::new(SyntheticBackend::new(LOCAL_MAC));
     let sync_socket = UdpSocket::bind_with_backend(
@@ -257,23 +260,17 @@ async fn bench_async_tx(payload_size: usize) -> u64 {
         let _ = sync_socket.send_to(&payload, dst);
     }
 
-    // Wrap in the Tokio async pattern (replicating DpdkUdpSocket's approach)
-    let socket = Arc::new(tokio::sync::Mutex::new(sync_socket));
+    // Wrap in std::sync::Mutex — matches the new DpdkUdpSocket pattern
+    let socket = Arc::new(std::sync::Mutex::new(sync_socket));
 
     // Reset counter
     backend.tx_count.store(0, Ordering::Relaxed);
 
-    // Timed run — replicates the exact DpdkUdpSocket::send_to pattern
+    // Timed run — direct lock + send_to, no spawn_blocking, no buf clone
     let start = Instant::now();
     let deadline = start + BENCH_DURATION;
     while Instant::now() < deadline {
-        let s = socket.clone();
-        let buf = payload.clone(); // DpdkUdpSocket clones buf every call
-        let _ = tokio::task::spawn_blocking(move || {
-            let s = s.blocking_lock();
-            s.send_to(&buf, dst)
-        })
-        .await;
+        let _ = socket.lock().unwrap().send_to(&payload, dst);
     }
     let elapsed = start.elapsed();
     let count = backend.tx_count();
@@ -329,7 +326,7 @@ fn bench_sync_rx(payload_size: usize) -> u64 {
     (count as f64 / elapsed.as_secs_f64()) as u64
 }
 
-/// Run an async recv_from benchmark (Tokio wrapper) and return packets-per-second.
+/// Run an async recv_from benchmark (new pattern: std::sync::Mutex + try_recv_from) and return PPS.
 async fn bench_async_rx(payload_size: usize) -> u64 {
     let backend = Arc::new(SyntheticBackend::new(LOCAL_MAC));
     let sync_socket = UdpSocket::bind_with_backend(
@@ -341,22 +338,17 @@ async fn bench_async_rx(payload_size: usize) -> u64 {
     // Pre-fill RX queue
     backend.prefill_rx(RX_PREFILL, payload_size, LOCAL_IP, LOCAL_PORT);
 
-    let socket = Arc::new(tokio::sync::Mutex::new(sync_socket));
-    let mut buf = vec![0u8; 2048];
+    // Wrap in std::sync::Mutex — matches the new DpdkUdpSocket pattern
+    let socket = Arc::new(std::sync::Mutex::new(sync_socket));
+    let mut buf = [0u8; 2048];
 
     // Warmup
     let warmup_end = Instant::now() + WARMUP_DURATION;
     while Instant::now() < warmup_end {
-        let s = socket.clone();
-        let mut buf_owned = buf.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let s = s.blocking_lock();
-            let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
-            let res = s.recv_from(&mut buf_owned);
-            let _ = s.set_read_timeout(None);
-            res
-        })
-        .await;
+        match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
+            Some(_) => {}
+            None => tokio::task::yield_now().await,
+        }
         if backend.rx_queue_len() < RX_REFILL_BATCH {
             backend.prefill_rx(RX_REFILL_BATCH, payload_size, LOCAL_IP, LOCAL_PORT);
         }
@@ -364,30 +356,13 @@ async fn bench_async_rx(payload_size: usize) -> u64 {
 
     let mut count: u64 = 0;
 
-    // Timed run — replicates the exact DpdkUdpSocket::recv_from pattern
+    // Timed run — direct lock + try_recv_from + yield, no spawn_blocking, no buf clone
     let start = Instant::now();
     let deadline = start + BENCH_DURATION;
     while Instant::now() < deadline {
-        let s = socket.clone();
-        let mut buf_owned = buf.clone(); // DpdkUdpSocket clones buf every call
-        let result = tokio::task::spawn_blocking(move || {
-            let s = s.blocking_lock();
-            let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
-            let res = s
-                .recv_from(&mut buf_owned)
-                .map(|(len, addr)| (len, addr, buf_owned));
-            let _ = s.set_read_timeout(None);
-            res
-        })
-        .await;
-        match result {
-            Ok(Ok((len, _addr, received_buf))) => {
-                buf[..len].copy_from_slice(&received_buf[..len]);
-                count += 1;
-            }
-            _ => {
-                tokio::task::yield_now().await;
-            }
+        match socket.lock().unwrap().try_recv_from(&mut buf).unwrap() {
+            Some(_) => count += 1,
+            None => tokio::task::yield_now().await,
         }
         if backend.rx_queue_len() < RX_REFILL_BATCH {
             backend.prefill_rx(RX_REFILL_BATCH, payload_size, LOCAL_IP, LOCAL_PORT);
@@ -553,15 +528,20 @@ async fn main() {
     // Print markdown table to stdout (for CI to capture)
     println!("## Synthetic UDP Performance Results\n");
     println!(
-        "Measures framework overhead: sync `dpdk_udp::UdpSocket` vs Tokio `spawn_blocking` + `Mutex` wrapper.\n"
+        "Measures framework overhead: sync `dpdk_udp::UdpSocket` vs {}.\n",
+        ASYNC_LABEL,
     );
     println!("{}", format_markdown_table(&results));
     println!("**{}**\n", summary);
     if worst_ratio > 5.0 {
         println!(
-            "> **Note:** Async wrapper is {:.0}x slower than sync on the worst case. \
-             This overhead comes from `spawn_blocking`, `Arc<Mutex<>>`, and per-packet \
-             `buf.to_vec()` allocations in the Tokio wrapper.",
+            "> **Warning:** Async wrapper is {:.0}x slower than sync on the worst case. \
+             Investigate framework overhead in the Tokio wrapper.",
+            worst_ratio
+        );
+    } else if worst_ratio < 2.0 {
+        println!(
+            "> **Good:** Async wrapper is within {:.1}x of sync — minimal framework overhead.",
             worst_ratio
         );
     }
