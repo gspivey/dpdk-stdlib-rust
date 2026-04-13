@@ -5859,4 +5859,139 @@ mod tests {
         }
         println!("{}", "=".repeat(75));
     }
+
+    // ========================================================================
+    // Synthetic PPS Benchmark: HW VLAN strip reconstruction vs direct TCI
+    // ========================================================================
+
+    /// Compares the performance of two approaches for handling NIC-stripped VLAN tags:
+    ///
+    /// 1. **Reconstruction (current)**: recv_frames rebuilds the tagged frame by
+    ///    inserting [0x8100 | TCI] into the byte stream, then process_frame_zerocopy
+    ///    calls detect_vlan() which parses those bytes back out.
+    ///
+    /// 2. **Direct TCI (proposed)**: Skip reconstruction entirely. Pass the
+    ///    hw_vlan_tci from mbuf metadata directly, letting detect_vlan() return
+    ///    the correct FrameLayout without frame modification.
+    ///
+    /// Run with:
+    ///   cargo test -p dpdk-stdlib-udp -- --nocapture hw_vlan_strip_benchmark
+    #[test]
+    fn hw_vlan_strip_benchmark() {
+        const ITERATIONS: u64 = 500_000;
+        const VID: u16 = 100;
+
+        // Build an untagged frame (simulates what NIC delivers after HW strip)
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vlan(Some(VlanConfig::new(VID).port_tagging()));
+        let untagged_frame = make_untagged_frame(port);
+
+        // Pre-build the reconstructed frame (what recv_frames currently does)
+        let reconstructed_frame = {
+            let tci: u16 = VID; // VID only, PCP=0, DEI=0
+            let mut frame = Vec::with_capacity(untagged_frame.len() + VLAN_TAG_LEN);
+            frame.extend_from_slice(&untagged_frame[..12]); // dst + src MAC
+            frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes()); // TPID
+            frame.extend_from_slice(&tci.to_be_bytes()); // TCI
+            frame.extend_from_slice(&untagged_frame[12..]); // original ethertype + rest
+            frame
+        };
+
+        println!("\n=== HW VLAN Strip Benchmark ({ITERATIONS} iterations) ===");
+        println!("{:<55} {:>12} {:>10}", "Approach", "PPS", "ns/pkt");
+        println!("{}", "-".repeat(80));
+
+        // ── Approach A: Reconstruction (current code path) ──
+        // Simulates: recv_frames reconstructs tagged frame → process_frame_zerocopy
+        // parses it back with detect_vlan().
+        {
+            let mut buf = [0u8; 1500];
+            // Warmup
+            for _ in 0..1000 {
+                let mut result = None;
+                socket.process_frame_zerocopy(&reconstructed_frame, port, &mut buf, &mut result);
+            }
+
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                // Simulate what recv_frames does: reconstruct the tagged frame each time
+                let tci: u16 = VID;
+                let mut frame = Vec::with_capacity(untagged_frame.len() + VLAN_TAG_LEN);
+                frame.extend_from_slice(&untagged_frame[..12]);
+                frame.extend_from_slice(&ETH_TYPE_VLAN.to_be_bytes());
+                frame.extend_from_slice(&tci.to_be_bytes());
+                frame.extend_from_slice(&untagged_frame[12..]);
+
+                let mut result = None;
+                socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result);
+            }
+            let elapsed_a = start.elapsed();
+            let pps_a = ITERATIONS as f64 / elapsed_a.as_secs_f64();
+            let ns_a = elapsed_a.as_nanos() as f64 / ITERATIONS as f64;
+
+            println!("{:<55} {:>10.0} K {:>8.0} ns  (current)",
+                "A: Reconstruct frame + detect_vlan parse",
+                pps_a / 1000.0, ns_a);
+
+            // ── Approach B: Direct TCI passthrough (proposed) ──
+            // Simulates: no reconstruction, detect_vlan receives hw_vlan_tci directly.
+            // Uses the untagged frame as-is, then manually builds the FrameLayout
+            // with the TCI from "hardware metadata".
+
+            // Warmup
+            for _ in 0..1000 {
+                let mut result = None;
+                // In the proposed approach, process_frame_zerocopy would call
+                // detect_vlan(frame, Some(hw_tci)) and get the right layout without
+                // the frame needing reconstruction. We simulate this by calling
+                // detect_vlan on the untagged frame, then overriding vlan_tci.
+                let layout = detect_vlan(&untagged_frame);
+                if let Some(mut l) = layout {
+                    l.vlan_tci = Some(VID);
+                    // The rest of process_frame_zerocopy uses layout.vlan_tci for filtering
+                    if let Some(ref vlan_cfg) = socket.vlan_config {
+                        let frame_vid = l.vlan_tci.map(|tci| tci & 0x0FFF);
+                        let _ = vlan_cfg.accepts_frame(frame_vid);
+                    }
+                }
+                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result);
+            }
+
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                // Simulate the proposed path: detect_vlan on untagged frame + hw TCI overlay
+                let mut layout = detect_vlan(&untagged_frame).unwrap();
+                layout.vlan_tci = Some(VID);
+
+                // VLAN filtering with the direct TCI
+                if let Some(ref vlan_cfg) = socket.vlan_config {
+                    let frame_vid = layout.vlan_tci.map(|tci| tci & 0x0FFF);
+                    if !vlan_cfg.accepts_frame(frame_vid) {
+                        continue;
+                    }
+                }
+
+                // Parse UDP from the untagged frame (no extra 4 bytes to skip)
+                let mut result = None;
+                socket.process_frame_zerocopy(&untagged_frame, port, &mut buf, &mut result);
+            }
+            let elapsed_b = start.elapsed();
+            let pps_b = ITERATIONS as f64 / elapsed_b.as_secs_f64();
+            let ns_b = elapsed_b.as_nanos() as f64 / ITERATIONS as f64;
+
+            println!("{:<55} {:>10.0} K {:>8.0} ns  (proposed)",
+                "B: Direct hw_vlan_tci (no reconstruction)",
+                pps_b / 1000.0, ns_b);
+
+            println!("{}", "-".repeat(80));
+
+            let speedup = pps_b / pps_a;
+            let saved_ns = ns_a - ns_b;
+            println!("Speedup:  {:.2}x  ({:.0} ns saved per packet)", speedup, saved_ns);
+            println!("At 600K PPS: reconstruction wastes ~{:.1} ms/sec of CPU",
+                saved_ns * 600_000.0 / 1_000_000.0);
+            println!("{}", "=".repeat(80));
+        }
+    }
 }
