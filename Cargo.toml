@@ -9,6 +9,7 @@ members = [
   "apps/test-client",
   "apps/tokio-echo",
   "apps/plain-echo",
+  "apps/synthetic-bench",
 ]
 
 [workspace.package]

@@ -2343,6 +2343,192 @@ impl UdpSocket {
         self.recv_from_inline(buf)
     }
 
+    /// Non-blocking single-poll receive attempt.
+    ///
+    /// Unlike `recv_from()` which blocks (polling in a loop with sleep) until a
+    /// packet arrives, this method performs exactly ONE poll of the backend and
+    /// returns immediately. Returns `Ok(None)` if no matching packet is available.
+    ///
+    /// This is designed for async wrappers that manage their own poll/yield loop
+    /// (e.g. the Tokio integration) to avoid the ~100μs internal sleep that the
+    /// blocking `recv_from` uses between polls.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        if self.has_pipeline.load(Ordering::Acquire) {
+            return self.try_recv_from_pipeline(buf);
+        }
+        self.try_recv_from_inline(buf)
+    }
+
+    /// Non-blocking pipeline recv: single dequeue attempt from app rings.
+    fn try_recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        let app_rings = self.cached_app_rings.as_ref()
+            .expect("try_recv_from_pipeline called without pipeline");
+        let frame_pool = self.cached_frame_pool.as_ref()
+            .expect("try_recv_from_pipeline called without pipeline");
+
+        // Check buffered packets first.
+        if self.has_buffered_packets.load(Ordering::Acquire) {
+            let mut queue = self.recv_queue.lock().unwrap();
+            if let Some((payload, src_addr)) = queue.pop() {
+                if queue.is_empty() {
+                    self.has_buffered_packets.store(false, Ordering::Release);
+                }
+                let copy_len = std::cmp::min(buf.len(), payload.len());
+                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                return Ok(Some((copy_len, src_addr)));
+            }
+            self.has_buffered_packets.store(false, Ordering::Release);
+        }
+
+        // Single round-robin dequeue attempt across app rings.
+        let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
+        let packet = dequeue_app_rings(app_rings, &mut rr);
+        self.recv_from_rr_index.store(rr, Ordering::Relaxed);
+
+        if let Some(app_pkt) = packet {
+            let start = app_pkt.payload_offset as usize;
+            let len = app_pkt.payload_len as usize;
+            let frame_data = unsafe { frame_pool.frame(app_pkt.frame_ref.pool_idx) };
+            let copy_len = std::cmp::min(buf.len(), len);
+            buf[..copy_len].copy_from_slice(&frame_data[start..start + copy_len]);
+            frame_pool.free(app_pkt.frame_ref.pool_idx);
+
+            // Connected socket filtering
+            if self.is_connected.load(Ordering::Acquire) {
+                if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                    if app_pkt.src_addr != connected {
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        if queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr).is_err() {
+                            self.record_rx_drop(copy_len);
+                        } else {
+                            self.has_buffered_packets.store(true, Ordering::Release);
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+
+            return Ok(Some((copy_len, app_pkt.src_addr)));
+        }
+
+        Ok(None)
+    }
+
+    /// Non-blocking inline recv: single poll of the backend, no sleep.
+    fn try_recv_from_inline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        let local_port = match self.local_addr {
+            SocketAddr::V4(v4) => v4.port(),
+            SocketAddr::V6(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+            }
+        };
+
+        // Check buffered packets first.
+        {
+            let mut queue = self.recv_queue.lock().unwrap();
+            if let Some((payload, src_addr)) = queue.pop() {
+                let copy_len = std::cmp::min(buf.len(), payload.len());
+                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                return Ok(Some((copy_len, src_addr)));
+            }
+        }
+
+        // Single poll of the backend.
+        match &self.socket_backend {
+            SocketBackend::Dpdk(res) => {
+                let packets = res.port.rx_burst(0, 32)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+
+                if packets.is_empty() {
+                    return Ok(None);
+                }
+
+                perf_inc!(self.perf_counters.rx_bursts);
+                perf_inc!(self.perf_counters.rx_burst_sum, packets.len() as u64);
+
+                let sample_this_burst = perf_should_sample!(self.latency_sampler);
+                let rx_timestamp = if sample_this_burst { Some(Instant::now()) } else { None };
+
+                let mut result: Option<(usize, SocketAddr)> = None;
+
+                for mbuf in &packets {
+                    let Some(data) = mbuf.data() else { continue };
+                    let len = mbuf.data_len() as usize;
+                    let frame_data = &data[..len.min(data.len())];
+
+                    let hw_vlan_tci = {
+                        let ol_flags = mbuf.ol_flags();
+                        let stripped = (ol_flags & dpdk_sys::RTE_MBUF_F_RX_VLAN_STRIPPED as u64) != 0;
+                        if stripped { Some(mbuf.vlan_tci()) } else { None }
+                    };
+
+                    if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, hw_vlan_tci) {
+                        if let Some(ts) = rx_timestamp {
+                            let latency_ns = ts.elapsed().as_nanos() as u64;
+                            self.latency_sampler.record(latency_ns);
+                            perf_inc!(self.perf_counters.latency_sample_count);
+                            perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
+                            self.perf_counters.update_latency_max(latency_ns);
+                        }
+                        return Ok(Some(r));
+                    }
+                }
+
+                if let Some(r) = result {
+                    if let Some(ts) = rx_timestamp {
+                        let latency_ns = ts.elapsed().as_nanos() as u64;
+                        self.latency_sampler.record(latency_ns);
+                        perf_inc!(self.perf_counters.latency_sample_count);
+                        perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
+                        self.perf_counters.update_latency_max(latency_ns);
+                    }
+                    return Ok(Some(r));
+                }
+            }
+            SocketBackend::Generic(backend) => {
+                let frames = backend.recv_frames(32)?;
+
+                if frames.is_empty() {
+                    return Ok(None);
+                }
+
+                perf_inc!(self.perf_counters.rx_bursts);
+                perf_inc!(self.perf_counters.rx_burst_sum, frames.len() as u64);
+
+                let sample_this_burst = perf_should_sample!(self.latency_sampler);
+                let rx_timestamp = if sample_this_burst { Some(Instant::now()) } else { None };
+
+                let mut result: Option<(usize, SocketAddr)> = None;
+
+                for frame_data in &frames {
+                    if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, None) {
+                        if let Some(ts) = rx_timestamp {
+                            let latency_ns = ts.elapsed().as_nanos() as u64;
+                            self.latency_sampler.record(latency_ns);
+                            perf_inc!(self.perf_counters.latency_sample_count);
+                            perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
+                            self.perf_counters.update_latency_max(latency_ns);
+                        }
+                        return Ok(Some(r));
+                    }
+                }
+
+                if let Some(r) = result {
+                    if let Some(ts) = rx_timestamp {
+                        let latency_ns = ts.elapsed().as_nanos() as u64;
+                        self.latency_sampler.record(latency_ns);
+                        perf_inc!(self.perf_counters.latency_sample_count);
+                        perf_inc!(self.perf_counters.latency_sum_ns, latency_ns);
+                        self.perf_counters.update_latency_max(latency_ns);
+                    }
+                    return Ok(Some(r));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Pipeline recv path: dequeue AppPackets from per-worker SPSC app rings.
     ///
     /// Phase 3 zero-copy: reads payload directly from the FramePool via the

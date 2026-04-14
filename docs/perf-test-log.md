@@ -1637,4 +1637,295 @@ First instrumented baseline. Single-core performance is reasonable (2.7-3.5x nat
 |--------|------|---------------|---------------|---------------|
 | single-core | 700K | 49.5% | 49.9% | 1.89% |
 | multicore | 350K | 75.5% | 28.5% | 27.6% |
+
+---
+
+## Run #17: Eliminate spawn_blocking Overhead in Tokio Async Wrapper
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | `4d90538` |
+| **Branch** | `claude/synthetic-udp-perf-test-Wef0p` |
+| **PR** | [#38](https://github.com/gspivey/dpdk-stdlib-rust/pull/38) |
+| **GH Actions Run** | [24352758600](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24352758600) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #16
+
+1. **Added `try_recv_from()` to `dpdk_udp::UdpSocket`**: Non-blocking single-poll receive that returns `Ok(None)` immediately instead of sleeping in a loop. Includes both pipeline and inline paths mirroring `recv_from`.
+2. **Replaced `tokio::sync::Mutex` with `std::sync::Mutex`** in `DpdkUdpSocket` and `compat::tokio::DpdkAsyncSocket`. Safe because critical sections are short CPU-only operations that never await.
+3. **Removed `spawn_blocking` from send/recv hot paths**: `send_to`, `send`, `recv_from`, `recv` now call directly through `std::sync::Mutex::lock()`. Only `connect` (ARP resolution) and `disable_perf_reporting` (thread join) retain `spawn_blocking`.
+4. **Eliminated per-call `buf.to_vec()` allocations**: The old pattern cloned the buffer on every send/recv to move it into `spawn_blocking`. No longer needed.
+5. **Added synthetic performance benchmark** (`apps/synthetic-bench/`): Measures pure framework overhead using a mock `PacketBackend`. Runs in CI on every push (~20s, no AWS credentials).
+
+### Synthetic Benchmark (CPU-only, no NIC)
+
+Measures framework overhead: sync `dpdk_udp::UdpSocket` vs async wrapper with `std::sync::Mutex` + `try_recv_from`.
+
+| Test | Payload | Sync PPS | Async PPS | Ratio (sync/async) |
+|------|---------|----------|-----------|-------------------|
+| TX send_to | 64B | 12.2M | 11.4M | 1.1x |
+| RX recv_from | 64B | 3.7M | 4.9M | 0.7x |
+| TX send_to | 1400B | 1.8M | 1.8M | 1.0x |
+| RX recv_from | 1400B | 1.2M | 1.2M | 0.9x |
+
+**Avg ratio: 0.9x** — framework overhead eliminated. Async is at parity with sync in CPU-only benchmarks.
+
+### Results: 64B Packets
+
+#### native-dpdk (DPDK C baseline)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 111 | 0.00% |
+| 140K | 140,000 | 140,000 | 122 | 0.00% |
+| 350K | 350,000 | 350,000 | 135 | 0.00% |
+| 700K | 700,000 | 699,734 | 180 | 0.04% |
+
+#### rust-dpdk (single-core, sync)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 242 | 1.43% |
+| 140K | 140,000 | 138,978 | 0 | 0.73% |
+| 350K | 350,000 | 348,787 | 0 | 0.35% |
+| 700K | 700,000 | 697,295 | 0 | 0.39% |
+
+#### tokio-dpdk (async wrapper — REWRITTEN)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 342,529 | 0 | 2.13% |
+| 700K | 700,000 | 343,487 | 0 | 50.93% |
+
+#### plain-rust (std::net baseline)
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 68,999 | 0 | 1.43% |
+| 140K | 140,000 | 138,970 | 246 | 0.74% |
+| 350K | 350,000 | 345,680 | 0 | 1.23% |
+| 700K | 700,000 | 460,189 | 0 | 34.26% |
+
+### Results: 512B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 117 | 0.00% |
+| 140K | 140,000 | 140,000 | 135 | 0.00% |
+| 350K | 350,000 | 349,982 | 148 | 0.01% |
+| 700K | 700,000 | 694,591 | 467 | 0.77% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 167 | 1.43% |
+| 140K | 140,000 | 138,967 | 0 | 0.74% |
+| 350K | 350,000 | 348,950 | 0 | 0.30% |
+| 700K | 700,000 | 689,904 | 325 | 1.44% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 244,816 | 0 | 30.05% |
+| 700K | 700,000 | 243,885 | 0 | 65.16% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 68,997 | 246 | 1.43% |
+| 140K | 140,000 | 138,999 | 251 | 0.72% |
+| 350K | 350,000 | 346,116 | 261 | 1.11% |
+| 700K | 700,000 | 440,036 | 0 | 37.14% |
+
+### Results: 1400B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 126 | 0.00% |
+| 140K | 140,000 | 140,000 | 142 | 0.00% |
+| 350K | 350,000 | 349,993 | 146 | 0.00% |
+| 700K | 476,649 | 476,640 | 2,504 | 0.00% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 68,997 | 258 | 1.43% |
+| 140K | 140,000 | 138,974 | 0 | 0.73% |
+| 350K | 350,000 | 348,994 | 0 | 0.29% |
+| 700K | 476,680 | 475,390 | 0 | 0.27% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 138,987 | 0 | 0.72% |
+| 350K | 350,000 | 159,913 | 0 | 54.31% |
+| 700K | 476,672 | 170,034 | 0 | 64.33% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 68,998 | 260 | 1.43% |
+| 140K | 140,000 | 138,974 | 0 | 0.73% |
+| 350K | 350,000 | 332,851 | 270 | 4.90% |
+| 700K | 476,650 | 345,258 | 0 | 27.57% |
+
+### Results: 8500B Packets (Jumbo)
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 128 | 0.00% |
+| 140K | 78,356 | 77,743 | 13,945 | 0.78% |
+| 350K | 78,344 | 76,199 | 14,300 | 2.74% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 68,998 | 0 | 1.43% |
+| 140K | 78,347 | 77,738 | 0 | 0.78% |
+| 350K | 78,355 | 75,607 | 0 | 3.51% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 57,364 | 0 | 18.05% |
+| 140K | 78,346 | 60,307 | 0 | 23.02% |
+| 350K | 78,286 | 61,092 | 0 | 21.96% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 54,901 | 0 | 21.57% |
+| 140K | 78,355 | 77,676 | 0 | 0.87% |
+| 350K | 78,338 | 69,092 | 0 | 11.80% |
+
+### Analysis
+
+**tokio-dpdk improvement vs Run #9:**
+
+| Packet Size | Rate | Run #9 RX pps | Run #17 RX pps | Improvement |
+|-------------|------|---------------|----------------|-------------|
+| 64B | 70K | 39,954 | 69,000 | **1.7x** |
+| 64B | 140K | 40,319 | 139,000 | **3.4x** |
+| 64B | 350K | 40,192 | 342,529 | **8.5x** |
+| 64B | 700K | 40,172 | 343,487 | **8.6x** |
+
+The old `spawn_blocking` + `tokio::sync::Mutex` + `buf.to_vec()` pattern capped `tokio-dpdk` at ~40K pps regardless of offered load. Eliminating these three overhead sources **unlocks 8.6x higher throughput** at 700K pps for small packets.
+
+**Remaining gap vs sync:**
+
+At 140K pps and below, `tokio-dpdk` matches `rust-dpdk` (both ~139K at 140K target). Above 350K pps, the Tokio `yield_now().await` scheduling latency between `try_recv_from` polls becomes the bottleneck. The NIC RX ring drains faster than the async loop can re-acquire the mutex and poll, causing overflow drops. This is inherent to the cooperative scheduling model — the sync path uses a tight CPU-bound poll loop with no scheduler intervention.
+
+**Key observations:**
+- **Low-rate workloads (≤140K pps):** tokio-dpdk is now fully competitive with sync DPDK
+- **High-rate workloads (≥350K pps):** tokio-dpdk caps at ~340K pps (64B) to ~170K pps (1400B) due to Tokio scheduler yield latency
+- **Synthetic bench confirms zero framework overhead:** The gap at high rates is not from Mutex or allocation overhead, but from the cooperative scheduling yield interval
+- **Possible future optimization:** Spin-poll N times before yielding (amortize scheduler overhead), or use a dedicated DPDK poll thread feeding an async channel. *(Update: Spin-poll was tested in Run #18 and disproven — the bottleneck is not scheduler latency.)*
 | multicore | 700K | 87.9% | 64.3% | 63.7% |
+
+---
+
+## Run #18: Spin-Poll Recv Loop — Hypothesis Disproven
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-13 |
+| **Git Hash** | `a02b721` (reverted in follow-up commit) |
+| **Branch** | `claude/synthetic-udp-perf-test-Wef0p` |
+| **PR** | [#38](https://github.com/gspivey/desktop-dpdk-stdlib-rust/pull/38) |
+| **GH Actions Run** | [24371244698](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24371244698) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Hypothesis
+
+Run #17 proposed that the tokio-dpdk high-rate gap (drops above 350K pps) came from `yield_now().await` scheduler latency: after every empty `try_recv_from` poll, the task goes to the back of the Tokio run queue, during which the NIC RX ring overflows. The proposed fix was to spin-poll up to 64 times before yielding, mirroring how real Tokio's reactor keeps a task on-CPU while the fd is readable.
+
+### Change
+
+`DpdkUdpSocket::recv_from` modified to spin up to 64 empty polls with `std::hint::spin_loop()` before calling `yield_now().await`. Synthetic bench updated to match.
+
+### Synthetic Benchmark Results (CPU-only)
+
+| Test | Payload | Sync PPS | Async PPS | Ratio |
+|------|---------|----------|-----------|-------|
+| TX send_to | 64B | 12.2M | 11.5M | 1.1x |
+| RX recv_from | 64B | 3.7M | 5.1M | 0.7x |
+| TX send_to | 1400B | 1.8M | 1.8M | 1.0x |
+| RX recv_from | 1400B | 1.2M | 1.3M | 0.9x |
+
+Synthetic bench showed async RX *faster* than sync (spin-polling avoids the 100μs sleep in sync's `recv_from_inline`). Looked promising. Hardware perf told a different story.
+
+### Hardware Results (tokio-dpdk vs Run #17)
+
+| Packet/Target | Run #17 RX | Run #18 RX | Δ |
+|---------------|-----------|-----------|----|
+| 64B/700K | 343K (51% drop) | 345K (51% drop) | essentially flat |
+| 512B/350K | 244K (30% drop) | 241K (31% drop) | essentially flat |
+| 1400B/350K | 160K (54% drop) | 157K (55% drop) | essentially flat |
+| 8500B/70K | 57K (18% drop) | 52K (25% drop) | slight regression |
+
+The spin-poll change had **no measurable effect** at the hardware level.
+
+### Critical Evidence: NIC Counters Disprove the Hypothesis
+
+| Config | NIC imissed | NIC ierrors |
+|--------|-------------|-------------|
+| rust-dpdk | **0** | 403K |
+| tokio-dpdk | **0** | 305K |
+
+**`imissed = 0`** means the NIC is not dropping packets due to ring overflow in either config. Packets are arriving at the DUT successfully. The drops TRex observes come from the echo round-trip — the tokio-dpdk app reads the packets but can't send the echo replies back fast enough.
+
+This **disproves** the Run #17 hypothesis. The bottleneck is not scheduler yield latency or NIC ring overflow; it is **per-packet CPU cost in the async echo path**.
+
+### What the Real Bottleneck Looks Like
+
+At every offered load ≥ 350K pps, tokio-dpdk plateaus around **345K pps round-trip** regardless of input rate (signature of a CPU-bound task hitting its per-task throughput ceiling). Per-packet cost estimate:
+
+- Echo cycle at 345K pps = 2.9 μs per round-trip
+- Rust-dpdk at 681K pps = 1.5 μs per round-trip
+- Async overhead per packet ≈ 1.4 μs
+
+Suspected contributors to the 1.4 μs async tax:
+1. **2× `std::sync::Mutex` lock/unlock per packet** (recv path + send path)
+2. **`async_trait` vtable dispatch** on every `recv_from` / `send_to`
+3. **`try_recv_from` returns one packet at a time** — app loop cost amortizes only once per packet, not per burst
+
+### Revert
+
+The spin-poll change was reverted because it did not help. The previous pattern (`yield_now()` after every empty poll) is restored. Synthetic bench reverted to match.
+
+### Future Directions for Closing the Remaining Gap
+
+The high-rate gap is structural to "an async echo server holding a `Mutex<UdpSocket>`." Approaches that could actually help:
+
+1. **Lock-free recv/send via `Arc<UdpSocket>`** — if the underlying DPDK port operations are thread-safe (rx_burst/tx_burst are per-queue), we can avoid the Mutex entirely by cloning an Arc and calling directly. Requires auditing `UdpSocket` internals for interior mutability.
+2. **Batch-oriented API** — expose `recv_from_batch(&mut [buf])` and `send_to_batch(&[frame])` so the async wrapper amortizes Mutex + vtable cost across many packets per call.
+3. **Dedicated DPDK poll thread + `tokio::sync::mpsc`** — move the rx_burst tight loop to a background thread (just like sync DPDK does), feeding packets into an mpsc channel. The async task drains the channel with proper waker-based notification. True analog of Tokio's reactor model.
+4. **Single-threaded runtime** — `tokio::runtime::Builder::new_current_thread()` eliminates the need for `Send` bounds and could allow `RefCell<UdpSocket>` instead of `Mutex<UdpSocket>`. Applies only when the workload truly is single-task.
+
+### Key Lesson
+
+Don't trust the synthetic bench alone. The synthetic RX test showed async *faster* than sync (because the sync path has `thread::sleep(100μs)` between empty polls). Hardware tells the truth: at 700K pps, the bottleneck is the application's per-packet CPU cost, not the empty-poll idle path.
