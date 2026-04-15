@@ -444,9 +444,27 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 ### Planned
 
-**IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
+Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwise. IPv6 is a multi-PR feature with a sub-task checklist; it only moves to Done when every box is ticked and a final performance run shows no regression vs the IPv4 baseline.
 
-**UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
+**IPv6** — Full dual-stack support: IPv6 addresses accepted anywhere IPv4 is today, 40-byte IPv6 headers on the wire, NDP (the IPv6 replacement for ARP), and ICMPv6 (echo + errors).
+
+- [ ] **1. IPv6 header build/parse** — 40-byte fixed header, plus extension-header chain walk (Hop-by-Hop, Routing, Fragment, Destination Options) to locate the L4 payload. New `dpdk-udp/src/ipv6.rs`.
+- [ ] **2. UDP over IPv6 checksum** — mandatory IPv6 pseudo-header checksum (unlike IPv4 where UDP checksum is optional). `verify_udp6_checksum` / `udp6_pseudo_header_checksum` helpers parallel to the existing IPv4 helpers.
+- [ ] **3. `SocketAddrV6` through `UdpSocket`** — `bind` / `send_to` / `recv_from` / `connect` / `local_addr` / `peer_addr` accept and return IPv6 addresses. `set_only_v6` / `only_v6` socket option. `AddressFamily` state on the socket so the send/recv paths pick the right wire format.
+- [ ] **4. IPv6 hardware offload flags** — TX: set `RTE_MBUF_F_TX_IPV6` + `RTE_MBUF_F_TX_UDP_CKSUM` with the IPv6 pseudo-header checksum in the UDP field. RX: validate IPv6 UDP checksums (honor `PKT_RX_L4_CKSUM_GOOD`). Software fallback on NICs without support. `has_tx_ipv6_cksum_offload()` accessor.
+- [ ] **5. Link-local / scope IDs / solicited-node multicast MAC** — `fe80::/10` handling, `%ifindex` scope parsing, `33:33:ff:XX:XX:XX` MAC derivation from the low 24 bits of the target IPv6 address. Prereq for task 6 (NDP).
+- [ ] **6. NDP (Neighbor Discovery Protocol)** — `NdpHandler` mirroring `ArpHandler`: Neighbor Solicitation and Neighbor Advertisement message types, atomic NDP cache with fast-path lookup, auto-resolution on send, gratuitous NA on bind (parallel to our Gratuitous ARP feature), and seeding the cache from `/proc/net/ipv6_neigh` on Linux.
+- [ ] **7. ICMPv6 echo reply** — auto-respond to `ping6`, parallel to our existing IPv4 ICMP echo reply.
+- [ ] **8. ICMPv6 error handling** — Destination Unreachable, Packet Too Big (with Next-Hop MTU), Time Exceeded, and Parameter Problem parsed and matched back to the originating socket. Plugs into the existing per-socket error queue (introduced for IPv4 ICMP errors) so `take_error()` works for IPv6 destinations too.
+- [ ] **9. Performance tests** — TRex PPS run at 64 / 512 / 1400B, plus the synthetic CPU-only benchmark, compared against the IPv4 baseline. Results posted to `docs/perf-test-log.md`. No PPS regression vs IPv4 required to cross off the IPv6 feature.
+
+**VXLAN endpoint (RFC 7348)** — High-performance VXLAN tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (dst port 4789) + 8-byte VXLAN header (24-bit VNI) + inner Ethernet frame. Per-socket VNI filtering on RX, builder API for TX. Inner payload is self-describing Ethernet, so inner IPv4 and inner IPv6 both work from day one. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" item below. New `vxlan-echo` demo app.
+
+**GENEVE endpoint (RFC 8926)** — Modern overlay tunnel: outer Ethernet + outer IPv4 + outer UDP (dst port 6081) + Geneve base header + variable-length TLV options (class / type / length / value, up to 252 bytes). Same frame shape as VXLAN plus extensible metadata — used by OVN, NSX-T, and AWS Gateway Load Balancer. Inner Ethernet (self-describing). Ships with IPv4 outer.
+
+**GUE endpoint (Generic UDP Encapsulation)** — Lightweight L3-over-UDP: outer Ethernet + outer IPv4 + outer UDP + 4-byte GUE header identifying the inner protocol (IPv4 = 4, IPv6 = 41, Ethernet = 143, MPLS = 137). Simpler and smaller than VXLAN / GENEVE for pure L3 tunnel use cases. Ships with IPv4 outer and inner IPv4 on day one; inner IPv6 becomes supported automatically once IPv6 task 1 (header parse) lands.
+
+**Encap: IPv6 outer** — Adds IPv6 outer support to all three encapsulation protocols (VXLAN, GENEVE, GUE), closing out dual-stack encap in a single PR. Depends on IPv6 tasks 1 (header build/parse), 2 (UDP pseudo-header checksum), and 4 (offload flags). Does NOT require NDP or ICMPv6 — only the wire-format subset of IPv6.
 
 ### Not Currently Planned
 
