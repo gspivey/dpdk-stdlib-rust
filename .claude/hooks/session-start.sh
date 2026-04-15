@@ -22,39 +22,17 @@ if ! command -v cargo &>/dev/null; then
   echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> "$CLAUDE_ENV_FILE"
 fi
 
-# Install gh CLI so agents can query GitHub Actions results without guessing.
-# This is required for private repos (WebFetch can't access them unauthenticated).
-# See CLAUDE.md "Querying CI Results" for the commands to use once installed.
-if ! command -v gh &>/dev/null; then
-  echo "Installing gh CLI..."
-  # Detect latest version; fall back to a known-good version if network fails
-  GH_VER=$(curl -sI https://github.com/cli/cli/releases/latest 2>/dev/null \
-    | grep -i '^location:' \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
-    | head -1 \
-    || echo "")
-  GH_VER="${GH_VER:-2.65.0}"
-  GH_ARCHIVE="gh_${GH_VER}_linux_amd64"
-  curl -sL "https://github.com/cli/cli/releases/download/v${GH_VER}/${GH_ARCHIVE}.tar.gz" \
-    | tar xz -C /tmp 2>/dev/null \
-    && mkdir -p ~/.local/bin \
-    && cp "/tmp/${GH_ARCHIVE}/bin/gh" ~/.local/bin/gh \
-    && echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$CLAUDE_ENV_FILE" \
-    && export PATH="$HOME/.local/bin:$PATH" \
-    && echo "gh ${GH_VER} installed to ~/.local/bin/gh" \
-    || echo "Warning: gh installation failed — CI querying will require manual setup"
-fi
-
-# Authenticate gh using a GitHub token set explicitly by the user.
-# Set GH_TOKEN in Claude Code's environment settings (claude.ai → project → environment)
-# with a fine-grained PAT scoped to: repo contents, actions (read), metadata (read).
-# Do NOT attempt to extract tokens from Claude Code's internal fd channel — that is an
-# intentional security boundary and not meant for hook access.
-if command -v gh &>/dev/null && [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-  echo "${GH_TOKEN:-$GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null \
-    && echo "gh authenticated" \
-    || echo "Warning: gh auth failed (token may lack required scope)"
-fi
+# GitHub API access note (agents running in Claude Code):
+#   Use the GitHub MCP server tools (mcp__github__*) for ALL GitHub interactions —
+#   PRs, issues, CI runs, comments, file reads. The MCP server is authenticated by
+#   the Claude harness; agents do not need and do not have a usable GH_TOKEN.
+#   The `gh` CLI is intentionally NOT installed here: in scheduled/remote sessions
+#   the token plumbing differs from interactive web sessions and `gh` calls
+#   typically 401 against api.github.com even when git operations (via the local
+#   proxy at 127.0.0.1/git/...) work fine.
+#
+# Git operations (clone, fetch, push, pull) use the pre-configured local git
+# proxy and work without any extra setup — just use `git` directly.
 
 # Build workspace so subsequent cargo test/build are incremental
 echo "Building workspace (incremental)..."

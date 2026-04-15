@@ -47,8 +47,8 @@
 1. **Write code** — read files before modifying, follow patterns in AGENTS.md
 2. **Unit tests** — `cargo build && cargo test` locally. If they fail, fix and re-run. Do NOT proceed with failures.
 3. **Push / PR** — push to the feature branch. Create a PR if one doesn't exist yet, otherwise push a new commit.
-4. **Integration tests** — triggered automatically on PR, or manually via `./scripts/ci-validate.sh`. Poll with `gh run view --json status,conclusion`. If they fail, read the PR comments and instance logs to diagnose. Fix the code and go back to step 1.
-5. **Performance tests** — trigger with `gh workflow run perf-tests.yml`. Poll until complete. Read the PR comments for benchmark results and app logs. If they fail or regress, fix and go back to step 1.
+4. **Integration tests** — triggered automatically on PR. Agents: poll status and read logs via the GitHub MCP tools (`mcp__github__pull_request_read` with `get_check_runs`, `mcp__github__pull_request_read` with `get_comments` to read staged `[CI] Stage: …` comments). Humans: use `./scripts/ci-validate.sh` locally. On failure, read the actual PR comments and logs — don't guess.
+5. **Performance tests** — trigger the `perf-tests.yml` workflow (via MCP `mcp__github__*` tooling in agent sessions, or `gh workflow run perf-tests.yml` locally). Results are posted back as PR comments; read them with `mcp__github__pull_request_read` (`get_comments`). If they regress, go back to step 1.
 6. **Success** — all tests pass. Ask the user to review the PR.
 
 **Key rules:**
@@ -59,153 +59,120 @@
 
 ## Claude Code (Hooks & Skills)
 
-### Querying CI / GitHub Actions Results
+### GitHub Access: MCP, Not `gh` CLI
 
-The repo is **private** — WebFetch cannot access it unauthenticated. Use the `gh` CLI.
-The session-start hook installs `gh` and authenticates it automatically in remote sessions.
-Verify it's ready:
+**Agents running in Claude Code do NOT use the `gh` CLI.** The system prompt makes this
+explicit: "You do NOT have access to the `gh` CLI, `hub` CLI, or direct GitHub API access.
+Instead, use the GitHub MCP server tools (prefixed with `mcp__github__`) for ALL GitHub
+interactions."
 
-```bash
-gh auth status        # should show "Logged in to github.com"
-gh --version          # confirm installed
+Why: in scheduled/remote Claude Code runs the harness doesn't vend a usable `GH_TOKEN` for
+direct `api.github.com` calls (`gh` returns HTTP 401). The MCP GitHub server is the
+authenticated channel the harness provides. Git operations (`git push`, `git fetch`) still
+work transparently because they go through a local git proxy (`http://127.0.0.1:*/git/...`),
+which handles auth server-side.
+
+Human developers running the `./scripts/*.sh` helpers locally can keep using `gh` — those
+scripts are for interactive development, not for agent use. This section is the agent path.
+
+### Querying CI / GitHub Actions Results (agent path, MCP)
+
+The repo is `gspivey/dpdk-stdlib-rust` (the only repo MCP is scoped to in this project).
+
+**Find the PR for the current branch and read its status:**
+```
+mcp__github__list_pull_requests(owner="gspivey", repo="dpdk-stdlib-rust",
+                                state="open", head="gspivey:<branch>")
+mcp__github__pull_request_read(method="get_status", owner=…, repo=…, pullNumber=<n>)
+mcp__github__pull_request_read(method="get_check_runs", owner=…, repo=…, pullNumber=<n>)
 ```
 
-If not ready, check `~/.local/bin/gh` and `$GH_TOKEN` / `$GITHUB_TOKEN`:
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-echo "${GH_TOKEN:-$GITHUB_TOKEN}" | gh auth login --with-token
+`get_check_runs` returns per-check status/conclusion for the head commit — this is the
+MCP equivalent of `gh run view --json status,conclusion` and is how agents poll CI.
+
+**Read staged CI comments on the PR (fastest path to diagnosis):**
 ```
-
-**List recent integration test runs:**
-```bash
-gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
+mcp__github__pull_request_read(method="get_comments", owner=…, repo=…, pullNumber=<n>)
 ```
+CI posts progress at each stage as separate comments. Look for `[CI] Stage: …` headers:
+- `[CI] Stage: Deploy` — instance IDs, SSM readiness
+- `[CI] Stage: Baseline Diagnostics` — networking state before tests
+- `[CI] Stage: Tier N Results` — test pass/fail summary
+- `[CI] Stage: Failure Diagnostics` — networking state + log excerpts on failure
+- `[CI] Stage: Summary` — final pass/fail for all tiers
 
-**Check a specific run (status + step breakdown):**
-```bash
-gh run view <run-id> --repo gspivey/dpdk-stdlib-rust
+These comments carry the richest summary info (failed step, error, truncated logs), so
+read them *before* reaching for raw workflow logs.
+
+**Subscribe to PR activity events instead of polling:**
 ```
-
-**⚠ `gh run watch` does NOT work in this repo.** The `GH_TOKEN` is a fine-grained PAT, which
-does not support the `checks:read` permission required by `gh run watch`. It will silently fail
-or error. **Always poll with `gh run view --json status,conclusion` instead:**
-```bash
-# Poll until a run completes
-while true; do
-  json=$(gh run view <run-id> --repo gspivey/dpdk-stdlib-rust --json status,conclusion)
-  status=$(echo "$json" | jq -r '.status')
-  if [ "$status" = "completed" ]; then
-    echo "Conclusion: $(echo "$json" | jq -r '.conclusion')"
-    break
-  fi
-  sleep 30
-done
+mcp__github__subscribe_pr_activity(pullRequestNumber=<n>)
 ```
+Events arrive wrapped in `<github-webhook-activity>` tags (comments, CI status changes,
+reviews). This is usually preferable to a poll loop.
 
-**Get only failed step logs (fastest path to root cause):**
-```bash
-gh run view <run-id> --log-failed --repo gspivey/dpdk-stdlib-rust
-```
+### Diagnosing CI Failures (agent path)
 
-**Download failure data (exit code 2 — infrastructure failure):**
-
-`ci-validate.sh` does this automatically on failure. To do it manually:
-
-```bash
-# Download the instance-logs artifact — this is the authoritative source of truth
-gh run download <run-id> --name instance-logs --repo gspivey/dpdk-stdlib-rust --dir /tmp/ci-logs
-
-# Structured summary: which step failed and the error message
-cat /tmp/ci-logs/failure-summary.json
-
-# Richest log: full EC2 user-data script output (what ran on the instance)
-# Search for the last === section header to find where it stopped
-tail -100 /tmp/ci-logs/sender-user-data.log
-
-# Fallback if SSM wasn't available (always present, even after instance teardown)
-tail -100 /tmp/ci-logs/sender-console-output.log
-```
-
-**What's in the `instance-logs` artifact:**
-
-| File | When present | What it contains |
-|---|---|---|
-| `failure-summary.json` | Always on exit 2 | `failed_step`, `error`, instance IDs, run URL |
-| `sender-user-data.log` | SSM available | Full `/var/log/user-data.log` from sender EC2 |
-| `sender-console-output.log` | Always | EC2 console output (survives termination) |
-| `sender-journal.txt` | SSM available | `journalctl` last 500 lines |
-| `sender-build-listing.txt` | SSM available | `ls /opt/dpdk-stdlib/target/release/` |
-| Same files for `receiver-*` | — | Receiver instance logs |
-
-**Interpreting exit codes:**
-
-| Exit code | Meaning | What to read |
-|---|---|---|
-| `2` | Infrastructure/setup failure | `failure-summary.json` → then read the log files above |
-| `1` | Test assertion failure | `test-results/*.xml` JUnit files |
-| `0` | All tests passed | — |
-
-**Diagnosis pattern:**
-```bash
-# Run ci-validate.sh — it auto-downloads failure data and prints it on failure
-./scripts/ci-validate.sh
-
-# Or manually inspect a past run:
-gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
-gh run download <run-id> --name instance-logs --repo gspivey/dpdk-stdlib-rust --dir /tmp/ci-logs
-cat /tmp/ci-logs/failure-summary.json
-tail -100 /tmp/ci-logs/sender-user-data.log
-```
-
-**Job-level step breakdown:**
-```bash
-gh api repos/gspivey/dpdk-stdlib-rust/actions/runs/<run-id>/jobs \
-  --jq '.jobs[] | {name, conclusion, failed_steps: [.steps[] | select(.conclusion != "success") | .name]}'
-```
-
-### Diagnosing CI Failures (Step-by-Step)
-
-When integration tests fail, follow this sequence. This works in **Claude Code web** (no AWS
-access needed — only `gh` CLI).
-
-**Quick path — use the diagnostic script:**
-```bash
-./scripts/diagnose-ci-failure.sh                    # Most recent failed run
-./scripts/diagnose-ci-failure.sh <run-id>           # Specific run
-./scripts/diagnose-ci-failure.sh --pr <number>      # Read staged CI comments from PR
-```
-
-**Manual path:**
-
-1. **Get the run ID:**
-   ```bash
-   gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
+1. **Find the PR and its current status:**
+   ```
+   mcp__github__list_pull_requests(...)  # get pullNumber
+   mcp__github__pull_request_read(method="get_check_runs", ...)
    ```
 
-2. **Read staged CI comments on the PR** (fastest — CI posts progress at each stage):
-   ```bash
-   gh pr view <pr-number> --comments --repo gspivey/dpdk-stdlib-rust
+2. **Read staged CI comments** (most efficient — CI self-documents):
    ```
-   Look for comments with `[CI] Stage:` headers. Each stage posts its own comment:
-   - `[CI] Stage: Deploy` — instance IDs, SSM readiness
-   - `[CI] Stage: Baseline Diagnostics` — networking state before tests
-   - `[CI] Stage: Tier N Results` — test pass/fail summary
-   - `[CI] Stage: Failure Diagnostics` — networking state + log excerpts on failure
-   - `[CI] Stage: Summary` — final pass/fail for all tiers
+   mcp__github__pull_request_read(method="get_comments", ...)
+   ```
+   The `[CI] Stage: Failure Diagnostics` comment usually contains the actual error and
+   log excerpts already triaged by the CI workflow. Start there.
 
 3. **Cross-reference with domain knowledge:**
-   - Read `docs/aws-vpc-networking.md` for networking failures (ARP, MAC, packets not arriving)
-   - Read `docs/debugging-log.md` for previously encountered issues
+   - `docs/aws-vpc-networking.md` for networking failures (ARP, MAC, packets not arriving)
+   - `docs/debugging-log.md` for previously encountered issues
 
 4. **If it's a networking issue** (most common):
-   The answer is almost always: **use the gateway MAC, not the peer MAC**.
-   Check that `--gateway-mac` is being discovered and passed correctly in the test harness.
+   The answer is almost always: **use the gateway MAC, not the peer MAC**. Check that
+   `--gateway-mac` is being discovered and passed correctly in the test harness.
    See `docs/aws-vpc-networking.md` Known Failure Patterns table.
 
-5. **Fix and re-run:**
-   ```bash
-   ./scripts/ci-validate.sh --skip-local   # Skip local cargo checks, just trigger CI
-   ```
+5. **Fix and push a new commit.** CI re-runs automatically on push. Do NOT re-run
+   `ci-validate.sh` from an agent session — it's a local-developer script that uses `gh`.
+
+### Instance-log artifacts (rich log data)
+
+When CI fails with exit code 2 (infrastructure failure), an `instance-logs` artifact is
+uploaded containing `failure-summary.json`, `sender-user-data.log`, `sender-console-output.log`,
+`sender-journal.txt`, `sender-build-listing.txt`, and `receiver-*` equivalents.
+
+The `[CI] Stage: Failure Diagnostics` PR comment already inlines the most useful slices of
+these. Agents should read that comment first. If deeper inspection is needed and the MCP
+tools don't expose workflow artifact downloads directly, ask the user to download and
+share the relevant tail — artifact fetching requires raw Actions API access.
+
+**Exit codes:**
+
+| Exit code | Meaning | Where to look |
+|---|---|---|
+| `2` | Infrastructure/setup failure | `[CI] Stage: Failure Diagnostics` comment |
+| `1` | Test assertion failure | `[CI] Stage: Tier N Results` comment, or JUnit XML artifacts |
+| `0` | All tests passed | — |
+
+### Local-developer equivalents (`gh` CLI)
+
+These commands are for humans running in a shell with a valid `GH_TOKEN`. Agents should
+use the MCP equivalents above.
+
+```bash
+gh run list --repo gspivey/dpdk-stdlib-rust --workflow=integration-tests.yml --limit 5
+gh run view <run-id> --repo gspivey/dpdk-stdlib-rust --json status,conclusion
+gh run view <run-id> --log-failed --repo gspivey/dpdk-stdlib-rust
+gh run download <run-id> --name instance-logs --repo gspivey/dpdk-stdlib-rust --dir /tmp/ci-logs
+./scripts/ci-validate.sh              # local: build, test, push, trigger CI, poll, report
+./scripts/diagnose-ci-failure.sh      # local: auto-fetch + summarize the most recent failed run
+```
+
+`gh run watch` does not work in this repo — the fine-grained PAT lacks `checks:read`.
+Poll with `--json status,conclusion` instead.
 
 ### Session Start Hook
 
@@ -245,9 +212,9 @@ Do NOT push a PR and hope CI catches problems — close the feedback loop in-ses
    ```
 
 4. **Only after all checks pass**, create the PR:
-   ```bash
-   gh pr create --title "..." --body "..."
-   ```
+   - Agents (Claude Code): use `mcp__github__create_pull_request` with `owner=gspivey`,
+     `repo=dpdk-stdlib-rust`, `base=development`, `head=<feature-branch>`.
+   - Humans (local shell): `gh pr create --base development --title "..." --body "..."`.
 
 For changes that don't touch networking code (docs, CI config, scripts), you can skip integration
 tests with `./scripts/ci-validate.sh --skip-integration`.
