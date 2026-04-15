@@ -2,7 +2,7 @@ name: Integration Tests
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, development]
   workflow_dispatch: {}
 
 # Only one integration test run at a time — concurrent runs race to create
