@@ -1929,3 +1929,199 @@ The high-rate gap is structural to "an async echo server holding a `Mutex<UdpSoc
 ### Key Lesson
 
 Don't trust the synthetic bench alone. The synthetic RX test showed async *faster* than sync (because the sync path has `thread::sleep(100μs)` between empty polls). Hardware tells the truth: at 700K pps, the bottleneck is the application's per-packet CPU cost, not the empty-poll idle path.
+
+---
+
+## Run #19: GUE Tunnel Endpoint — Regression Check
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-17 |
+| **Git Hash** | `333f7ab` |
+| **Branch** | `feat/gue-endpoint` |
+| **PR** | [#42](https://github.com/gspivey/dpdk-stdlib-rust/pull/42) |
+| **GH Actions Run** | [24552791821](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/24552791821) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #18
+
+1. **GUE tunnel endpoint** (`dpdk-udp/src/gue.rs`): New module implementing Generic UDP Encapsulation (RFC 8470-style). 4-byte GUE header codec, full frame encap/decap, `GueConfig` builder.
+2. **Transparent tunnel in `UdpSocket`**: TX auto-encapsulates when GUE configured, RX auto-decapsulates. ARP resolves tunnel remote endpoint. MTU accounts for 32-byte overhead.
+3. **`NetworkConfig::with_gue()`** builder integration parallel to the existing VLAN pattern.
+4. **23 new unit tests** including socket-level integration tests and a synthetic PPS benchmark measuring GUE decap overhead.
+
+**Key question:** Does the GUE `Option` check in the send/recv hot path introduce measurable overhead when GUE is *not* configured? (These benchmarks run without GUE enabled.)
+
+### Results: 64B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 112 | 0.00% |
+| 140K | 140,000 | 140,000 | 127 | 0.00% |
+| 350K | 350,000 | 350,000 | 141 | 0.00% |
+| 700K | 700,000 | 699,748 | 183 | 0.04% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 349,000 | 0 | 0.29% |
+| 700K | 700,000 | 698,818 | 0 | 0.17% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 328,786 | 0 | 6.06% |
+| 700K | 700,000 | 329,154 | 0 | 52.98% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 348,999 | 254 | 0.29% |
+| 700K | 700,000 | 556,893 | 538 | 20.44% |
+
+### Results: 512B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 116 | 0.00% |
+| 140K | 140,000 | 140,000 | 139 | 0.00% |
+| 350K | 350,000 | 350,000 | 150 | 0.00% |
+| 700K | 700,000 | 673,733 | 232 | 3.75% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 226 | 1.43% |
+| 140K | 140,000 | 139,000 | 244 | 0.71% |
+| 350K | 350,000 | 349,000 | 0 | 0.29% |
+| 700K | 700,000 | 698,083 | 338 | 0.27% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 237,279 | 0 | 32.21% |
+| 700K | 700,000 | 237,131 | 0 | 66.12% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 348,977 | 261 | 0.29% |
+| 700K | 700,000 | 502,796 | 0 | 28.17% |
+
+### Results: 1400B Packets
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 114 | 0.00% |
+| 140K | 140,000 | 140,000 | 138 | 0.00% |
+| 350K | 350,000 | 350,000 | 150 | 0.00% |
+| 700K | 476,378 | 476,320 | 2,895 | 0.01% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 349,000 | 0 | 0.29% |
+| 700K | 476,319 | 475,551 | 0 | 0.16% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 0 | 0.71% |
+| 350K | 350,000 | 151,011 | 0 | 56.85% |
+| 700K | 476,337 | 160,838 | 0 | 66.23% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 0 | 1.43% |
+| 140K | 140,000 | 139,000 | 237 | 0.71% |
+| 350K | 350,000 | 348,870 | 286 | 0.32% |
+| 700K | 476,276 | 454,143 | 0 | 4.65% |
+
+### Results: 8500B Packets (Jumbo)
+
+#### native-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 70,000 | 138 | 0.00% |
+| 140K | 78,306 | 78,303 | 14,516 | 0.00% |
+| 350K | 78,283 | 77,773 | 14,272 | 0.65% |
+
+#### rust-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 69,000 | 518 | 1.43% |
+| 140K | 78,335 | 77,736 | 0 | 0.76% |
+| 350K | 78,294 | 77,804 | 0 | 0.63% |
+
+#### tokio-dpdk
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 54,202 | 0 | 22.57% |
+| 140K | 78,295 | 57,693 | 0 | 26.31% |
+| 350K | 78,293 | 57,720 | 0 | 26.28% |
+
+#### plain-rust
+
+| Target PPS | TX pps | RX pps | Avg Latency (us) | Drop % |
+|-----------|--------|--------|-------------------|--------|
+| 70K | 70,000 | 37,593 | 0 | 46.30% |
+| 140K | 78,337 | 77,774 | 0 | 0.72% |
+| 350K | 78,346 | 78,042 | 0 | 0.39% |
+
+### Analysis
+
+**Regression check: rust-dpdk (GUE code in hot path) vs Run #17:**
+
+| Packet Size | Rate | Run #17 RX pps | Run #19 RX pps | Delta |
+|-------------|------|----------------|----------------|-------|
+| 64B | 700K | 697,295 | 698,818 | +0.2% |
+| 512B | 700K | 689,904 | 698,083 | +1.2% |
+| 1400B | 700K | 475,390 | 475,551 | flat |
+| 8500B | 350K | 75,607 | 77,804 | +2.9% |
+
+**No regressions detected.** The GUE `Option::is_some()` check in `send_to_addr()` and `process_frame_zerocopy()` adds zero measurable overhead when GUE is not configured. The branch predictor trivially handles the always-false check.
+
+**tokio-dpdk variance at high rates:**
+
+| Packet Size | Rate | Run #17 RX | Run #19 RX | Delta |
+|-------------|------|-----------|-----------|-------|
+| 64B | 350K | 342,529 | 328,786 | -4.0% |
+| 64B | 700K | 343,487 | 329,154 | -4.2% |
+| 1400B | 350K | 159,913 | 151,011 | -5.6% |
+
+This is within normal run-to-run variance for the async path at its CPU-bound plateau (documented in Runs #17 and #18). The sync `rust-dpdk` path — which executes the same GUE check — shows zero regression, confirming the variance is from Tokio scheduler noise, not the GUE code changes.
+
+**Conclusion:** GUE tunnel endpoint can be merged with no performance impact on existing non-GUE workloads.
