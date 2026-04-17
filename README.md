@@ -20,7 +20,7 @@ DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace d
 - **Multiple backends**: DPDK (kernel bypass), AF_PACKET (raw sockets), AF_PACKET+MMAP (zero-copy)
 - **Automatic fallback**: Works without DPDK installed (development, testing, CI)
 - **Hardware offload**: IPv4/UDP checksum offloading on supported NICs
-- **Protocol support**: ARP resolution, ICMP echo reply
+- **Protocol support**: ARP resolution, ICMP echo reply, GUE tunnel endpoint
 - **Async runtime**: Full Tokio integration with poll-based API
 
 ## Quick Start
@@ -391,6 +391,7 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | Multicast join/leave | Basic | IPv4 only, simplified group tracking |
 | Connected socket filtering | Complete | Buffers non-matching packets |
 | Socket timeouts | Complete | Read and write deadlines |
+| GUE tunnel endpoint | Complete | L3-over-UDP encapsulation (RFC 8470), per-socket config, inner IPv4 |
 
 ### What's Not Implemented
 
@@ -399,7 +400,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
+| **UDP encapsulation (VXLAN/GENEVE)** | Tunnel endpoint support | GUE done, VXLAN/GENEVE planned | Planned |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
 | **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
 | **GSO/GRO** | Batch segmentation/coalescing for bulk transfers | Single-packet TX/RX | Not planned |
@@ -442,6 +443,8 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the hardware TCI is passed directly to `detect_vlan()` for zero-allocation VLAN filtering (see [NIC Hardware Offloads](#nic-hardware-offloads)). Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
 
+**GUE endpoint (Generic UDP Encapsulation)** — Lightweight L3-over-UDP tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (default port 6080) + 4-byte GUE header + inner IPv4 + inner UDP + payload. The 32-byte encapsulation overhead is the smallest of the three planned tunnel protocols. Configurable per-socket via `set_gue(Some(GueConfig::new(remote_ip)))` or through `NetworkConfig::with_gue()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the GUE tunnel automatically. RX decapsulates matching frames and returns the inner source address to the application. ARP resolution targets the tunnel remote endpoint. MTU check accounts for the 32-byte overhead. Ships with IPv4 outer and inner IPv4; inner IPv6 will be supported automatically once IPv6 header build/parse lands. 23 unit tests including a synthetic PPS benchmark measuring GUE decapsulation overhead.
+
 ### Planned
 
 Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwise. IPv6 is a multi-PR feature with a sub-task checklist; it only moves to Done when every box is ticked and a final performance run shows no regression vs the IPv4 baseline.
@@ -461,8 +464,6 @@ Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwi
 **VXLAN endpoint (RFC 7348)** — High-performance VXLAN tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (dst port 4789) + 8-byte VXLAN header (24-bit VNI) + inner Ethernet frame. Per-socket VNI filtering on RX, builder API for TX. Inner payload is self-describing Ethernet, so inner IPv4 and inner IPv6 both work from day one. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" item below. New `vxlan-echo` demo app.
 
 **GENEVE endpoint (RFC 8926)** — Modern overlay tunnel: outer Ethernet + outer IPv4 + outer UDP (dst port 6081) + Geneve base header + variable-length TLV options (class / type / length / value, up to 252 bytes). Same frame shape as VXLAN plus extensible metadata — used by OVN, NSX-T, and AWS Gateway Load Balancer. Inner Ethernet (self-describing). Ships with IPv4 outer.
-
-**GUE endpoint (Generic UDP Encapsulation)** — Lightweight L3-over-UDP: outer Ethernet + outer IPv4 + outer UDP + 4-byte GUE header identifying the inner protocol (IPv4 = 4, IPv6 = 41, Ethernet = 143, MPLS = 137). Simpler and smaller than VXLAN / GENEVE for pure L3 tunnel use cases. Ships with IPv4 outer and inner IPv4 on day one; inner IPv6 becomes supported automatically once IPv6 task 1 (header parse) lands.
 
 **Encap: IPv6 outer** — Adds IPv6 outer support to all three encapsulation protocols (VXLAN, GENEVE, GUE), closing out dual-stack encap in a single PR. Depends on IPv6 tasks 1 (header build/parse), 2 (UDP pseudo-header checksum), and 4 (offload flags). Does NOT require NDP or ICMPv6 — only the wire-format subset of IPv6.
 

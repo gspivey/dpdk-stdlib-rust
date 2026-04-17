@@ -75,6 +75,9 @@ pub struct NetworkConfig {
     /// Optional 802.1Q VLAN configuration. When set, outgoing frames are tagged
     /// with the specified VLAN ID and priority.
     pub vlan: Option<crate::VlanConfig>,
+    /// Optional GUE tunnel configuration. When set, packets are encapsulated
+    /// in a GUE tunnel on TX and decapsulated on RX.
+    pub gue: Option<crate::gue::GueConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -86,6 +89,7 @@ impl Default for NetworkConfig {
             static_routes: Vec::new(),
             mtu: 1500,
             vlan: None,
+            gue: None,
         }
     }
 }
@@ -121,6 +125,12 @@ impl NetworkConfig {
     /// Configure 802.1Q VLAN tagging.
     pub fn with_vlan(mut self, vlan: crate::VlanConfig) -> Self {
         self.vlan = Some(vlan);
+        self
+    }
+
+    /// Configure GUE tunnel encapsulation.
+    pub fn with_gue(mut self, gue: crate::gue::GueConfig) -> Self {
+        self.gue = Some(gue);
         self
     }
 

@@ -53,6 +53,7 @@ pub mod routing;
 pub mod topology;
 pub mod perf;
 pub mod frame_pool;
+pub mod gue;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
@@ -66,6 +67,7 @@ pub use perf::{
     LatencySampler, NicStatsFn, NicStatsSnapshot, PerfCounters, PerfReporter, PerfSnapshot,
 };
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
+pub use gue::{GueConfig, GueHeader, GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD};
 
 // ============================================================================
 // Error Types
@@ -1881,6 +1883,10 @@ pub struct UdpSocket {
     routing_table: RoutingTable,
     /// Optional 802.1Q VLAN configuration. When set, outgoing frames are tagged.
     vlan_config: Option<VlanConfig>,
+    /// Optional GUE tunnel configuration. When set, packets are encapsulated in
+    /// GUE (outer UDP + 4-byte GUE header + inner IPv4/UDP) on TX, and
+    /// decapsulated on RX.
+    gue_config: Option<gue::GueConfig>,
     /// Number of UDP payloads dropped because the socket receive buffer was full.
     /// Lock-free read via `recv_drops()` — mirrors Linux `sk_drops`.
     rx_dropped_packets: AtomicU64,
@@ -1985,6 +1991,7 @@ impl UdpSocket {
             has_connection_state: AtomicBool::new(false),
             routing_table,
             vlan_config: None,
+            gue_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2100,6 +2107,7 @@ impl UdpSocket {
             has_connection_state: AtomicBool::new(false),
             routing_table,
             vlan_config: None,
+            gue_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2200,7 +2208,12 @@ impl UdpSocket {
         };
 
         // Reject payloads that exceed the MTU-derived limit.
-        let max_payload = self.routing_table.max_udp_payload();
+        // GUE encapsulation adds 32 bytes of overhead (outer IP + outer UDP + GUE header).
+        let max_payload = if self.gue_config.is_some() {
+            self.routing_table.max_udp_payload().saturating_sub(gue::GUE_ENCAP_OVERHEAD)
+        } else {
+            self.routing_table.max_udp_payload()
+        };
         if buf.len() > max_payload {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2211,9 +2224,15 @@ impl UdpSocket {
             ));
         }
 
-        // Determine the ARP target: for same-subnet destinations, ARP for the
-        // peer directly; for cross-subnet, ARP for the gateway instead.
-        let arp_target = match self.routing_table.lookup(dst_ip) {
+        // When GUE is configured, ARP for the tunnel remote endpoint instead
+        // of the original destination. The outer frame is addressed to the
+        // tunnel peer; the inner addresses carry the original src/dst.
+        let arp_target_ip = if let Some(ref gue_cfg) = self.gue_config {
+            gue_cfg.remote_ip
+        } else {
+            dst_ip
+        };
+        let arp_target = match self.routing_table.lookup(arp_target_ip) {
             routing::NextHop::Direct(ip) => ip,
             routing::NextHop::Gateway(gw) => gw,
         };
@@ -2239,23 +2258,52 @@ impl UdpSocket {
 
         // Build frame into reusable buffer (zero-alloc) and send.
         //
-        // VLAN TX behavior depends on mode and hardware offload availability:
-        //   Access  -> send untagged (no 802.1Q tag)
-        //   Trunk   -> send tagged with configured VID (software or hardware)
-        //   PortTag -> send tagged with configured VID (software or hardware)
-        //   None    -> send untagged
-        //
-        // When hardware VLAN insert is available (and force_software is false),
-        // we build an untagged frame and let the NIC insert the tag from
-        // mbuf.vlan_tci. This eliminates the ~10% CPU overhead of software
-        // tag insertion on tagged frames.
+        // Three mutually exclusive modes:
+        //   GUE    -> encapsulate: outer-eth/outer-ip/outer-udp/gue/inner-ip/inner-udp/payload
+        //   VLAN   -> tag or hardware-offload per VlanMode
+        //   Plain  -> standard untagged UDP frame
         let mut tx_buf = self.tx_buf.borrow_mut();
-        let should_tag = self.vlan_config.as_ref().map_or(false, |v| v.tags_on_tx());
-        let hw_vlan_tci = if should_tag {
-            let vlan_cfg = self.vlan_config.as_ref().unwrap();
-            let use_hw = self.has_hw_vlan_insert() && !vlan_cfg.force_software;
-            if use_hw {
-                // Hardware VLAN insert: build untagged frame, NIC inserts tag
+        let hw_vlan_tci = if let Some(ref gue_cfg) = self.gue_config {
+            // GUE tunnel encapsulation
+            gue::build_gue_frame_into(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, gue_cfg.remote_ip,
+                gue_cfg.local_port, gue_cfg.remote_port,
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("GUE encap failed: {}", e)))?;
+            None
+        } else {
+            let should_tag = self.vlan_config.as_ref().map_or(false, |v| v.tags_on_tx());
+            if should_tag {
+                let vlan_cfg = self.vlan_config.as_ref().unwrap();
+                let use_hw = self.has_hw_vlan_insert() && !vlan_cfg.force_software;
+                if use_hw {
+                    build_udp_frame_into(
+                        &mut tx_buf,
+                        &src_mac,
+                        &dst_mac.octets(),
+                        src_ip, dst_ip,
+                        src_port, dst_port,
+                        buf, self.ttl,
+                    ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+                    Some(vlan_cfg.encode_tci())
+                } else {
+                    build_udp_frame_into_vlan(
+                        &mut tx_buf,
+                        &src_mac,
+                        &dst_mac.octets(),
+                        src_ip, dst_ip,
+                        src_port, dst_port,
+                        buf, self.ttl,
+                        vlan_cfg,
+                    ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
+                    None
+                }
+            } else {
                 build_udp_frame_into(
                     &mut tx_buf,
                     &src_mac,
@@ -2264,30 +2312,8 @@ impl UdpSocket {
                     src_port, dst_port,
                     buf, self.ttl,
                 ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
-                Some(vlan_cfg.encode_tci())
-            } else {
-                // Software VLAN insert: build tagged frame
-                build_udp_frame_into_vlan(
-                    &mut tx_buf,
-                    &src_mac,
-                    &dst_mac.octets(),
-                    src_ip, dst_ip,
-                    src_port, dst_port,
-                    buf, self.ttl,
-                    vlan_cfg,
-                ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
                 None
             }
-        } else {
-            build_udp_frame_into(
-                &mut tx_buf,
-                &src_mac,
-                &dst_mac.octets(),
-                src_ip, dst_ip,
-                src_port, dst_port,
-                buf, self.ttl,
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("packet build failed: {}", e)))?;
-            None
         };
 
         // P3.5: Worker-direct TX uses cached send function (no topology.lock()).
@@ -2844,6 +2870,50 @@ impl UdpSocket {
             }
         }
 
+        // GUE RX decapsulation: if GUE is configured and the outer UDP dst_port
+        // matches the GUE local port, decapsulate the inner IPv4/UDP packet.
+        if let Some(ref gue_cfg) = self.gue_config {
+            if layout.ethertype == ETH_TYPE_IPV4 {
+                if let Some(decap) = gue::try_decap_gue(frame_data, layout.l3_offset, gue_cfg.local_port) {
+                    if decap.inner_dst_port != local_port {
+                        return None;
+                    }
+
+                    perf_inc!(self.perf_counters.rx_packets);
+                    perf_inc!(self.perf_counters.rx_bytes, decap.payload.len() as u64);
+
+                    let src_addr = SocketAddr::V4(
+                        SocketAddrV4::new(decap.inner_src_ip, decap.inner_src_port),
+                    );
+
+                    if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                        if src_addr != connected {
+                            let payload_len = decap.payload.len();
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                                self.record_rx_drop(payload_len);
+                            }
+                            return None;
+                        }
+                    }
+
+                    if result.is_none() {
+                        let copy_len = std::cmp::min(buf.len(), decap.payload.len());
+                        buf[..copy_len].copy_from_slice(&decap.payload[..copy_len]);
+                        *result = Some((copy_len, src_addr));
+                    } else {
+                        let payload_len = decap.payload.len();
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                            self.record_rx_drop(payload_len);
+                        }
+                    }
+
+                    return None;
+                }
+            }
+        }
+
         // Zero-copy UDP parse — payload borrows from frame_data.
         // Handles both tagged and untagged frames via detect_vlan internally.
         let parsed = match parse_udp_packet_ref(frame_data) {
@@ -3055,6 +3125,41 @@ impl UdpSocket {
     /// Returns the current VLAN configuration, if any.
     pub fn vlan(&self) -> Option<&VlanConfig> {
         self.vlan_config.as_ref()
+    }
+
+    // ========================================================================
+    // GUE (Generic UDP Encapsulation) Configuration
+    // ========================================================================
+
+    /// Configure GUE tunnel encapsulation on this socket.
+    ///
+    /// When set, outgoing packets are encapsulated in a GUE tunnel:
+    /// `[Outer Eth][Outer IPv4][Outer UDP][GUE Header][Inner IPv4][Inner UDP][Payload]`
+    ///
+    /// Incoming packets on the GUE port are automatically decapsulated, and
+    /// the inner source address is returned to the application.
+    ///
+    /// Set to `None` to disable GUE (send/receive plain UDP).
+    pub fn set_gue(&mut self, config: Option<gue::GueConfig>) {
+        self.gue_config = config;
+    }
+
+    /// Returns the current GUE tunnel configuration, if any.
+    pub fn gue(&self) -> Option<&gue::GueConfig> {
+        self.gue_config.as_ref()
+    }
+
+    /// Returns the maximum UDP payload size accounting for GUE overhead.
+    ///
+    /// When GUE is configured, the effective max payload is reduced by 32 bytes
+    /// (outer IPv4 + outer UDP + GUE header).
+    pub fn max_gue_payload(&self) -> usize {
+        let base = self.routing_table.max_udp_payload();
+        if self.gue_config.is_some() {
+            base.saturating_sub(gue::GUE_ENCAP_OVERHEAD)
+        } else {
+            base
+        }
     }
 
     // ========================================================================
@@ -3827,10 +3932,11 @@ impl UdpSocketBuilder {
         // Create the socket using the standard bind path
         let mut socket = UdpSocket::bind(addr)?;
 
-        // Apply routing and VLAN configuration if provided.
-        // Extract vlan before moving net_config into RoutingTable.
+        // Apply routing, VLAN, and GUE configuration if provided.
+        // Extract vlan/gue before moving net_config into RoutingTable.
         if let Some(mut net_config) = self.network_config {
             socket.vlan_config = net_config.vlan.take();
+            socket.gue_config = net_config.gue.take();
             socket.routing_table = RoutingTable::with_config(net_config);
         }
 
@@ -6182,5 +6288,241 @@ mod tests {
                 saved_ns * 600_000.0 / 1_000_000.0);
             println!("{}", "=".repeat(80));
         }
+    }
+
+    // ── GUE (Generic UDP Encapsulation) socket-level tests ──
+
+    fn make_gue_frame(
+        inner_src_ip: Ipv4Addr,
+        inner_dst_ip: Ipv4Addr,
+        inner_src_port: u16,
+        inner_dst_port: u16,
+        gue_dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        gue::build_gue_frame_into(
+            &mut frame,
+            &[0xaa; 6],
+            &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 1),
+            6080,
+            gue_dst_port,
+            inner_src_ip,
+            inner_dst_ip,
+            inner_src_port,
+            inner_dst_port,
+            payload,
+            64,
+        )
+        .unwrap();
+        frame
+    }
+
+    #[test]
+    fn gue_rx_decapsulates_matching_frame() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000,
+            port,
+            6080,
+            b"gue tunnel payload",
+        );
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+
+        assert!(result.is_some(), "GUE frame should be decapsulated and accepted");
+        let (len, src_addr) = result.unwrap();
+        assert_eq!(len, 18);
+        assert_eq!(&buf[..len], b"gue tunnel payload");
+        assert_eq!(src_addr, SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(192, 168, 1, 10),
+            9000,
+        )));
+    }
+
+    #[test]
+    fn gue_rx_rejects_wrong_inner_port() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000,
+            port + 1, // wrong inner port
+            6080,
+            b"wrong port",
+        );
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GUE frame with wrong inner port should be dropped");
+    }
+
+    #[test]
+    fn gue_rx_rejects_wrong_outer_port() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000,
+            port,
+            7000, // wrong outer GUE port
+            b"wrong outer port",
+        );
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        // Falls through to normal UDP parse which won't match either
+        assert!(result.is_none(), "GUE frame with wrong outer port should not decap");
+    }
+
+    #[test]
+    fn gue_rx_passthrough_when_not_configured() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+
+        // Normal untagged frame should work without GUE config
+        let frame = make_untagged_frame(port);
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "Normal frames should work without GUE config");
+    }
+
+    #[test]
+    fn gue_max_payload_accounts_for_overhead() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let base = socket.max_gue_payload();
+
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+        // GUE overhead is 32 bytes (outer IP 20 + outer UDP 8 + GUE header 4)
+        assert_eq!(socket.max_gue_payload(), base - 32);
+    }
+
+    #[test]
+    fn gue_config_via_network_config() {
+        let net_cfg = NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 50), 24)
+            .with_gateway(Ipv4Addr::new(10, 0, 1, 1))
+            .with_gue(gue::GueConfig::new(Ipv4Addr::new(10, 0, 2, 1)));
+        assert!(net_cfg.gue.is_some());
+    }
+
+    #[test]
+    fn gue_set_and_get() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(socket.gue().is_none());
+
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(socket.gue().is_some());
+        assert_eq!(socket.gue().unwrap().remote_ip, Ipv4Addr::new(10, 0, 0, 2));
+
+        socket.set_gue(None);
+        assert!(socket.gue().is_none());
+    }
+
+    #[test]
+    fn gue_rx_empty_payload() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000,
+            port,
+            6080,
+            &[],
+        );
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "Empty GUE payload should be accepted");
+        let (len, _) = result.unwrap();
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn gue_pps_benchmark() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000,
+            port,
+            6080,
+            b"benchmark payload data for GUE tunnel",
+        );
+
+        let no_gue_frame = make_untagged_frame(port);
+
+        let mut buf = [0u8; 1500];
+        const ITERATIONS: usize = 500_000;
+        const WARMUP: usize = 10_000;
+
+        println!("\n{}", "=".repeat(80));
+        println!("GUE Encapsulation PPS Benchmark ({} iterations per scenario)", ITERATIONS);
+        println!("{}", "=".repeat(80));
+        println!("{:<55} {:>10} {:>10}", "Scenario", "PPS (K)", "ns/pkt");
+        println!("{}", "-".repeat(80));
+
+        // Warmup
+        for _ in 0..WARMUP {
+            let mut result = None;
+            socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        }
+
+        // Benchmark: GUE decapsulation
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut result = None;
+            socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        }
+        let elapsed_gue = start.elapsed();
+        let pps_gue = ITERATIONS as f64 / elapsed_gue.as_secs_f64();
+        let ns_gue = elapsed_gue.as_nanos() as f64 / ITERATIONS as f64;
+        println!("{:<55} {:>10.0} {:>10.0}", "GUE decap (matching frame)", pps_gue / 1000.0, ns_gue);
+
+        // Benchmark: baseline no-GUE processing (disable GUE first)
+        socket.set_gue(None);
+        for _ in 0..WARMUP {
+            let mut result = None;
+            socket.process_frame_zerocopy(&no_gue_frame, port, &mut buf, &mut result, None);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut result = None;
+            socket.process_frame_zerocopy(&no_gue_frame, port, &mut buf, &mut result, None);
+        }
+        let elapsed_plain = start.elapsed();
+        let pps_plain = ITERATIONS as f64 / elapsed_plain.as_secs_f64();
+        let ns_plain = elapsed_plain.as_nanos() as f64 / ITERATIONS as f64;
+        println!("{:<55} {:>10.0} {:>10.0}", "Plain UDP (no GUE, baseline)", pps_plain / 1000.0, ns_plain);
+
+        println!("{}", "-".repeat(80));
+        let overhead = ns_gue - ns_plain;
+        let overhead_pct = overhead / ns_plain * 100.0;
+        println!("GUE overhead: {:.0} ns/pkt ({:.1}%)", overhead, overhead_pct);
+        println!("{}", "=".repeat(80));
     }
 }
