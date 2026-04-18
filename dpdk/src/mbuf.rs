@@ -7,6 +7,63 @@ use crate::error::{DpdkError, DpdkResult};
 use std::ffi::CString;
 use std::ptr::NonNull;
 
+// ---------------------------------------------------------------------------
+// cfg-gated field accessors for rte_mbuf
+//
+// With real bindgen output (dpdk_bindgen), several rte_mbuf fields live inside
+// anonymous unions/structs (e.g., pkt_len is at __bindgen_anon_3.pkt_len).
+// With stubs (dpdk_stubs), they are direct fields. These helpers provide a
+// single API that works in both modes.
+// ---------------------------------------------------------------------------
+
+#[cfg(dpdk_stubs)]
+#[inline(always)]
+unsafe fn mbuf_pkt_len(m: *const dpdk_sys::rte_mbuf) -> u32 {
+    (*m).pkt_len
+}
+
+#[cfg(dpdk_bindgen)]
+#[inline(always)]
+unsafe fn mbuf_pkt_len(m: *const dpdk_sys::rte_mbuf) -> u32 {
+    (*m).__bindgen_anon_3.__bindgen_anon_1.pkt_len
+}
+
+#[cfg(dpdk_stubs)]
+#[inline(always)]
+unsafe fn mbuf_set_pkt_len(m: *mut dpdk_sys::rte_mbuf, len: u32) {
+    (*m).pkt_len = len;
+}
+
+#[cfg(dpdk_bindgen)]
+#[inline(always)]
+unsafe fn mbuf_set_pkt_len(m: *mut dpdk_sys::rte_mbuf, len: u32) {
+    (*m).__bindgen_anon_3.__bindgen_anon_1.pkt_len = len;
+}
+
+#[cfg(dpdk_stubs)]
+#[inline(always)]
+unsafe fn mbuf_data_len(m: *const dpdk_sys::rte_mbuf) -> u16 {
+    (*m).data_len
+}
+
+#[cfg(dpdk_bindgen)]
+#[inline(always)]
+unsafe fn mbuf_data_len(m: *const dpdk_sys::rte_mbuf) -> u16 {
+    (*m).__bindgen_anon_3.__bindgen_anon_1.data_len
+}
+
+#[cfg(dpdk_stubs)]
+#[inline(always)]
+unsafe fn mbuf_set_data_len(m: *mut dpdk_sys::rte_mbuf, len: u16) {
+    (*m).data_len = len;
+}
+
+#[cfg(dpdk_bindgen)]
+#[inline(always)]
+unsafe fn mbuf_set_data_len(m: *mut dpdk_sys::rte_mbuf, len: u16) {
+    (*m).__bindgen_anon_3.__bindgen_anon_1.data_len = len;
+}
+
 /// A memory buffer for packet data
 ///
 /// Mbufs are the basic unit for carrying packet data in DPDK.
@@ -54,12 +111,12 @@ impl Mbuf {
 
     /// Get the total packet length
     pub fn packet_len(&self) -> u32 {
-        unsafe { (*self.raw.as_ptr()).pkt_len }
+        unsafe { mbuf_pkt_len(self.raw.as_ptr()) }
     }
 
     /// Get the data length in this segment
     pub fn data_len(&self) -> u16 {
-        unsafe { (*self.raw.as_ptr()).data_len }
+        unsafe { mbuf_data_len(self.raw.as_ptr()) }
     }
 
     /// Get the buffer length (total available space)
@@ -78,7 +135,7 @@ impl Mbuf {
                 return None;
             }
             let data_ptr = (buf_addr as *const u8).add((*mbuf).data_off as usize);
-            Some(std::slice::from_raw_parts(data_ptr, (*mbuf).data_len as usize))
+            Some(std::slice::from_raw_parts(data_ptr, mbuf_data_len(mbuf) as usize))
         }
     }
 
@@ -93,21 +150,21 @@ impl Mbuf {
                 return None;
             }
             let data_ptr = (buf_addr as *mut u8).add((*mbuf).data_off as usize);
-            Some(std::slice::from_raw_parts_mut(data_ptr, (*mbuf).data_len as usize))
+            Some(std::slice::from_raw_parts_mut(data_ptr, mbuf_data_len(mbuf) as usize))
         }
     }
 
     /// Set the data length
     pub fn set_data_len(&mut self, len: u16) {
         unsafe {
-            (*self.raw.as_ptr()).data_len = len;
+            mbuf_set_data_len(self.raw.as_ptr(), len);
         }
     }
 
     /// Set the packet length
     pub fn set_packet_len(&mut self, len: u32) {
         unsafe {
-            (*self.raw.as_ptr()).pkt_len = len;
+            mbuf_set_pkt_len(self.raw.as_ptr(), len);
         }
     }
 

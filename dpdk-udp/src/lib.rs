@@ -101,8 +101,8 @@ pub type UdpResult<T> = Result<T, UdpError>;
 // Constants
 // ============================================================================
 
-/// Maximum UDP payload size (MTU 1500 - IP header 20 - UDP header 8)
-pub const MAX_UDP_PAYLOAD: usize = 1472;
+/// Maximum UDP payload size (jumbo MTU 9001 - IP header 20 - UDP header 8)
+pub const MAX_UDP_PAYLOAD: usize = 8973;
 
 /// Maximum possible frame size for jumbo MTU (9001 + 14 Ethernet header).
 /// TxBuffer is always allocated at this size to avoid reallocation when
@@ -1216,7 +1216,7 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         &MempoolConfig::new()
             .with_size(8192)
             .with_cache_size(256)
-            .with_data_room_size(JUMBO_DATA_ROOM_SIZE),
+            .with_data_room_size(10240),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
     // Initialize port with 2 TX queues, jumbo MTU, and checksum offloads:
@@ -4590,7 +4590,7 @@ mod tests {
         assert_eq!(IPV4_HEADER_LEN, 20);
         assert_eq!(UDP_HEADER_LEN, 8);
         assert_eq!(TOTAL_HEADER_LEN, 42);
-        assert_eq!(MAX_UDP_PAYLOAD, 1472);
+        assert_eq!(MAX_UDP_PAYLOAD, 8973);
     }
 
     #[test]

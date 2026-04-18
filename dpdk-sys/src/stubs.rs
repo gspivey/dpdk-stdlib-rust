@@ -18,7 +18,7 @@ pub const RTE_ETHER_TYPE_IPV6: u16 = 0x86DD;
 pub const RTE_ETHER_TYPE_ARP: u16 = 0x0806;
 pub const RTE_ETHER_TYPE_VLAN: u16 = 0x8100;
 
-pub const RTE_MBUF_DEFAULT_BUF_SIZE: u16 = 2048 + 128; // RTE_PKTMBUF_HEADROOM
+pub const RTE_MBUF_DEFAULT_BUF_SIZE: u16 = 10240 + 128; // RTE_PKTMBUF_HEADROOM
 pub const RTE_PKTMBUF_HEADROOM: u16 = 128;
 
 pub const RTE_ETH_TX_OFFLOAD_VLAN_INSERT: u64 = 0x00000001;
@@ -656,7 +656,7 @@ pub extern "C" fn rte_mempool_free(mp: *mut rte_mempool) {
 #[no_mangle]
 pub extern "C" fn rte_pktmbuf_alloc(_mp: *mut rte_mempool) -> *mut rte_mbuf {
     // Allocate a stub mbuf with a real buffer
-    let buf_size = 2048usize;
+    let buf_size = 10240usize;
     let buf: Vec<u8> = vec![0u8; buf_size];
     let buf_ptr = Box::into_raw(buf.into_boxed_slice()) as *mut c_void;
 

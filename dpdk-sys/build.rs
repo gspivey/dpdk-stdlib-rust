@@ -105,9 +105,18 @@ fn compile_shim() {
         "/usr/include/dpdk",
         "/usr/local/include/dpdk",
         "/opt/dpdk/include",
+        "/usr/include/aarch64-linux-gnu/dpdk",
+        "/usr/include/x86_64-linux-gnu/dpdk",
     ];
     for path in &common_paths {
         if PathBuf::from(path).exists() {
+            build.include(path);
+        }
+    }
+
+    // pkg-config discovery for include paths
+    if let Ok(lib) = pkg_config::Config::new().atleast_version("21.0").probe("libdpdk") {
+        for path in &lib.include_paths {
             build.include(path);
         }
     }
@@ -175,11 +184,21 @@ fn generate_bindings() {
         "/usr/include/dpdk",
         "/usr/local/include/dpdk",
         "/opt/dpdk/include",
+        "/usr/include/aarch64-linux-gnu/dpdk",
+        "/usr/include/x86_64-linux-gnu/dpdk",
+        "/usr/include/aarch64-linux-gnu",
     ];
 
     for path in &common_paths {
         if PathBuf::from(path).exists() {
             builder = builder.clang_arg(format!("-I{}", path));
+        }
+    }
+
+    // pkg-config discovery for clang include paths
+    if let Ok(lib) = pkg_config::Config::new().atleast_version("21.0").probe("libdpdk") {
+        for path in &lib.include_paths {
+            builder = builder.clang_arg(format!("-I{}", path.display()));
         }
     }
 
