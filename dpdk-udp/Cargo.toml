@@ -19,6 +19,6 @@ perf-counters = []
 
 [dependencies]
 thiserror = { workspace = true }
-dpdk = { version = "0.1.0", path = "../dpdk", package = "dpdk-stdlib" }
-dpdk-sys = { version = "0.1.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
+dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 libc = { workspace = true }

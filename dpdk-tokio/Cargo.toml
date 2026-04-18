@@ -20,7 +20,7 @@ thiserror.workspace = true
 async-trait = "0.1"
 
 # Optional DPDK support
-dpdk-udp = { version = "0.1.0", path = "../dpdk-udp", optional = true, package = "dpdk-stdlib-udp" }
+dpdk-udp = { version = "0.2.0", path = "../dpdk-udp", optional = true, package = "dpdk-stdlib-udp" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
