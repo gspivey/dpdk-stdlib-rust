@@ -43,6 +43,15 @@ extern "C" {
 
     fn dpdk_shim_set_mbuf_tx_offload(m: *mut rte_mbuf, val: u64);
     fn dpdk_shim_get_mbuf_tx_offload(m: *const rte_mbuf) -> u64;
+
+    // Mbuf length/offset field accessors — same pattern as tx_offload
+    fn dpdk_shim_get_mbuf_pkt_len(m: *const rte_mbuf) -> u32;
+    fn dpdk_shim_set_mbuf_pkt_len(m: *mut rte_mbuf, len: u32);
+    fn dpdk_shim_get_mbuf_data_len(m: *const rte_mbuf) -> u16;
+    fn dpdk_shim_set_mbuf_data_len(m: *mut rte_mbuf, len: u16);
+    fn dpdk_shim_get_mbuf_data_off(m: *const rte_mbuf) -> u16;
+    fn dpdk_shim_set_mbuf_data_off(m: *mut rte_mbuf, off: u16);
+    fn dpdk_shim_get_mbuf_buf_len(m: *const rte_mbuf) -> u16;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +125,43 @@ pub unsafe fn mbuf_set_tx_offload(m: *mut rte_mbuf, val: u64) {
 #[inline]
 pub unsafe fn mbuf_get_tx_offload(m: *const rte_mbuf) -> u64 {
     dpdk_shim_get_mbuf_tx_offload(m)
+}
+
+// Mbuf length/offset field access — same anonymous-union pattern as tx_offload.
+
+#[inline]
+pub unsafe fn mbuf_get_pkt_len(m: *const rte_mbuf) -> u32 {
+    dpdk_shim_get_mbuf_pkt_len(m)
+}
+
+#[inline]
+pub unsafe fn mbuf_set_pkt_len(m: *mut rte_mbuf, len: u32) {
+    dpdk_shim_set_mbuf_pkt_len(m, len)
+}
+
+#[inline]
+pub unsafe fn mbuf_get_data_len(m: *const rte_mbuf) -> u16 {
+    dpdk_shim_get_mbuf_data_len(m)
+}
+
+#[inline]
+pub unsafe fn mbuf_set_data_len(m: *mut rte_mbuf, len: u16) {
+    dpdk_shim_set_mbuf_data_len(m, len)
+}
+
+#[inline]
+pub unsafe fn mbuf_get_data_off(m: *const rte_mbuf) -> u16 {
+    dpdk_shim_get_mbuf_data_off(m)
+}
+
+#[inline]
+pub unsafe fn mbuf_set_data_off(m: *mut rte_mbuf, off: u16) {
+    dpdk_shim_set_mbuf_data_off(m, off)
+}
+
+#[inline]
+pub unsafe fn mbuf_get_buf_len(m: *const rte_mbuf) -> u16 {
+    dpdk_shim_get_mbuf_buf_len(m)
 }
 
 // ---------------------------------------------------------------------------

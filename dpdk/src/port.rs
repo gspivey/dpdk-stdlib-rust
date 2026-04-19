@@ -8,8 +8,8 @@ use crate::mbuf::{Mbuf, Mempool};
 use std::ptr;
 
 /// Default number of RX/TX descriptors per queue
-pub const DEFAULT_RX_DESC: u16 = 1024;
-pub const DEFAULT_TX_DESC: u16 = 1024;
+pub const DEFAULT_RX_DESC: u16 = 512;
+pub const DEFAULT_TX_DESC: u16 = 512;
 
 /// Default burst size for packet I/O
 pub const DEFAULT_BURST_SIZE: u16 = 32;

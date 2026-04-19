@@ -15,5 +15,8 @@ dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys
 thiserror = { workspace = true }
 libc = { workspace = true }
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dev-dependencies]
 serial_test = { workspace = true }

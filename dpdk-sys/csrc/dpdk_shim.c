@@ -65,6 +65,38 @@ uint64_t dpdk_shim_get_mbuf_tx_offload(const struct rte_mbuf *m) {
     return m->tx_offload;
 }
 
+/* ---- Mbuf length/offset field access (rte_mbuf.h) ---- */
+/* pkt_len, data_len, data_off and buf_len live inside anonymous unions
+   in rte_mbuf — same pattern as tx_offload above. */
+
+uint32_t dpdk_shim_get_mbuf_pkt_len(const struct rte_mbuf *m) {
+    return m->pkt_len;
+}
+
+void dpdk_shim_set_mbuf_pkt_len(struct rte_mbuf *m, uint32_t len) {
+    m->pkt_len = len;
+}
+
+uint16_t dpdk_shim_get_mbuf_data_len(const struct rte_mbuf *m) {
+    return m->data_len;
+}
+
+void dpdk_shim_set_mbuf_data_len(struct rte_mbuf *m, uint16_t len) {
+    m->data_len = len;
+}
+
+uint16_t dpdk_shim_get_mbuf_data_off(const struct rte_mbuf *m) {
+    return m->data_off;
+}
+
+void dpdk_shim_set_mbuf_data_off(struct rte_mbuf *m, uint16_t off) {
+    m->data_off = off;
+}
+
+uint16_t dpdk_shim_get_mbuf_buf_len(const struct rte_mbuf *m) {
+    return m->buf_len;
+}
+
 /* ---- Errno (rte_errno.h) ---- */
 
 int dpdk_shim_rte_errno(void) {

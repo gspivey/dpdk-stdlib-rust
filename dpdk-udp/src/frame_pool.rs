@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Maximum Ethernet frame size (MTU 1500 + 14 Ethernet header + 4 FCS).
 /// Rounded up to next power of 2 for alignment.
-const DEFAULT_FRAME_SIZE: usize = 2048;
+const DEFAULT_FRAME_SIZE: usize = 10240;
 
 /// Default pool capacity (number of frame slots).
 const DEFAULT_POOL_CAPACITY: usize = 16384;
