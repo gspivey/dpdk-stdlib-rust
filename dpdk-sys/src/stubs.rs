@@ -1001,6 +1001,43 @@ pub unsafe fn mbuf_get_tx_offload(m: *const rte_mbuf) -> u64 {
     (*m).tx_offload
 }
 
+// Mbuf length/offset field accessors — mirror the C shim API so callers are cfg-free
+
+#[inline]
+pub unsafe fn mbuf_get_pkt_len(m: *const rte_mbuf) -> u32 {
+    (*m).pkt_len
+}
+
+#[inline]
+pub unsafe fn mbuf_set_pkt_len(m: *mut rte_mbuf, len: u32) {
+    (*m).pkt_len = len;
+}
+
+#[inline]
+pub unsafe fn mbuf_get_data_len(m: *const rte_mbuf) -> u16 {
+    (*m).data_len
+}
+
+#[inline]
+pub unsafe fn mbuf_set_data_len(m: *mut rte_mbuf, len: u16) {
+    (*m).data_len = len;
+}
+
+#[inline]
+pub unsafe fn mbuf_get_data_off(m: *const rte_mbuf) -> u16 {
+    (*m).data_off
+}
+
+#[inline]
+pub unsafe fn mbuf_set_data_off(m: *mut rte_mbuf, off: u16) {
+    (*m).data_off = off;
+}
+
+#[inline]
+pub unsafe fn mbuf_get_buf_len(m: *const rte_mbuf) -> u16 {
+    (*m).buf_len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

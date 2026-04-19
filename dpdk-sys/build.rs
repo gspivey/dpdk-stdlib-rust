@@ -129,6 +129,13 @@ fn compile_shim() {
         }
     }
 
+    // DPDK headers on x86_64 include SSE/AVX intrinsics (e.g. _mm_alignr_epi8)
+    // that require at least -mssse3. Use -march=native so the compiler enables
+    // whichever extensions the build host supports.
+    if cfg!(target_arch = "x86_64") {
+        build.flag("-march=native");
+    }
+
     build.compile("dpdk_shim");
     println!("cargo:rerun-if-changed=csrc/dpdk_shim.c");
 }
