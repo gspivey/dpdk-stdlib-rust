@@ -145,6 +145,15 @@ do_bind() {
     echo "  Current driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
     echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
 
+    # Tell NetworkManager to stop managing this interface so it doesn't hold
+    # the ena driver open or restart DHCP while we're trying to unbind.
+    local iface
+    iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
+    if [[ -n "$iface" ]]; then
+        nmcli device set "$iface" managed no 2>/dev/null || true
+        echo "Set $iface as unmanaged by NetworkManager"
+    fi
+
     # Kill any DPDK processes that might hold the vfio-pci device open
     kill_dpdk_processes
 

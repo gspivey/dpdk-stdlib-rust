@@ -32,7 +32,7 @@ TEST_TIMEOUT=120             # 2 minutes per test scenario
 ENI_BIND_TIMEOUT=90          # 90 seconds for ENI bind/unbind (generous for SSM agent recovery)
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
-CDK_STACK_NAME="DpdkTestStack"
+CDK_STACK_NAME="${CDK_STACK_NAME:-DpdkTestStack}"
 SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
 LOGS_DIR="$REPO_ROOT/instance-logs"
 FAILED_STEP=""               # Set by fail_with_logs; written to step summary / failure JSON
@@ -225,7 +225,7 @@ deploy_infrastructure() {
     # Pass pre-built AMI ID to CDK if available
     local cdk_context_args=""
     if [[ -n "${DPDK_AMI_ID:-}" ]]; then
-        cdk_context_args="-c amiId=${DPDK_AMI_ID}"
+        cdk_context_args="-c ${CDK_AMI_CONTEXT_KEY:-amiId}=${DPDK_AMI_ID}"
         log_info "Using pre-built DPDK AMI: $DPDK_AMI_ID"
     else
         log_info "No pre-built AMI specified, using stock AL2023 with full bootstrap"

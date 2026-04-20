@@ -101,8 +101,10 @@ pub type UdpResult<T> = Result<T, UdpError>;
 // Constants
 // ============================================================================
 
-/// Maximum UDP payload size (jumbo MTU 9001 - IP header 20 - UDP header 8)
-pub const MAX_UDP_PAYLOAD: usize = 8973;
+/// Maximum UDP payload size for standard MTU 1500 (1500 - 20 IPv4 - 8 UDP).
+/// For runtime MTU-aware limits use `UdpSocket::max_udp_payload()`, which
+/// returns `mtu - 28` for whatever MTU the port is configured with.
+pub const MAX_UDP_PAYLOAD: usize = 1472;
 
 /// Maximum possible frame size for jumbo MTU (9001 + 14 Ethernet header).
 /// TxBuffer is always allocated at this size to avoid reallocation when
@@ -1126,6 +1128,8 @@ struct DpdkResources {
     active_tx_offload: u64,
     /// Active RX offload flags (used for hardware VLAN strip detection).
     active_rx_offload: u64,
+    /// MTU the port was configured with. Drives mempool sizing and routing table init.
+    mtu: u16,
 }
 
 /// Global DPDK resources (initialized once per port)
@@ -1184,7 +1188,7 @@ fn seed_arp_cache_from_kernel(cache: &ArpCache) {
     }
 }
 
-fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
+fn get_or_init_dpdk(port_id: u16, mtu: u16) -> io::Result<Arc<DpdkResources>> {
     let mut guard = DPDK_RESOURCES.lock().unwrap();
 
     if let Some(ref resources) = *guard {
@@ -1209,17 +1213,26 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     let eal = dpdk::Eal::init(&eal_args_ref)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
 
-    // Create mempool with jumbo-frame-capable mbufs (9KB data room).
-    // ENA always supports 9001 MTU; oversized mbufs don't hurt small packets.
+    // Size the mempool from the configured MTU:
+    //   data_room = mtu + 14 (Eth header) + 128 (RTE_PKTMBUF_HEADROOM)
+    //   pool count = 4096 for jumbo (>1500) to keep hugepage footprint under ~40 MB;
+    //                8192 for standard MTU (~16 MB).
+    let data_room_size: u16 = mtu + ETH_HEADER_LEN as u16 + 128;
+    let pool_n: u32 = if mtu > 1500 { 4096 } else { 8192 };
+
     let mempool = Mempool::create_with_config(
         "udp_pool",
         &MempoolConfig::new()
-            .with_size(8192)
+            .with_size(pool_n)
             .with_cache_size(256)
-            .with_data_room_size(10240),
+            .with_data_room_size(data_room_size),
     ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
 
-    // Initialize port with 2 TX queues, jumbo MTU, and checksum offloads:
+    // Descriptor ring size: jumbo frames are ~6× larger than standard, so halve
+    // the ring depth to keep per-queue memory proportional.
+    let desc_n: u16 = if mtu > 1500 { 512 } else { 1024 };
+
+    // Initialize port with 2 TX queues, configured MTU, and checksum offloads:
     // - TX queue 0: RX lcore (ARP/ICMP replies, tx_ring drain)
     // - TX queue 1: Application thread (worker-direct TX for send_to)
     // Checksum offload is requested for both RX and TX; Port::init() will
@@ -1227,7 +1240,8 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
     // silently dropped (software fallback).
     let port_config = PortConfig::default()
         .with_queues(1, 2)
-        .with_mtu(9001)
+        .with_descriptors(desc_n, desc_n)
+        .with_mtu(mtu as u32)
         .with_checksum_offload()
         .with_vlan_offload();
     let port = Port::init(port_id, port_config, &mempool)
@@ -1257,7 +1271,8 @@ fn get_or_init_dpdk(port_id: u16) -> io::Result<Arc<DpdkResources>> {
         src_mac,
         arp_cache,
         active_tx_offload,
-        active_rx_offload: active_rx_offload,
+        active_rx_offload,
+        mtu,
     });
 
     *guard = Some(Arc::clone(&resources));
@@ -1925,8 +1940,8 @@ impl UdpSocket {
             local_v4
         };
 
-        // Get or initialize DPDK resources
-        let resources = get_or_init_dpdk(0)?;
+        // Get or initialize DPDK resources (ENA supports 9001 MTU by default)
+        let resources = get_or_init_dpdk(0, 9001)?;
 
         // Create protocol handlers with shared ARP cache
         let local_mac = resources.src_mac.octets();
@@ -1949,12 +1964,10 @@ impl UdpSocket {
         // Falls back to passthrough (no routing) if detection fails.
         let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
 
-        // When using DPDK, the port is configured for jumbo frames (MTU 9001)
-        // but auto-detect may report MTU 1500 because the DPDK ENI has no
-        // kernel interface to read from (it's bound to vfio-pci). Override
-        // the routing table MTU to match the DPDK port configuration.
-        if routing_table.mtu() < 9001 {
-            routing_table.set_mtu(9001);
+        // The DPDK ENI is bound to vfio-pci so the kernel has no interface to
+        // read MTU from; override the routing table to match the port config.
+        if routing_table.mtu() < resources.mtu {
+            routing_table.set_mtu(resources.mtu);
         }
 
         let socket = UdpSocket {
@@ -2057,7 +2070,7 @@ impl UdpSocket {
 
         // We still need DpdkResources for backward-compatible methods.
         // Initialize DPDK resources as a fallback (they're lazy-initialized).
-        let resources = get_or_init_dpdk(0)?;
+        let resources = get_or_init_dpdk(0, 9001)?;
 
         println!("✅ {} UDP socket bound to {} (MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
             backend_name, SocketAddr::V4(local_v4),
@@ -2069,8 +2082,8 @@ impl UdpSocket {
 
         // DPDK backends have jumbo MTU configured at the port level, but
         // auto-detect may miss it because the ENI is on vfio-pci (no kernel iface).
-        if backend_name == "dpdk" && routing_table.mtu() < 9001 {
-            routing_table.set_mtu(9001);
+        if backend_name == "dpdk" && routing_table.mtu() < resources.mtu {
+            routing_table.set_mtu(resources.mtu);
         }
 
         let socket = UdpSocket {
@@ -3929,6 +3942,15 @@ impl UdpSocketBuilder {
     pub fn bind<A: ToSocketAddrs>(self, addr: A) -> io::Result<UdpSocket> {
         let topo_config = self.topology_config();
 
+        // Pre-initialize DPDK with the configured MTU so the singleton is
+        // sized correctly before UdpSocket::bind() claims it. Ignored if DPDK
+        // is unavailable (UdpSocket::bind() will fall back to raw sockets).
+        let mtu = self.network_config.as_ref()
+            .map(|c| c.mtu)
+            .filter(|&m| m > 0)
+            .unwrap_or(9001);
+        let _ = get_or_init_dpdk(0, mtu);
+
         // Create the socket using the standard bind path
         let mut socket = UdpSocket::bind(addr)?;
 
@@ -4590,7 +4612,7 @@ mod tests {
         assert_eq!(IPV4_HEADER_LEN, 20);
         assert_eq!(UDP_HEADER_LEN, 8);
         assert_eq!(TOTAL_HEADER_LEN, 42);
-        assert_eq!(MAX_UDP_PAYLOAD, 8973);
+        assert_eq!(MAX_UDP_PAYLOAD, 1472);
     }
 
     #[test]
