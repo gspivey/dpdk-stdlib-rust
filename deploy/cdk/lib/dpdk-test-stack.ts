@@ -4,12 +4,31 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { Construct } from 'constructs';
 
+export interface DpdkTestStackProps extends cdk.StackProps {
+  /** EC2 instance class for sender and receiver. Default: C5N */
+  instanceClass?: ec2.InstanceClass;
+  /** EC2 instance size for sender and receiver. Default: LARGE */
+  instanceSize?: ec2.InstanceSize;
+  /** CPU architecture for stock AL2023 AMI fallback. Default: X86_64 */
+  cpuType?: ec2.AmazonLinuxCpuType;
+  /** CDK context key used to pass a pre-built AMI ID. Default: 'amiId' */
+  amiContextKey?: string;
+  /** Architecture suffix for the SSM agent RPM fallback URL. Default: 'linux_amd64' */
+  ssmAgentRpmArch?: string;
+}
+
 export class DpdkTestStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: DpdkTestStackProps) {
     super(scope, id, props);
 
+    const instanceClass = props?.instanceClass ?? ec2.InstanceClass.C5N;
+    const instanceSize  = props?.instanceSize  ?? ec2.InstanceSize.LARGE;
+    const cpuType       = props?.cpuType       ?? ec2.AmazonLinuxCpuType.X86_64;
+    const amiContextKey = props?.amiContextKey ?? 'amiId';
+    const ssmAgentRpmArch = props?.ssmAgentRpmArch ?? 'linux_amd64';
+
     // Check for pre-built AMI via CDK context
-    const amiId = this.node.tryGetContext('amiId');
+    const amiId = this.node.tryGetContext(amiContextKey);
     const usePrebuiltAmi = !!amiId;
 
     // VPC for our test instances
@@ -115,9 +134,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Select machine image: pre-built DPDK AMI or stock AL2023
     const machineImage = usePrebuiltAmi
       ? ec2.MachineImage.genericLinux({ [this.region]: amiId })
-      : ec2.MachineImage.latestAmazonLinux2023({
-          cpuType: ec2.AmazonLinuxCpuType.X86_64,
-        });
+      : ec2.MachineImage.latestAmazonLinux2023({ cpuType });
 
     // Timeout: 20 min with pre-built AMI (cargo build takes 8-12 min on c5n.large), 35 min for full bootstrap
     const creationTimeout = usePrebuiltAmi ? 'PT20M' : 'PT35M';
@@ -195,7 +212,7 @@ export class DpdkTestStack extends cdk.Stack {
         // The pre-built AMI may lack SSM agent (base AL2023 variants differ),
         // and Packer builds bake in stale registration data.
         'echo "=== Ensuring SSM agent is installed and running ==="',
-        'if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi',
+        `if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/${ssmAgentRpmArch}/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi`,
         '# Clear stale registration from AMI build and restart fresh',
         'systemctl stop amazon-ssm-agent 2>/dev/null || true',
         'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
@@ -309,7 +326,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Create sender instance
     const senderInstance = new ec2.Instance(this, 'DpdkSender', {
       vpc,
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5N, ec2.InstanceSize.LARGE),
+      instanceType: ec2.InstanceType.of(instanceClass, instanceSize),
       machineImage,
       securityGroup: mgmtSecurityGroup,
       userData: senderUserData,
@@ -333,7 +350,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Create receiver instance
     const receiverInstance = new ec2.Instance(this, 'DpdkReceiver', {
       vpc,
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5N, ec2.InstanceSize.LARGE),
+      instanceType: ec2.InstanceType.of(instanceClass, instanceSize),
       machineImage,
       securityGroup: mgmtSecurityGroup,
       userData: receiverUserData,

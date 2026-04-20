@@ -1,0 +1,223 @@
+name: Performance Tests (Graviton)
+
+on:
+  workflow_dispatch:
+    inputs:
+      packet_sizes:
+        description: 'Comma-separated packet sizes (bytes)'
+        required: false
+        default: '64,512,1400,8500'
+      duration:
+        description: 'Seconds per rate step'
+        required: false
+        default: '30'
+      rate_steps:
+        description: 'Comma-separated target PPS values'
+        required: false
+        default: '70000,140000,350000,700000'
+      configs:
+        description: 'DUT configs to benchmark'
+        required: false
+        default: 'plain-rust,rust-dpdk,tokio-dpdk,native-dpdk'
+      teardown:
+        description: 'Destroy stack after tests'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: perf-tests-graviton
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Synthesize PerfTestStackGraviton
+        run: |
+          cd deploy/cdk
+          npx cdk synth PerfTestStackGraviton --quiet
+
+  perf-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: validate-cdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch AMI IDs from SSM
+        id: amis
+        run: |
+          DPDK_AMI=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/graviton/latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          TREX_AMI=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/trex-latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          echo "dpdk_ami=${DPDK_AMI}" >> "$GITHUB_OUTPUT"
+          echo "trex_ami=${TREX_AMI}" >> "$GITHUB_OUTPUT"
+
+          echo "Graviton DPDK AMI: ${DPDK_AMI:-none}"
+          echo "TRex AMI (x86): ${TREX_AMI:-none}"
+
+          if [[ -z "$TREX_AMI" ]]; then
+            echo "::warning::No TRex AMI found. Run the 'Build TRex AMI' workflow first."
+          fi
+          if [[ -z "$DPDK_AMI" ]]; then
+            echo "::warning::No Graviton DPDK AMI found. Run the 'Build DPDK AMI (Graviton)' workflow first."
+          fi
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          echo "number=${PR}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run performance tests
+        id: tests
+        run: |
+          chmod +x scripts/run-perf-tests.sh
+
+          TEARDOWN_FLAG=""
+          if [[ "${{ inputs.teardown }}" == "false" ]]; then
+            TEARDOWN_FLAG="--no-teardown"
+          else
+            TEARDOWN_FLAG="--teardown"
+          fi
+
+          ./scripts/run-perf-tests.sh \
+            $TEARDOWN_FLAG \
+            --packet-sizes "${{ inputs.packet_sizes || '64,512,1400,8500' }}" \
+            --duration "${{ inputs.duration || '30' }}" \
+            --rate-steps "${{ inputs.rate_steps || '70000,140000,350000,700000' }}" \
+            --configs "${{ inputs.configs || 'plain-rust,rust-dpdk,tokio-dpdk,native-dpdk' }}" \
+            --json-summary
+        env:
+          CDK_STACK_NAME: PerfTestStackGraviton
+          DPDK_AMI_CDK_CONTEXT_KEY: gravitonDpdkAmiId
+          DPDK_AMI_ID: ${{ steps.amis.outputs.dpdk_ami }}
+          TREX_AMI_ID: ${{ steps.amis.outputs.trex_ami }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.ref_name }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          REPORT="/tmp/perf-failure-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "## Performance Test Failure — Graviton ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+          fi
+
+          for log in instance-logs/*-user-data.log; do
+            [ -f "$log" ] || continue
+            echo "### $(basename "$log") (last 80 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -80 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+
+          cat "$REPORT"
+
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post failure report to PR"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-graviton
+          path: perf-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-instance-logs-graviton
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Safety net teardown
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          if [[ "${{ inputs.teardown }}" != "false" ]]; then
+            cd deploy/cdk
+            npx cdk destroy PerfTestStackGraviton --force || echo "Teardown failed (may already be destroyed)"
+          fi

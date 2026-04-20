@@ -1,0 +1,162 @@
+name: Build DPDK AMI (Graviton)
+
+on:
+  schedule:
+    - cron: '0 4 * * 0,3' # Sunday and Wednesday 4:00 AM UTC (twice weekly)
+  workflow_dispatch:
+    inputs:
+      dpdk_version:
+        description: 'DPDK version to build'
+        required: false
+        default: '22.11.6'
+  push:
+    branches: [main]
+    paths:
+      - 'packer/dpdk-ami-graviton.pkr.hcl'
+      - 'scripts/install_dpdk_amazon_linux.sh'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  SSM_AMI_PARAMETER: /dpdk-stdlib-rust/ami/graviton/latest
+  SSM_DPDK_VERSION_PARAMETER: /dpdk-stdlib-rust/ami/graviton/dpdk-version
+
+jobs:
+  build-ami:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: 'latest'
+
+      - name: Initialize Packer
+        run: |
+          cd packer
+          packer init dpdk-ami-graviton.pkr.hcl
+
+      - name: Validate Packer template
+        run: |
+          cd packer
+          packer validate dpdk-ami-graviton.pkr.hcl
+
+      - name: Build AMI
+        id: build
+        run: |
+          cd packer
+          DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
+
+          set +e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "dpdk_version=${DPDK_VERSION}" \
+            -machine-readable \
+            dpdk-ami-graviton.pkr.hcl 2>&1 | tee packer-output.log
+          PACKER_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $PACKER_EXIT -ne 0 ]]; then
+            PACKER_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
+            PACKER_LAST_UI=$(grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -3 | tr '\n' ' ' || echo "unknown")
+            echo "::error::Packer build failed (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}. Last output: ${PACKER_LAST_UI}"
+
+            {
+              echo "## Packer Build Failed (exit code ${PACKER_EXIT})"
+              echo ""
+              echo "### Error Messages"
+              echo '```'
+              grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
+              echo '```'
+              echo ""
+              echo "### Last 80 UI Messages"
+              echo '```'
+              grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -80 || echo "(none)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit $PACKER_EXIT
+          fi
+
+          AMI_ID=$(grep 'artifact,0,id' packer-output.log | awk -F, '{print $NF}' | awk -F: '{print $NF}')
+
+          if [[ -z "$AMI_ID" || ! "$AMI_ID" =~ ^ami- ]]; then
+            echo "::error::Failed to extract AMI ID from Packer output"
+            tail -80 packer-output.log
+            exit 1
+          fi
+
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          echo "dpdk_version=${DPDK_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Built Graviton AMI: ${AMI_ID}"
+
+      - name: Upload Packer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-graviton-output-log
+          path: packer/packer-output.log
+          retention-days: 7
+
+      - name: Store AMI ID in SSM Parameter Store
+        run: |
+          AMI_ID="${{ steps.build.outputs.ami_id }}"
+          DPDK_VERSION="${{ steps.build.outputs.dpdk_version }}"
+
+          if [[ -z "$AMI_ID" ]]; then
+            echo "::error::AMI ID is empty, cannot store in SSM"
+            exit 1
+          fi
+
+          echo "Storing Graviton AMI ID ${AMI_ID} in SSM..."
+          aws ssm put-parameter \
+            --name "${{ env.SSM_AMI_PARAMETER }}" \
+            --type String \
+            --value "${AMI_ID}" \
+            --overwrite \
+            --description "Latest Graviton DPDK AMI for dpdk-stdlib-rust integration tests"
+
+          aws ssm put-parameter \
+            --name "${{ env.SSM_DPDK_VERSION_PARAMETER }}" \
+            --type String \
+            --value "${DPDK_VERSION}" \
+            --overwrite \
+            --description "DPDK version in the latest pre-built Graviton AMI"
+
+          echo "Stored Graviton AMI ID ${AMI_ID} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
+
+      - name: Deregister old Graviton AMIs (keep last 3)
+        run: |
+          OLD_AMIS=$(aws ec2 describe-images \
+            --owners self \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=tag:Arch,Values=arm64" \
+            --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
+            --output text)
+
+          for ami_id in $OLD_AMIS; do
+            echo "Deregistering old Graviton AMI: $ami_id"
+            SNAPSHOTS=$(aws ec2 describe-images \
+              --image-ids "$ami_id" \
+              --query "Images[0].BlockDeviceMappings[*].Ebs.SnapshotId" \
+              --output text)
+
+            aws ec2 deregister-image --image-id "$ami_id"
+
+            for snap_id in $SNAPSHOTS; do
+              echo "Deleting snapshot: $snap_id"
+              aws ec2 delete-snapshot --snapshot-id "$snap_id" || true
+            done
+          done

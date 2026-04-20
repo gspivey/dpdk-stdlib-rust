@@ -37,7 +37,7 @@ RATE_STEPS="70000,140000,350000,700000"
 CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
 JSON_SUMMARY=false
 
-CDK_STACK_NAME="PerfTestStack"
+CDK_STACK_NAME="${CDK_STACK_NAME:-PerfTestStack}"
 CDK_DIR="$REPO_ROOT/deploy/cdk"
 RESULTS_DIR="$REPO_ROOT/perf-results"
 LOGS_DIR="$REPO_ROOT/instance-logs"
@@ -1741,9 +1741,9 @@ main() {
     # ── Phase 1: Deploy ──────────────────────────────────────────────────────
 
     if [[ "$SKIP_DEPLOY" == "false" ]]; then
-        log_info "Phase 1: Deploying PerfTestStack..."
+        log_info "Phase 1: Deploying $CDK_STACK_NAME..."
         post_pr_comment "## [Perf] Stage: Deploy
-Deploying \`PerfTestStack\`...
+Deploying \`$CDK_STACK_NAME\`...
 Configs: \`$CONFIGS\`
 Packet sizes: \`$PACKET_SIZES\`"
 
@@ -1760,7 +1760,7 @@ Packet sizes: \`$PACKET_SIZES\`"
         if [[ -n "${TREX_AMI_ID:-}" ]]; then trex_ami="$TREX_AMI_ID"; fi
 
         if [[ -n "$dpdk_ami" ]]; then
-            context_args="$context_args -c dpdkAmiId=$dpdk_ami"
+            context_args="$context_args -c ${DPDK_AMI_CDK_CONTEXT_KEY:-dpdkAmiId}=$dpdk_ami"
             log_info "Using pre-built DPDK AMI: $dpdk_ami"
         fi
         if [[ -n "$trex_ami" ]]; then

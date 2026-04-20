@@ -1,0 +1,304 @@
+name: Integration Tests (Graviton)
+
+on:
+  pull_request:
+    branches: [main, development]
+  workflow_dispatch: {}
+
+concurrency:
+  group: integration-tests-graviton
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  synthetic-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-synth-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-synth-
+
+      - name: Run synthetic benchmark
+        id: bench
+        run: |
+          cargo build --release -p synthetic-bench
+          cargo run --release -p synthetic-bench > /tmp/bench-results.md 2>/tmp/bench-stderr.log
+          cat /tmp/bench-stderr.log >&2
+          cat /tmp/bench-results.md
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then exit 0; fi
+
+          REPORT="/tmp/synth-perf-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "## Synthetic Performance Results — Graviton ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          cat /tmp/bench-results.md >> "$REPORT"
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post synthetic perf PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-bench-results-graviton
+          path: /tmp/bench-results.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Validate CDK template
+        run: |
+          chmod +x scripts/validate-cdk.sh
+          ./scripts/validate-cdk.sh
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    needs: validate-cdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch Graviton DPDK AMI ID from SSM
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/graviton/latest \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$AMI_ID" ]]; then
+            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+            echo "Using pre-built Graviton DPDK AMI: ${AMI_ID}"
+          else
+            echo "ami_id=" >> "$GITHUB_OUTPUT"
+            echo "No pre-built Graviton AMI found, will use stock AL2023 arm64 with full bootstrap"
+          fi
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run integration tests
+        id: tests
+        run: |
+          chmod +x scripts/run-integration-tests.sh
+          chmod +x scripts/integration-tests/*.sh
+          ./scripts/run-integration-tests.sh --teardown --json-summary
+        env:
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          CDK_STACK_NAME: DpdkTestStackGraviton
+          CDK_AMI_CONTEXT_KEY: gravitonAmiId
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== Failure Diagnostics ==="
+          REPORT="/tmp/failure-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "## Integration Test Failure — Graviton (Run ${{ github.run_id }})" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${{ github.sha }}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "### failure-summary.json" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            echo "### $(basename "$log") (${LOGSIZE} bytes, last 80 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -80 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          cat "$REPORT"
+
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post PR comment"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post instance logs to PR
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then exit 0; fi
+
+          REPORT="/tmp/instance-logs-report.md"
+          OUTCOME="${{ steps.tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ Integration Tests Passed — Graviton ([run](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ Integration Tests Failed — Graviton ([run](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          echo "### Test Results" >> "$REPORT"
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures" >> "$REPORT"
+          done
+          echo "" >> "$REPORT"
+
+          echo "### Application Logs (last 20 lines)" >> "$REPORT"
+          for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "**$(basename "$log")**" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-report.md
+            mv /tmp/truncated-report.md "$REPORT"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post instance logs PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results-graviton
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-logs-graviton
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: EC2 Integration Tests (Graviton)
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-error: true
+          fail-on-empty: false
+
+      - name: Safety net teardown
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          cd deploy/cdk
+          npx cdk destroy DpdkTestStackGraviton --force || echo "Teardown failed (may already be destroyed)"
