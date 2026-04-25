@@ -54,6 +54,7 @@ pub mod topology;
 pub mod perf;
 pub mod frame_pool;
 pub mod gue;
+pub mod ipv6;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
@@ -68,6 +69,14 @@ pub use perf::{
 };
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
 pub use gue::{GueConfig, GueHeader, GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD};
+pub use ipv6::{
+    build_udp6_frame, build_udp6_frame_into, parse_udp6_packet, parse_udp6_packet_ref,
+    udp6_checksum, udp6_pseudo_header_checksum, verify_udp6_checksum, walk_extension_headers,
+    ParsedUdp6Packet, ParsedUdp6PacketRef, Ipv6NextHeader,
+    ETH_TYPE_IPV6, IPV6_HEADER_LEN, MAX_UDP_PAYLOAD_V6, TOTAL_HEADER_LEN_V6,
+    TOTAL_HEADER_LEN_V6_VLAN, IP_PROTO_HOPOPT, IP_PROTO_ROUTING, IP_PROTO_FRAGMENT,
+    IP_PROTO_ICMPV6, IP_PROTO_DSTOPTS, IP_PROTO_NONE,
+};
 
 // ============================================================================
 // Error Types
