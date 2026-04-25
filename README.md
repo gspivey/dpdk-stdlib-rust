@@ -451,7 +451,7 @@ Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwi
 
 **IPv6** — Full dual-stack support: IPv6 addresses accepted anywhere IPv4 is today, 40-byte IPv6 headers on the wire, NDP (the IPv6 replacement for ARP), and ICMPv6 (echo + errors).
 
-- [ ] **1. IPv6 header build/parse** — 40-byte fixed header, plus extension-header chain walk (Hop-by-Hop, Routing, Fragment, Destination Options) to locate the L4 payload. New `dpdk-udp/src/ipv6.rs`.
+- [x] **1. IPv6 header build/parse** — 40-byte fixed header, plus extension-header chain walk (Hop-by-Hop, Routing, Fragment, Destination Options) to locate the L4 payload. New `dpdk-udp/src/ipv6.rs`. *(PR [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49), 34 tests)*
 - [ ] **2. UDP over IPv6 checksum** — mandatory IPv6 pseudo-header checksum (unlike IPv4 where UDP checksum is optional). `verify_udp6_checksum` / `udp6_pseudo_header_checksum` helpers parallel to the existing IPv4 helpers.
 - [ ] **3. `SocketAddrV6` through `UdpSocket`** — `bind` / `send_to` / `recv_from` / `connect` / `local_addr` / `peer_addr` accept and return IPv6 addresses. `set_only_v6` / `only_v6` socket option. `AddressFamily` state on the socket so the send/recv paths pick the right wire format.
 - [ ] **4. IPv6 hardware offload flags** — TX: set `RTE_MBUF_F_TX_IPV6` + `RTE_MBUF_F_TX_UDP_CKSUM` with the IPv6 pseudo-header checksum in the UDP field. RX: validate IPv6 UDP checksums (honor `PKT_RX_L4_CKSUM_GOOD`). Software fallback on NICs without support. `has_tx_ipv6_cksum_offload()` accessor.
