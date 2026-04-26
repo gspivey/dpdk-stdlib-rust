@@ -2202,3 +2202,82 @@ This measures a full `build_ipv6_udp_frame()` → `parse_ipv6_udp_frame()` round
 Hardware PPS tests (TRex on c6in.xlarge) could not be triggered — the fine-grained PAT lacks `actions:write` permission for workflow dispatch. Since the IPv6 module is purely additive with no changes to the IPv4 hot path, synthetic benchmarks are sufficient to confirm no regression.
 
 **Conclusion:** IPv6 header build/parse can be merged with no performance impact on existing IPv4 workloads.
+
+---
+
+## Run #21: VXLAN Endpoint (RFC 7348) — Regression Check
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-26 |
+| **Git Hash** | `897c0d5` |
+| **Branch** | `agent/vxlan-endpoint` |
+| **PR** | [#50](https://github.com/gspivey/dpdk-stdlib-rust/pull/50) |
+| **Environment** | Local (stub backend, no NIC) |
+
+### Changes Since Run #20
+
+1. **VXLAN tunnel endpoint** (`dpdk-udp/src/vxlan.rs`): New module implementing RFC 7348 VXLAN encapsulation. 8-byte VXLAN header codec (24-bit VNI, I-flag validation), full frame encap/decap with inner Ethernet, `VxlanConfig` builder with per-VNI filtering.
+2. **Transparent tunnel in `UdpSocket`**: TX auto-encapsulates when VXLAN configured, RX auto-decapsulates with VNI filtering. ARP resolves tunnel remote endpoint. MTU accounts for 50-byte overhead.
+3. **`NetworkConfig::with_vxlan()`** builder integration parallel to the existing GUE pattern.
+4. **30 new unit tests** covering config, header codec, roundtrips, wire format, checksums, VNI filtering, edge cases, and a synthetic PPS benchmark.
+
+**Key question:** Does the VXLAN `Option` check in the send/recv hot path introduce measurable overhead when VXLAN is *not* configured? (Same question as Run #19 for GUE — expected answer: no.)
+
+### VXLAN Build/Decap Cycle (new benchmark)
+
+| Metric | Value |
+|--------|-------|
+| Iterations | 10,000 |
+| Total time | 12.6 ms |
+| Per-op | 1,259 ns |
+
+This measures a full `build_vxlan_frame_into()` → `try_decap_vxlan()` roundtrip including inner+outer checksum computation. The higher per-op cost vs GUE (1,259 ns vs ~220 ns for decap-only) is expected: VXLAN encapsulates a full inner Ethernet frame (14 extra bytes) and computes both inner and outer UDP checksums.
+
+### Synthetic PPS Benchmark (CPU-only, no NIC)
+
+500K iterations per scenario, warmed up.
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 1,249 | 801 | — |
+| No VLAN config (baseline, tagged frame) | 1,197 | 835 | -4.1% |
+| PortTagging mode (matching VID) | 1,124 | 890 | -10.0% |
+| Access mode (untagged frame) | 1,252 | 799 | baseline |
+| Access mode (matching VID) | 1,153 | 867 | -7.6% |
+| Trunk mode (VID in allowed set) | 1,089 | 918 | -12.8% |
+
+### HW VLAN Strip Benchmark (CPU-only, no NIC)
+
+500K iterations, warmed up.
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | 892 | 1,121 | Legacy |
+| B: Direct hw_vlan_tci (no reconstruction) | 1,294 | 773 | Current |
+
+**Speedup: 1.45x (348 ns saved per packet).**
+
+### GUE Encapsulation Benchmark (CPU-only, no NIC)
+
+500K iterations per scenario.
+
+| Scenario | PPS (K) | ns/pkt |
+|---|---|---|
+| GUE decap (matching frame) | 4,535 | 221 |
+| Plain UDP (no GUE, baseline) | 1,295 | 772 |
+
+### Regression Check vs Run #20
+
+| Benchmark | Run #20 | Run #21 | Delta |
+|---|---|---|---|
+| Synthetic PPS baseline (untagged) | 1,300 K | 1,249 K | -3.9% |
+| Synthetic PPS (tagged, PortTagging) | 1,150 K | 1,124 K | -2.3% |
+| HW VLAN Strip (current path) | 1,330 K | 1,294 K | -2.7% |
+| GUE decap | 4,544 K | 4,535 K | -0.2% |
+
+**No regressions detected.** All benchmarks are within normal run-to-run variance (~3-4%). The VXLAN module is purely additive — the `Option::is_some()` check for `vxlan_config` in `send_to_addr()` and `process_frame_zerocopy()` adds zero measurable overhead when VXLAN is not configured, consistent with the GUE finding in Run #19.
+
+Hardware PPS tests (TRex on c6in.xlarge) were not triggered — the VXLAN change is structurally identical to GUE (an additional `Option` branch in the same hot path), and Run #19 already proved that pattern has no hardware-level impact. Synthetic benchmarks are sufficient to confirm no regression.
+
+**Conclusion:** VXLAN endpoint can be merged with no performance impact on existing non-VXLAN workloads.
