@@ -6669,4 +6669,110 @@ mod tests {
         println!("GUE overhead: {:.0} ns/pkt ({:.1}%)", overhead, overhead_pct);
         println!("{}", "=".repeat(80));
     }
+
+    // ── Cross-tunnel isolation tests (GUE + VXLAN) ──
+
+    #[test]
+    fn vxlan_rx_decapsulates_matching_frame() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vxlan(Some(vxlan::VxlanConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let mut frame = Vec::new();
+        vxlan::build_vxlan_frame_into(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            4789, 4789, 100,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"vxlan payload", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+
+        assert!(result.is_some(), "VXLAN frame should be decapsulated");
+        let (len, src_addr) = result.unwrap();
+        assert_eq!(&buf[..len], b"vxlan payload");
+        assert_eq!(src_addr, SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(192, 168, 1, 10), 9000,
+        )));
+    }
+
+    #[test]
+    fn vxlan_rx_rejects_wrong_vni() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_vxlan(Some(vxlan::VxlanConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let mut frame = Vec::new();
+        vxlan::build_vxlan_frame_into(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            4789, 4789, 999, // wrong VNI
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"wrong vni", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "VXLAN frame with wrong VNI should be rejected");
+    }
+
+    #[test]
+    fn gue_socket_ignores_vxlan_frame_and_vice_versa() {
+        // A GUE-configured socket should not decap a VXLAN frame
+        let mut gue_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gue_port = socket_local_port(&gue_socket);
+        gue_socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let mut vxlan_frame = Vec::new();
+        vxlan::build_vxlan_frame_into(
+            &mut vxlan_frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            4789, 4789, 100,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, gue_port,
+            b"vxlan for gue socket", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        gue_socket.process_frame_zerocopy(&vxlan_frame, gue_port, &mut buf, &mut result, None);
+        // GUE socket should not match VXLAN frame (different outer UDP port)
+        assert!(result.is_none(), "GUE socket should not decap a VXLAN frame");
+
+        // A VXLAN-configured socket should not decap a GUE frame
+        let mut vxlan_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let vxlan_port = socket_local_port(&vxlan_socket);
+        vxlan_socket.set_vxlan(Some(vxlan::VxlanConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let gue_frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000, vxlan_port, 6080,
+            b"gue for vxlan socket",
+        );
+
+        let mut buf2 = [0u8; 1500];
+        let mut result2 = None;
+        vxlan_socket.process_frame_zerocopy(&gue_frame, vxlan_port, &mut buf2, &mut result2, None);
+        // VXLAN socket should not match GUE frame (different outer UDP port)
+        assert!(result2.is_none(), "VXLAN socket should not decap a GUE frame");
+    }
 }
