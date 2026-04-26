@@ -55,6 +55,7 @@ pub mod perf;
 pub mod frame_pool;
 pub mod gue;
 pub mod ipv6;
+pub mod vxlan;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
@@ -69,6 +70,10 @@ pub use perf::{
 };
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
 pub use gue::{GueConfig, GueHeader, GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD};
+pub use vxlan::{
+    VxlanConfig, VxlanHeader, VxlanDecapResult, VXLAN_DEFAULT_PORT, VXLAN_ENCAP_OVERHEAD,
+    VXLAN_HEADER_LEN, VXLAN_VNI_MAX, build_vxlan_frame_into, try_decap_vxlan,
+};
 pub use ipv6::{
     build_udp6_frame, build_udp6_frame_into, parse_udp6_packet, parse_udp6_packet_ref,
     udp6_checksum, udp6_pseudo_header_checksum, verify_udp6_checksum, walk_extension_headers,
