@@ -400,7 +400,7 @@ The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) ha
 | Feature | Kernel | Us | Impact |
 |---------|--------|-----|--------|
 | **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **UDP encapsulation (VXLAN/GENEVE)** | Tunnel endpoint support | GUE done, VXLAN/GENEVE planned | Planned |
+| **UDP encapsulation (VXLAN/GENEVE)** | Tunnel endpoint support | GUE + VXLAN done, GENEVE planned | Partial |
 | **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
 | **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
 | **GSO/GRO** | Batch segmentation/coalescing for bulk transfers | Single-packet TX/RX | Not planned |
@@ -445,6 +445,8 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **GUE endpoint (Generic UDP Encapsulation)** — Lightweight L3-over-UDP tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (default port 6080) + 4-byte GUE header + inner IPv4 + inner UDP + payload. The 32-byte encapsulation overhead is the smallest of the three planned tunnel protocols. Configurable per-socket via `set_gue(Some(GueConfig::new(remote_ip)))` or through `NetworkConfig::with_gue()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the GUE tunnel automatically. RX decapsulates matching frames and returns the inner source address to the application. ARP resolution targets the tunnel remote endpoint. MTU check accounts for the 32-byte overhead. Ships with IPv4 outer and inner IPv4; inner IPv6 will be supported automatically once IPv6 header build/parse lands. 23 unit tests including a synthetic PPS benchmark measuring GUE decapsulation overhead.
 
+**VXLAN endpoint (RFC 7348)** — High-performance VXLAN tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (dst port 4789) + 8-byte VXLAN header (24-bit VNI) + inner Ethernet frame. Per-socket VNI filtering on RX, builder API for TX. Configurable per-socket via `set_vxlan(Some(VxlanConfig::new(remote_ip, vni)))` or through `NetworkConfig::with_vxlan()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the VXLAN tunnel automatically. RX decapsulates matching frames (VNI filter) and returns the inner source address to the application. Inner payload is self-describing Ethernet, so inner IPv4 and inner IPv6 both work from day one. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" roadmap item. 30 unit tests including a synthetic PPS benchmark measuring VXLAN build+decap overhead.
+
 ### Planned
 
 Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwise. IPv6 is a multi-PR feature with a sub-task checklist; it only moves to Done when every box is ticked and a final performance run shows no regression vs the IPv4 baseline.
@@ -460,8 +462,6 @@ Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwi
 - [ ] **7. ICMPv6 echo reply** — auto-respond to `ping6`, parallel to our existing IPv4 ICMP echo reply.
 - [ ] **8. ICMPv6 error handling** — Destination Unreachable, Packet Too Big (with Next-Hop MTU), Time Exceeded, and Parameter Problem parsed and matched back to the originating socket. Plugs into the existing per-socket error queue (introduced for IPv4 ICMP errors) so `take_error()` works for IPv6 destinations too.
 - [ ] **9. Performance tests** — TRex PPS run at 64 / 512 / 1400B, plus the synthetic CPU-only benchmark, compared against the IPv4 baseline. Results posted to `docs/perf-test-log.md`. No PPS regression vs IPv4 required to cross off the IPv6 feature.
-
-**VXLAN endpoint (RFC 7348)** — High-performance VXLAN tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (dst port 4789) + 8-byte VXLAN header (24-bit VNI) + inner Ethernet frame. Per-socket VNI filtering on RX, builder API for TX. Inner payload is self-describing Ethernet, so inner IPv4 and inner IPv6 both work from day one. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" item below. New `vxlan-echo` demo app.
 
 **GENEVE endpoint (RFC 8926)** — Modern overlay tunnel: outer Ethernet + outer IPv4 + outer UDP (dst port 6081) + Geneve base header + variable-length TLV options (class / type / length / value, up to 252 bytes). Same frame shape as VXLAN plus extensible metadata — used by OVN, NSX-T, and AWS Gateway Load Balancer. Inner Ethernet (self-describing). Ships with IPv4 outer.
 
