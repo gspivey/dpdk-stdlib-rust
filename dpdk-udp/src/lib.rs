@@ -1916,6 +1916,10 @@ pub struct UdpSocket {
     /// GUE (outer UDP + 4-byte GUE header + inner IPv4/UDP) on TX, and
     /// decapsulated on RX.
     gue_config: Option<gue::GueConfig>,
+    /// Optional VXLAN tunnel configuration. When set, packets are encapsulated in
+    /// VXLAN (outer UDP + 8-byte VXLAN header + inner Ethernet frame) on TX, and
+    /// decapsulated on RX with per-VNI filtering.
+    vxlan_config: Option<vxlan::VxlanConfig>,
     /// Number of UDP payloads dropped because the socket receive buffer was full.
     /// Lock-free read via `recv_drops()` — mirrors Linux `sk_drops`.
     rx_dropped_packets: AtomicU64,
@@ -2019,6 +2023,7 @@ impl UdpSocket {
             routing_table,
             vlan_config: None,
             gue_config: None,
+            vxlan_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2135,6 +2140,7 @@ impl UdpSocket {
             routing_table,
             vlan_config: None,
             gue_config: None,
+            vxlan_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2235,8 +2241,10 @@ impl UdpSocket {
         };
 
         // Reject payloads that exceed the MTU-derived limit.
-        // GUE encapsulation adds 32 bytes of overhead (outer IP + outer UDP + GUE header).
-        let max_payload = if self.gue_config.is_some() {
+        // GUE encapsulation adds 32 bytes, VXLAN adds 50 bytes of overhead.
+        let max_payload = if self.vxlan_config.is_some() {
+            self.routing_table.max_udp_payload().saturating_sub(vxlan::VXLAN_ENCAP_OVERHEAD)
+        } else if self.gue_config.is_some() {
             self.routing_table.max_udp_payload().saturating_sub(gue::GUE_ENCAP_OVERHEAD)
         } else {
             self.routing_table.max_udp_payload()
@@ -2251,10 +2259,11 @@ impl UdpSocket {
             ));
         }
 
-        // When GUE is configured, ARP for the tunnel remote endpoint instead
-        // of the original destination. The outer frame is addressed to the
-        // tunnel peer; the inner addresses carry the original src/dst.
-        let arp_target_ip = if let Some(ref gue_cfg) = self.gue_config {
+        // When GUE or VXLAN is configured, ARP for the tunnel remote endpoint
+        // instead of the original destination.
+        let arp_target_ip = if let Some(ref vxlan_cfg) = self.vxlan_config {
+            vxlan_cfg.remote_ip
+        } else if let Some(ref gue_cfg) = self.gue_config {
             gue_cfg.remote_ip
         } else {
             dst_ip
@@ -2285,12 +2294,29 @@ impl UdpSocket {
 
         // Build frame into reusable buffer (zero-alloc) and send.
         //
-        // Three mutually exclusive modes:
+        // Four mutually exclusive modes:
+        //   VXLAN  -> encapsulate: outer-eth/outer-ip/outer-udp/vxlan/inner-eth/inner-ip/inner-udp/payload
         //   GUE    -> encapsulate: outer-eth/outer-ip/outer-udp/gue/inner-ip/inner-udp/payload
         //   VLAN   -> tag or hardware-offload per VlanMode
         //   Plain  -> standard untagged UDP frame
         let mut tx_buf = self.tx_buf.borrow_mut();
-        let hw_vlan_tci = if let Some(ref gue_cfg) = self.gue_config {
+        let hw_vlan_tci = if let Some(ref vxlan_cfg) = self.vxlan_config {
+            // VXLAN tunnel encapsulation
+            vxlan::build_vxlan_frame_into(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, vxlan_cfg.remote_ip,
+                vxlan_cfg.local_port, vxlan_cfg.remote_port,
+                vxlan_cfg.vni,
+                &vxlan_cfg.inner_src_mac,
+                &vxlan_cfg.inner_dst_mac,
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("VXLAN encap failed: {}", e)))?;
+            None
+        } else if let Some(ref gue_cfg) = self.gue_config {
             // GUE tunnel encapsulation
             gue::build_gue_frame_into(
                 &mut tx_buf,
@@ -2941,6 +2967,52 @@ impl UdpSocket {
             }
         }
 
+        // VXLAN RX decapsulation: if VXLAN is configured and the outer UDP dst_port
+        // matches the VXLAN local port, decapsulate the inner Ethernet/IPv4/UDP packet.
+        if let Some(ref vxlan_cfg) = self.vxlan_config {
+            if layout.ethertype == ETH_TYPE_IPV4 {
+                if let Some(decap) = vxlan::try_decap_vxlan(
+                    frame_data, layout.l3_offset, vxlan_cfg.local_port, Some(vxlan_cfg.vni),
+                ) {
+                    if decap.inner_dst_port != local_port {
+                        return None;
+                    }
+
+                    perf_inc!(self.perf_counters.rx_packets);
+                    perf_inc!(self.perf_counters.rx_bytes, decap.payload.len() as u64);
+
+                    let src_addr = SocketAddr::V4(
+                        SocketAddrV4::new(decap.inner_src_ip, decap.inner_src_port),
+                    );
+
+                    if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                        if src_addr != connected {
+                            let payload_len = decap.payload.len();
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                                self.record_rx_drop(payload_len);
+                            }
+                            return None;
+                        }
+                    }
+
+                    if result.is_none() {
+                        let copy_len = std::cmp::min(buf.len(), decap.payload.len());
+                        buf[..copy_len].copy_from_slice(&decap.payload[..copy_len]);
+                        *result = Some((copy_len, src_addr));
+                    } else {
+                        let payload_len = decap.payload.len();
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                            self.record_rx_drop(payload_len);
+                        }
+                    }
+
+                    return None;
+                }
+            }
+        }
+
         // Zero-copy UDP parse — payload borrows from frame_data.
         // Handles both tagged and untagged frames via detect_vlan internally.
         let parsed = match parse_udp_packet_ref(frame_data) {
@@ -3184,6 +3256,41 @@ impl UdpSocket {
         let base = self.routing_table.max_udp_payload();
         if self.gue_config.is_some() {
             base.saturating_sub(gue::GUE_ENCAP_OVERHEAD)
+        } else {
+            base
+        }
+    }
+
+    // ========================================================================
+    // VXLAN (RFC 7348) Configuration
+    // ========================================================================
+
+    /// Configure VXLAN tunnel encapsulation on this socket.
+    ///
+    /// When set, outgoing packets are encapsulated in a VXLAN tunnel:
+    /// `[Outer Eth][Outer IPv4][Outer UDP][VXLAN Header][Inner Eth][Inner IPv4][Inner UDP][Payload]`
+    ///
+    /// Incoming packets on the VXLAN port with a matching VNI are automatically
+    /// decapsulated, and the inner source address is returned to the application.
+    ///
+    /// Set to `None` to disable VXLAN (send/receive plain UDP).
+    pub fn set_vxlan(&mut self, config: Option<vxlan::VxlanConfig>) {
+        self.vxlan_config = config;
+    }
+
+    /// Returns the current VXLAN tunnel configuration, if any.
+    pub fn vxlan(&self) -> Option<&vxlan::VxlanConfig> {
+        self.vxlan_config.as_ref()
+    }
+
+    /// Returns the maximum UDP payload size accounting for VXLAN overhead.
+    ///
+    /// When VXLAN is configured, the effective max payload is reduced by 50 bytes
+    /// (outer IPv4 + outer UDP + VXLAN header + inner Ethernet).
+    pub fn max_vxlan_payload(&self) -> usize {
+        let base = self.routing_table.max_udp_payload();
+        if self.vxlan_config.is_some() {
+            base.saturating_sub(vxlan::VXLAN_ENCAP_OVERHEAD)
         } else {
             base
         }
@@ -3973,6 +4080,7 @@ impl UdpSocketBuilder {
         if let Some(mut net_config) = self.network_config {
             socket.vlan_config = net_config.vlan.take();
             socket.gue_config = net_config.gue.take();
+            socket.vxlan_config = net_config.vxlan.take();
             socket.routing_table = RoutingTable::with_config(net_config);
         }
 

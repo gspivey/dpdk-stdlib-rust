@@ -78,6 +78,9 @@ pub struct NetworkConfig {
     /// Optional GUE tunnel configuration. When set, packets are encapsulated
     /// in a GUE tunnel on TX and decapsulated on RX.
     pub gue: Option<crate::gue::GueConfig>,
+    /// Optional VXLAN tunnel configuration. When set, packets are encapsulated
+    /// in a VXLAN tunnel on TX and decapsulated on RX with per-VNI filtering.
+    pub vxlan: Option<crate::vxlan::VxlanConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -90,6 +93,7 @@ impl Default for NetworkConfig {
             mtu: 1500,
             vlan: None,
             gue: None,
+            vxlan: None,
         }
     }
 }
@@ -131,6 +135,12 @@ impl NetworkConfig {
     /// Configure GUE tunnel encapsulation.
     pub fn with_gue(mut self, gue: crate::gue::GueConfig) -> Self {
         self.gue = Some(gue);
+        self
+    }
+
+    /// Configure VXLAN tunnel encapsulation.
+    pub fn with_vxlan(mut self, vxlan: crate::vxlan::VxlanConfig) -> Self {
+        self.vxlan = Some(vxlan);
         self
     }
 
