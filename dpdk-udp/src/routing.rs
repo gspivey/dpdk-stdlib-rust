@@ -81,6 +81,9 @@ pub struct NetworkConfig {
     /// Optional VXLAN tunnel configuration. When set, packets are encapsulated
     /// in a VXLAN tunnel on TX and decapsulated on RX with per-VNI filtering.
     pub vxlan: Option<crate::vxlan::VxlanConfig>,
+    /// Optional GENEVE tunnel configuration. When set, packets are encapsulated
+    /// in a GENEVE tunnel on TX and decapsulated on RX with per-VNI filtering.
+    pub geneve: Option<crate::geneve::GeneveConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -94,6 +97,7 @@ impl Default for NetworkConfig {
             vlan: None,
             gue: None,
             vxlan: None,
+            geneve: None,
         }
     }
 }
@@ -141,6 +145,12 @@ impl NetworkConfig {
     /// Configure VXLAN tunnel encapsulation.
     pub fn with_vxlan(mut self, vxlan: crate::vxlan::VxlanConfig) -> Self {
         self.vxlan = Some(vxlan);
+        self
+    }
+
+    /// Configure GENEVE tunnel encapsulation.
+    pub fn with_geneve(mut self, geneve: crate::geneve::GeneveConfig) -> Self {
+        self.geneve = Some(geneve);
         self
     }
 
