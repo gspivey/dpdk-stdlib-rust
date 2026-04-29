@@ -1926,6 +1926,10 @@ pub struct UdpSocket {
     /// VXLAN (outer UDP + 8-byte VXLAN header + inner Ethernet frame) on TX, and
     /// decapsulated on RX with per-VNI filtering.
     vxlan_config: Option<vxlan::VxlanConfig>,
+    /// Optional GENEVE tunnel configuration. When set, packets are encapsulated in
+    /// GENEVE (outer UDP + variable-length GENEVE header + inner Ethernet frame) on TX,
+    /// and decapsulated on RX with per-VNI filtering.
+    geneve_config: Option<geneve::GeneveConfig>,
     /// Number of UDP payloads dropped because the socket receive buffer was full.
     /// Lock-free read via `recv_drops()` — mirrors Linux `sk_drops`.
     rx_dropped_packets: AtomicU64,
@@ -2030,6 +2034,7 @@ impl UdpSocket {
             vlan_config: None,
             gue_config: None,
             vxlan_config: None,
+            geneve_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2147,6 +2152,7 @@ impl UdpSocket {
             vlan_config: None,
             gue_config: None,
             vxlan_config: None,
+            geneve_config: None,
             rx_dropped_packets: AtomicU64::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
@@ -2247,9 +2253,11 @@ impl UdpSocket {
         };
 
         // Reject payloads that exceed the MTU-derived limit.
-        // GUE encapsulation adds 32 bytes, VXLAN adds 50 bytes of overhead.
+        // GUE encapsulation adds 32 bytes, VXLAN adds 50 bytes, GENEVE adds 50+ bytes of overhead.
         let max_payload = if self.vxlan_config.is_some() {
             self.routing_table.max_udp_payload().saturating_sub(vxlan::VXLAN_ENCAP_OVERHEAD)
+        } else if self.geneve_config.is_some() {
+            self.routing_table.max_udp_payload().saturating_sub(geneve::GENEVE_ENCAP_OVERHEAD)
         } else if self.gue_config.is_some() {
             self.routing_table.max_udp_payload().saturating_sub(gue::GUE_ENCAP_OVERHEAD)
         } else {
@@ -2265,10 +2273,12 @@ impl UdpSocket {
             ));
         }
 
-        // When GUE or VXLAN is configured, ARP for the tunnel remote endpoint
+        // When GUE, VXLAN, or GENEVE is configured, ARP for the tunnel remote endpoint
         // instead of the original destination.
         let arp_target_ip = if let Some(ref vxlan_cfg) = self.vxlan_config {
             vxlan_cfg.remote_ip
+        } else if let Some(ref geneve_cfg) = self.geneve_config {
+            geneve_cfg.remote_ip
         } else if let Some(ref gue_cfg) = self.gue_config {
             gue_cfg.remote_ip
         } else {
@@ -2300,11 +2310,12 @@ impl UdpSocket {
 
         // Build frame into reusable buffer (zero-alloc) and send.
         //
-        // Four mutually exclusive modes:
-        //   VXLAN  -> encapsulate: outer-eth/outer-ip/outer-udp/vxlan/inner-eth/inner-ip/inner-udp/payload
-        //   GUE    -> encapsulate: outer-eth/outer-ip/outer-udp/gue/inner-ip/inner-udp/payload
-        //   VLAN   -> tag or hardware-offload per VlanMode
-        //   Plain  -> standard untagged UDP frame
+        // Five mutually exclusive modes:
+        //   VXLAN   -> encapsulate: outer-eth/outer-ip/outer-udp/vxlan/inner-eth/inner-ip/inner-udp/payload
+        //   GENEVE  -> encapsulate: outer-eth/outer-ip/outer-udp/geneve/inner-eth/inner-ip/inner-udp/payload
+        //   GUE     -> encapsulate: outer-eth/outer-ip/outer-udp/gue/inner-ip/inner-udp/payload
+        //   VLAN    -> tag or hardware-offload per VlanMode
+        //   Plain   -> standard untagged UDP frame
         let mut tx_buf = self.tx_buf.borrow_mut();
         let hw_vlan_tci = if let Some(ref vxlan_cfg) = self.vxlan_config {
             // VXLAN tunnel encapsulation
@@ -2321,6 +2332,23 @@ impl UdpSocket {
                 src_port, dst_port,
                 buf, self.ttl,
             ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("VXLAN encap failed: {}", e)))?;
+            None
+        } else if let Some(ref geneve_cfg) = self.geneve_config {
+            // GENEVE tunnel encapsulation
+            let hdr = geneve::GeneveHeader::new(geneve_cfg.vni);
+            geneve::build_geneve_frame_into(
+                &mut tx_buf,
+                &src_mac,
+                &dst_mac.octets(),
+                src_ip, geneve_cfg.remote_ip,
+                geneve_cfg.local_port, geneve_cfg.remote_port,
+                &hdr,
+                &geneve_cfg.inner_src_mac,
+                &geneve_cfg.inner_dst_mac,
+                src_ip, dst_ip,
+                src_port, dst_port,
+                buf, self.ttl,
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("GENEVE encap failed: {}", e)))?;
             None
         } else if let Some(ref gue_cfg) = self.gue_config {
             // GUE tunnel encapsulation
@@ -3019,6 +3047,52 @@ impl UdpSocket {
             }
         }
 
+        // GENEVE RX decapsulation: if GENEVE is configured and the outer UDP dst_port
+        // matches the GENEVE local port, decapsulate the inner Ethernet/IPv4/UDP packet.
+        if let Some(ref geneve_cfg) = self.geneve_config {
+            if layout.ethertype == ETH_TYPE_IPV4 {
+                if let Some(decap) = geneve::try_decap_geneve(
+                    frame_data, layout.l3_offset, geneve_cfg.local_port, Some(geneve_cfg.vni),
+                ) {
+                    if decap.inner_dst_port != local_port {
+                        return None;
+                    }
+
+                    perf_inc!(self.perf_counters.rx_packets);
+                    perf_inc!(self.perf_counters.rx_bytes, decap.payload.len() as u64);
+
+                    let src_addr = SocketAddr::V4(
+                        SocketAddrV4::new(decap.inner_src_ip, decap.inner_src_port),
+                    );
+
+                    if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                        if src_addr != connected {
+                            let payload_len = decap.payload.len();
+                            let mut queue = self.recv_queue.lock().unwrap();
+                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                                self.record_rx_drop(payload_len);
+                            }
+                            return None;
+                        }
+                    }
+
+                    if result.is_none() {
+                        let copy_len = std::cmp::min(buf.len(), decap.payload.len());
+                        buf[..copy_len].copy_from_slice(&decap.payload[..copy_len]);
+                        *result = Some((copy_len, src_addr));
+                    } else {
+                        let payload_len = decap.payload.len();
+                        let mut queue = self.recv_queue.lock().unwrap();
+                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
+                            self.record_rx_drop(payload_len);
+                        }
+                    }
+
+                    return None;
+                }
+            }
+        }
+
         // Zero-copy UDP parse — payload borrows from frame_data.
         // Handles both tagged and untagged frames via detect_vlan internally.
         let parsed = match parse_udp_packet_ref(frame_data) {
@@ -3297,6 +3371,41 @@ impl UdpSocket {
         let base = self.routing_table.max_udp_payload();
         if self.vxlan_config.is_some() {
             base.saturating_sub(vxlan::VXLAN_ENCAP_OVERHEAD)
+        } else {
+            base
+        }
+    }
+
+    // ========================================================================
+    // GENEVE (RFC 8926) Configuration
+    // ========================================================================
+
+    /// Configure GENEVE tunnel encapsulation on this socket.
+    ///
+    /// When set, outgoing packets are encapsulated in a GENEVE tunnel:
+    /// `[Outer Eth][Outer IPv4][Outer UDP][GENEVE Header][Inner Eth][Inner IPv4][Inner UDP][Payload]`
+    ///
+    /// Incoming packets on the GENEVE port with a matching VNI are automatically
+    /// decapsulated, and the inner source address is returned to the application.
+    ///
+    /// Set to `None` to disable GENEVE (send/receive plain UDP).
+    pub fn set_geneve(&mut self, config: Option<geneve::GeneveConfig>) {
+        self.geneve_config = config;
+    }
+
+    /// Returns the current GENEVE tunnel configuration, if any.
+    pub fn geneve(&self) -> Option<&geneve::GeneveConfig> {
+        self.geneve_config.as_ref()
+    }
+
+    /// Returns the maximum UDP payload size accounting for GENEVE overhead.
+    ///
+    /// When GENEVE is configured, the effective max payload is reduced by 50 bytes
+    /// (outer IPv4 + outer UDP + GENEVE base header + inner Ethernet).
+    pub fn max_geneve_payload(&self) -> usize {
+        let base = self.routing_table.max_udp_payload();
+        if self.geneve_config.is_some() {
+            base.saturating_sub(geneve::GENEVE_ENCAP_OVERHEAD)
         } else {
             base
         }
@@ -4087,6 +4196,7 @@ impl UdpSocketBuilder {
             socket.vlan_config = net_config.vlan.take();
             socket.gue_config = net_config.gue.take();
             socket.vxlan_config = net_config.vxlan.take();
+            socket.geneve_config = net_config.geneve.take();
             socket.routing_table = RoutingTable::with_config(net_config);
         }
 
@@ -6780,5 +6890,167 @@ mod tests {
         vxlan_socket.process_frame_zerocopy(&gue_frame, vxlan_port, &mut buf2, &mut result2, None);
         // VXLAN socket should not match GUE frame (different outer UDP port)
         assert!(result2.is_none(), "VXLAN socket should not decap a GUE frame");
+    }
+
+    // ── GENEVE (RFC 8926) integration tests ──
+
+    #[test]
+    fn geneve_rx_decapsulates_matching_frame() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_geneve(Some(geneve::GeneveConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let hdr = geneve::GeneveHeader::new(100);
+        let mut frame = Vec::new();
+        geneve::build_geneve_frame_into(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            6081, 6081, &hdr,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"geneve payload", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+
+        assert!(result.is_some(), "GENEVE frame should be decapsulated");
+        let (len, src_addr) = result.unwrap();
+        assert_eq!(&buf[..len], b"geneve payload");
+        assert_eq!(src_addr, SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(192, 168, 1, 10), 9000,
+        )));
+    }
+
+    #[test]
+    fn geneve_rx_rejects_wrong_vni() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_geneve(Some(geneve::GeneveConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let hdr = geneve::GeneveHeader::new(999); // wrong VNI
+        let mut frame = Vec::new();
+        geneve::build_geneve_frame_into(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            6081, 6081, &hdr,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"wrong vni", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GENEVE frame with wrong VNI should be rejected");
+    }
+
+    #[test]
+    fn geneve_set_and_get() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(socket.geneve().is_none());
+
+        let cfg = geneve::GeneveConfig::new(Ipv4Addr::new(10, 0, 0, 2), 42);
+        socket.set_geneve(Some(cfg.clone()));
+        assert_eq!(socket.geneve().unwrap().vni, 42);
+        assert_eq!(socket.geneve().unwrap().remote_ip, Ipv4Addr::new(10, 0, 0, 2));
+
+        socket.set_geneve(None);
+        assert!(socket.geneve().is_none());
+    }
+
+    #[test]
+    fn geneve_max_payload_accounts_for_overhead() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let base = socket.max_geneve_payload();
+        socket.set_geneve(Some(geneve::GeneveConfig::new(Ipv4Addr::new(10, 0, 0, 2), 1)));
+        let with_geneve = socket.max_geneve_payload();
+        assert_eq!(base - with_geneve, geneve::GENEVE_ENCAP_OVERHEAD);
+    }
+
+    #[test]
+    fn geneve_config_via_network_config() {
+        let net_cfg = NetworkConfig::new(Ipv4Addr::new(10, 0, 1, 50), 24)
+            .with_geneve(geneve::GeneveConfig::new(Ipv4Addr::new(10, 0, 2, 1), 500));
+        assert!(net_cfg.geneve.is_some());
+        assert_eq!(net_cfg.geneve.as_ref().unwrap().vni, 500);
+    }
+
+    #[test]
+    fn geneve_rx_empty_payload() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_geneve(Some(geneve::GeneveConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let hdr = geneve::GeneveHeader::new(100);
+        let mut frame = Vec::new();
+        geneve::build_geneve_frame_into(
+            &mut frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            6081, 6081, &hdr,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "Empty GENEVE payload should be accepted");
+        let (len, _) = result.unwrap();
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn geneve_socket_ignores_vxlan_and_gue_frames() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket_local_port(&socket);
+        socket.set_geneve(Some(geneve::GeneveConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        // VXLAN frame should not be decapped by GENEVE socket
+        let mut vxlan_frame = Vec::new();
+        vxlan::build_vxlan_frame_into(
+            &mut vxlan_frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            4789, 4789, 100,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, port,
+            b"vxlan for geneve socket", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&vxlan_frame, port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GENEVE socket should not decap a VXLAN frame");
+
+        // GUE frame should not be decapped by GENEVE socket
+        let gue_frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000, port, 6080,
+            b"gue for geneve socket",
+        );
+
+        let mut buf2 = [0u8; 1500];
+        let mut result2 = None;
+        socket.process_frame_zerocopy(&gue_frame, port, &mut buf2, &mut result2, None);
+        assert!(result2.is_none(), "GENEVE socket should not decap a GUE frame");
     }
 }
