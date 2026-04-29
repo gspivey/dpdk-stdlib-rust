@@ -7053,4 +7053,104 @@ mod tests {
         socket.process_frame_zerocopy(&gue_frame, port, &mut buf2, &mut result2, None);
         assert!(result2.is_none(), "GENEVE socket should not decap a GUE frame");
     }
+
+    // ── Three-way cross-tunnel isolation (GUE + VXLAN + GENEVE) ──
+
+    #[test]
+    fn three_tunnel_protocols_coexist_independently() {
+        // Create three sockets, each configured for a different tunnel protocol.
+        // Send each protocol's frame to all three sockets and verify that only
+        // the matching socket decapsulates it.
+        let mut gue_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gue_port = socket_local_port(&gue_socket);
+        gue_socket.set_gue(Some(gue::GueConfig::new(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let mut vxlan_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let vxlan_port = socket_local_port(&vxlan_socket);
+        vxlan_socket.set_vxlan(Some(vxlan::VxlanConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 100,
+        )));
+
+        let mut geneve_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let geneve_port = socket_local_port(&geneve_socket);
+        geneve_socket.set_geneve(Some(geneve::GeneveConfig::new(
+            Ipv4Addr::new(10, 0, 0, 2), 200,
+        )));
+
+        // Build one frame per protocol, each targeting its own socket's port
+        let gue_frame = make_gue_frame(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            9000, gue_port, 6080,
+            b"gue-payload",
+        );
+
+        let mut vxlan_frame = Vec::new();
+        vxlan::build_vxlan_frame_into(
+            &mut vxlan_frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            4789, 4789, 100,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, vxlan_port,
+            b"vxlan-payload", 64,
+        ).unwrap();
+
+        let geneve_hdr = geneve::GeneveHeader::new(200);
+        let mut geneve_frame = Vec::new();
+        geneve::build_geneve_frame_into(
+            &mut geneve_frame,
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 1),
+            6081, 6081, &geneve_hdr,
+            &[0xcc; 6], &[0xdd; 6],
+            Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(127, 0, 0, 1),
+            9000, geneve_port,
+            b"geneve-payload", 64,
+        ).unwrap();
+
+        // GUE socket: should only decap GUE frame
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        gue_socket.process_frame_zerocopy(&gue_frame, gue_port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "GUE socket should decap GUE frame");
+        assert_eq!(&buf[..result.unwrap().0], b"gue-payload");
+
+        result = None;
+        gue_socket.process_frame_zerocopy(&vxlan_frame, gue_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GUE socket should reject VXLAN frame");
+
+        result = None;
+        gue_socket.process_frame_zerocopy(&geneve_frame, gue_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GUE socket should reject GENEVE frame");
+
+        // VXLAN socket: should only decap VXLAN frame
+        result = None;
+        vxlan_socket.process_frame_zerocopy(&vxlan_frame, vxlan_port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "VXLAN socket should decap VXLAN frame");
+        assert_eq!(&buf[..result.unwrap().0], b"vxlan-payload");
+
+        result = None;
+        vxlan_socket.process_frame_zerocopy(&gue_frame, vxlan_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "VXLAN socket should reject GUE frame");
+
+        result = None;
+        vxlan_socket.process_frame_zerocopy(&geneve_frame, vxlan_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "VXLAN socket should reject GENEVE frame");
+
+        // GENEVE socket: should only decap GENEVE frame
+        result = None;
+        geneve_socket.process_frame_zerocopy(&geneve_frame, geneve_port, &mut buf, &mut result, None);
+        assert!(result.is_some(), "GENEVE socket should decap GENEVE frame");
+        assert_eq!(&buf[..result.unwrap().0], b"geneve-payload");
+
+        result = None;
+        geneve_socket.process_frame_zerocopy(&gue_frame, geneve_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GENEVE socket should reject GUE frame");
+
+        result = None;
+        geneve_socket.process_frame_zerocopy(&vxlan_frame, geneve_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "GENEVE socket should reject VXLAN frame");
+    }
 }
