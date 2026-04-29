@@ -53,6 +53,7 @@ pub mod routing;
 pub mod topology;
 pub mod perf;
 pub mod frame_pool;
+pub mod geneve;
 pub mod gue;
 pub mod ipv6;
 pub mod vxlan;
@@ -70,6 +71,11 @@ pub use perf::{
 };
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
 pub use gue::{GueConfig, GueHeader, GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD};
+pub use geneve::{
+    GeneveConfig, GeneveHeader, GeneveDecapResult, GeneveTlvOption,
+    GENEVE_DEFAULT_PORT, GENEVE_ENCAP_OVERHEAD, GENEVE_BASE_HEADER_LEN,
+    GENEVE_VNI_MAX, build_geneve_frame_into, try_decap_geneve,
+};
 pub use vxlan::{
     VxlanConfig, VxlanHeader, VxlanDecapResult, VXLAN_DEFAULT_PORT, VXLAN_ENCAP_OVERHEAD,
     VXLAN_HEADER_LEN, VXLAN_VNI_MAX, build_vxlan_frame_into, try_decap_vxlan,
