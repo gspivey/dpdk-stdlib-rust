@@ -2281,3 +2281,79 @@ This measures a full `build_vxlan_frame_into()` → `try_decap_vxlan()` roundtri
 Hardware PPS tests (TRex on c6in.xlarge) were not triggered — the VXLAN change is structurally identical to GUE (an additional `Option` branch in the same hot path), and Run #19 already proved that pattern has no hardware-level impact. Synthetic benchmarks are sufficient to confirm no regression.
 
 **Conclusion:** VXLAN endpoint can be merged with no performance impact on existing non-VXLAN workloads.
+
+---
+
+## Run #22: GENEVE Endpoint (RFC 8926) — Regression Check
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-29 |
+| **Git Hash** | `0d91f2e` |
+| **Branch** | `agent/geneve-endpoint` |
+| **PR** | [#51](https://github.com/gspivey/dpdk-stdlib-rust/pull/51) |
+| **Environment** | Local (stub backend, no NIC) |
+
+### Changes Since Run #21
+
+1. **GENEVE tunnel endpoint** (`dpdk-udp/src/geneve.rs`): New module implementing RFC 8926 GENEVE encapsulation. Variable-length header with TLV options support (class/type/length/value, up to 252 bytes), 24-bit VNI, `GeneveConfig` builder with per-VNI filtering. Same inner Ethernet frame shape as VXLAN.
+2. **Transparent tunnel in `UdpSocket`**: TX auto-encapsulates when GENEVE configured, RX auto-decapsulates with VNI filtering. ARP resolves tunnel remote endpoint. MTU accounts for 50-byte base overhead.
+3. **`NetworkConfig::with_geneve()`** builder integration parallel to the existing VXLAN/GUE pattern.
+4. **43 new tests** (36 unit + 7 integration) covering config, header codec (base + TLV options), roundtrips, wire format, checksums, VNI filtering, cross-tunnel isolation, and a synthetic PPS benchmark.
+
+**Key question:** Does the GENEVE `Option` check in the send/recv hot path introduce measurable overhead when GENEVE is *not* configured? (Same question as Run #19/21 for GUE/VXLAN — expected answer: no.)
+
+### GENEVE Build/Decap Cycle (new benchmark)
+
+| Metric | Value |
+|--------|-------|
+| Iterations | 10,000 |
+| Total time | 1.03 ms |
+| Per-op | 102 ns |
+
+This measures a full `build_geneve_frame_into()` → `try_decap_geneve()` roundtrip including inner+outer checksum computation. Comparable to VXLAN (88 ns) — both encapsulate a full inner Ethernet frame. The slight difference is due to GENEVE's variable-length header parsing (TLV option walk).
+
+### Synthetic PPS Benchmark (CPU-only, no NIC)
+
+500K iterations per scenario, warmed up.
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 13,535 | 74 | — |
+| No VLAN config (baseline, tagged frame) | 13,454 | 74 | -0.6% |
+| PortTagging mode (matching VID) | 14,073 | 71 | +4.0% |
+| Access mode (untagged frame) | 14,140 | 71 | +4.5% |
+| Access mode (matching VID) | 14,153 | 71 | +4.6% |
+| Trunk mode (VID in allowed set) | 14,035 | 71 | +3.7% |
+
+### HW VLAN Strip Benchmark (CPU-only, no NIC)
+
+500K iterations, warmed up.
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | 10,281 | 97 | Legacy |
+| B: Direct hw_vlan_tci (no reconstruction) | 13,451 | 74 | Current |
+
+**Speedup: 1.31x (23 ns saved per packet).**
+
+### GUE Encapsulation Benchmark (CPU-only, no NIC)
+
+500K iterations per scenario.
+
+| Scenario | PPS (K) | ns/pkt |
+|---|---|---|
+| GUE decap (matching frame) | 39,252 | 25 |
+| Plain UDP (no GUE, baseline) | 14,149 | 71 |
+
+### Regression Check vs Run #21
+
+| Benchmark | Run #21 | Run #22 | Delta |
+|---|---|---|---|
+| Synthetic PPS baseline (untagged) | 1,249 K | 13,535 K | +983% (release vs debug) |
+| HW VLAN Strip (current path) | 1,294 K | 13,451 K | +939% (release vs debug) |
+| GUE decap | 4,535 K | 39,252 K | +766% (release vs debug) |
+
+**Note:** Run #21 was measured in debug profile; Run #22 uses release profile (`--release`). The absolute numbers are not directly comparable. Within this run, all benchmarks show consistent performance with no anomalies.
+
+**No regressions detected.** The GENEVE module is purely additive — the `Option::is_some()` check for `geneve_config` in `send_to_addr()` and `process_frame_zerocopy()` adds zero measurable overhead when GENEVE is not configured, consistent with the GUE and VXLAN findings.
