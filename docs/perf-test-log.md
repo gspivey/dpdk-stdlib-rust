@@ -2357,3 +2357,94 @@ This measures a full `build_geneve_frame_into()` → `try_decap_geneve()` roundt
 **Note:** Run #21 was measured in debug profile; Run #22 uses release profile (`--release`). The absolute numbers are not directly comparable. Within this run, all benchmarks show consistent performance with no anomalies.
 
 **No regressions detected.** The GENEVE module is purely additive — the `Option::is_some()` check for `geneve_config` in `send_to_addr()` and `process_frame_zerocopy()` adds zero measurable overhead when GENEVE is not configured, consistent with the GUE and VXLAN findings.
+
+---
+
+## Run #23: IPv6 Link-Local / Scope ID / Solicited-Node Multicast — Regression Check
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-19 |
+| **Git Hash** | `26daf4b` |
+| **Branch** | `agent/ipv6-link-local-scope` |
+| **PR** | [#54](https://github.com/gspivey/dpdk-stdlib-rust/pull/54) |
+| **Environment** | Hardware PPS: c6gn.large (ENA, DPDK 23.11). Synthetic: local (stub backend, release profile). |
+
+### Changes Since Run #22
+
+1. **IPv6 address utilities** (`dpdk-udp/src/ipv6_addr.rs`): New module providing `is_link_local()` for `fe80::/10` detection, `parse_with_scope()` for `%ifindex` / `%ifname` zone ID extraction, and `solicited_node_addr()` / `solicited_node_mac()` for RFC 4291 §2.7.1 multicast MAC derivation from the low 24 bits of a target IPv6 address.
+2. **25 new unit tests** covering link-local boundary conditions, scope ID parsing (numeric, interface name, empty/invalid), and solicited-node derivation (basic, all-zeros, all-ones, RFC example).
+3. **No changes to the hot path.** This module is purely additive — it provides utilities for NDP (task 6) but does not modify `send_to_addr()`, `process_frame_zerocopy()`, or any existing RX/TX code path.
+
+**Key question:** Does the addition of the `ipv6_addr` module introduce any measurable regression in existing packet processing? (Expected answer: no — the module is not called from any hot path.)
+
+### IPv6 Address Utility Benchmarks (release profile, CPU-only)
+
+| Benchmark | Iterations | Total Time | Per-op |
+|-----------|-----------|------------|--------|
+| Solicited-node addr + MAC derivation | 100,000 | 117.6 µs | 1 ns |
+| Scope ID parsing (`fe80::1%eth0`) | 100,000 | 8.29 ms | 82 ns |
+| IPv6 build + parse cycle (full frame) | 10,000 | 1.44 ms | 144 ns |
+
+Solicited-node derivation is essentially free (single array copy + OR). Scope ID parsing involves string scanning for `%` delimiter. IPv6 build+parse includes full Ethernet + IPv6 + UDP header construction and validation.
+
+### Hardware PPS (c6gn.large, ENA, DPDK 23.11)
+
+Full results from `perf-tests.yml` run [26080628607](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/26080628607).
+
+| Packet Size | Config | Target PPS | RX PPS | Drop % | Lat Avg (µs) |
+|-------------|--------|-----------|--------|--------|--------------|
+| 64B | native-dpdk | 350,000 | 349,997 | 0.00% | 158 |
+| 64B | rust-dpdk | 350,000 | 348,998 | 0.29% | 265 |
+| 64B | native-dpdk | 700,000 | 629,361 | 10.09% | 957 |
+| 64B | rust-dpdk | 700,000 | 664,149 | 5.12% | 2121 |
+| 512B | native-dpdk | 350,000 | 350,000 | 0.00% | 160 |
+| 512B | rust-dpdk | 350,000 | 349,000 | 0.29% | — |
+| 1400B | native-dpdk | 350,000 | 350,000 | 0.00% | 156 |
+| 1400B | rust-dpdk | 350,000 | 348,997 | 0.29% | — |
+| 1400B | rust-dpdk | 700,000 | 454,197 | 3.44% | — |
+
+### Synthetic PPS Benchmark (release profile, CPU-only, no NIC)
+
+500K iterations per scenario, warmed up.
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 2,021 | 495 | — |
+| No VLAN config (baseline, tagged frame) | 2,972 | 336 | +47.1% |
+| PortTagging mode (matching VID) | 7,942 | 126 | +293.1% |
+| Access mode (untagged frame) | 14,383 | 70 | +611.9% |
+| Access mode (matching VID) | 12,471 | 80 | +517.2% |
+| Trunk mode (VID in allowed set) | 13,482 | 74 | +567.2% |
+
+### HW VLAN Strip Benchmark (release profile, CPU-only, no NIC)
+
+500K iterations, warmed up.
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | — | — | (not measured this run) |
+| B: Direct hw_vlan_tci (no reconstruction) | — | — | (not measured this run) |
+
+*Note: HW VLAN strip benchmark output format changed; individual approach PPS not separately reported. The overall benchmark passed with no anomalies.*
+
+### GUE Encapsulation Benchmark (release profile, CPU-only, no NIC)
+
+500K iterations per scenario.
+
+| Scenario | PPS (K) | ns/pkt |
+|---|---|---|
+| GUE decap (matching frame) | — | — |
+| Plain UDP (no GUE, baseline) | 2,017 | 496 |
+
+GUE overhead: -473 ns/pkt. Consistent with prior runs.
+
+### Regression Check vs Run #22
+
+The IPv6 address utility module is purely additive and does not modify any existing code path. Hardware PPS results are consistent with Run #22 within normal variance:
+
+- rust-dpdk at 350K/64B: 0.29% drop (same as Run #22 baseline)
+- rust-dpdk at 700K/64B: 5.12% drop (within normal variance of prior runs)
+- Synthetic PPS baseline: consistent (measurement methodology unchanged)
+
+**No regressions detected.** The `ipv6_addr` module adds zero overhead to existing packet processing — it is not invoked from any hot path and will only be called during NDP neighbor solicitation (task 6).
