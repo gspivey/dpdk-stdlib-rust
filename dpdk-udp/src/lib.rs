@@ -1406,35 +1406,64 @@ impl SocketBackend {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
                 data.copy_from_slice(frame);
 
-                // TX hardware checksum offload: when the NIC supports it, set mbuf
-                // metadata so the NIC computes IPv4 and UDP checksums instead of
-                // software. The frame was already built with software checksums by
-                // build_udp_frame_into(); the NIC will overwrite them.
-                if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
-                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0;
-                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
+                // TX hardware checksum offload: detect frame type from ethertype
+                // and set appropriate mbuf metadata for the NIC.
+                let mut l3_len: u16 = 0;
+                if tx_offload != 0 && frame.len() >= ETH_HEADER_LEN + 2 {
+                    let ethertype = u16::from_be_bytes([data[12], data[13]]);
 
-                    if has_ip_cksum || has_udp_cksum {
-                        ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV4 as u64;
+                    if ethertype == ETH_TYPE_IPV4 && frame.len() >= TOTAL_HEADER_LEN {
+                        // IPv4 offload
+                        let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0;
+                        let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
 
-                        if has_ip_cksum {
-                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64;
-                            // NIC expects IPv4 checksum field to be 0
-                            let ip_cksum_off = ETH_HEADER_LEN + 10;
-                            data[ip_cksum_off] = 0;
-                            data[ip_cksum_off + 1] = 0;
+                        if has_ip_cksum || has_udp_cksum {
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV4 as u64;
+                            l3_len = IPV4_HEADER_LEN as u16;
+
+                            if has_ip_cksum {
+                                ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IP_CKSUM as u64;
+                                // NIC expects IPv4 checksum field to be 0
+                                let ip_cksum_off = ETH_HEADER_LEN + 10;
+                                data[ip_cksum_off] = 0;
+                                data[ip_cksum_off + 1] = 0;
+                            }
+
+                            if has_udp_cksum {
+                                ol_flags |= dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64;
+                                // NIC expects pseudo-header checksum in the UDP checksum field
+                                let src_ip: [u8; 4] = data[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16]
+                                    .try_into().unwrap();
+                                let dst_ip: [u8; 4] = data[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20]
+                                    .try_into().unwrap();
+                                let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+                                let udp_len = u16::from_be_bytes([data[udp_off + 4], data[udp_off + 5]]);
+                                let phdr_cksum = udp_pseudo_header_checksum(&src_ip, &dst_ip, udp_len);
+                                data[udp_off + 6..udp_off + 8].copy_from_slice(&phdr_cksum.to_be_bytes());
+                            }
                         }
+                    } else if ethertype == ipv6::ETH_TYPE_IPV6
+                        && frame.len() >= ipv6::TOTAL_HEADER_LEN_V6
+                    {
+                        // IPv6 offload: no IP header checksum (IPv6 has none),
+                        // but UDP checksum is mandatory and can be offloaded.
+                        let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
 
                         if has_udp_cksum {
+                            ol_flags |= dpdk_sys::RTE_MBUF_F_TX_IPV6 as u64;
                             ol_flags |= dpdk_sys::RTE_MBUF_F_TX_UDP_CKSUM as u64;
-                            // NIC expects pseudo-header checksum in the UDP checksum field
-                            let src_ip: [u8; 4] = data[ETH_HEADER_LEN + 12..ETH_HEADER_LEN + 16]
-                                .try_into().unwrap();
-                            let dst_ip: [u8; 4] = data[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20]
-                                .try_into().unwrap();
-                            let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+                            l3_len = ipv6::IPV6_HEADER_LEN as u16;
+
+                            // NIC expects IPv6 pseudo-header checksum in the UDP checksum field
+                            let src_ip = std::net::Ipv6Addr::from(
+                                <[u8; 16]>::try_from(&data[ETH_HEADER_LEN + 8..ETH_HEADER_LEN + 24]).unwrap()
+                            );
+                            let dst_ip = std::net::Ipv6Addr::from(
+                                <[u8; 16]>::try_from(&data[ETH_HEADER_LEN + 24..ETH_HEADER_LEN + 40]).unwrap()
+                            );
+                            let udp_off = ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN;
                             let udp_len = u16::from_be_bytes([data[udp_off + 4], data[udp_off + 5]]);
-                            let phdr_cksum = udp_pseudo_header_checksum(&src_ip, &dst_ip, udp_len);
+                            let phdr_cksum = udp6_pseudo_header_checksum(&src_ip, &dst_ip, udp_len as u32);
                             data[udp_off + 6..udp_off + 8].copy_from_slice(&phdr_cksum.to_be_bytes());
                         }
                     }
@@ -1443,16 +1472,12 @@ impl SocketBackend {
                 // set_tx_offload and set_ol_flags go through raw pointer, not
                 // through the &mut [u8] data slice, so they don't conflict.
                 let _ = data;
-                if tx_offload != 0 && frame.len() >= TOTAL_HEADER_LEN {
-                    let has_ip_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM as u64) != 0;
-                    let has_udp_cksum = (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_UDP_CKSUM as u64) != 0;
-                    if has_ip_cksum || has_udp_cksum {
-                        mbuf.set_tx_offload(
-                            ETH_HEADER_LEN as u8,
-                            IPV4_HEADER_LEN as u16,
-                            UDP_HEADER_LEN as u8,
-                        );
-                    }
+                if l3_len > 0 {
+                    mbuf.set_tx_offload(
+                        ETH_HEADER_LEN as u8,
+                        l3_len,
+                        UDP_HEADER_LEN as u8,
+                    );
                 }
                 if ol_flags != 0 {
                     mbuf.set_ol_flags(ol_flags);
