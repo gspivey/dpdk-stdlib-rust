@@ -184,6 +184,7 @@ pub const SOCKET_ID_ANY: libc::c_int = -1;
 // Mbuf TX offload flags (set by application, consumed by NIC).
 // These are #define macros in rte_mbuf_core.h that bindgen cannot capture.
 pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
+pub const RTE_MBUF_F_TX_IPV6: u64 = 1 << 56;
 pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
 pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
 
