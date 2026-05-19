@@ -56,6 +56,7 @@ pub mod frame_pool;
 pub mod geneve;
 pub mod gue;
 pub mod ipv6;
+pub mod ipv6_addr;
 pub mod vxlan;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
@@ -87,6 +88,10 @@ pub use ipv6::{
     ETH_TYPE_IPV6, IPV6_HEADER_LEN, MAX_UDP_PAYLOAD_V6, TOTAL_HEADER_LEN_V6,
     TOTAL_HEADER_LEN_V6_VLAN, IP_PROTO_HOPOPT, IP_PROTO_ROUTING, IP_PROTO_FRAGMENT,
     IP_PROTO_ICMPV6, IP_PROTO_DSTOPTS, IP_PROTO_NONE,
+};
+pub use ipv6_addr::{
+    is_link_local, parse_scoped_address, solicited_node_multicast_addr,
+    solicited_node_multicast_mac, ipv6_multicast_mac, ScopedIpv6Addr,
 };
 
 // ============================================================================
