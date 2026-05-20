@@ -58,6 +58,7 @@ pub mod geneve;
 pub mod gue;
 pub mod ipv6;
 pub mod ipv6_addr;
+pub mod ndp;
 pub mod vxlan;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
@@ -94,6 +95,14 @@ pub use ipv6::{
 pub use ipv6_addr::{
     is_link_local, parse_scoped_address, solicited_node_multicast_addr,
     solicited_node_multicast_mac, ipv6_multicast_mac, ScopedIpv6Addr,
+};
+pub use ndp::{
+    NdpCache, NdpHandler, NdpPacket, ProcNeighEntry,
+    build_neighbor_solicitation, build_neighbor_advertisement, build_gratuitous_na,
+    parse_ndp_packet, parse_proc_ipv6_neigh, seed_cache_from_proc,
+    ICMPV6_TYPE_NEIGHBOR_SOLICITATION, ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT,
+    NA_FLAG_ROUTER, NA_FLAG_SOLICITED, NA_FLAG_OVERRIDE,
+    NDP_HOP_LIMIT, NDP_NS_FRAME_LEN, NDP_NA_FRAME_LEN,
 };
 
 // ============================================================================
