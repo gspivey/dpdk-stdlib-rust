@@ -44,6 +44,7 @@ use thiserror::Error;
 
 pub mod arp;
 pub mod icmp;
+pub mod icmpv6;
 pub mod backend;
 pub mod backend_dpdk;
 pub mod backend_raw;
@@ -61,6 +62,7 @@ pub mod vxlan;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
+pub use icmpv6::{Icmpv6Handler, Icmpv6Packet, build_icmpv6_frame, parse_icmpv6_packet, icmpv6_checksum, build_echo6_request, ICMPV6_TYPE_ECHO_REQUEST, ICMPV6_TYPE_ECHO_REPLY, ICMPV6_HEADER_LEN};
 pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
@@ -1928,6 +1930,8 @@ pub struct UdpSocket {
     arp_handler: ArpHandler,
     /// ICMP handler for ping responses
     icmp_handler: IcmpHandler,
+    /// ICMPv6 handler for ping6 responses
+    icmpv6_handler: Icmpv6Handler,
     /// Connection state tracking (for connected sockets)
     connection_state: RwLock<Option<ConnectionState>>,
     /// Receive queue for buffered packets
@@ -2043,6 +2047,7 @@ impl UdpSocket {
         );
 
         let icmp_handler = IcmpHandler::new(local_mac, local_ip);
+        let icmpv6_handler = Icmpv6Handler::new(local_mac, std::net::Ipv6Addr::UNSPECIFIED);
 
         println!("✅ DPDK UDP socket bound to {} (MAC: {})", SocketAddr::V4(local_v4), resources.src_mac);
 
@@ -2068,6 +2073,7 @@ impl UdpSocket {
             dst_mac: MacAddress::broadcast(),
             arp_handler,
             icmp_handler,
+            icmpv6_handler,
             connection_state: RwLock::new(None),
             recv_queue: Mutex::new(ReceiveQueue::with_limits(
                 DEFAULT_RECV_BUFFER_PACKETS,
@@ -2156,6 +2162,7 @@ impl UdpSocket {
         );
 
         let icmp_handler = IcmpHandler::new(local_mac, local_ip);
+        let icmpv6_handler = Icmpv6Handler::new(local_mac, std::net::Ipv6Addr::UNSPECIFIED);
 
         let backend_name = backend.backend_name();
 
@@ -2186,6 +2193,7 @@ impl UdpSocket {
             dst_mac: MacAddress::broadcast(),
             arp_handler,
             icmp_handler,
+            icmpv6_handler,
             connection_state: RwLock::new(None),
             recv_queue: Mutex::new(ReceiveQueue::with_limits(
                 DEFAULT_RECV_BUFFER_PACKETS,
@@ -3015,6 +3023,19 @@ impl UdpSocket {
                 }
                 perf_inc!(self.perf_counters.rx_icmp_handled);
                 return None;
+            }
+        }
+
+        // Handle ICMPv6 (echo reply for ping6)
+        if layout.ethertype == ETH_TYPE_IPV6 && frame_data.len() > layout.l3_offset + IPV6_HEADER_LEN {
+            if let Some(nh) = ipv6::walk_extension_headers(&frame_data[layout.l3_offset..]) {
+                if nh.protocol == IP_PROTO_ICMPV6 && self.auto_icmp {
+                    if let Some(reply_frame) = self.icmpv6_handler.process_icmpv6(frame_data) {
+                        let _ = self.socket_backend.send_frame(&reply_frame, None);
+                    }
+                    perf_inc!(self.perf_counters.rx_icmp_handled);
+                    return None;
+                }
             }
         }
 
