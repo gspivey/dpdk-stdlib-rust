@@ -10,6 +10,82 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #18: NDP (Neighbor Discovery Protocol) — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-20 |
+| **Git Hash** | `1dd5643` |
+| **Branch** | `agent/ndp` |
+| **PR** | [#59](https://github.com/gspivey/dpdk-stdlib-rust/pull/59) |
+| **GH Actions Run** | [26163492881](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/26163492881) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #17
+
+1. **`1dd5643` — NDP (Neighbor Discovery Protocol) module.** New `dpdk-udp/src/ndp.rs` implementing RFC 4861 Neighbor Solicitation/Advertisement: parse/build NS and NA frames, NdpCache with atomic fast-path for single-peer steady state, NdpHandler mirroring ArpHandler, gratuitous NA on bind, and `/proc/net/ipv6_neigh` cache seeding. 32 unit tests. This is a new module — zero changes to the existing RX/TX hot path.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,997 | 0.3% | 348,979 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 697,788 | 0.3% | 382,398 | 45.4% | 699,686 | 0.04% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,916 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 696,778 | 0.5% | 431,308 | 38.4% | 694,499 | 0.8% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,651 | 0.4% | 350,000 | 0.0% |
+| 700,000 | 475,607 | 0.2% | 437,947 | 8.1% | 457,658 | 4.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 36,107 | 48.4% | 70,000 | 0.0% |
+| 140,000 | 76,140 | 2.7% | 77,729 | 0.8% | 76,031 | 2.9% |
+| 350,000 | 77,675 | 0.8% | 77,893 | 0.5% | 77,976 | 0.4% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 306,839 | 12.3% |
+| 700,000 | 307,556 | 56.1% |
+
+### Analysis
+
+**No performance regression from NDP module.** NDP is a standalone new module (`ndp.rs`) that adds no code to the existing UDP RX/TX hot path. The benchmark results confirm zero measurable impact:
+
+- **rust-dpdk at 700K PPS, 64B**: 697,788 RX (0.3% drop) — matches Run #15's 665K and exceeds it, within normal variance
+- **rust-dpdk at 700K PPS, 512B**: 696,778 RX (0.5% drop) — consistent with Run #15's 657K
+- **rust-dpdk at 700K PPS, 1400B**: 475,607 RX (0.2% drop) — matches Run #15's 470K
+
+**rust-dpdk vs native-dpdk parity**: At 700K PPS with 64B packets, Rust delivers 697,788 vs native C's 699,686 — within 0.3%. At 1400B near-MTU, Rust actually beats native C (475,607 vs 457,658) due to the line-rate cap.
+
+**tokio-dpdk**: Caps at ~307K PPS at 350K+ target — improved from Run #15's ~37K cap, likely due to recent tokio compat layer improvements.
+
+---
+
 ## Run #17: ICMPv6 Error Handling — No Regression
 
 | Field | Value |
