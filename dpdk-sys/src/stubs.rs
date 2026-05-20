@@ -33,6 +33,7 @@ pub const RTE_ETH_RX_OFFLOAD_TCP_CKSUM: u64 = 0x00000008;
 
 // Mbuf TX offload flags (set by application, consumed by NIC)
 pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
+pub const RTE_MBUF_F_TX_IPV6: u64 = 1 << 56;
 pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
 pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
 
