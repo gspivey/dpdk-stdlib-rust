@@ -10,6 +10,59 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 ---
 
+## Run #17: ICMPv6 Error Handling — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-20 |
+| **Git Hash** | `62d8c5c` |
+| **Branch** | `agent/icmpv6-error-handling` |
+| **PR** | [#58](https://github.com/gspivey/dpdk-stdlib-rust/pull/58) |
+
+### Changes Since Run #16
+
+1. **`62d8c5c` — ICMPv6 error handling with socket error queue integration.** Added ICMPv6 error message parsing (Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem), extraction of original IPv6+UDP datagram context (src/dst IP + ports), mapping to `io::Error` kinds matching Linux errno conventions, and integration with the existing bounded per-socket error queue via `take_error()`. The ICMPv6 error processing is wired into the RX path but only fires on received ICMPv6 error packets matching the socket's local port — zero impact on the UDP hot path.
+
+### Synthetic PPS Benchmark (CPU-only, no NIC)
+
+Measures `process_frame_zerocopy()` throughput on stub backend (500K iterations, warmed up).
+
+| Scenario | PPS (K) | ns/pkt | Overhead vs baseline |
+|---|---|---|---|
+| No VLAN config (baseline, untagged) | 1,337 | 748 | — |
+| No VLAN config (baseline, tagged frame) | 1,212 | 825 | -9.4% |
+| PortTagging mode (matching VID) | 1,223 | 818 | -8.5% |
+| Access mode (untagged frame) | 1,327 | 754 | -0.8% |
+| Access mode (matching VID) | 1,176 | 850 | -12.0% |
+| Trunk mode (VID in allowed set) | 1,146 | 873 | -14.3% |
+| Trunk mode (untagged, native_vlan) | 1,343 | 745 | baseline |
+| PortTagging DROP (wrong VID) | 20,025 | 50 | — |
+| PortTagging DROP (untagged) | 34,809 | 29 | — |
+
+### HW VLAN Strip Benchmark (CPU-only, no NIC)
+
+| Approach | PPS (K) | ns/pkt | Notes |
+|---|---|---|---|
+| A: Reconstruct frame + detect_vlan parse | 972 | 1,028 | Legacy: Vec alloc + memcpy per packet |
+| B: Direct hw_vlan_tci (no reconstruction) | 1,282 | 780 | Current: zero-alloc TCI passthrough |
+
+**Speedup: 1.32x (248 ns saved per packet).**
+
+### ICMPv6 Error Parse Benchmark (CPU-only)
+
+| Operation | Iterations | ns/op |
+|---|---|---|
+| ICMPv6 error parse | 10,000 | 124 |
+| ICMPv6 echo build+parse | 10,000 | 1,228 |
+
+### Analysis
+
+**No performance regression from ICMPv6 error handling.** The synthetic PPS numbers are consistent with Run #16 (baseline 1,337K vs 1,012K in Run #16 — improvement is due to different host machine, not code changes). The ICMPv6 error parsing path is only invoked when an ICMPv6 error packet arrives (type 1-4), which is a rare event in normal operation. The main UDP RX hot path (`process_frame_zerocopy`) is unchanged for non-ICMPv6 packets.
+
+**ICMPv6 error parse cost: 124 ns/packet.** This is ~6x cheaper than a full echo build+parse cycle (1,228 ns) because error parsing only extracts addresses and ports from the embedded original datagram without building a response frame.
+
+---
+
 ## Run #16: Eliminate HW VLAN Frame Reconstruction
 
 | Field | Value |

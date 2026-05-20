@@ -62,7 +62,7 @@ pub mod vxlan;
 
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
-pub use icmpv6::{Icmpv6Handler, Icmpv6Packet, build_icmpv6_frame, parse_icmpv6_packet, icmpv6_checksum, build_echo6_request, ICMPV6_TYPE_ECHO_REQUEST, ICMPV6_TYPE_ECHO_REPLY, ICMPV6_HEADER_LEN};
+pub use icmpv6::{Icmpv6Action, Icmpv6ErrorInfo, Icmpv6Handler, Icmpv6Packet, build_icmpv6_frame, parse_icmpv6_packet, parse_icmpv6_error, icmpv6_checksum, build_echo6_request, ICMPV6_TYPE_ECHO_REQUEST, ICMPV6_TYPE_ECHO_REPLY, ICMPV6_HEADER_LEN, ICMPV6_TYPE_DEST_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, ICMPV6_TYPE_TIME_EXCEEDED, ICMPV6_TYPE_PARAMETER_PROBLEM};
 pub use backend::{PacketBackend, BackendConfig, BackendType};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
@@ -3026,12 +3026,27 @@ impl UdpSocket {
             }
         }
 
-        // Handle ICMPv6 (echo reply for ping6)
+        // Handle ICMPv6 (echo reply + error messages)
         if layout.ethertype == ETH_TYPE_IPV6 && frame_data.len() > layout.l3_offset + IPV6_HEADER_LEN {
             if let Some(nh) = ipv6::walk_extension_headers(&frame_data[layout.l3_offset..]) {
-                if nh.protocol == IP_PROTO_ICMPV6 && self.auto_icmp {
-                    if let Some(reply_frame) = self.icmpv6_handler.process_icmpv6(frame_data) {
-                        let _ = self.socket_backend.send_frame(&reply_frame, None);
+                if nh.protocol == IP_PROTO_ICMPV6 {
+                    if let Some(action) = self.icmpv6_handler.process_icmpv6_full(frame_data) {
+                        match action {
+                            icmpv6::Icmpv6Action::Reply(reply_frame) => {
+                                if self.auto_icmp {
+                                    let _ = self.socket_backend.send_frame(&reply_frame, None);
+                                }
+                            }
+                            icmpv6::Icmpv6Action::Error(error_info) => {
+                                let local_port = match self.local_addr {
+                                    SocketAddr::V4(v4) => v4.port(),
+                                    SocketAddr::V6(v6) => v6.port(),
+                                };
+                                if error_info.original_src_port == local_port {
+                                    self.queue_icmp_error(error_info.to_io_error());
+                                }
+                            }
+                        }
                     }
                     perf_inc!(self.perf_counters.rx_icmp_handled);
                     return None;
