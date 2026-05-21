@@ -17,11 +17,13 @@
 //! ```
 
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use crate::{
     ipv4_checksum, udp_checksum, ETH_HEADER_LEN, ETH_TYPE_IPV4, IPV4_HEADER_LEN,
     IP_PROTO_UDP, UDP_HEADER_LEN,
 };
+use crate::ipv6::{ETH_TYPE_IPV6, IPV6_HEADER_LEN, udp6_checksum};
 
 pub const GUE_HEADER_LEN: usize = 4;
 
@@ -355,6 +357,254 @@ pub fn try_decap_gue<'a>(
     })
 }
 
+// ============================================================================
+// IPv6 Outer Support
+// ============================================================================
+
+/// Encapsulation overhead for GUE with IPv6 outer: IPv6(40) + UDP(8) + GUE(4) = 52.
+pub const GUE_ENCAP_OVERHEAD_V6: usize = IPV6_HEADER_LEN + UDP_HEADER_LEN + GUE_HEADER_LEN;
+
+/// Configuration for a GUE tunnel endpoint with IPv6 outer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GueConfig6 {
+    /// Remote tunnel endpoint IPv6 address.
+    pub remote_ip: Ipv6Addr,
+    /// Outer UDP destination port (default: 6080).
+    pub remote_port: u16,
+    /// Outer UDP source port (default: 6080).
+    pub local_port: u16,
+}
+
+impl GueConfig6 {
+    pub fn new(remote_ip: Ipv6Addr) -> Self {
+        Self {
+            remote_ip,
+            remote_port: GUE_DEFAULT_PORT,
+            local_port: GUE_DEFAULT_PORT,
+        }
+    }
+
+    pub fn with_remote_port(mut self, port: u16) -> Self {
+        self.remote_port = port;
+        self
+    }
+
+    pub fn with_local_port(mut self, port: u16) -> Self {
+        self.local_port = port;
+        self
+    }
+}
+
+/// Build a GUE-encapsulated frame with IPv6 outer into a caller-provided buffer.
+///
+/// Produces: `[Outer Eth][Outer IPv6][Outer UDP][GUE][Inner IPv4][Inner UDP][Payload]`
+#[allow(clippy::too_many_arguments)]
+pub fn build_gue_frame_into_v6(
+    out: &mut Vec<u8>,
+    outer_src_mac: &[u8; 6],
+    outer_dst_mac: &[u8; 6],
+    outer_src_ip: Ipv6Addr,
+    outer_dst_ip: Ipv6Addr,
+    outer_src_port: u16,
+    outer_dst_port: u16,
+    inner_src_ip: Ipv4Addr,
+    inner_dst_ip: Ipv4Addr,
+    inner_src_port: u16,
+    inner_dst_port: u16,
+    payload: &[u8],
+    hop_limit: u8,
+) -> Result<usize, crate::UdpError> {
+    let inner_udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+    let inner_ip_total = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let inner_pkt_len = IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len();
+
+    let outer_udp_payload = GUE_HEADER_LEN + inner_pkt_len;
+    let outer_udp_len = (UDP_HEADER_LEN + outer_udp_payload) as u16;
+    let ipv6_payload_len = outer_udp_len;
+
+    let total_len = ETH_HEADER_LEN + IPV6_HEADER_LEN + outer_udp_len as usize;
+    out.resize(total_len, 0);
+
+    let inner_src_bytes = inner_src_ip.octets();
+    let inner_dst_bytes = inner_dst_ip.octets();
+
+    // === Outer Ethernet Header (14 bytes) ===
+    out[0..6].copy_from_slice(outer_dst_mac);
+    out[6..12].copy_from_slice(outer_src_mac);
+    out[12..14].copy_from_slice(&ETH_TYPE_IPV6.to_be_bytes());
+
+    // === Outer IPv6 Header (40 bytes) ===
+    let oip = ETH_HEADER_LEN;
+    out[oip] = 0x60; // version 6, traffic class 0
+    out[oip + 1] = 0x00;
+    out[oip + 2] = 0x00;
+    out[oip + 3] = 0x00; // flow label 0
+    out[oip + 4..oip + 6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
+    out[oip + 6] = IP_PROTO_UDP; // next header
+    out[oip + 7] = hop_limit;
+    out[oip + 8..oip + 24].copy_from_slice(&outer_src_ip.octets());
+    out[oip + 24..oip + 40].copy_from_slice(&outer_dst_ip.octets());
+
+    // === Outer UDP Header (8 bytes) ===
+    let oudp = oip + IPV6_HEADER_LEN;
+    out[oudp..oudp + 2].copy_from_slice(&outer_src_port.to_be_bytes());
+    out[oudp + 2..oudp + 4].copy_from_slice(&outer_dst_port.to_be_bytes());
+    out[oudp + 4..oudp + 6].copy_from_slice(&outer_udp_len.to_be_bytes());
+    out[oudp + 6..oudp + 8].copy_from_slice(&[0x00, 0x00]); // checksum placeholder
+
+    // === GUE Header (4 bytes) ===
+    let gue_off = oudp + UDP_HEADER_LEN;
+    let gue_hdr = GueHeader::new_data(GUE_PROTO_IPV4);
+    gue_hdr.encode(&mut out[gue_off..gue_off + GUE_HEADER_LEN]);
+
+    // === Inner IPv4 Header (20 bytes) ===
+    let iip = gue_off + GUE_HEADER_LEN;
+    out[iip] = 0x45;
+    out[iip + 1] = 0x00;
+    out[iip + 2..iip + 4].copy_from_slice(&inner_ip_total.to_be_bytes());
+    out[iip + 4..iip + 6].copy_from_slice(&[0x00, 0x00]);
+    out[iip + 6..iip + 8].copy_from_slice(&[0x40, 0x00]); // DF
+    out[iip + 8] = 64; // inner TTL
+    out[iip + 9] = IP_PROTO_UDP;
+    out[iip + 10..iip + 12].copy_from_slice(&[0x00, 0x00]);
+    out[iip + 12..iip + 16].copy_from_slice(&inner_src_bytes);
+    out[iip + 16..iip + 20].copy_from_slice(&inner_dst_bytes);
+    let iip_cksum = ipv4_checksum(&out[iip..iip + IPV4_HEADER_LEN]);
+    out[iip + 10..iip + 12].copy_from_slice(&iip_cksum.to_be_bytes());
+
+    // === Inner UDP Header (8 bytes) ===
+    let iudp = iip + IPV4_HEADER_LEN;
+    out[iudp..iudp + 2].copy_from_slice(&inner_src_port.to_be_bytes());
+    out[iudp + 2..iudp + 4].copy_from_slice(&inner_dst_port.to_be_bytes());
+    out[iudp + 4..iudp + 6].copy_from_slice(&inner_udp_len.to_be_bytes());
+    out[iudp + 6..iudp + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === Payload ===
+    let poff = iudp + UDP_HEADER_LEN;
+    out[poff..poff + payload.len()].copy_from_slice(payload);
+
+    // Inner UDP checksum (IPv4)
+    let inner_udp_cksum = udp_checksum(
+        &inner_src_bytes,
+        &inner_dst_bytes,
+        &out[iudp..iudp + UDP_HEADER_LEN],
+        payload,
+    );
+    out[iudp + 6..iudp + 8].copy_from_slice(&inner_udp_cksum.to_be_bytes());
+
+    // Outer UDP checksum (IPv6 — mandatory)
+    let outer_udp_cksum = udp6_checksum(
+        &outer_src_ip,
+        &outer_dst_ip,
+        &out[oudp..oudp + UDP_HEADER_LEN],
+        &out[oudp + UDP_HEADER_LEN..total_len],
+    );
+    out[oudp + 6..oudp + 8].copy_from_slice(&outer_udp_cksum.to_be_bytes());
+
+    Ok(total_len)
+}
+
+/// Result of decapsulating a GUE frame with IPv6 outer.
+#[derive(Debug)]
+pub struct GueDecapResult6<'a> {
+    pub inner_src_ip: Ipv4Addr,
+    pub inner_dst_ip: Ipv4Addr,
+    pub inner_src_port: u16,
+    pub inner_dst_port: u16,
+    pub payload: &'a [u8],
+    pub outer_src_ip: Ipv6Addr,
+    pub gue_header: GueHeader,
+}
+
+/// Try to decapsulate a GUE frame with IPv6 outer.
+///
+/// `frame` is the full Ethernet frame. `l3_offset` is where the outer IPv6
+/// header starts. The caller has already verified the outer ethertype is IPv6.
+pub fn try_decap_gue_v6<'a>(
+    frame: &'a [u8],
+    l3_offset: usize,
+    gue_local_port: u16,
+) -> Option<GueDecapResult6<'a>> {
+    if frame.len() < l3_offset + IPV6_HEADER_LEN {
+        return None;
+    }
+    let oip = &frame[l3_offset..];
+    // Verify IPv6 version
+    if (oip[0] >> 4) != 6 {
+        return None;
+    }
+    // Next header must be UDP
+    if oip[6] != IP_PROTO_UDP {
+        return None;
+    }
+    let outer_src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&oip[8..24]).unwrap());
+
+    // Outer UDP header
+    let oudp_off = l3_offset + IPV6_HEADER_LEN;
+    if frame.len() < oudp_off + UDP_HEADER_LEN {
+        return None;
+    }
+    let outer_dst_port = u16::from_be_bytes([frame[oudp_off + 2], frame[oudp_off + 3]]);
+    if outer_dst_port != gue_local_port {
+        return None;
+    }
+
+    // GUE header
+    let gue_off = oudp_off + UDP_HEADER_LEN;
+    let gue_hdr = GueHeader::parse(&frame[gue_off..])?;
+    if gue_hdr.c_flag {
+        return None;
+    }
+    if gue_hdr.proto != GUE_PROTO_IPV4 {
+        return None;
+    }
+
+    // Inner IPv4 header
+    let inner_off = gue_off + gue_hdr.total_len();
+    if frame.len() < inner_off + IPV4_HEADER_LEN {
+        return None;
+    }
+    let iip = &frame[inner_off..];
+    if (iip[0] >> 4) != 4 {
+        return None;
+    }
+    let iip_ihl = (iip[0] & 0x0F) as usize * 4;
+    if iip_ihl < 20 || frame.len() < inner_off + iip_ihl {
+        return None;
+    }
+    if iip[9] != IP_PROTO_UDP {
+        return None;
+    }
+    let inner_src_ip = Ipv4Addr::new(iip[12], iip[13], iip[14], iip[15]);
+    let inner_dst_ip = Ipv4Addr::new(iip[16], iip[17], iip[18], iip[19]);
+
+    // Inner UDP header
+    let iudp_off = inner_off + iip_ihl;
+    if frame.len() < iudp_off + UDP_HEADER_LEN {
+        return None;
+    }
+    let inner_src_port = u16::from_be_bytes([frame[iudp_off], frame[iudp_off + 1]]);
+    let inner_dst_port = u16::from_be_bytes([frame[iudp_off + 2], frame[iudp_off + 3]]);
+    let inner_udp_len = u16::from_be_bytes([frame[iudp_off + 4], frame[iudp_off + 5]]) as usize;
+
+    if inner_udp_len < UDP_HEADER_LEN || frame.len() < iudp_off + inner_udp_len {
+        return None;
+    }
+
+    let payload_start = iudp_off + UDP_HEADER_LEN;
+    let payload_len = inner_udp_len - UDP_HEADER_LEN;
+
+    Some(GueDecapResult6 {
+        inner_src_ip,
+        inner_dst_ip,
+        inner_src_port,
+        inner_dst_port,
+        payload: &frame[payload_start..payload_start + payload_len],
+        outer_src_ip,
+        gue_header: gue_hdr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +836,207 @@ mod tests {
         let decap = try_decap_gue(&frame, ETH_HEADER_LEN, 6080).unwrap();
         assert_eq!(decap.payload.len(), 1400);
         assert!(decap.payload.iter().all(|&b| b == 0xAB));
+    }
+
+    // =========================================================================
+    // IPv6 outer tests
+    // =========================================================================
+
+    mod ipv6_outer {
+        use super::*;
+        use std::net::Ipv6Addr;
+        use crate::ipv6::{ETH_TYPE_IPV6, IPV6_HEADER_LEN};
+
+        const SRC_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        const DST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+        fn outer_src() -> Ipv6Addr { "2001:db8::1".parse().unwrap() }
+        fn outer_dst() -> Ipv6Addr { "2001:db8::2".parse().unwrap() }
+        fn inner_src() -> Ipv4Addr { Ipv4Addr::new(192, 168, 1, 10) }
+        fn inner_dst() -> Ipv4Addr { Ipv4Addr::new(192, 168, 1, 20) }
+
+        #[test]
+        fn config6_defaults() {
+            let cfg = GueConfig6::new(outer_dst());
+            assert_eq!(cfg.remote_ip, outer_dst());
+            assert_eq!(cfg.remote_port, GUE_DEFAULT_PORT);
+            assert_eq!(cfg.local_port, GUE_DEFAULT_PORT);
+        }
+
+        #[test]
+        fn config6_builder() {
+            let cfg = GueConfig6::new(outer_dst())
+                .with_remote_port(7000)
+                .with_local_port(7001);
+            assert_eq!(cfg.remote_port, 7000);
+            assert_eq!(cfg.local_port, 7001);
+        }
+
+        #[test]
+        fn build_and_decap_roundtrip() {
+            let payload = b"hello GUE IPv6 tunnel";
+            let mut frame = Vec::new();
+            let len = build_gue_frame_into_v6(
+                &mut frame,
+                &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(),
+                6080, 6080,
+                inner_src(), inner_dst(),
+                9000, 9001,
+                payload, 64,
+            ).unwrap();
+
+            assert_eq!(frame.len(), len);
+            // 14 (eth) + 40 (outer IPv6) + 8 (outer UDP) + 4 (GUE) + 20 (inner IPv4) + 8 (inner UDP) + payload
+            let expected = 14 + 40 + 8 + 4 + 20 + 8 + payload.len();
+            assert_eq!(len, expected);
+
+            let decap = try_decap_gue_v6(&frame, ETH_HEADER_LEN, 6080).unwrap();
+            assert_eq!(decap.inner_src_ip, inner_src());
+            assert_eq!(decap.inner_dst_ip, inner_dst());
+            assert_eq!(decap.inner_src_port, 9000);
+            assert_eq!(decap.inner_dst_port, 9001);
+            assert_eq!(decap.payload, payload);
+            assert_eq!(decap.outer_src_ip, outer_src());
+        }
+
+        #[test]
+        fn wire_format_ethertype_is_ipv6() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 1, 2, b"x", 64,
+            ).unwrap();
+            let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+            assert_eq!(ethertype, ETH_TYPE_IPV6);
+        }
+
+        #[test]
+        fn wire_format_ipv6_version() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 1, 2, b"x", 64,
+            ).unwrap();
+            assert_eq!(frame[ETH_HEADER_LEN] >> 4, 6);
+        }
+
+        #[test]
+        fn wire_format_hop_limit() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 1, 2, b"x", 42,
+            ).unwrap();
+            assert_eq!(frame[ETH_HEADER_LEN + 7], 42);
+        }
+
+        #[test]
+        fn wire_format_next_header_is_udp() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 1, 2, b"x", 64,
+            ).unwrap();
+            assert_eq!(frame[ETH_HEADER_LEN + 6], crate::IP_PROTO_UDP);
+        }
+
+        #[test]
+        fn wire_format_outer_udp_checksum_valid() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 9000, 9001,
+                b"checksum test", 64,
+            ).unwrap();
+            assert!(crate::verify_udp6_checksum(&frame));
+        }
+
+        #[test]
+        fn decap_rejects_wrong_port() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 9000, 9001, b"x", 64,
+            ).unwrap();
+            assert!(try_decap_gue_v6(&frame, ETH_HEADER_LEN, 7000).is_none());
+        }
+
+        #[test]
+        fn decap_rejects_control_message() {
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 9000, 9001, b"x", 64,
+            ).unwrap();
+            // GUE header is at: ETH(14) + IPv6(40) + UDP(8) = offset 62
+            frame[62] = 0x20; // Set C flag
+            assert!(try_decap_gue_v6(&frame, ETH_HEADER_LEN, 6080).is_none());
+        }
+
+        #[test]
+        fn build_empty_payload() {
+            let mut frame = Vec::new();
+            let len = build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 9000, 9001, &[], 64,
+            ).unwrap();
+            // 14 + 40 + 8 + 4 + 20 + 8 = 94
+            assert_eq!(len, 94);
+            let decap = try_decap_gue_v6(&frame, ETH_HEADER_LEN, 6080).unwrap();
+            assert!(decap.payload.is_empty());
+        }
+
+        #[test]
+        fn build_large_payload() {
+            let payload = vec![0xAB; 1400];
+            let mut frame = Vec::new();
+            build_gue_frame_into_v6(
+                &mut frame, &SRC_MAC, &DST_MAC,
+                outer_src(), outer_dst(), 6080, 6080,
+                inner_src(), inner_dst(), 9000, 9001, &payload, 64,
+            ).unwrap();
+            let decap = try_decap_gue_v6(&frame, ETH_HEADER_LEN, 6080).unwrap();
+            assert_eq!(decap.payload.len(), 1400);
+            assert!(decap.payload.iter().all(|&b| b == 0xAB));
+        }
+
+        #[test]
+        fn encap_overhead_v6_is_correct() {
+            // outer IPv6(40) + outer UDP(8) + GUE(4) = 52
+            assert_eq!(GUE_ENCAP_OVERHEAD_V6, 52);
+        }
+
+        #[test]
+        fn perf_build_decap_cycle_v6() {
+            let payload = vec![0xAA; 64];
+            let mut buf = Vec::with_capacity(1500);
+            let iterations = 10_000;
+
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                build_gue_frame_into_v6(
+                    &mut buf, &SRC_MAC, &DST_MAC,
+                    outer_src(), outer_dst(), 6080, 6080,
+                    inner_src(), inner_dst(), 9000, 9001, &payload, 64,
+                ).unwrap();
+                let _ = try_decap_gue_v6(&buf, ETH_HEADER_LEN, 6080).unwrap();
+            }
+            let elapsed = start.elapsed();
+            let ns_per_op = elapsed.as_nanos() / iterations as u128;
+            eprintln!(
+                "[PERF] GUE IPv6-outer build+decap: {} iterations in {:?} ({} ns/op)",
+                iterations, elapsed, ns_per_op
+            );
+            assert!(ns_per_op < 10_000, "build+decap too slow: {} ns/op", ns_per_op);
+        }
     }
 }

@@ -19,11 +19,13 @@
 //! ```
 
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use crate::{
     ipv4_checksum, udp_checksum, ETH_HEADER_LEN, ETH_TYPE_IPV4, IPV4_HEADER_LEN,
     IP_PROTO_UDP, UDP_HEADER_LEN,
 };
+use crate::ipv6::{ETH_TYPE_IPV6, IPV6_HEADER_LEN, udp6_checksum};
 
 /// GENEVE base header size (8 bytes, no options).
 pub const GENEVE_BASE_HEADER_LEN: usize = 8;
@@ -519,6 +521,299 @@ pub fn try_decap_geneve<'a>(
 }
 
 // ============================================================================
+// IPv6 Outer Support
+// ============================================================================
+
+/// Encapsulation overhead for GENEVE with IPv6 outer (no options):
+/// IPv6(40) + UDP(8) + GENEVE base(8) + inner Eth(14) = 70.
+pub const GENEVE_ENCAP_OVERHEAD_V6: usize =
+    IPV6_HEADER_LEN + UDP_HEADER_LEN + GENEVE_BASE_HEADER_LEN + ETH_HEADER_LEN;
+
+/// Configuration for a GENEVE tunnel endpoint with IPv6 outer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneveConfig6 {
+    /// Remote tunnel endpoint IPv6 address (VTEP peer).
+    pub remote_ip: Ipv6Addr,
+    /// GENEVE Virtual Network Identifier (24-bit).
+    pub vni: u32,
+    /// Outer UDP destination port (default: 6081).
+    pub remote_port: u16,
+    /// Outer UDP source port (default: 6081).
+    pub local_port: u16,
+    /// Inner source MAC address for encapsulated frames.
+    pub inner_src_mac: [u8; 6],
+    /// Inner destination MAC address for encapsulated frames.
+    pub inner_dst_mac: [u8; 6],
+}
+
+impl GeneveConfig6 {
+    pub fn new(remote_ip: Ipv6Addr, vni: u32) -> Self {
+        assert!(vni <= GENEVE_VNI_MAX, "VNI must be 24-bit (max {})", GENEVE_VNI_MAX);
+        Self {
+            remote_ip,
+            vni,
+            remote_port: GENEVE_DEFAULT_PORT,
+            local_port: GENEVE_DEFAULT_PORT,
+            inner_src_mac: [0; 6],
+            inner_dst_mac: [0xFF; 6],
+        }
+    }
+
+    pub fn with_remote_port(mut self, port: u16) -> Self {
+        self.remote_port = port;
+        self
+    }
+
+    pub fn with_local_port(mut self, port: u16) -> Self {
+        self.local_port = port;
+        self
+    }
+
+    pub fn with_inner_src_mac(mut self, mac: [u8; 6]) -> Self {
+        self.inner_src_mac = mac;
+        self
+    }
+
+    pub fn with_inner_dst_mac(mut self, mac: [u8; 6]) -> Self {
+        self.inner_dst_mac = mac;
+        self
+    }
+}
+
+/// Build a GENEVE-encapsulated frame with IPv6 outer into a caller-provided buffer.
+///
+/// Produces:
+/// `[Outer Eth][Outer IPv6][Outer UDP][GENEVE][Inner Eth][Inner IPv4][Inner UDP][Payload]`
+#[allow(clippy::too_many_arguments)]
+pub fn build_geneve_frame_into_v6(
+    out: &mut Vec<u8>,
+    outer_src_mac: &[u8; 6],
+    outer_dst_mac: &[u8; 6],
+    outer_src_ip: Ipv6Addr,
+    outer_dst_ip: Ipv6Addr,
+    outer_src_port: u16,
+    outer_dst_port: u16,
+    geneve_header: &GeneveHeader,
+    inner_src_mac: &[u8; 6],
+    inner_dst_mac: &[u8; 6],
+    inner_src_ip: Ipv4Addr,
+    inner_dst_ip: Ipv4Addr,
+    inner_src_port: u16,
+    inner_dst_port: u16,
+    payload: &[u8],
+    hop_limit: u8,
+) -> Result<usize, crate::UdpError> {
+    let geneve_len = geneve_header.header_len();
+
+    let inner_udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+    let inner_ip_total = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let inner_frame_len = ETH_HEADER_LEN + inner_ip_total as usize;
+
+    let outer_udp_payload_len = geneve_len + inner_frame_len;
+    let outer_udp_len = (UDP_HEADER_LEN + outer_udp_payload_len) as u16;
+    let ipv6_payload_len = outer_udp_len;
+
+    let total_len = ETH_HEADER_LEN + IPV6_HEADER_LEN + outer_udp_len as usize;
+    out.resize(total_len, 0);
+
+    let inner_src_bytes = inner_src_ip.octets();
+    let inner_dst_bytes = inner_dst_ip.octets();
+
+    // === Outer Ethernet Header (14 bytes) ===
+    out[0..6].copy_from_slice(outer_dst_mac);
+    out[6..12].copy_from_slice(outer_src_mac);
+    out[12..14].copy_from_slice(&ETH_TYPE_IPV6.to_be_bytes());
+
+    // === Outer IPv6 Header (40 bytes) ===
+    let oip = ETH_HEADER_LEN;
+    out[oip] = 0x60;
+    out[oip + 1] = 0x00;
+    out[oip + 2] = 0x00;
+    out[oip + 3] = 0x00;
+    out[oip + 4..oip + 6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
+    out[oip + 6] = IP_PROTO_UDP;
+    out[oip + 7] = hop_limit;
+    out[oip + 8..oip + 24].copy_from_slice(&outer_src_ip.octets());
+    out[oip + 24..oip + 40].copy_from_slice(&outer_dst_ip.octets());
+
+    // === Outer UDP Header (8 bytes) ===
+    let oudp = oip + IPV6_HEADER_LEN;
+    out[oudp..oudp + 2].copy_from_slice(&outer_src_port.to_be_bytes());
+    out[oudp + 2..oudp + 4].copy_from_slice(&outer_dst_port.to_be_bytes());
+    out[oudp + 4..oudp + 6].copy_from_slice(&outer_udp_len.to_be_bytes());
+    out[oudp + 6..oudp + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === GENEVE Header ===
+    let geneve_off = oudp + UDP_HEADER_LEN;
+    geneve_header.encode(&mut out[geneve_off..geneve_off + geneve_len]);
+
+    // === Inner Ethernet Header (14 bytes) ===
+    let ieth = geneve_off + geneve_len;
+    out[ieth..ieth + 6].copy_from_slice(inner_dst_mac);
+    out[ieth + 6..ieth + 12].copy_from_slice(inner_src_mac);
+    out[ieth + 12..ieth + 14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+    // === Inner IPv4 Header (20 bytes) ===
+    let iip = ieth + ETH_HEADER_LEN;
+    out[iip] = 0x45;
+    out[iip + 1] = 0x00;
+    out[iip + 2..iip + 4].copy_from_slice(&inner_ip_total.to_be_bytes());
+    out[iip + 4..iip + 6].copy_from_slice(&[0x00, 0x00]);
+    out[iip + 6..iip + 8].copy_from_slice(&[0x40, 0x00]);
+    out[iip + 8] = 64;
+    out[iip + 9] = IP_PROTO_UDP;
+    out[iip + 10..iip + 12].copy_from_slice(&[0x00, 0x00]);
+    out[iip + 12..iip + 16].copy_from_slice(&inner_src_bytes);
+    out[iip + 16..iip + 20].copy_from_slice(&inner_dst_bytes);
+    let iip_cksum = ipv4_checksum(&out[iip..iip + IPV4_HEADER_LEN]);
+    out[iip + 10..iip + 12].copy_from_slice(&iip_cksum.to_be_bytes());
+
+    // === Inner UDP Header (8 bytes) ===
+    let iudp = iip + IPV4_HEADER_LEN;
+    out[iudp..iudp + 2].copy_from_slice(&inner_src_port.to_be_bytes());
+    out[iudp + 2..iudp + 4].copy_from_slice(&inner_dst_port.to_be_bytes());
+    out[iudp + 4..iudp + 6].copy_from_slice(&inner_udp_len.to_be_bytes());
+    out[iudp + 6..iudp + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === Payload ===
+    let poff = iudp + UDP_HEADER_LEN;
+    out[poff..poff + payload.len()].copy_from_slice(payload);
+
+    // Inner UDP checksum (IPv4)
+    let inner_udp_cksum = udp_checksum(
+        &inner_src_bytes,
+        &inner_dst_bytes,
+        &out[iudp..iudp + UDP_HEADER_LEN],
+        payload,
+    );
+    out[iudp + 6..iudp + 8].copy_from_slice(&inner_udp_cksum.to_be_bytes());
+
+    // Outer UDP checksum (IPv6 — mandatory)
+    let outer_udp_cksum = udp6_checksum(
+        &outer_src_ip,
+        &outer_dst_ip,
+        &out[oudp..oudp + UDP_HEADER_LEN],
+        &out[oudp + UDP_HEADER_LEN..total_len],
+    );
+    out[oudp + 6..oudp + 8].copy_from_slice(&outer_udp_cksum.to_be_bytes());
+
+    Ok(total_len)
+}
+
+/// Result of decapsulating a GENEVE frame with IPv6 outer.
+#[derive(Debug)]
+pub struct GeneveDecapResult6<'a> {
+    pub inner_src_ip: Ipv4Addr,
+    pub inner_dst_ip: Ipv4Addr,
+    pub inner_src_port: u16,
+    pub inner_dst_port: u16,
+    pub payload: &'a [u8],
+    pub outer_src_ip: Ipv6Addr,
+    pub geneve_header: GeneveHeader,
+    pub inner_src_mac: [u8; 6],
+    pub inner_dst_mac: [u8; 6],
+}
+
+/// Try to decapsulate a GENEVE frame with IPv6 outer.
+pub fn try_decap_geneve_v6<'a>(
+    frame: &'a [u8],
+    l3_offset: usize,
+    geneve_local_port: u16,
+    expected_vni: Option<u32>,
+) -> Option<GeneveDecapResult6<'a>> {
+    if frame.len() < l3_offset + IPV6_HEADER_LEN {
+        return None;
+    }
+    let oip = &frame[l3_offset..];
+    if (oip[0] >> 4) != 6 {
+        return None;
+    }
+    if oip[6] != IP_PROTO_UDP {
+        return None;
+    }
+    let outer_src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&oip[8..24]).unwrap());
+
+    // Outer UDP header
+    let oudp_off = l3_offset + IPV6_HEADER_LEN;
+    if frame.len() < oudp_off + UDP_HEADER_LEN {
+        return None;
+    }
+    let outer_dst_port = u16::from_be_bytes([frame[oudp_off + 2], frame[oudp_off + 3]]);
+    if outer_dst_port != geneve_local_port {
+        return None;
+    }
+
+    // GENEVE header
+    let geneve_off = oudp_off + UDP_HEADER_LEN;
+    let geneve_hdr = GeneveHeader::parse(&frame[geneve_off..])?;
+
+    if let Some(expected) = expected_vni {
+        if geneve_hdr.vni != expected {
+            return None;
+        }
+    }
+
+    // Inner Ethernet header
+    let ieth = geneve_off + geneve_hdr.header_len();
+    if frame.len() < ieth + ETH_HEADER_LEN {
+        return None;
+    }
+    let inner_dst_mac: [u8; 6] = frame[ieth..ieth + 6].try_into().ok()?;
+    let inner_src_mac: [u8; 6] = frame[ieth + 6..ieth + 12].try_into().ok()?;
+    let inner_ethertype = u16::from_be_bytes([frame[ieth + 12], frame[ieth + 13]]);
+    if inner_ethertype != ETH_TYPE_IPV4 {
+        return None;
+    }
+
+    // Inner IPv4 header
+    let iip_off = ieth + ETH_HEADER_LEN;
+    if frame.len() < iip_off + IPV4_HEADER_LEN {
+        return None;
+    }
+    let iip = &frame[iip_off..];
+    if (iip[0] >> 4) != 4 {
+        return None;
+    }
+    let iip_ihl = (iip[0] & 0x0F) as usize * 4;
+    if iip_ihl < 20 || frame.len() < iip_off + iip_ihl {
+        return None;
+    }
+    if iip[9] != IP_PROTO_UDP {
+        return None;
+    }
+    let inner_src_ip = Ipv4Addr::new(iip[12], iip[13], iip[14], iip[15]);
+    let inner_dst_ip = Ipv4Addr::new(iip[16], iip[17], iip[18], iip[19]);
+
+    // Inner UDP header
+    let iudp_off = iip_off + iip_ihl;
+    if frame.len() < iudp_off + UDP_HEADER_LEN {
+        return None;
+    }
+    let inner_src_port = u16::from_be_bytes([frame[iudp_off], frame[iudp_off + 1]]);
+    let inner_dst_port = u16::from_be_bytes([frame[iudp_off + 2], frame[iudp_off + 3]]);
+    let inner_udp_len = u16::from_be_bytes([frame[iudp_off + 4], frame[iudp_off + 5]]) as usize;
+
+    if inner_udp_len < UDP_HEADER_LEN || frame.len() < iudp_off + inner_udp_len {
+        return None;
+    }
+
+    let payload_start = iudp_off + UDP_HEADER_LEN;
+    let payload_len = inner_udp_len - UDP_HEADER_LEN;
+
+    Some(GeneveDecapResult6 {
+        inner_src_ip,
+        inner_dst_ip,
+        inner_src_port,
+        inner_dst_port,
+        payload: &frame[payload_start..payload_start + payload_len],
+        outer_src_ip,
+        geneve_header: geneve_hdr,
+        inner_src_mac,
+        inner_dst_mac,
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -962,5 +1257,247 @@ mod tests {
             iterations, elapsed, ns_per_op
         );
         assert!(ns_per_op < 10_000, "build+decap too slow: {} ns/op", ns_per_op);
+    }
+
+    // =========================================================================
+    // IPv6 outer tests
+    // =========================================================================
+
+    mod ipv6_outer {
+        use super::*;
+        use std::net::Ipv6Addr;
+        use crate::ipv6::{ETH_TYPE_IPV6, IPV6_HEADER_LEN};
+
+        const OUTER_SRC_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        const OUTER_DST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        const INNER_SRC_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x01, 0x01];
+        const INNER_DST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x01, 0x02];
+
+        fn outer_src() -> Ipv6Addr { "2001:db8::1".parse().unwrap() }
+        fn outer_dst() -> Ipv6Addr { "2001:db8::2".parse().unwrap() }
+        fn inner_src() -> Ipv4Addr { Ipv4Addr::new(192, 168, 1, 10) }
+        fn inner_dst() -> Ipv4Addr { Ipv4Addr::new(192, 168, 1, 20) }
+
+        #[test]
+        fn config6_defaults() {
+            let cfg = GeneveConfig6::new(outer_dst(), 100);
+            assert_eq!(cfg.remote_ip, outer_dst());
+            assert_eq!(cfg.vni, 100);
+            assert_eq!(cfg.remote_port, GENEVE_DEFAULT_PORT);
+            assert_eq!(cfg.local_port, GENEVE_DEFAULT_PORT);
+        }
+
+        #[test]
+        fn config6_builder() {
+            let cfg = GeneveConfig6::new(outer_dst(), 200)
+                .with_remote_port(5000)
+                .with_local_port(5001)
+                .with_inner_src_mac([0xAA; 6])
+                .with_inner_dst_mac([0xBB; 6]);
+            assert_eq!(cfg.remote_port, 5000);
+            assert_eq!(cfg.local_port, 5001);
+            assert_eq!(cfg.inner_src_mac, [0xAA; 6]);
+            assert_eq!(cfg.inner_dst_mac, [0xBB; 6]);
+        }
+
+        #[test]
+        #[should_panic(expected = "VNI must be 24-bit")]
+        fn config6_rejects_oversized_vni() {
+            GeneveConfig6::new(outer_dst(), GENEVE_VNI_MAX + 1);
+        }
+
+        #[test]
+        fn build_and_decap_roundtrip() {
+            let payload = b"hello GENEVE IPv6 tunnel";
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            let len = build_geneve_frame_into_v6(
+                &mut frame,
+                &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(),
+                6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(),
+                9000, 9001, payload, 64,
+            ).unwrap();
+
+            assert_eq!(frame.len(), len);
+            // 14 (eth) + 40 (IPv6) + 8 (UDP) + 8 (GENEVE) + 14 (inner eth) + 20 (inner IPv4) + 8 (inner UDP) + payload
+            let expected = 14 + 40 + 8 + 8 + 14 + 20 + 8 + payload.len();
+            assert_eq!(len, expected);
+
+            let decap = try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 6081, Some(100)).unwrap();
+            assert_eq!(decap.inner_src_ip, inner_src());
+            assert_eq!(decap.inner_dst_ip, inner_dst());
+            assert_eq!(decap.inner_src_port, 9000);
+            assert_eq!(decap.inner_dst_port, 9001);
+            assert_eq!(decap.payload, payload);
+            assert_eq!(decap.outer_src_ip, outer_src());
+            assert_eq!(decap.geneve_header.vni, 100);
+            assert_eq!(decap.inner_src_mac, INNER_SRC_MAC);
+            assert_eq!(decap.inner_dst_mac, INNER_DST_MAC);
+        }
+
+        #[test]
+        fn build_and_decap_with_options() {
+            let options = vec![
+                GeneveTlvOption { class: 0x0102, option_type: 1, data: vec![0xAA, 0xBB, 0xCC, 0xDD] },
+            ];
+            let opt_len = 4 + options[0].data.len(); // 4-byte TLV header + data
+            let hdr = GeneveHeader {
+                version: GENEVE_VERSION,
+                options_len: opt_len,
+                oam: false,
+                critical: false,
+                protocol_type: GENEVE_INNER_ETYPE_ETH,
+                vni: 100,
+                options: options.clone(),
+            };
+            let payload = b"with opts";
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame,
+                &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(),
+                6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(),
+                9000, 9001, payload, 64,
+            ).unwrap();
+
+            let decap = try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 6081, Some(100)).unwrap();
+            assert_eq!(decap.payload, payload);
+            assert_eq!(decap.geneve_header.options.len(), 1);
+            assert_eq!(decap.geneve_header.options[0].class, 0x0102);
+            assert_eq!(decap.geneve_header.options[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        }
+
+        #[test]
+        fn wire_format_ethertype_is_ipv6() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 1, 2, b"x", 64,
+            ).unwrap();
+            let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+            assert_eq!(ethertype, ETH_TYPE_IPV6);
+        }
+
+        #[test]
+        fn wire_format_ipv6_version() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 1, 2, b"x", 64,
+            ).unwrap();
+            assert_eq!(frame[ETH_HEADER_LEN] >> 4, 6);
+        }
+
+        #[test]
+        fn wire_format_outer_udp_checksum_valid() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 9000, 9001, b"checksum test", 64,
+            ).unwrap();
+            assert!(crate::verify_udp6_checksum(&frame));
+        }
+
+        #[test]
+        fn decap_rejects_wrong_port() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 9000, 9001, b"x", 64,
+            ).unwrap();
+            assert!(try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 7000, Some(100)).is_none());
+        }
+
+        #[test]
+        fn decap_rejects_wrong_vni() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 9000, 9001, b"x", 64,
+            ).unwrap();
+            assert!(try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 6081, Some(200)).is_none());
+        }
+
+        #[test]
+        fn decap_accepts_any_vni_when_none() {
+            let hdr = GeneveHeader::new(999);
+            let mut frame = Vec::new();
+            build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 9000, 9001, b"x", 64,
+            ).unwrap();
+            let decap = try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 6081, None).unwrap();
+            assert_eq!(decap.geneve_header.vni, 999);
+        }
+
+        #[test]
+        fn build_empty_payload() {
+            let hdr = GeneveHeader::new(100);
+            let mut frame = Vec::new();
+            let len = build_geneve_frame_into_v6(
+                &mut frame, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                outer_src(), outer_dst(), 6081, 6081, &hdr,
+                &INNER_SRC_MAC, &INNER_DST_MAC,
+                inner_src(), inner_dst(), 9000, 9001, &[], 64,
+            ).unwrap();
+            // 14 + 40 + 8 + 8 + 14 + 20 + 8 = 112
+            assert_eq!(len, 112);
+            let decap = try_decap_geneve_v6(&frame, ETH_HEADER_LEN, 6081, Some(100)).unwrap();
+            assert!(decap.payload.is_empty());
+        }
+
+        #[test]
+        fn encap_overhead_v6_is_correct() {
+            // outer IPv6(40) + outer UDP(8) + GENEVE base(8) + inner Eth(14) = 70
+            assert_eq!(GENEVE_ENCAP_OVERHEAD_V6, 70);
+        }
+
+        #[test]
+        fn perf_build_decap_cycle_v6() {
+            let payload = vec![0xAA; 64];
+            let hdr = GeneveHeader::new(100);
+            let mut buf = Vec::with_capacity(1500);
+            let iterations = 10_000;
+
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                build_geneve_frame_into_v6(
+                    &mut buf, &OUTER_SRC_MAC, &OUTER_DST_MAC,
+                    outer_src(), outer_dst(), 6081, 6081, &hdr,
+                    &INNER_SRC_MAC, &INNER_DST_MAC,
+                    inner_src(), inner_dst(), 12345, 9000, &payload, 64,
+                ).unwrap();
+                let _ = try_decap_geneve_v6(&buf, ETH_HEADER_LEN, 6081, Some(100)).unwrap();
+            }
+            let elapsed = start.elapsed();
+            let ns_per_op = elapsed.as_nanos() / iterations as u128;
+            eprintln!(
+                "[PERF] GENEVE IPv6-outer build+decap: {} iterations in {:?} ({} ns/op)",
+                iterations, elapsed, ns_per_op
+            );
+            assert!(ns_per_op < 10_000, "build+decap too slow: {} ns/op", ns_per_op);
+        }
     }
 }

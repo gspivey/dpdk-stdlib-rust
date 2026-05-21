@@ -74,15 +74,25 @@ pub use perf::{
     LatencySampler, NicStatsFn, NicStatsSnapshot, PerfCounters, PerfReporter, PerfSnapshot,
 };
 pub use routing::{RoutingTable, NetworkConfig, RouteEntry, NextHop, ProcArpEntry};
-pub use gue::{GueConfig, GueHeader, GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD};
+pub use gue::{
+    GueConfig, GueConfig6, GueHeader, GueDecapResult6,
+    GUE_DEFAULT_PORT, GUE_ENCAP_OVERHEAD, GUE_ENCAP_OVERHEAD_V6,
+    build_gue_frame_into, build_gue_frame_into_v6, try_decap_gue, try_decap_gue_v6,
+    GueDecapResult,
+};
 pub use geneve::{
-    GeneveConfig, GeneveHeader, GeneveDecapResult, GeneveTlvOption,
-    GENEVE_DEFAULT_PORT, GENEVE_ENCAP_OVERHEAD, GENEVE_BASE_HEADER_LEN,
-    GENEVE_VNI_MAX, build_geneve_frame_into, try_decap_geneve,
+    GeneveConfig, GeneveConfig6, GeneveHeader, GeneveDecapResult, GeneveDecapResult6,
+    GeneveTlvOption, GENEVE_DEFAULT_PORT, GENEVE_ENCAP_OVERHEAD, GENEVE_ENCAP_OVERHEAD_V6,
+    GENEVE_BASE_HEADER_LEN, GENEVE_VNI_MAX,
+    build_geneve_frame_into, build_geneve_frame_into_v6,
+    try_decap_geneve, try_decap_geneve_v6,
 };
 pub use vxlan::{
-    VxlanConfig, VxlanHeader, VxlanDecapResult, VXLAN_DEFAULT_PORT, VXLAN_ENCAP_OVERHEAD,
-    VXLAN_HEADER_LEN, VXLAN_VNI_MAX, build_vxlan_frame_into, try_decap_vxlan,
+    VxlanConfig, VxlanConfig6, VxlanHeader, VxlanDecapResult, VxlanDecapResult6,
+    VXLAN_DEFAULT_PORT, VXLAN_ENCAP_OVERHEAD, VXLAN_ENCAP_OVERHEAD_V6,
+    VXLAN_HEADER_LEN, VXLAN_VNI_MAX,
+    build_vxlan_frame_into, build_vxlan_frame_into_v6,
+    try_decap_vxlan, try_decap_vxlan_v6,
 };
 pub use ipv6::{
     build_udp6_frame, build_udp6_frame_into, parse_udp6_packet, parse_udp6_packet_ref,

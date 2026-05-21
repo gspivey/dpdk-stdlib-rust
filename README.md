@@ -451,6 +451,8 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 **GENEVE endpoint (RFC 8926)** — Modern overlay tunnel: outer Ethernet + outer IPv4 + outer UDP (dst port 6081) + variable-length GENEVE header (24-bit VNI + TLV options up to 252 bytes) + inner Ethernet frame. Same frame shape as VXLAN plus extensible metadata — used by OVN, NSX-T, and AWS Gateway Load Balancer. Configurable per-socket via `set_geneve(Some(GeneveConfig::new(remote_ip, vni)))` or through `NetworkConfig::with_geneve()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the GENEVE tunnel automatically. RX decapsulates matching frames (VNI filter) and returns the inner source address to the application. TLV options are parsed on RX and available via the `GeneveHeader` in decap results. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" roadmap item. 43 tests (36 unit + 7 integration) including a synthetic PPS benchmark measuring GENEVE build+decap overhead.
 
+**Encap: IPv6 outer** — IPv6 outer support for all three encapsulation protocols (VXLAN, GENEVE, GUE). Each protocol gains `build_*_frame_into_v6()` and `try_decap_*_v6()` functions using outer IPv6 headers with mandatory UDP6 checksum (RFC 8200 §8.1). New `*Config6` structs with `Ipv6Addr`, `*DecapResult6` types, and `*_ENCAP_OVERHEAD_V6` constants. Wire format: `[Outer Eth 14B][Outer IPv6 40B][Outer UDP 8B][Protocol Header][Inner frame]`. 41 unit tests including synthetic PPS benchmarks. *(PR [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60))*
+
 ### Planned
 
 Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwise. IPv6 is a multi-PR feature with a sub-task checklist; it only moves to Done when every box is ticked and a final performance run shows no regression vs the IPv4 baseline.
@@ -466,8 +468,6 @@ Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwi
 - [x] **7. ICMPv6 echo reply** — auto-respond to `ping6`, parallel to our existing IPv4 ICMP echo reply.
 - [x] **8. ICMPv6 error handling** — Destination Unreachable, Packet Too Big (with Next-Hop MTU), Time Exceeded, and Parameter Problem parsed and matched back to the originating socket. Plugs into the existing per-socket error queue (introduced for IPv4 ICMP errors) so `take_error()` works for IPv6 destinations too. *(PR [#58](https://github.com/gspivey/dpdk-stdlib-rust/pull/58), 24 tests)*
 - [ ] **9. Performance tests** — TRex PPS run at 64 / 512 / 1400B, plus the synthetic CPU-only benchmark, compared against the IPv4 baseline. Results posted to `docs/perf-test-log.md`. No PPS regression vs IPv4 required to cross off the IPv6 feature.
-
-**Encap: IPv6 outer** — Adds IPv6 outer support to all three encapsulation protocols (VXLAN, GENEVE, GUE), closing out dual-stack encap in a single PR. Depends on IPv6 tasks 1 (header build/parse), 2 (UDP pseudo-header checksum), and 4 (offload flags). Does NOT require NDP or ICMPv6 — only the wire-format subset of IPv6.
 
 ### Not Currently Planned
 
