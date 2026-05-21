@@ -7472,4 +7472,84 @@ mod tests {
         let bad = dpdk_sys::RTE_MBUF_F_RX_L4_CKSUM_BAD as u64;
         assert_eq!(good & bad, 0);
     }
+
+    // ========================================================================
+    // IPv6 RX Checksum Validation (process_frame_zerocopy integration)
+    // ========================================================================
+
+    #[test]
+    fn process_frame_zerocopy_accepts_valid_ipv6_udp() {
+        use crate::ipv6::build_udp6_frame;
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"ipv6 payload", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        let (len, _src_addr) = result.expect("valid IPv6 UDP frame should be accepted");
+        assert_eq!(&buf[..len], b"ipv6 payload");
+    }
+
+    #[test]
+    fn process_frame_zerocopy_rejects_corrupted_ipv6_checksum() {
+        use crate::ipv6::build_udp6_frame;
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"corrupt ipv6", 64,
+        ).unwrap();
+
+        // Corrupt the payload (invalidates checksum)
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        assert!(result.is_none(), "corrupted IPv6 UDP checksum should be rejected");
+    }
+
+    #[test]
+    fn process_frame_zerocopy_rejects_zero_ipv6_checksum() {
+        use crate::ipv6::{build_udp6_frame, IPV6_HEADER_LEN};
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"zero cksum", 64,
+        ).unwrap();
+
+        // Zero out the UDP checksum (invalid for IPv6)
+        let udp_off = ETH_HEADER_LEN + IPV6_HEADER_LEN;
+        frame[udp_off + 6] = 0;
+        frame[udp_off + 7] = 0;
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        assert!(result.is_none(), "zero UDP checksum should be rejected for IPv6");
+    }
 }

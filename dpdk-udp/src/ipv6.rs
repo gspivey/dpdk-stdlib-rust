@@ -1039,6 +1039,297 @@ mod tests {
         assert_eq!(parsed.src_ip, ll);
     }
 
+    // --- UDP6 checksum: VLAN-tagged frames ---
+
+    #[test]
+    fn udp6_checksum_valid_on_vlan_tagged_frame() {
+        // Manually construct a VLAN-tagged IPv6/UDP frame with valid checksum
+        let payload = b"vlan-cksum";
+        let inner_len = IPV6_HEADER_LEN + UDP_HEADER_LEN + payload.len();
+        let total = ETH_HEADER_LEN + crate::VLAN_TAG_LEN + inner_len;
+        let mut frame = vec![0u8; total];
+
+        frame[0..6].copy_from_slice(&DST_MAC);
+        frame[6..12].copy_from_slice(&SRC_MAC);
+        frame[12..14].copy_from_slice(&crate::ETH_TYPE_VLAN.to_be_bytes());
+        frame[14..16].copy_from_slice(&200u16.to_be_bytes());
+        frame[16..18].copy_from_slice(&ETH_TYPE_IPV6.to_be_bytes());
+
+        let l3 = ETH_HEADER_LEN + crate::VLAN_TAG_LEN;
+        frame[l3] = 0x60;
+        let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+        frame[l3 + 4..l3 + 6].copy_from_slice(&udp_len.to_be_bytes());
+        frame[l3 + 6] = IP_PROTO_UDP;
+        frame[l3 + 7] = 64;
+        frame[l3 + 8..l3 + 24].copy_from_slice(&src_ip().octets());
+        frame[l3 + 24..l3 + 40].copy_from_slice(&dst_ip().octets());
+
+        let udp_off = l3 + IPV6_HEADER_LEN;
+        frame[udp_off..udp_off + 2].copy_from_slice(&5000u16.to_be_bytes());
+        frame[udp_off + 2..udp_off + 4].copy_from_slice(&6000u16.to_be_bytes());
+        frame[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+        frame[udp_off + UDP_HEADER_LEN..].copy_from_slice(payload);
+
+        let cksum = udp6_checksum(
+            &src_ip(), &dst_ip(),
+            &frame[udp_off..udp_off + UDP_HEADER_LEN],
+            payload,
+        );
+        frame[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
+
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_detects_corruption_in_vlan_frame() {
+        let payload = b"vlan-corrupt";
+        let inner_len = IPV6_HEADER_LEN + UDP_HEADER_LEN + payload.len();
+        let total = ETH_HEADER_LEN + crate::VLAN_TAG_LEN + inner_len;
+        let mut frame = vec![0u8; total];
+
+        frame[0..6].copy_from_slice(&DST_MAC);
+        frame[6..12].copy_from_slice(&SRC_MAC);
+        frame[12..14].copy_from_slice(&crate::ETH_TYPE_VLAN.to_be_bytes());
+        frame[14..16].copy_from_slice(&100u16.to_be_bytes());
+        frame[16..18].copy_from_slice(&ETH_TYPE_IPV6.to_be_bytes());
+
+        let l3 = ETH_HEADER_LEN + crate::VLAN_TAG_LEN;
+        frame[l3] = 0x60;
+        let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+        frame[l3 + 4..l3 + 6].copy_from_slice(&udp_len.to_be_bytes());
+        frame[l3 + 6] = IP_PROTO_UDP;
+        frame[l3 + 7] = 64;
+        frame[l3 + 8..l3 + 24].copy_from_slice(&src_ip().octets());
+        frame[l3 + 24..l3 + 40].copy_from_slice(&dst_ip().octets());
+
+        let udp_off = l3 + IPV6_HEADER_LEN;
+        frame[udp_off..udp_off + 2].copy_from_slice(&5000u16.to_be_bytes());
+        frame[udp_off + 2..udp_off + 4].copy_from_slice(&6000u16.to_be_bytes());
+        frame[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+        frame[udp_off + UDP_HEADER_LEN..].copy_from_slice(payload);
+
+        let cksum = udp6_checksum(
+            &src_ip(), &dst_ip(),
+            &frame[udp_off..udp_off + UDP_HEADER_LEN],
+            payload,
+        );
+        frame[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
+
+        // Corrupt a payload byte
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    // --- UDP6 checksum: extension headers ---
+
+    #[test]
+    fn udp6_checksum_with_hop_by_hop_extension() {
+        // Build frame with Hop-by-Hop extension header before UDP
+        let payload = b"ext-hdr";
+        let ext_len = 8; // minimum extension header size
+        let inner_len = IPV6_HEADER_LEN + ext_len + UDP_HEADER_LEN + payload.len();
+        let total = ETH_HEADER_LEN + inner_len;
+        let mut frame = vec![0u8; total];
+
+        frame[0..6].copy_from_slice(&DST_MAC);
+        frame[6..12].copy_from_slice(&SRC_MAC);
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV6.to_be_bytes());
+
+        let l3 = ETH_HEADER_LEN;
+        frame[l3] = 0x60;
+        let ipv6_payload_len = (ext_len + UDP_HEADER_LEN + payload.len()) as u16;
+        frame[l3 + 4..l3 + 6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
+        frame[l3 + 6] = IP_PROTO_HOPOPT; // Next Header = Hop-by-Hop
+        frame[l3 + 7] = 64;
+        frame[l3 + 8..l3 + 24].copy_from_slice(&src_ip().octets());
+        frame[l3 + 24..l3 + 40].copy_from_slice(&dst_ip().octets());
+
+        // Hop-by-Hop extension header (8 bytes)
+        let ext_off = l3 + IPV6_HEADER_LEN;
+        frame[ext_off] = IP_PROTO_UDP; // Next Header = UDP
+        frame[ext_off + 1] = 0; // Length = (0+1)*8 = 8 bytes
+
+        // UDP header
+        let udp_off = ext_off + ext_len;
+        let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+        frame[udp_off..udp_off + 2].copy_from_slice(&7000u16.to_be_bytes());
+        frame[udp_off + 2..udp_off + 4].copy_from_slice(&8000u16.to_be_bytes());
+        frame[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+        frame[udp_off + UDP_HEADER_LEN..].copy_from_slice(payload);
+
+        // Compute checksum (pseudo-header uses the IPv6 addresses, not extension headers)
+        let cksum = udp6_checksum(
+            &src_ip(), &dst_ip(),
+            &frame[udp_off..udp_off + UDP_HEADER_LEN],
+            payload,
+        );
+        frame[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
+
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    // --- UDP6 checksum: various payload sizes ---
+
+    #[test]
+    fn udp6_checksum_empty_payload() {
+        let frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"", 64,
+        ).unwrap();
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_single_byte_payload() {
+        let frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"x", 64,
+        ).unwrap();
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_odd_length_payload() {
+        // Odd-length payload exercises the padding logic in checksum_add
+        let frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"odd", 64,
+        ).unwrap();
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_max_standard_payload() {
+        let payload = vec![0xAB; MAX_UDP_PAYLOAD_V6];
+        let frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, &payload, 64,
+        ).unwrap();
+        assert!(verify_udp6_checksum(&frame));
+    }
+
+    // --- UDP6 checksum: corruption in different fields ---
+
+    #[test]
+    fn udp6_checksum_detects_src_ip_corruption() {
+        let mut frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"data", 64,
+        ).unwrap();
+        // Corrupt source IP (byte 8 of IPv6 header)
+        frame[ETH_HEADER_LEN + 8] ^= 0x01;
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_detects_dst_ip_corruption() {
+        let mut frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"data", 64,
+        ).unwrap();
+        // Corrupt destination IP (byte 24 of IPv6 header)
+        frame[ETH_HEADER_LEN + 24] ^= 0x01;
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_detects_src_port_corruption() {
+        let mut frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1000, 2000, b"data", 64,
+        ).unwrap();
+        let udp_off = ETH_HEADER_LEN + IPV6_HEADER_LEN;
+        frame[udp_off] ^= 0x01; // corrupt src port high byte
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_detects_dst_port_corruption() {
+        let mut frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1000, 2000, b"data", 64,
+        ).unwrap();
+        let udp_off = ETH_HEADER_LEN + IPV6_HEADER_LEN;
+        frame[udp_off + 2] ^= 0x01; // corrupt dst port high byte
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    // --- UDP6 checksum: edge cases ---
+
+    #[test]
+    fn udp6_checksum_rejects_truncated_frame() {
+        let frame = build_udp6_frame(
+            &SRC_MAC, &DST_MAC, src_ip(), dst_ip(), 1, 2, b"data", 64,
+        ).unwrap();
+        // Truncate to just past the UDP header (missing payload)
+        let truncated = &frame[..ETH_HEADER_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN];
+        // The UDP length field says there's payload, but it's missing
+        assert!(!verify_udp6_checksum(truncated));
+    }
+
+    #[test]
+    fn udp6_checksum_rejects_non_ipv6_frame() {
+        // Build an IPv4 frame
+        let frame = crate::build_udp_frame(
+            &SRC_MAC, &DST_MAC,
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            1000, 2000, b"ipv4", 64,
+        ).unwrap();
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    #[test]
+    fn udp6_checksum_rejects_too_short_frame() {
+        // Frame too short to contain even Ethernet + IPv6 header
+        let frame = vec![0u8; 20];
+        assert!(!verify_udp6_checksum(&frame));
+    }
+
+    // --- UDP6 pseudo-header checksum properties ---
+
+    #[test]
+    fn udp6_pseudo_header_checksum_different_lengths() {
+        let a = udp6_pseudo_header_checksum(&src_ip(), &dst_ip(), 8);
+        let b = udp6_pseudo_header_checksum(&src_ip(), &dst_ip(), 100);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn udp6_pseudo_header_checksum_different_src() {
+        let other_src: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let a = udp6_pseudo_header_checksum(&src_ip(), &dst_ip(), 16);
+        let b = udp6_pseudo_header_checksum(&other_src, &dst_ip(), 16);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn udp6_pseudo_header_checksum_different_dst() {
+        let other_dst: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let a = udp6_pseudo_header_checksum(&src_ip(), &dst_ip(), 16);
+        let b = udp6_pseudo_header_checksum(&src_ip(), &other_dst, 16);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn udp6_pseudo_header_checksum_large_length() {
+        // Test with a length > 65535 (uses the 32-bit upper-layer length field)
+        let phc = udp6_pseudo_header_checksum(&src_ip(), &dst_ip(), 70000);
+        assert_ne!(phc, 0);
+    }
+
+    // --- UDP6 checksum: computed value of 0 becomes 0xFFFF ---
+
+    #[test]
+    fn udp6_checksum_zero_becomes_ffff() {
+        // RFC 8200 §8.1: if the computed checksum is zero, it is transmitted as 0xFFFF
+        // We can't easily construct a payload that produces exactly zero, but we can
+        // verify the function's contract: the return value is never 0.
+        // Test with many different payloads to increase confidence.
+        for i in 0..256u16 {
+            let payload = [i as u8; 1];
+            let cksum = udp6_checksum(
+                &src_ip(), &dst_ip(),
+                &[0x00, 0x01, 0x00, 0x02, 0x00, 0x09, 0x00, 0x00], // ports 1,2 len 9
+                &payload,
+            );
+            assert_ne!(cksum, 0, "checksum must never be 0 for IPv6");
+        }
+    }
+
     // --- Synthetic performance benchmark ---
 
     #[test]
