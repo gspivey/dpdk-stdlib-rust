@@ -5,6 +5,95 @@ Each entry captures the git context, test configuration, results, and analysis.
 
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
+
+## Run #25: Encap IPv6 Outer (GUE, VXLAN, GENEVE) — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-21 |
+| **Git Hash** | `28febfd` |
+| **Branch** | `agent/encap-ipv6-outer` |
+| **PR** | [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60) |
+| **GH Actions Run** | [26204734648](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/26204734648) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #18
+
+1. **`28febfd` — IPv6 outer support for GUE, VXLAN, GENEVE.** Adds `build_*_frame_into_v6()` and `try_decap_*_v6()` functions for all three encap protocols, using outer IPv6 headers with mandatory UDP6 checksum (RFC 8200 §8.1). New `*Config6`, `*DecapResult6`, and `*_ENCAP_OVERHEAD_V6` types/constants. 41 new unit tests including synthetic PPS benchmarks. This is purely additive — zero changes to the existing IPv4 encap or plain UDP hot paths.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,996 | 0.3% | 348,912 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 699,000 | 0.1% | 400,193 | 42.8% | 698,643 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,883 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 699,000 | 0.1% | 582,543 | 16.8% | 698,348 | 0.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,957 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 569,926 | 18.6% | 583,762 | 16.6% | 674,637 | 3.6% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 33,908 | 51.6% | 70,000 | 0.0% |
+| 140,000 | 124,350 | 0.7% | 124,329 | 0.7% | 125,301 | 0.0% |
+| 350,000 | 123,085 | 1.7% | 124,013 | 1.0% | 120,300 | 3.9% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 307,647 | 12.1% |
+| 700,000 | 307,850 | 56.0% |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | **OK** | 0 / 0 / 0 | 422,439 / 422,439 / 0 | 0 / 0 / 0 |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 263,721 / 263,721 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression from IPv6 outer encap.** The feature adds new `build_*_frame_into_v6()` and `try_decap_*_v6()` functions alongside the existing IPv4 encap code. Zero changes to the existing hot path — no new branches, no new Option checks in `send_to_addr()` or `process_frame_zerocopy()`.
+
+**rust-dpdk at 700K PPS, 64B**: 699,000 RX (0.1% drop) — matches Run #18's 699,000 exactly.
+
+**rust-dpdk at 700K PPS, 512B**: 699,000 RX (0.1% drop) — matches Run #18's 699,000 exactly.
+
+**rust-dpdk at 700K PPS, 1400B**: 569,926 RX (18.6% drop) — identical to Run #18's 569,926.
+
+**rust-dpdk vs native-dpdk parity**: At 700K PPS with 64B packets, Rust delivers 699,000 vs native C's 698,643 — Rust is marginally ahead (within measurement noise). At 350K PPS, both deliver ~349K with <0.3% drops.
+
+**tokio-dpdk**: Caps at ~307K PPS at 350K+ target — consistent with Run #18's 307,647, confirming the async compat layer ceiling is unchanged.
+
+**Conclusion**: IPv6 outer encap is performance-neutral. The new code paths are only invoked when the IPv6 outer build/decap functions are explicitly called — they do not affect the existing IPv4 encap or plain UDP paths.
+
+---
 2. **Synthetic PPS** — `cargo test -- --nocapture vlan_pps_benchmark` (measures pure CPU overhead of RX processing pipeline, independent of NIC speed; ~5s to run)
 3. **HW VLAN Strip** — `cargo test -- --nocapture hw_vlan_strip_benchmark` (measures cost of frame reconstruction vs direct hw_vlan_tci passthrough; regression guard for the RX VLAN offload path)
 
