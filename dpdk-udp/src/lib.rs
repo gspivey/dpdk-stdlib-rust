@@ -3211,77 +3211,121 @@ impl UdpSocket {
 
         // Zero-copy UDP parse — payload borrows from frame_data.
         // Handles both tagged and untagged frames via detect_vlan internally.
-        let parsed = match parse_udp_packet_ref(frame_data) {
-            Some(p) => p,
-            None => {
+        // Try IPv4 first, then IPv6.
+        if let Some(parsed) = parse_udp_packet_ref(frame_data) {
+            // IPv4 path: validate both IPv4 header and UDP checksums.
+            if !verify_ipv4_checksum(frame_data) {
                 perf_inc!(self.perf_counters.rx_drops_parse_fail);
                 return None;
             }
-        };
+            if !verify_udp_checksum(frame_data) {
+                perf_inc!(self.perf_counters.rx_drops_parse_fail);
+                return None;
+            }
 
-        // Validate RX checksums (IPv4 header + UDP) in software.
-        // Both verifiers handle VLAN-tagged frames via detect_vlan internally.
-        if !verify_ipv4_checksum(frame_data) {
-            perf_inc!(self.perf_counters.rx_drops_parse_fail);
-            return None;
-        }
-        if !verify_udp_checksum(frame_data) {
-            perf_inc!(self.perf_counters.rx_drops_parse_fail);
-            return None;
-        }
+            perf_inc!(self.perf_counters.rx_packets);
+            perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
 
-        // Count successfully parsed RX packets
-        perf_inc!(self.perf_counters.rx_packets);
-        perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
+            self.arp_handler.cache.insert(
+                parsed.src_ip,
+                MacAddress::new(parsed.src_mac),
+            );
 
-        // Learn source MAC for reply routing
-        self.arp_handler.cache.insert(
-            parsed.src_ip,
-            MacAddress::new(parsed.src_mac),
-        );
+            if parsed.dst_port != local_port {
+                return None;
+            }
 
-        if parsed.dst_port != local_port {
-            return None;
-        }
+            let src_addr = SocketAddr::V4(
+                SocketAddrV4::new(parsed.src_ip, parsed.src_port)
+            );
 
-        let src_addr = SocketAddr::V4(
-            SocketAddrV4::new(parsed.src_ip, parsed.src_port)
-        );
+            if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                if src_addr != connected {
+                    let payload_len = parsed.payload.len();
+                    let mut queue = self.recv_queue.lock().unwrap();
+                    if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
+                        self.record_rx_drop(payload_len);
+                    }
+                    return None;
+                }
+            }
 
-        // If connected, only accept packets from the connected address
-        if let Some(connected) = *self.connected_addr.lock().unwrap() {
-            if src_addr != connected {
+            if result.is_none() {
+                let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+                buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+                if let Ok(mut guard) = self.connection_state.write() {
+                    if let Some(ref mut state) = *guard {
+                        state.record_recv(copy_len);
+                    }
+                }
+
+                *result = Some((copy_len, src_addr));
+            } else {
                 let payload_len = parsed.payload.len();
                 let mut queue = self.recv_queue.lock().unwrap();
-                // Must allocate here — queued packets outlive the frame/mbuf
                 if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
                     self.record_rx_drop(payload_len);
                 }
-                return None;
             }
+
+            return None;
         }
 
-        if result.is_none() {
-            // First matching packet: copy directly to user buffer (zero intermediate alloc)
-            let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
-            buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+        // IPv6 path: try parsing as IPv6/UDP.
+        if let Some(parsed) = ipv6::parse_udp6_packet_ref(frame_data) {
+            // Mandatory UDP checksum validation for IPv6 (RFC 8200 §8.1).
+            if !verify_udp6_checksum(frame_data) {
+                perf_inc!(self.perf_counters.rx_drops_parse_fail);
+                return None;
+            }
 
-            if let Ok(mut guard) = self.connection_state.write() {
-                if let Some(ref mut state) = *guard {
-                    state.record_recv(copy_len);
+            perf_inc!(self.perf_counters.rx_packets);
+            perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
+
+            if parsed.dst_port != local_port {
+                return None;
+            }
+
+            let src_addr = SocketAddr::V6(
+                std::net::SocketAddrV6::new(parsed.src_ip, parsed.src_port, 0, 0)
+            );
+
+            if let Some(connected) = *self.connected_addr.lock().unwrap() {
+                if src_addr != connected {
+                    let payload_len = parsed.payload.len();
+                    let mut queue = self.recv_queue.lock().unwrap();
+                    if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
+                        self.record_rx_drop(payload_len);
+                    }
+                    return None;
                 }
             }
 
-            *result = Some((copy_len, src_addr));
-        } else {
-            // Additional matching packets: must allocate for the queue
-            let payload_len = parsed.payload.len();
-            let mut queue = self.recv_queue.lock().unwrap();
-            if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
-                self.record_rx_drop(payload_len);
+            if result.is_none() {
+                let copy_len = std::cmp::min(buf.len(), parsed.payload.len());
+                buf[..copy_len].copy_from_slice(&parsed.payload[..copy_len]);
+
+                if let Ok(mut guard) = self.connection_state.write() {
+                    if let Some(ref mut state) = *guard {
+                        state.record_recv(copy_len);
+                    }
+                }
+
+                *result = Some((copy_len, src_addr));
+            } else {
+                let payload_len = parsed.payload.len();
+                let mut queue = self.recv_queue.lock().unwrap();
+                if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
+                    self.record_rx_drop(payload_len);
+                }
             }
+
+            return None;
         }
 
+        // Neither IPv4 nor IPv6 UDP — drop.
+        perf_inc!(self.perf_counters.rx_drops_parse_fail);
         None
     }
 
@@ -7471,5 +7515,85 @@ mod tests {
         // GOOD and BAD must not overlap
         let bad = dpdk_sys::RTE_MBUF_F_RX_L4_CKSUM_BAD as u64;
         assert_eq!(good & bad, 0);
+    }
+
+    // ========================================================================
+    // IPv6 RX Checksum Validation (process_frame_zerocopy integration)
+    // ========================================================================
+
+    #[test]
+    fn process_frame_zerocopy_accepts_valid_ipv6_udp() {
+        use crate::ipv6::build_udp6_frame;
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"ipv6 payload", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        let (len, _src_addr) = result.expect("valid IPv6 UDP frame should be accepted");
+        assert_eq!(&buf[..len], b"ipv6 payload");
+    }
+
+    #[test]
+    fn process_frame_zerocopy_rejects_corrupted_ipv6_checksum() {
+        use crate::ipv6::build_udp6_frame;
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"corrupt ipv6", 64,
+        ).unwrap();
+
+        // Corrupt the payload (invalidates checksum)
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        assert!(result.is_none(), "corrupted IPv6 UDP checksum should be rejected");
+    }
+
+    #[test]
+    fn process_frame_zerocopy_rejects_zero_ipv6_checksum() {
+        use crate::ipv6::{build_udp6_frame, IPV6_HEADER_LEN};
+        use std::net::Ipv6Addr;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = socket_local_port(&socket);
+
+        let src_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"zero cksum", 64,
+        ).unwrap();
+
+        // Zero out the UDP checksum (invalid for IPv6)
+        let udp_off = ETH_HEADER_LEN + IPV6_HEADER_LEN;
+        frame[udp_off + 6] = 0;
+        frame[udp_off + 7] = 0;
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        assert!(result.is_none(), "zero UDP checksum should be rejected for IPv6");
     }
 }
