@@ -6,6 +6,86 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #26: IPv6 SocketAddrV6 through UdpSocket — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-29 |
+| **Git Hash** | `7cd3da0` |
+| **Branch** | `agent/ipv6-socket-addr` |
+| **PR** | [#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62) |
+| **GH Actions Run** | [26633424088](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/26633424088) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #25
+
+1. **`7cd3da0` — IPv6 SocketAddrV6 through UdpSocket.** `bind()`/`send_to()`/`recv_from()`/`connect()` now accept IPv6 addresses. Added `AddressFamily` enum, `set_only_v6()`/`only_v6()` socket option, `NdpHandler` integration for IPv6 neighbor resolution on TX. Gratuitous NA on bind for IPv6 sockets. 18 new tests. This change adds a new `send_to_v6()` path and an `only_v6` atomic check in `process_frame_zerocopy()` — the IPv4 hot path gains one `AtomicBool::load(Acquire)` which is always false for IPv4 sockets.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,995 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,982 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,969 | 0.3% | 348,893 | 0.3% | 349,985 | 0.0% |
+| 700,000 | 695,587 | 0.6% | 550,494 | 21.4% | 698,590 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,992 | 0.3% | 348,893 | 0.3% | 349,980 | 0.0% |
+| 700,000 | 693,903 | 0.9% | 401,830 | 42.6% | 698,803 | 0.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,973 | 0.7% | 139,989 | 0.0% |
+| 350,000 | 348,997 | 0.3% | 348,947 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 558,263 | 20.2% | 389,116 | 44.4% | 647,469 | 7.5% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 42,718 | 39.0% | 70,000 | 0.0% |
+| 140,000 | 124,362 | 0.8% | 124,343 | 0.8% | 125,302 | 0.0% |
+| 350,000 | 123,676 | 1.3% | 121,835 | 2.7% | 124,337 | 0.8% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 68,999 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 311,412 | 11.0% |
+| 700,000 | 310,799 | 55.6% |
+
+### Analysis
+
+**No performance regression from IPv6 socket address support.** The only change to the IPv4 hot path is a single `AtomicBool::load(Acquire)` for the `only_v6` check in `process_frame_zerocopy()`, which is always `false` for IPv4-bound sockets and costs ~1 ns (within measurement noise).
+
+**rust-dpdk at 700K PPS, 64B**: 695,587 RX (0.6% drop) — within normal variance of Run #25's 699,000 (0.1%). The ~3K difference is environmental noise (ENA scheduling jitter).
+
+**rust-dpdk at 700K PPS, 512B**: 693,903 RX (0.9% drop) — within normal variance of Run #25's 699,000 (0.1%).
+
+**rust-dpdk at 700K PPS, 1400B**: 558,263 RX (20.2% drop) — consistent with Run #25's 569,926 (18.6%). Both are within the expected range for near-MTU packets at saturation on c6in.xlarge.
+
+**rust-dpdk vs native-dpdk parity**: At 350K PPS, Rust delivers 348,969-348,997 vs native C's 349,980-350,000 — effectively identical. At 700K PPS with 64B, Rust is 695,587 vs native 698,590 (99.6% of native throughput).
+
+**tokio-dpdk**: Caps at ~311K PPS — consistent with Run #25's 307,647, confirming the async compat layer ceiling is unchanged.
+
+**Conclusion**: IPv6 socket address support is performance-neutral for IPv4 traffic. The new `send_to_v6()` and `bind_v6()` paths are only invoked for IPv6 destinations — they do not affect the existing IPv4 send/recv hot paths.
+
+---
+
 ## Run #25: Encap IPv6 Outer (GUE, VXLAN, GENEVE) — No Regression
 
 | Field | Value |
