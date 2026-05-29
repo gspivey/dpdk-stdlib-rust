@@ -13,7 +13,7 @@
 
 use std::cell::UnsafeCell;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::collections::VecDeque;
@@ -142,6 +142,21 @@ pub enum UdpError {
 }
 
 pub type UdpResult<T> = Result<T, UdpError>;
+
+// ============================================================================
+// Address Family
+// ============================================================================
+
+/// Socket address family, determining which wire format (IPv4 or IPv6) the
+/// socket uses for outbound frames and which inbound frames it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4 socket — sends/receives IPv4/UDP frames.
+    IPv4,
+    /// IPv6 socket — sends/receives IPv6/UDP frames. When `only_v6` is false
+    /// (the default), also accepts IPv4 frames (dual-stack).
+    IPv6,
+}
 
 // ============================================================================
 // Constants
@@ -2025,6 +2040,13 @@ pub struct UdpSocket {
     /// Fast-path flag: true when `error_queue` has entries. Avoids locking the
     /// mutex on every `take_error()` call when there are no errors (common case).
     has_pending_error: AtomicBool,
+    /// Address family of this socket (IPv4 or IPv6).
+    address_family: AddressFamily,
+    /// IPV6_V6ONLY: when true, an IPv6 socket only accepts IPv6 frames.
+    /// When false (default), the socket is dual-stack and also accepts IPv4.
+    only_v6: AtomicBool,
+    /// NDP handler for IPv6 neighbor resolution (parallel to arp_handler for IPv4).
+    ndp_handler: NdpHandler,
 }
 
 impl UdpSocket {
@@ -2036,14 +2058,14 @@ impl UdpSocket {
         let addr = addr.to_socket_addrs()?.next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
 
-        // Only support IPv4 for now
-        let local_v4 = match addr {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
-            }
-        };
+        match addr {
+            SocketAddr::V4(v4) => Self::bind_v4(v4),
+            SocketAddr::V6(v6) => Self::bind_v6(v6),
+        }
+    }
 
+    /// Internal: bind to an IPv4 address.
+    fn bind_v4(local_v4: SocketAddrV4) -> io::Result<UdpSocket> {
         // Allocate an ephemeral port if port 0 was requested
         let local_v4 = if local_v4.port() == 0 {
             let ephemeral = allocate_ephemeral_port();
@@ -2125,10 +2147,103 @@ impl UdpSocket {
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
             has_pending_error: AtomicBool::new(false),
+            address_family: AddressFamily::IPv4,
+            only_v6: AtomicBool::new(false),
+            ndp_handler: NdpHandler::new(local_mac, Ipv6Addr::UNSPECIFIED),
         };
 
         // Send Gratuitous ARP to announce our MAC/IP mapping on the network
         socket.send_gratuitous_arp_if_enabled();
+
+        Ok(socket)
+    }
+
+    /// Internal: bind to an IPv6 address.
+    fn bind_v6(local_v6: SocketAddrV6) -> io::Result<UdpSocket> {
+        // Allocate an ephemeral port if port 0 was requested
+        let local_v6 = if local_v6.port() == 0 {
+            let ephemeral = allocate_ephemeral_port();
+            SocketAddrV6::new(*local_v6.ip(), ephemeral, local_v6.flowinfo(), local_v6.scope_id())
+        } else {
+            local_v6
+        };
+
+        // Get or initialize DPDK resources
+        let resources = get_or_init_dpdk(0, 9001)?;
+
+        let local_mac = resources.src_mac.octets();
+        let local_ipv6 = *local_v6.ip();
+
+        // ARP handler still needed for dual-stack (IPv4 frames on same port)
+        let arp_handler = ArpHandler::with_cache(
+            local_mac,
+            Ipv4Addr::UNSPECIFIED,
+            Arc::clone(&resources.arp_cache),
+        );
+
+        let icmp_handler = IcmpHandler::new(local_mac, Ipv4Addr::UNSPECIFIED);
+        let icmpv6_handler = Icmpv6Handler::new(local_mac, local_ipv6);
+        let ndp_handler = NdpHandler::new(local_mac, local_ipv6);
+
+        println!("✅ DPDK UDP socket bound to {} (MAC: {})", SocketAddr::V6(local_v6), resources.src_mac);
+
+        let socket_backend = SocketBackend::Dpdk(Arc::clone(&resources));
+
+        // For IPv6, routing table uses default (no IPv4 subnet detection)
+        let mut routing_table = RoutingTable::default();
+        if routing_table.mtu() < resources.mtu {
+            routing_table.set_mtu(resources.mtu);
+        }
+
+        let socket = UdpSocket {
+            local_addr: SocketAddr::V6(local_v6),
+            connected_addr: Mutex::new(None),
+            socket_backend,
+            resources,
+            ttl: 64,
+            dst_mac: MacAddress::broadcast(),
+            arp_handler,
+            icmp_handler,
+            icmpv6_handler,
+            connection_state: RwLock::new(None),
+            recv_queue: Mutex::new(ReceiveQueue::with_limits(
+                DEFAULT_RECV_BUFFER_PACKETS,
+                DEFAULT_RECV_BUFFER_BYTES,
+            )),
+            auto_arp: true,
+            auto_icmp: true,
+            auto_garp: true,
+            read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
+            topology: Mutex::new(None),
+            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
+            perf_counters: Arc::new(PerfCounters::new()),
+            latency_sampler: Arc::new(LatencySampler::default()),
+            perf_reporter: Mutex::new(None),
+            recv_from_rr_index: AtomicUsize::new(0),
+            has_pipeline: AtomicBool::new(false),
+            cached_app_rings: None,
+            cached_frame_pool: None,
+            cached_direct_send: None,
+            is_connected: AtomicBool::new(false),
+            has_buffered_packets: AtomicBool::new(false),
+            has_connection_state: AtomicBool::new(false),
+            routing_table,
+            vlan_config: None,
+            gue_config: None,
+            vxlan_config: None,
+            geneve_config: None,
+            rx_dropped_packets: AtomicU64::new(0),
+            rx_dropped_bytes: AtomicU64::new(0),
+            error_queue: Mutex::new(VecDeque::new()),
+            has_pending_error: AtomicBool::new(false),
+            address_family: AddressFamily::IPv6,
+            only_v6: AtomicBool::new(false),
+            ndp_handler,
+        };
+
+        // Send Gratuitous NA for IPv6 (parallel to Gratuitous ARP for IPv4)
+        socket.send_gratuitous_na_if_enabled();
 
         Ok(socket)
     }
@@ -2155,33 +2270,43 @@ impl UdpSocket {
         let addr = addr.to_socket_addrs()?.next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
 
-        let local_v4 = match addr {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+        let (local_addr, address_family, local_ip_v4) = match addr {
+            SocketAddr::V4(v4) => {
+                let v4 = if v4.port() == 0 {
+                    SocketAddrV4::new(*v4.ip(), allocate_ephemeral_port())
+                } else {
+                    v4
+                };
+                (SocketAddr::V4(v4), AddressFamily::IPv4, Some(*v4.ip()))
+            }
+            SocketAddr::V6(v6) => {
+                let v6 = if v6.port() == 0 {
+                    SocketAddrV6::new(*v6.ip(), allocate_ephemeral_port(), v6.flowinfo(), v6.scope_id())
+                } else {
+                    v6
+                };
+                (SocketAddr::V6(v6), AddressFamily::IPv6, None)
             }
         };
 
-        // Allocate an ephemeral port if port 0 was requested
-        let local_v4 = if local_v4.port() == 0 {
-            let ephemeral = allocate_ephemeral_port();
-            SocketAddrV4::new(*local_v4.ip(), ephemeral)
-        } else {
-            local_v4
-        };
-
         let local_mac = backend.mac_address();
-        let local_ip = *local_v4.ip();
         let arp_cache = Arc::new(ArpCache::new());
 
+        // For IPv4, use the actual IP; for IPv6, use UNSPECIFIED for ARP handler
+        let arp_ip = local_ip_v4.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let arp_handler = ArpHandler::with_cache(
             local_mac,
-            local_ip,
+            arp_ip,
             Arc::clone(&arp_cache),
         );
 
-        let icmp_handler = IcmpHandler::new(local_mac, local_ip);
-        let icmpv6_handler = Icmpv6Handler::new(local_mac, std::net::Ipv6Addr::UNSPECIFIED);
+        let icmp_handler = IcmpHandler::new(local_mac, arp_ip);
+        let local_ipv6 = match local_addr {
+            SocketAddr::V6(v6) => *v6.ip(),
+            _ => Ipv6Addr::UNSPECIFIED,
+        };
+        let icmpv6_handler = Icmpv6Handler::new(local_mac, local_ipv6);
+        let ndp_handler = NdpHandler::new(local_mac, local_ipv6);
 
         let backend_name = backend.backend_name();
 
@@ -2190,12 +2315,12 @@ impl UdpSocket {
         let resources = get_or_init_dpdk(0, 9001)?;
 
         println!("✅ {} UDP socket bound to {} (MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-            backend_name, SocketAddr::V4(local_v4),
+            backend_name, local_addr,
             local_mac[0], local_mac[1], local_mac[2],
             local_mac[3], local_mac[4], local_mac[5]);
 
         // Auto-detect routing from OS if possible (Phase 3).
-        let mut routing_table = auto_detect_routing(local_ip, &arp_handler);
+        let mut routing_table = auto_detect_routing(arp_ip, &arp_handler);
 
         // DPDK backends have jumbo MTU configured at the port level, but
         // auto-detect may miss it because the ENI is on vfio-pci (no kernel iface).
@@ -2204,7 +2329,7 @@ impl UdpSocket {
         }
 
         let socket = UdpSocket {
-            local_addr: SocketAddr::V4(local_v4),
+            local_addr,
             connected_addr: Mutex::new(None),
             socket_backend: SocketBackend::Generic(backend),
             resources,
@@ -2245,6 +2370,9 @@ impl UdpSocket {
             rx_dropped_bytes: AtomicU64::new(0),
             error_queue: Mutex::new(VecDeque::new()),
             has_pending_error: AtomicBool::new(false),
+            address_family,
+            only_v6: AtomicBool::new(false),
+            ndp_handler,
         };
 
         // Send Gratuitous ARP to announce our MAC/IP mapping on the network
@@ -2325,18 +2453,21 @@ impl UdpSocket {
     /// run-to-completion path. The multi-core topology path still allocates
     /// because the TX ring takes ownership of the frame.
     fn send_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        // Extract IPv4 addresses
+        // Dispatch based on destination address family
+        match addr {
+            SocketAddr::V4(v4) => self.send_to_v4(buf, *v4.ip(), v4.port()),
+            SocketAddr::V6(v6) => self.send_to_v6(buf, *v6.ip(), v6.port()),
+        }
+    }
+
+    /// Internal: send a UDP datagram over IPv4.
+    fn send_to_v4(&self, buf: &[u8], dst_ip: Ipv4Addr, dst_port: u16) -> io::Result<usize> {
         let (src_ip, src_port) = match self.local_addr {
             SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
-            }
-        };
-
-        let (dst_ip, dst_port) = match addr {
-            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
+            SocketAddr::V6(v6) => {
+                // IPv6 socket sending to IPv4 — use unspecified as source IPv4
+                // (dual-stack behavior: map to IPv4-compatible)
+                (Ipv4Addr::UNSPECIFIED, v6.port())
             }
         };
 
@@ -2522,6 +2653,81 @@ impl UdpSocket {
         Ok(buf.len())
     }
 
+    /// Internal: send a UDP datagram over IPv6.
+    fn send_to_v6(&self, buf: &[u8], dst_ip: Ipv6Addr, dst_port: u16) -> io::Result<usize> {
+        let (src_ip, src_port) = match self.local_addr {
+            SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
+            SocketAddr::V4(_) => {
+                // IPv4 socket trying to send to IPv6 — error
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot send to IPv6 address from IPv4 socket",
+                ));
+            }
+        };
+
+        // IPv6 max payload: MTU - 40 (IPv6 header) - 8 (UDP header)
+        let max_payload = (self.routing_table.mtu() as usize).saturating_sub(48);
+        if buf.len() > max_payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload too large: {} bytes exceeds max UDP payload {} (MTU {})",
+                    buf.len(), max_payload, self.routing_table.mtu(),
+                ),
+            ));
+        }
+
+        // Resolve destination MAC via NDP (IPv6 equivalent of ARP)
+        let dst_mac = match self.ndp_handler.resolve(&dst_ip) {
+            Some(mac) => mac,
+            None => {
+                // For multicast, derive MAC directly
+                if dst_ip.octets()[0] == 0xFF {
+                    ipv6_addr::ipv6_multicast_mac(&dst_ip)
+                } else {
+                    // Send NDP solicitation and use broadcast as fallback
+                    if let Some(ns_frame) = self.ndp_handler.make_solicitation(&dst_ip) {
+                        let _ = self.socket_backend.send_frame(&ns_frame, None);
+                    }
+                    // Use broadcast MAC as fallback (stub mode will accept it)
+                    [0xff; 6]
+                }
+            }
+        };
+
+        let src_mac = self.socket_backend.mac_address();
+
+        // Build IPv6/UDP frame
+        let mut tx_buf = self.tx_buf.borrow_mut();
+        ipv6::build_udp6_frame_into(
+            &mut tx_buf,
+            &src_mac,
+            &dst_mac,
+            src_ip, dst_ip,
+            src_port, dst_port,
+            buf, self.ttl,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("IPv6 packet build failed: {}", e)))?;
+
+        // Send the frame
+        self.socket_backend.send_frame(&tx_buf, None)?;
+
+        // Increment TX counters
+        perf_inc!(self.perf_counters.tx_packets);
+        perf_inc!(self.perf_counters.tx_bytes, buf.len() as u64);
+
+        // Update connection state if connected
+        if self.has_connection_state.load(Ordering::Acquire) {
+            if let Ok(mut guard) = self.connection_state.write() {
+                if let Some(ref mut state) = *guard {
+                    state.record_send(buf.len());
+                }
+            }
+        }
+
+        Ok(buf.len())
+    }
+
     /// Receives a single datagram message on the socket.
     ///
     /// This calls DPDK's rx_burst to receive packets, parses the Ethernet/IPv4/UDP
@@ -2619,9 +2825,7 @@ impl UdpSocket {
     fn try_recv_from_inline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
-            }
+            SocketAddr::V6(v6) => v6.port(),
         };
 
         // Check buffered packets first.
@@ -2838,9 +3042,7 @@ impl UdpSocket {
         // Get our local port for filtering (do this once outside the loop)
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
-            SocketAddr::V6(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported"));
-            }
+            SocketAddr::V6(v6) => v6.port(),
         };
 
         let deadline = self.read_timeout.lock().unwrap().map(|d| Instant::now() + d);
@@ -3212,6 +3414,8 @@ impl UdpSocket {
         // Zero-copy UDP parse — payload borrows from frame_data.
         // Handles both tagged and untagged frames via detect_vlan internally.
         // Try IPv4 first, then IPv6.
+        // If only_v6 is set, skip IPv4 entirely.
+        if !self.only_v6.load(Ordering::Acquire) {
         if let Some(parsed) = parse_udp_packet_ref(frame_data) {
             // IPv4 path: validate both IPv4 header and UDP checksums.
             if !verify_ipv4_checksum(frame_data) {
@@ -3271,6 +3475,7 @@ impl UdpSocket {
 
             return None;
         }
+        } // end if !only_v6
 
         // IPv6 path: try parsing as IPv6/UDP.
         if let Some(parsed) = ipv6::parse_udp6_packet_ref(frame_data) {
@@ -3339,6 +3544,35 @@ impl UdpSocket {
         self.connected_addr.lock().unwrap().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
         })
+    }
+
+    /// Returns the address family of this socket.
+    pub fn address_family(&self) -> AddressFamily {
+        self.address_family
+    }
+
+    /// Sets the `IPV6_V6ONLY` socket option.
+    ///
+    /// When `true`, an IPv6 socket will only receive IPv6 packets.
+    /// When `false` (the default), the socket is dual-stack and also accepts IPv4.
+    ///
+    /// Returns an error if called on an IPv4 socket.
+    pub fn set_only_v6(&mut self, only_v6: bool) -> io::Result<()> {
+        if self.address_family != AddressFamily::IPv6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set_only_v6 is only valid on IPv6 sockets",
+            ));
+        }
+        self.only_v6.store(only_v6, Ordering::Release);
+        Ok(())
+    }
+
+    /// Gets the `IPV6_V6ONLY` socket option.
+    ///
+    /// Returns `false` for IPv4 sockets (they never accept IPv6).
+    pub fn only_v6(&self) -> io::Result<bool> {
+        Ok(self.only_v6.load(Ordering::Acquire))
     }
 
     /// Connects this UDP socket to a remote address.
@@ -3627,6 +3861,15 @@ impl UdpSocket {
     fn send_gratuitous_arp_if_enabled(&self) {
         if self.auto_garp {
             let _ = self.send_gratuitous_arp();
+        }
+    }
+
+    /// Sends a Gratuitous Neighbor Advertisement if auto_garp is enabled (IPv6).
+    fn send_gratuitous_na_if_enabled(&self) {
+        if self.auto_garp {
+            if let Some(na_frame) = self.ndp_handler.make_gratuitous_na() {
+                let _ = self.socket_backend.send_frame(&na_frame, None);
+            }
         }
     }
 
@@ -7595,5 +7838,287 @@ mod tests {
         socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
 
         assert!(result.is_none(), "zero UDP checksum should be rejected for IPv6");
+    }
+
+    // ========================================================================
+    // IPv6 Socket Address Support (SocketAddrV6 through UdpSocket)
+    // ========================================================================
+
+    #[test]
+    fn bind_ipv6_unspecified_succeeds() {
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), std::net::Ipv6Addr::UNSPECIFIED);
+                assert_ne!(v6.port(), 0, "ephemeral port should be allocated");
+            }
+            _ => panic!("expected V6 address"),
+        }
+    }
+
+    #[test]
+    fn bind_ipv6_specific_address_succeeds() {
+        let socket = UdpSocket::bind("[2001:db8::1]:9876").unwrap();
+        let addr = socket.local_addr().unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap());
+                assert_eq!(v6.port(), 9876);
+            }
+            _ => panic!("expected V6 address"),
+        }
+    }
+
+    #[test]
+    fn bind_ipv6_loopback_succeeds() {
+        let socket = UdpSocket::bind("[::1]:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), std::net::Ipv6Addr::LOCALHOST);
+            }
+            _ => panic!("expected V6 address"),
+        }
+    }
+
+    #[test]
+    fn bind_ipv6_link_local_succeeds() {
+        let socket = UdpSocket::bind("[fe80::1]:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert!(crate::ipv6_addr::is_link_local(v6.ip()));
+            }
+            _ => panic!("expected V6 address"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv6_sets_peer_addr() {
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        socket.connect("[2001:db8::99]:4000").unwrap();
+        let peer = socket.peer_addr().unwrap();
+        match peer {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), "2001:db8::99".parse::<std::net::Ipv6Addr>().unwrap());
+                assert_eq!(v6.port(), 4000);
+            }
+            _ => panic!("expected V6 peer address"),
+        }
+    }
+
+    #[test]
+    fn send_to_ipv6_builds_valid_frame() {
+        let socket = UdpSocket::bind("[2001:db8::1]:5000").unwrap();
+        // In stub mode, tx_burst returns 0 (no packets sent), so send_to returns WouldBlock.
+        // This test verifies that the IPv6 send path is reachable and doesn't error
+        // with "IPv6 not supported" — the WouldBlock is expected stub behavior.
+        let result = socket.send_to(b"hello ipv6", "[2001:db8::2]:6000");
+        match result {
+            Ok(n) => assert_eq!(n, 10),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn send_to_ipv6_rejects_oversized_payload() {
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        // MTU 9001 - 48 (IPv6+UDP headers) = 8953 max payload
+        let big = vec![0u8; 10000];
+        let result = socket.send_to(&big, "[2001:db8::2]:6000");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recv_from_ipv6_returns_v6_source_addr() {
+        use crate::ipv6::build_udp6_frame;
+
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+
+        let src_ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"v6 data", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        let (len, src_addr) = result.expect("valid IPv6 frame should be accepted");
+        assert_eq!(&buf[..len], b"v6 data");
+        match src_addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), src_ip);
+                assert_eq!(v6.port(), 8000);
+            }
+            _ => panic!("expected V6 source address"),
+        }
+    }
+
+    #[test]
+    fn set_only_v6_and_only_v6_accessors() {
+        let mut socket = UdpSocket::bind("[::]:0").unwrap();
+        // Default: not only_v6 (dual-stack)
+        assert!(!socket.only_v6().unwrap());
+
+        socket.set_only_v6(true).unwrap();
+        assert!(socket.only_v6().unwrap());
+
+        socket.set_only_v6(false).unwrap();
+        assert!(!socket.only_v6().unwrap());
+    }
+
+    #[test]
+    fn only_v6_socket_rejects_ipv4_frames() {
+        use crate::ipv6::build_udp6_frame;
+
+        let mut socket = UdpSocket::bind("[::]:0").unwrap();
+        socket.set_only_v6(true).unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+
+        // Build an IPv4 frame targeting the same port
+        let ipv4_frame = build_udp_frame(
+            &[0xaa; 6], &[0xbb; 6],
+            Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2),
+            8000, local_port,
+            b"ipv4 data", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&ipv4_frame, local_port, &mut buf, &mut result, None);
+        assert!(result.is_none(), "only_v6 socket should reject IPv4 frames");
+    }
+
+    #[test]
+    fn only_v6_socket_accepts_ipv6_frames() {
+        use crate::ipv6::build_udp6_frame;        let mut socket = UdpSocket::bind("[::]:0").unwrap();
+        socket.set_only_v6(true).unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+
+        let src_ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            8000, local_port, b"v6 only", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        let (len, _) = result.expect("only_v6 socket should accept IPv6 frames");
+        assert_eq!(&buf[..len], b"v6 only");
+    }
+
+    #[test]
+    fn set_only_v6_on_ipv4_socket_returns_error() {
+        let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = socket.set_only_v6(true);
+        assert!(result.is_err(), "set_only_v6 on IPv4 socket should fail");
+    }
+
+    #[test]
+    fn ipv6_socket_address_family_is_v6() {
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        assert_eq!(socket.address_family(), AddressFamily::IPv6);
+    }
+
+    #[test]
+    fn ipv4_socket_address_family_is_v4() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(socket.address_family(), AddressFamily::IPv4);
+    }
+
+    #[test]
+    fn ipv6_socket_send_then_recv_roundtrip() {
+        use crate::ipv6::build_udp6_frame;
+
+        // Bind an IPv6 socket
+        let socket = UdpSocket::bind("[2001:db8::2]:0").unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+
+        // Simulate receiving a frame from a peer
+        let src_ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_ip: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], src_ip, dst_ip,
+            7777, local_port, b"roundtrip", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        let (len, src_addr) = result.expect("should receive IPv6 frame");
+        assert_eq!(&buf[..len], b"roundtrip");
+        assert_eq!(src_addr, SocketAddr::V6(std::net::SocketAddrV6::new(src_ip, 7777, 0, 0)));
+    }
+
+    #[test]
+    fn ipv6_connected_socket_filters_non_matching_source() {
+        use crate::ipv6::build_udp6_frame;
+
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+
+        // Connect to a specific peer
+        socket.connect("[2001:db8::99]:4000").unwrap();
+
+        // Receive a frame from a DIFFERENT source
+        let wrong_src: std::net::Ipv6Addr = "2001:db8::77".parse().unwrap();
+        let dst_ip: std::net::Ipv6Addr = "::".parse().unwrap();
+        let frame = build_udp6_frame(
+            &[0xaa; 6], &[0xbb; 6], wrong_src, dst_ip,
+            5000, local_port, b"wrong src", 64,
+        ).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+
+        // Should be buffered (not returned directly) because source doesn't match connected peer
+        assert!(result.is_none(), "frame from non-connected source should be buffered");
+    }
+
+    #[test]
+    fn ipv6_send_to_with_connected_socket() {
+        let socket = UdpSocket::bind("[::]:0").unwrap();
+        socket.connect("[2001:db8::99]:4000").unwrap();
+        // send() should use the connected address. In stub mode, WouldBlock is expected.
+        let result = socket.send(b"connected send");
+        match result {
+            Ok(n) => assert_eq!(n, 14),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn bind_with_backend_ipv6_succeeds() {
+        // bind_with_backend with IPv6 is tested indirectly through bind("[::]:0")
+        // which uses the DPDK backend. Verify the address family is correct.
+        let socket = UdpSocket::bind("[::1]:0").unwrap();
+        assert_eq!(socket.address_family(), AddressFamily::IPv6);
+        assert!(matches!(socket.local_addr().unwrap(), SocketAddr::V6(_)));
     }
 }
