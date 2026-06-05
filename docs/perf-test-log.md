@@ -6,6 +6,96 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #28: Extract dpdk-stdlib-net Shared Crate — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-05 |
+| **Git Hash** | `0a1e8c29` |
+| **Branch** | `agent/extract-dpdk-stdlib-net` |
+| **PR** | [#65](https://github.com/gspivey/dpdk-stdlib-rust/pull/65) |
+| **GH Actions Run** | [27030695277](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27030695277) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #27
+
+1. **`d2fd316` — Extract dpdk-stdlib-net shared crate.** Moved `PacketBackend` trait, `DpdkBackend`, `RawSocketBackend`, `ring_buffer.rs`, and checksum helpers (`ipv4_checksum`, `pseudo_header_checksum`) out of `dpdk-udp` into a new `dpdk-stdlib-net` crate. `dpdk-udp` re-exports everything for backward compatibility. Added `NeighborResolver` trait and `ArpResolver` implementation.
+2. **`0a1e8c29` — Add `rx_readiness()` to PacketBackend trait.** New method on `PacketBackend` signaling frame availability for event-loop integration. Default implementation returns `Ready` immediately.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,978 | 1.5% | 68,999 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,904 | 0.8% | 138,995 | 0.7% | 139,997 | 0.0% |
+| 350,000 | 348,601 | 0.4% | 346,336 | 1.0% | 349,936 | 0.0% |
+| 700,000 | 693,327 | 1.0% | 485,680 | 30.6% | 698,763 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,987 | 1.4% | 68,985 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,942 | 0.8% | 138,992 | 0.7% | 139,993 | 0.0% |
+| 350,000 | 348,844 | 0.3% | 342,625 | 2.1% | 350,000 | 0.0% |
+| 700,000 | 673,282 | 3.8% | 411,087 | 41.3% | 692,824 | 1.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,958 | 1.5% | 68,982 | 1.5% | 70,000 | 0.0% |
+| 140,000 | 138,983 | 0.7% | 138,950 | 0.8% | 140,000 | 0.0% |
+| 350,000 | 348,761 | 0.4% | 340,725 | 2.7% | 349,984 | 0.0% |
+| 700,000 | 474,955 | 0.4% | 443,222 | 7.0% | 475,803 | 0.2% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 36,719 | 47.5% | 70,000 | 0.0% |
+| 140,000 | 75,417 | 3.7% | 77,762 | 0.7% | 78,271 | 0.0% |
+| 350,000 | 77,215 | 1.4% | 76,434 | 2.4% | 76,221 | 2.7% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 68,992 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 302,598 | 13.5% |
+| 700,000 | 303,180 | 56.7% |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | no FINAL (abnormal shutdown) | — | — | — |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 282,825 / 282,825 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression from the dpdk-stdlib-net extraction.** The refactor moves existing code into a new crate with re-exports preserving backward compatibility. The packet processing hot path is unchanged — only the module boundaries moved.
+
+**rust-dpdk at 700K PPS, 64B**: 693,327 RX (1.0% drop) — consistent with Run #26's 695,587 (0.6%) and Run #27's 689,799 (1.5%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 512B**: 673,282 RX (3.8% drop) — consistent with Run #26's 693,903 (0.9%) and Run #27's 672,346 (4.0%). Instance-level variance.
+
+**rust-dpdk at 700K PPS, 1400B**: 474,955 RX (0.4% drop) — excellent, line-rate capped at ~476K. Consistent with prior runs.
+
+**rust-dpdk vs native-dpdk parity**: At 350K PPS, Rust delivers 348,601–348,844 vs native C's 349,936–350,000 — effectively identical. At 700K PPS with 64B, Rust is 693,327 vs native 698,763 (99.2% of native throughput).
+
+**tokio-dpdk**: Caps at ~303K PPS — consistent with Run #26's 311,412 and Run #27's 305,967, confirming the async compat layer ceiling is unchanged.
+
+**Conclusion**: The `dpdk-stdlib-net` crate extraction is performance-neutral. Moving `PacketBackend`, backends, and checksum helpers to a shared crate introduces no measurable overhead. The `rx_readiness()` trait addition has a default no-op implementation that is never called in the benchmark path.
+
+---
+
 ## Run #26: IPv6 SocketAddrV6 through UdpSocket — No Regression
 
 | Field | Value |

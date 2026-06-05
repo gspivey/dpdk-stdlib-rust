@@ -13,7 +13,7 @@ Each item targets ~300–500 lines of new/modified Rust (or equivalent for scrip
 Move `PacketBackend` trait, `DpdkBackend`, `RawSocketBackend`, `ring_buffer.rs`, `ipv4_checksum`/`pseudo_header_checksum` helpers out of `dpdk-stdlib-udp` into a new `dpdk-stdlib-net` crate. Add a `NeighborResolver` trait + `ArpResolver` implementation. `dpdk-stdlib-udp` re-exports everything for backward compatibility. CI must enforce `dpdk-stdlib-tcp` never depends on `dpdk-stdlib-udp`. Use two commits: `1.1a` = git-mv + re-export (no behavior change), `1.1b` = add `rx_readiness()` to the trait.
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `1.1`, `1.2`, `1.3`, `1.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #65
 
 ---
 
