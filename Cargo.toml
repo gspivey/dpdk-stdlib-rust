@@ -3,7 +3,9 @@ resolver = "2"
 members = [
   "dpdk-sys",
   "dpdk",
+  "dpdk-stdlib-net",
   "dpdk-udp",
+  "dpdk-stdlib-tcp",
   "dpdk-tokio",
   "apps/echo",
   "apps/test-client",

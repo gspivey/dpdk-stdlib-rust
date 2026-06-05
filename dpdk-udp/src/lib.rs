@@ -115,6 +115,9 @@ pub use ndp::{
     NDP_HOP_LIMIT, NDP_NS_FRAME_LEN, NDP_NA_FRAME_LEN,
 };
 
+// Re-exports from dpdk-stdlib-net for backward compatibility
+pub use dpdk_stdlib_net::{self as dpdk_net, NeighborResolver, ArpResolver};
+
 // ============================================================================
 // Error Types
 // ============================================================================

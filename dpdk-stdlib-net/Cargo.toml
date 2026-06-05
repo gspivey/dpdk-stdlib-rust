@@ -1,0 +1,14 @@
+[package]
+name = "dpdk-stdlib-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared networking traits and backends for dpdk-stdlib crates"
+
+[dependencies]
+dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
+libc = { workspace = true }
