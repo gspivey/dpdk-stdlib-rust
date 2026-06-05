@@ -1,5 +1,9 @@
 # dpdk-stdlib-rust
 
+[![crates.io dpdk-stdlib-udp](https://img.shields.io/crates/v/dpdk-stdlib-udp.svg)](https://crates.io/crates/dpdk-stdlib-udp)
+[![crates.io dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg)](https://crates.io/crates/dpdk-stdlib-tokio)
+[![crates.io dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg)](https://crates.io/crates/dpdk-stdlib)
+
 Drop-in DPDK-accelerated replacements for `std::net::UdpSocket` and `tokio::net::UdpSocket`. Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
 
 ## Why
@@ -24,6 +28,21 @@ DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace d
 - **Async runtime**: Full Tokio integration with poll-based API
 
 ## Quick Start
+
+### Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+# Sync (std::net::UdpSocket drop-in)
+dpdk-udp = { version = "0.2", package = "dpdk-stdlib-udp" }
+
+# Async (tokio::net::UdpSocket drop-in)
+dpdk-tokio = { version = "0.2", package = "dpdk-stdlib-tokio" }
+```
+
+The `package` rename means your `use` statements stay identical to what you have today — `use dpdk_udp::UdpSocket` and `use dpdk_tokio::compat::tokio::UdpSocket`.
 
 ### As a Library
 
@@ -375,42 +394,72 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 
 ### What's Implemented
 
+**Core API & Backends**
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `std::net::UdpSocket` API | 19/19 methods | Full API compatibility |
 | `tokio::net::UdpSocket` API | Complete | All async + poll methods |
-| IPv4 UDP send/receive | Complete | Build and parse Ethernet/IPv4/UDP frames |
-| ARP resolution | Complete | Cache with atomic fast-path, auto-request, kernel ARP seeding, gratuitous ARP on bind |
-| ICMP echo reply | Complete | Auto-responds to ping |
-| ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. queued via `take_error()` |
-| Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
-| Hardware VLAN offload | Complete | NIC inserts/strips 802.1Q tags, software fallback, force-software option |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
-| Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
-| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default |
-| Multicast join/leave | Basic | IPv4 only, simplified group tracking |
-| Connected socket filtering | Complete | Buffers non-matching packets |
+| Hardware checksum offload | Complete | TX NIC offload (`IP_CKSUM`, `UDP_CKSUM`), RX software validation · [#32](https://github.com/gspivey/dpdk-stdlib-rust/pull/32) |
+| Hardware VLAN offload | Complete | NIC tag insert/strip, software fallback, force-software option · [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+| Ephemeral port allocation | Complete | Linux-compatible range (32768–60999) |
 | Socket timeouts | Complete | Read and write deadlines |
-| GUE tunnel endpoint | Complete | L3-over-UDP encapsulation (RFC 8470), per-socket config, inner IPv4 |
-| VXLAN tunnel endpoint | Complete | RFC 7348, 24-bit VNI, inner Ethernet, per-VNI filtering |
-| GENEVE tunnel endpoint | Complete | RFC 8926, 24-bit VNI, TLV options, inner Ethernet, per-VNI filtering |
+| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default · [#33](https://github.com/gspivey/dpdk-stdlib-rust/pull/33) |
+| Connected socket filtering | Complete | Buffers non-matching packets |
+| Multicast join/leave | Basic | IPv4 only, simplified group tracking |
+
+**IPv4**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| IPv4 UDP send/receive | Complete | Ethernet/IPv4/UDP frame build and parse |
+| ARP resolution | Complete | Cache, auto-request, kernel ARP seeding, gratuitous ARP on bind · [#34](https://github.com/gspivey/dpdk-stdlib-rust/pull/34) |
+| ICMP echo reply | Complete | Auto-responds to ping |
+| ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. via `take_error()` · [#35](https://github.com/gspivey/dpdk-stdlib-rust/pull/35) |
+| 802.1Q VLAN | Complete | Access/Trunk/PortTagging modes, all protocol handlers covered · [#36](https://github.com/gspivey/dpdk-stdlib-rust/pull/36) |
+| Subnet-aware routing | Complete | LPM routes, OS auto-detect from `/proc/net/route`, configurable gateway/MTU · [#29](https://github.com/gspivey/dpdk-stdlib-rust/pull/29) [#30](https://github.com/gspivey/dpdk-stdlib-rust/pull/30) |
+| Jumbo frames | Complete | Configurable MTU up to 9001 bytes · [#32](https://github.com/gspivey/dpdk-stdlib-rust/pull/32) |
+
+**IPv6**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| IPv6 header build/parse | Complete | 40-byte fixed header, extension-header chain walk · [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49) |
+| IPv6 UDP send/receive | Complete | `SocketAddrV6` through all socket methods, `only_v6` option · [#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62) |
+| IPv6 UDP checksum | Complete | Mandatory pseudo-header checksum, zero-checksum rejection per RFC 8200 · [#61](https://github.com/gspivey/dpdk-stdlib-rust/pull/61) |
+| IPv6 hardware offload | Complete | `RTE_MBUF_F_TX_IPV6` + `UDP_CKSUM`, RX `PKT_RX_L4_CKSUM_GOOD` · [#55](https://github.com/gspivey/dpdk-stdlib-rust/pull/55) |
+| IPv6 link-local / scope IDs | Complete | `fe80::/10` handling, `%ifindex` scope, solicited-node multicast MAC · [#54](https://github.com/gspivey/dpdk-stdlib-rust/pull/54) |
+| NDP | Complete | Neighbor Solicitation/Advertisement, atomic cache, gratuitous NA on bind, kernel seeding · [#59](https://github.com/gspivey/dpdk-stdlib-rust/pull/59) |
+| ICMPv6 echo reply | Complete | Auto-responds to `ping6` · [#56](https://github.com/gspivey/dpdk-stdlib-rust/pull/56) |
+| ICMPv6 error handling | Complete | Dest Unreachable, Packet Too Big (with MTU), Time Exceeded · [#58](https://github.com/gspivey/dpdk-stdlib-rust/pull/58) |
+
+**Tunneling**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| GUE endpoint | Complete | RFC 8470 L3-over-UDP, IPv4/IPv6 outer · [#42](https://github.com/gspivey/dpdk-stdlib-rust/pull/42) |
+| VXLAN endpoint | Complete | RFC 7348, 24-bit VNI, inner Ethernet, per-VNI filtering · [#50](https://github.com/gspivey/dpdk-stdlib-rust/pull/50) |
+| GENEVE endpoint | Complete | RFC 8926, 24-bit VNI, TLV options, inner Ethernet · [#51](https://github.com/gspivey/dpdk-stdlib-rust/pull/51) |
+| IPv6 outer for all encap protocols | Complete | VXLAN/GENEVE/GUE with IPv6 outer headers, mandatory UDP6 checksum · [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60) |
 
 ### What's Not Implemented
 
-The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) handles significantly more than raw packet I/O. The following kernel features have **no equivalent** in this library. Planned items are listed first, matching the Roadmap order below.
+The following features are absent or incomplete. TCP and QUIC are the primary planned additions; the rest are intentional scope exclusions.
 
-| Feature | Kernel | Us | Impact |
-|---------|--------|-----|--------|
-| **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **UDP encapsulation (VXLAN/GENEVE)** | Tunnel endpoint support | GUE + VXLAN + GENEVE all complete | Done |
-| **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
-| **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
-| **GSO/GRO** | Batch segmentation/coalescing for bulk transfers | Single-packet TX/RX | Not planned |
-| **Netfilter / iptables** | Full hook chain (PREROUTING through POSTROUTING) | None — DPDK bypasses kernel entirely | Not planned |
-| **Network namespaces** | Per-namespace socket/routing isolation | None | Not planned |
-| **BPF/XDP** | Programmable packet processing at NIC driver level | None | Not planned |
-| **TOS/DSCP** | `IP_TOS` socket option | Always 0x00 | Not planned |
-| **Cork / MSG_MORE** | Accumulate multiple writes into one datagram | None | Not planned |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **TCP** | Planned | Full `TcpStream`/`TcpListener` — see [ROADMAP.md](ROADMAP.md) |
+| **QUIC** | Planned | Native DPDK via s2n-quic `io::Provider` — see [ROADMAP.md](ROADMAP.md) |
+| **IPv6 performance benchmarks** | Pending | Protocol complete; TRex PPS run not yet recorded |
+| **IP fragmentation/reassembly** | Not planned | Modern networks use PMTUD; DF always set |
+| **SO_REUSEPORT** | Not planned | Use RSS queues for multi-socket steering |
+| **GSO/GRO** | Not planned | `rx_burst`/`tx_burst` amortizes per-packet costs |
+| **Netfilter / iptables** | Not planned | DPDK bypasses kernel; use Security Groups / upstream ACLs |
+| **Network namespaces** | Not planned | Container isolation is a kernel concern |
+| **BPF/XDP** | Not planned | Not applicable to userspace DPDK |
+| **TOS/DSCP** | Not planned | Trivial to add; most DPDK deployments use dedicated NICs |
+| **Cork / MSG_MORE** | Not planned | `tx_burst` already batches at NIC level |
 
 ### Current Environment Assumptions
 
@@ -425,64 +474,19 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 ## Roadmap
 
-### Done
+All completed work is captured in the [What's Implemented](#whats-implemented) tables above. The detailed, agent-shippable task list lives in **[ROADMAP.md](ROADMAP.md)**.
 
-**Subnet-aware routing** — Subnet mask awareness with longest-prefix-match static routes, configurable default gateway, and MTU. Auto-detects subnet/gateway from `/proc/net/route` and seeds ARP cache from `/proc/net/arp` on Linux. Falls back to passthrough when detection fails. The library now runs correctly on bare-metal servers and on-premises environments. See `docs/routing.md`.
+### Next Major Features
 
-**Jumbo frames** — Configurable MTU via `NetworkConfig` (up to 9001 bytes). `send_to()` rejects payloads exceeding the MTU-derived limit. TxBuffer is always sized for jumbo frames to avoid reallocation.
+**TCP** (IPv4 first) — Full drop-in replacements for `std::net::TcpStream`, `std::net::TcpListener`, `tokio::net::TcpStream`, and `tokio::net::TcpListener`. Driven by a dedicated engine thread with SPSC rings, standard congestion control (Reno + fast retransmit), and EC2 integration tests vs. the kernel TCP stack. Published as `dpdk-stdlib-tcp`.
 
-**RX checksum validation** — IPv4 header and UDP checksums are verified in software on every received packet. Packets with corrupted headers or payloads are silently dropped before reaching the application. Handles UDP checksum-disabled (0) per RFC 768.
+**QUIC** (IPv4 first) — Native DPDK QUIC via an s2n-quic `io::Provider` (`dpdk-stdlib-quic` crate). The provider owns an s2n-quic endpoint and drives it from a busy-poll event loop thread with no Tokio runtime dependency in the I/O path. ECN and GSO supported.
 
-**TX hardware checksum offload** — When the NIC supports `CHECKSUM_PARTIAL` mode (e.g., ENA on AWS), the DPDK backend sets mbuf offload flags (`RTE_MBUF_F_TX_IP_CKSUM`, `RTE_MBUF_F_TX_UDP_CKSUM`) and writes the pseudo-header checksum so the NIC computes final checksums. Falls back to software checksums on NICs without offload or on non-DPDK backends.
+**TCP IPv6** — IPv6 address support in the TCP stack (follow-on spec, additive over IPv4 TCP).
 
-**RX backpressure and drop counters** — Socket-level receive buffer accounting with a configurable byte limit (SO_RCVBUF equivalent) and lock-free atomic drop counters. Applications call `set_recv_buffer_size(bytes)` to tune the limit and `recv_drops()` to read a `RecvDropStats { packets, bytes }` snapshot for production monitoring. Drops are also surfaced via the existing `rx_drops_buffer_full` perf counter and rolled into the `rx_drops` rate on the perf reporter. Default is 256 KiB, mirroring Linux `net.core.rmem_default`.
+**QUIC IPv6** — IPv6 address support in the QUIC provider (follow-on spec, additive over IPv4 QUIC).
 
-**Gratuitous ARP** — Broadcasts an unsolicited ARP announcement on `bind()` so switches and routers learn the socket's MAC/IP mapping immediately, without waiting for inbound ARP requests. Configurable via `set_auto_garp(bool)` (enabled by default). Also available on-demand via `send_gratuitous_arp()` for failover or IP migration scenarios.
-
-**ICMP error handling** — ICMP error messages (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem) are parsed and matched back to the originating socket using the embedded original datagram header. Errors are queued per-socket and surfaced via `take_error()`, mirroring Linux `SO_ERROR` behavior. Supported error types: Port/Host/Network Unreachable (`ConnectionRefused`), Fragmentation Needed with Next-Hop MTU (`Other`), TTL Exceeded (`TimedOut`), Admin Prohibited (`PermissionDenied`), and Parameter Problem (`InvalidData`). The error queue is bounded (16 entries) to prevent ICMP flood amplification.
-
-**VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip with three operating modes matching Linux 8021q subinterface semantics. **Access mode**: RX accepts untagged + matching VID (strips tag), TX sends untagged. **Trunk mode**: RX accepts frames tagged with any VID in an allowed set (optional native VLAN for untagged), TX tags. **PortTagging mode** (default): RX only accepts matching VID (strips tag, drops untagged), TX always tags. Configurable per-socket via `set_vlan(Some(VlanConfig::new(100).access()))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
-
-**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the hardware TCI is passed directly to `detect_vlan()` for zero-allocation VLAN filtering (see [NIC Hardware Offloads](#nic-hardware-offloads)). Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
-
-**GUE endpoint (Generic UDP Encapsulation)** — Lightweight L3-over-UDP tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (default port 6080) + 4-byte GUE header + inner IPv4 + inner UDP + payload. The 32-byte encapsulation overhead is the smallest of the three planned tunnel protocols. Configurable per-socket via `set_gue(Some(GueConfig::new(remote_ip)))` or through `NetworkConfig::with_gue()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the GUE tunnel automatically. RX decapsulates matching frames and returns the inner source address to the application. ARP resolution targets the tunnel remote endpoint. MTU check accounts for the 32-byte overhead. Ships with IPv4 outer and inner IPv4; inner IPv6 will be supported automatically once IPv6 header build/parse lands. 23 unit tests including a synthetic PPS benchmark measuring GUE decapsulation overhead.
-
-**VXLAN endpoint (RFC 7348)** — High-performance VXLAN tunnel endpoint: outer Ethernet + outer IPv4 + outer UDP (dst port 4789) + 8-byte VXLAN header (24-bit VNI) + inner Ethernet frame. Per-socket VNI filtering on RX, builder API for TX. Configurable per-socket via `set_vxlan(Some(VxlanConfig::new(remote_ip, vni)))` or through `NetworkConfig::with_vxlan()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the VXLAN tunnel automatically. RX decapsulates matching frames (VNI filter) and returns the inner source address to the application. Inner payload is self-describing Ethernet, so inner IPv4 and inner IPv6 both work from day one. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" roadmap item. 30 unit tests including a synthetic PPS benchmark measuring VXLAN build+decap overhead.
-
-**GENEVE endpoint (RFC 8926)** — Modern overlay tunnel: outer Ethernet + outer IPv4 + outer UDP (dst port 6081) + variable-length GENEVE header (24-bit VNI + TLV options up to 252 bytes) + inner Ethernet frame. Same frame shape as VXLAN plus extensible metadata — used by OVN, NSX-T, and AWS Gateway Load Balancer. Configurable per-socket via `set_geneve(Some(GeneveConfig::new(remote_ip, vni)))` or through `NetworkConfig::with_geneve()` on the builder. TX encapsulates transparently — the application calls `send_to(payload, inner_dst)` and the library wraps in the GENEVE tunnel automatically. RX decapsulates matching frames (VNI filter) and returns the inner source address to the application. TLV options are parsed on RX and available via the `GeneveHeader` in decap results. Ships with IPv4 outer; IPv6 outer is added by the "Encap: IPv6 outer" roadmap item. 43 tests (36 unit + 7 integration) including a synthetic PPS benchmark measuring GENEVE build+decap overhead.
-
-**Encap: IPv6 outer** — IPv6 outer support for all three encapsulation protocols (VXLAN, GENEVE, GUE). Each protocol gains `build_*_frame_into_v6()` and `try_decap_*_v6()` functions using outer IPv6 headers with mandatory UDP6 checksum (RFC 8200 §8.1). New `*Config6` structs with `Ipv6Addr`, `*DecapResult6` types, and `*_ENCAP_OVERHEAD_V6` constants. Wire format: `[Outer Eth 14B][Outer IPv6 40B][Outer UDP 8B][Protocol Header][Inner frame]`. 41 unit tests including synthetic PPS benchmarks. *(PR [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60))*
-
-### Planned
-
-Each bullet below is a standalone, one-PR-sized deliverable unless noted otherwise. IPv6 is a multi-PR feature with a sub-task checklist; it only moves to Done when every box is ticked and a final performance run shows no regression vs the IPv4 baseline.
-
-**IPv6** — Full dual-stack support: IPv6 addresses accepted anywhere IPv4 is today, 40-byte IPv6 headers on the wire, NDP (the IPv6 replacement for ARP), and ICMPv6 (echo + errors).
-
-- [x] **1. IPv6 header build/parse** — 40-byte fixed header, plus extension-header chain walk (Hop-by-Hop, Routing, Fragment, Destination Options) to locate the L4 payload. New `dpdk-udp/src/ipv6.rs`. *(PR [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49), 34 tests)*
-- [x] **2. UDP over IPv6 checksum** — mandatory IPv6 pseudo-header checksum (unlike IPv4 where UDP checksum is optional). `verify_udp6_checksum` / `udp6_pseudo_header_checksum` helpers parallel to the existing IPv4 helpers. RX path validates IPv6 UDP checksums and rejects zero checksums (RFC 8200 §8.1). *(PR [#61](https://github.com/gspivey/dpdk-stdlib-rust/pull/61), 21 tests)*
-- [x] **3. `SocketAddrV6` through `UdpSocket`** — `bind` / `send_to` / `recv_from` / `connect` / `local_addr` / `peer_addr` accept and return IPv6 addresses. `set_only_v6` / `only_v6` socket option. `AddressFamily` state on the socket so the send/recv paths pick the right wire format. *(PR [#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62), 18 tests)*
-- [x] **4. IPv6 hardware offload flags** — TX: set `RTE_MBUF_F_TX_IPV6` + `RTE_MBUF_F_TX_UDP_CKSUM` with the IPv6 pseudo-header checksum in the UDP field. RX: validate IPv6 UDP checksums (honor `PKT_RX_L4_CKSUM_GOOD`). Software fallback on NICs without support. `has_tx_ipv6_cksum_offload()` accessor. *(PR [#55](https://github.com/gspivey/dpdk-stdlib-rust/pull/55), 8 tests)*
-- [x] **5. Link-local / scope IDs / solicited-node multicast MAC** — `fe80::/10` handling, `%ifindex` scope parsing, `33:33:ff:XX:XX:XX` MAC derivation from the low 24 bits of the target IPv6 address. Prereq for task 6 (NDP).
-- [x] **6. NDP (Neighbor Discovery Protocol)** — `NdpHandler` mirroring `ArpHandler`: Neighbor Solicitation and Neighbor Advertisement message types, atomic NDP cache with fast-path lookup, auto-resolution on send, gratuitous NA on bind (parallel to our Gratuitous ARP feature), and seeding the cache from `/proc/net/ipv6_neigh` on Linux. *(PR [#59](https://github.com/gspivey/dpdk-stdlib-rust/pull/59), 32 tests)*
-- [x] **7. ICMPv6 echo reply** — auto-respond to `ping6`, parallel to our existing IPv4 ICMP echo reply.
-- [x] **8. ICMPv6 error handling** — Destination Unreachable, Packet Too Big (with Next-Hop MTU), Time Exceeded, and Parameter Problem parsed and matched back to the originating socket. Plugs into the existing per-socket error queue (introduced for IPv4 ICMP errors) so `take_error()` works for IPv6 destinations too. *(PR [#58](https://github.com/gspivey/dpdk-stdlib-rust/pull/58), 24 tests)*
-- [x] **9. Performance tests** — TRex PPS run at 64 / 512 / 1400B, plus the synthetic CPU-only benchmark, compared against the IPv4 baseline. Results posted to `docs/perf-test-log.md`. No PPS regression vs IPv4 required to cross off the IPv6 feature. *(PR [#63](https://github.com/gspivey/dpdk-stdlib-rust/pull/63))*
-
-### Not Currently Planned
-
-These are features the Linux kernel provides that we intentionally defer to the network infrastructure or consider out of scope:
-
-- **IP fragmentation/reassembly** — Modern networks use PMTUD; fragmentation is rare and problematic
-- **SO_REUSEPORT** — Use RSS to steer traffic to dedicated queues instead
-- **GSO/GRO** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
-- **Netfilter / iptables** — Rely on external filtering (Security Groups, hardware ACLs, upstream firewalls)
-- **Network namespaces** — Container isolation is a kernel concern
-- **BPF/XDP** — Not applicable to userspace DPDK. Hardware filtering is possible via DPDK's `rte_flow` API (FFI bindings exist but no safe wrapper yet — could be exposed if there is demand)
-- **TOS/DSCP** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
-- **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
-
-If you think a feature should be included, open an issue or feel free to cut a PR.
+IPv6 protocol tasks 1–8 are complete (PRs [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49)–[#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62)). Synthetic CPU benchmarks merged in [#63](https://github.com/gspivey/dpdk-stdlib-rust/pull/63). The remaining item — a TRex PPS run at 64/512/1400 B compared against the IPv4 baseline — is tracked in [ROADMAP.md](ROADMAP.md) as item 13.
 
 ## DPDK Installation (Optional)
 
