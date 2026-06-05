@@ -1,0 +1,25 @@
+[package]
+name = "dpdk-stdlib-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Native DPDK I/O provider for s2n-quic (kernel-bypass QUIC transport)"
+
+[dependencies]
+s2n-quic = "=1.81.0"
+s2n-quic-core = "=0.81.0"
+dpdk-udp = { version = "0.2.0", path = "../dpdk-udp", package = "dpdk-stdlib-udp" }
+dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
+thiserror = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }
+rcgen = "0.13"
+
+[[bin]]
+name = "quic-smoke"
+path = "src/bin/quic-smoke.rs"

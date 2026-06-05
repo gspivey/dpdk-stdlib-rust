@@ -22,7 +22,7 @@ Move `PacketBackend` trait, `DpdkBackend`, `RawSocketBackend`, `ring_buffer.rs`,
 Create `dpdk-stdlib-quic/` workspace crate with empty module stubs, a `quic-smoke` binary that compiles in stub mode and exits 0, and a `.github/workflows/quic-integration-tests.yml` skeleton (`continue-on-error: true`, single instance, no ENI bind, no gateway MAC). The walking-skeleton CI grows in later items.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.5`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #66
 
 ---
 

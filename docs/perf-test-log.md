@@ -6,6 +6,86 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #29: dpdk-stdlib-quic Crate Skeleton — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-05 |
+| **Git Hash** | `fd6cc6e` |
+| **Branch** | `agent/quic-crate-skeleton` |
+| **PR** | [#66](https://github.com/gspivey/dpdk-stdlib-rust/pull/66) |
+| **GH Actions Run** | [27043756328](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27043756328) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #28
+
+1. **`fd6cc6e` — Add dpdk-stdlib-quic crate skeleton.** New workspace crate with module stubs for the native DPDK s2n-quic provider (clock, ecn, error, event_loop, frame, loopback, path_handle, provider, rx, stats, tx). Pins `s2n-quic = "=1.81.0"` and `s2n-quic-core = "=0.81.0"`. Adds `LoopbackBackend` (all 9 `PacketBackend` methods), `ProviderBuilder` + `DpdkProvider` + `ProviderHandle` public API, and `quic-smoke` walking-skeleton binary. 11 new tests. No existing crate APIs modified.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,955 | 0.7% | 138,988 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,566 | 0.4% | 345,352 | 1.3% | 349,948 | 0.0% |
+| 700,000 | 696,849 | 0.5% | 492,922 | 29.6% | 698,821 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,981 | 1.5% | 68,995 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,956 | 0.7% | 138,987 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,771 | 0.4% | 340,967 | 2.6% | 350,000 | 0.0% |
+| 700,000 | 698,056 | 0.3% | 471,715 | 32.6% | 699,964 | 0.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,985 | 1.5% | 68,997 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,947 | 0.8% | 138,981 | 0.7% | 139,985 | 0.0% |
+| 350,000 | 348,991 | 0.3% | 337,327 | 3.6% | 349,998 | 0.0% |
+| 700,000 | 474,982 | 0.3% | 343,875 | 27.9% | 476,198 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 33,300 | 52.4% | 70,000 | 0.0% |
+| 140,000 | 74,586 | 4.8% | 75,318 | 3.9% | 76,281 | 2.6% |
+| 350,000 | 77,851 | 0.6% | 76,669 | 2.1% | 77,705 | 0.8% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 314,246 | 10.2% |
+| 700,000 | 313,334 | 55.2% |
+
+### Analysis
+
+**No performance regression from dpdk-stdlib-quic crate skeleton.** The change adds a new workspace crate with module stubs — zero modifications to existing crates' source code, no new branches in any hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 696,849 RX (0.5% drop) — consistent with Run #28's 693,327 (1.0%) and Run #27's 689,799 (1.5%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 512B**: 698,056 RX (0.3% drop) — excellent, better than Run #28's 673,282 (3.8%). Instance-level variance.
+
+**rust-dpdk at 700K PPS, 1400B**: 474,982 RX (0.3% drop) — line-rate capped at ~476K. Consistent with Run #28's 474,955 (0.4%).
+
+**native-dpdk at 700K PPS, 512B**: 699,964 RX (0.005% drop) — near-perfect. Confirms the instance had excellent network conditions this run.
+
+**tokio-dpdk**: Caps at ~314K PPS — consistent with Run #28's 302,598 and Run #27's 305,967, confirming the async compat layer ceiling is unchanged.
+
+**Conclusion**: The `dpdk-stdlib-quic` crate skeleton is performance-neutral. Adding a new workspace crate with stubs introduces no measurable overhead — the existing DPDK hot path is completely untouched.
+
+---
+
 ## Run #28: Extract dpdk-stdlib-net Shared Crate — No Regression
 
 | Field | Value |
