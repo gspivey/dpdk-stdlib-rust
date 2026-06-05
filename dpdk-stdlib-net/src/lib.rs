@@ -19,7 +19,7 @@ pub mod ring_buffer;
 pub mod checksum;
 pub mod neighbor;
 
-pub use backend::{BackendConfig, BackendType, PacketBackend};
+pub use backend::{BackendConfig, BackendType, PacketBackend, RxReadiness};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use checksum::{ipv4_checksum, udp_pseudo_header_checksum};

@@ -10,6 +10,24 @@
 //! to work with any backend without code changes.
 
 use std::io;
+use std::os::unix::io::RawFd;
+use std::sync::{Arc, Condvar, Mutex};
+
+/// Describes how a backend can signal RX readiness to the engine loop.
+///
+/// The engine adapts its wait strategy based on this:
+/// - `Fd` → epoll/select on the file descriptor
+/// - `PollOnly` → busy-poll (dedicated core, normal for kernel-bypass)
+/// - `Condvar` → condvar wait (for stubs/tests, no busy-spin)
+#[derive(Clone)]
+pub enum RxReadiness {
+    /// Backend has a pollable fd (e.g., AF_PACKET socket).
+    Fd(RawFd),
+    /// Backend is poll-only (e.g., DPDK rx_burst) — engine busy-polls.
+    PollOnly,
+    /// Stub/test backend — engine uses condvar wait.
+    Condvar(Arc<(Mutex<bool>, Condvar)>),
+}
 
 /// Abstract trait for raw packet I/O backends.
 ///
@@ -76,6 +94,14 @@ pub trait PacketBackend: Send + Sync {
 
     /// Check if all-multicast mode is currently enabled.
     fn is_allmulticast(&self) -> bool;
+
+    /// Describe how this backend signals RX readiness.
+    ///
+    /// The engine loop uses this to decide its wait strategy:
+    /// - `Fd` → epoll/select on the returned file descriptor
+    /// - `PollOnly` → dedicated-core busy-poll (DPDK)
+    /// - `Condvar` → condvar wait (stubs/tests)
+    fn rx_readiness(&self) -> RxReadiness;
 }
 
 /// Configuration for backend selection and initialization.

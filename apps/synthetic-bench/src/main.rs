@@ -254,6 +254,10 @@ impl PacketBackend for SyntheticBackend {
     fn is_allmulticast(&self) -> bool {
         false
     }
+
+    fn rx_readiness(&self) -> dpdk_udp::dpdk_net::RxReadiness {
+        dpdk_udp::dpdk_net::RxReadiness::PollOnly
+    }
 }
 
 // ---------------------------------------------------------------------------

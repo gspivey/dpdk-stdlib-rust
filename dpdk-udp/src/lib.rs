@@ -64,7 +64,7 @@ pub mod vxlan;
 pub use arp::{ArpCache, ArpHandler, ArpPacket};
 pub use icmp::{IcmpAction, IcmpErrorInfo, IcmpHandler, IcmpPacket};
 pub use icmpv6::{Icmpv6Action, Icmpv6ErrorInfo, Icmpv6Handler, Icmpv6Packet, build_icmpv6_frame, parse_icmpv6_packet, parse_icmpv6_error, icmpv6_checksum, build_echo6_request, ICMPV6_TYPE_ECHO_REQUEST, ICMPV6_TYPE_ECHO_REPLY, ICMPV6_HEADER_LEN, ICMPV6_TYPE_DEST_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, ICMPV6_TYPE_TIME_EXCEEDED, ICMPV6_TYPE_PARAMETER_PROBLEM};
-pub use backend::{PacketBackend, BackendConfig, BackendType};
+pub use backend::{PacketBackend, BackendConfig, BackendType, RxReadiness};
 pub use backend_dpdk::DpdkBackend;
 pub use backend_raw::RawSocketBackend;
 pub use ring::{SpscRing, MpscRing};

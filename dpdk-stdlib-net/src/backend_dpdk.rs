@@ -179,6 +179,10 @@ impl PacketBackend for DpdkBackend {
     fn is_allmulticast(&self) -> bool {
         self.allmulticast.load(Ordering::Relaxed)
     }
+
+    fn rx_readiness(&self) -> crate::backend::RxReadiness {
+        crate::backend::RxReadiness::PollOnly
+    }
 }
 
 #[cfg(test)]

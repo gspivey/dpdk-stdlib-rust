@@ -522,6 +522,10 @@ impl PacketBackend for RawSocketBackend {
     fn is_allmulticast(&self) -> bool {
         self.allmulticast.load(Ordering::Relaxed)
     }
+
+    fn rx_readiness(&self) -> crate::backend::RxReadiness {
+        crate::backend::RxReadiness::Fd(self.fd)
+    }
 }
 
 impl Drop for RawSocketBackend {

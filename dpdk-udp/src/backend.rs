@@ -4,4 +4,4 @@
 //! `BackendType` from the shared `dpdk-stdlib-net` crate for backward
 //! compatibility.
 
-pub use dpdk_stdlib_net::backend::{BackendConfig, BackendType, PacketBackend};
+pub use dpdk_stdlib_net::backend::{BackendConfig, BackendType, PacketBackend, RxReadiness};
