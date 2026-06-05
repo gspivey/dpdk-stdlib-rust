@@ -1,0 +1,13 @@
+[package]
+name = "dpdk-stdlib-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "DPDK-accelerated TCP stack for dpdk-stdlib-rust"
+
+[dependencies]
+dpdk-stdlib-net = { version = "0.2.0", path = "../dpdk-stdlib-net" }
+dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
