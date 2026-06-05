@@ -486,9 +486,7 @@ All completed work is captured in the [What's Implemented](#whats-implemented) t
 
 **QUIC IPv6** — IPv6 address support in the QUIC provider (follow-on spec, additive over IPv4 QUIC).
 
-### IPv6 Performance Benchmark
-
-Tasks 1–8 of the IPv6 feature are complete. The remaining item — a TRex PPS run at 64/512/1400 B compared against the IPv4 baseline — is tracked in [ROADMAP.md](ROADMAP.md) as a standalone deliverable.
+IPv6 protocol tasks 1–8 are complete (PRs [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49)–[#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62)). Synthetic CPU benchmarks merged in [#63](https://github.com/gspivey/dpdk-stdlib-rust/pull/63). The remaining item — a TRex PPS run at 64/512/1400 B compared against the IPv4 baseline — is tracked in [ROADMAP.md](ROADMAP.md) as item 13.
 
 ## DPDK Installation (Optional)
 
