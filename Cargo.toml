@@ -6,6 +6,7 @@ members = [
   "dpdk-stdlib-net",
   "dpdk-udp",
   "dpdk-stdlib-tcp",
+  "dpdk-stdlib-quic",
   "dpdk-tokio",
   "apps/echo",
   "apps/test-client",
