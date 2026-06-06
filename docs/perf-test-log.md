@@ -6,6 +6,84 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #34: dpdk-stdlib-quic Stats, Gateway-MAC, LoopbackBackend — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-06 |
+| **Git Hash** | `c6100c76` |
+| **Branch** | `agent/quic-stats-gateway-loopback` |
+| **PR** | [#71](https://github.com/gspivey/dpdk-stdlib-rust/pull/71) |
+| **GH Actions Run** | [27063712285](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27063712285) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #33
+
+1. **`c6100c76` — Mark spec tasks 8.1–8.4 complete.** `ProviderStats` atomic counters, `ProviderHandle` with shutdown flag, `ProviderBuilder::with_gateway_mac`, `LoopbackBackend` implementing all `PacketBackend` methods, and 8 unit tests. All code was introduced in prior PRs (#66 skeleton) — this is a documentation-only change marking formal completion. No hot-path modifications.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,959 | 0.7% | 138,998 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,784 | 0.3% | 322,066 | 8.0% | 349,994 | 0.0% |
+| 700,000 | 698,349 | 0.2% | 501,484 | 28.4% | 699,750 | 0.04% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,991 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,980 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,892 | 0.3% | 309,241 | 11.6% | 350,000 | 0.0% |
+| 700,000 | 696,932 | 0.4% | 468,547 | 33.1% | 698,838 | 0.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,994 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,952 | 0.7% | 138,974 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,989 | 0.3% | 305,528 | 12.7% | 350,000 | 0.0% |
+| 700,000 | 475,058 | 0.3% | 393,212 | 17.5% | 475,859 | 0.08% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 37,631 | 46.2% | 70,000 | 0.0% |
+| 140,000 | 74,422 | 5.0% | 77,160 | 1.5% | 74,537 | 4.9% |
+| 350,000 | 77,866 | 0.6% | 77,053 | 1.7% | 75,958 | 3.1% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 321,480 | 8.1% |
+| 700,000 | 323,307 | 53.8% |
+
+### Analysis
+
+**No performance regression.** This PR is a documentation-only change (marking spec tasks complete). No code in any hot path was modified.
+
+**rust-dpdk at 700K PPS, 64B**: 698,349 RX (0.2% drop) — consistent with Run #33's 697,128 (0.4%). Within normal variance.
+
+**native-dpdk at 700K PPS, 64B**: 699,750 RX (0.04% drop) — consistent with Run #33's 699,095 (0.13%). Slightly better due to variance.
+
+**native-dpdk zero-drop through 350K PPS**: Achieves 0.0% drop at 64B/512B/1400B up to 350K PPS — matches Run #33.
+
+**tokio-dpdk**: Caps at ~323K PPS at high rates — consistent with Run #33's ~326K ceiling.
+
+**Conclusion**: Performance-neutral as expected — no code changes to any data-path crate.
+
+---
+
 ## Run #33: dpdk-stdlib-quic TX Queue — No Regression
 
 | Field | Value |
