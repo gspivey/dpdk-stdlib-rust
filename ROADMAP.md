@@ -49,7 +49,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 `DpdkRxQueue` implementing `s2n_quic_core::io::rx::Queue` (`for_each`, `is_empty`). `parse_to_rx_datagram(frame, local_addr)` reuses `parse_udp_packet_ref` from `dpdk-stdlib-udp`, extracts TOS for ECN, constructs `Header { path: DpdkPathHandle, ecn }`, returns payload as `Vec<u8>`. Unit tests: valid parse, wrong dst_port drop, non-IPv4 drop, truncated drop, `for_each` drains all.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `5.1`, `5.2`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #69
 
 ---
 
