@@ -40,7 +40,7 @@ Create `dpdk-stdlib-quic/` workspace crate with empty module stubs, a `quic-smok
 Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-breaking additive change, sets `frame[ip+1] = tos` and recomputes the IPv4 checksum. Create `dpdk-stdlib-quic/src/frame.rs` as a thin wrapper/re-export. Unit tests: TOS byte at the correct offset, checksum validity after TOS modification, ECN bits survive a round-trip through TOS.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `4.1`, `4.2`, `4.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #68
 
 ---
 
