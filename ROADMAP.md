@@ -31,7 +31,7 @@ Create `dpdk-stdlib-quic/` workspace crate with empty module stubs, a `quic-smok
 `DpdkQuicError` enum (`thiserror`, `Send + Sync`). `StdClock` wrapping `std::time::Instant`. `DpdkPathHandle` implementing `s2n_quic_core::path::Handle` (IPv4 only; IPv6 → `UnsupportedAddressFamily`). ECN helpers: `extract_ecn(u8) -> ExplicitCongestionNotification` (direct cast), `ecn_to_tos_bits` (as u8). Unit tests: clock monotonicity, path handle round-trip, ECN round-trip for all 4 codepoints, IPv6 rejection.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `2.1`, `2.2`, `2.3`, `2.4`, `2.5`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #67
 
 ---
 

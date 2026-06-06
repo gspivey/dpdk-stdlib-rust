@@ -6,6 +6,86 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #30: dpdk-stdlib-quic Foundational Types — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-05 |
+| **Git Hash** | `9b15b5d` |
+| **Branch** | `agent/quic-foundational-types` |
+| **PR** | [#67](https://github.com/gspivey/dpdk-stdlib-rust/pull/67) |
+| **GH Actions Run** | [27048937704](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27048937704) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #29
+
+1. **`9b15b5d` — Add unit tests for dpdk-stdlib-quic foundational types.** 14 new unit tests covering `DpdkQuicError` (Send+Sync+'static assertions), `StdClock` (monotonicity), `DpdkPathHandle` (from_remote_address round-trip, IPv6 rejection via `try_new()`), and ECN helpers (all 4 codepoints extraction, round-trip, upper-bit masking). Added `DpdkPathHandle::try_new()` constructor for IPv6 validation at construction boundaries. No existing crate APIs modified.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,976 | 1.5% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,946 | 0.8% | 138,967 | 0.7% | 139,988 | 0.0% |
+| 350,000 | 348,918 | 0.3% | 304,798 | 12.9% | 350,000 | 0.0% |
+| 700,000 | 694,451 | 0.8% | 493,481 | 29.5% | 696,104 | 0.6% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,985 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,961 | 0.7% | 138,991 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,801 | 0.3% | 313,389 | 10.5% | 350,000 | 0.0% |
+| 700,000 | 692,253 | 1.1% | 468,232 | 33.1% | 691,725 | 1.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,989 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,978 | 0.7% | 138,975 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,915 | 0.3% | 307,432 | 12.2% | 349,980 | 0.0% |
+| 700,000 | 475,049 | 0.4% | 293,022 | 38.5% | 475,762 | 0.1% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 53,778 | 23.2% | 70,000 | 0.0% |
+| 140,000 | 75,031 | 4.2% | 75,775 | 3.3% | 72,743 | 7.2% |
+| 350,000 | 76,388 | 2.5% | 73,203 | 6.6% | 77,425 | 1.2% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 303,884 | 13.2% |
+| 700,000 | 305,482 | 56.4% |
+
+### Analysis
+
+**No performance regression from dpdk-stdlib-quic foundational types.** The change adds unit tests and a `try_new()` constructor to the QUIC crate — zero modifications to existing crates' source code, no new branches in any hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 694,451 RX (0.8% drop) — consistent with Run #29's 696,849 (0.5%) and Run #28's 693,327 (1.0%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 512B**: 692,253 RX (1.1% drop) — consistent with Run #29's 698,056 (0.3%). Instance-level variance.
+
+**rust-dpdk at 700K PPS, 1400B**: 475,049 RX (0.4% drop) — line-rate capped at ~476K. Consistent with Run #29's 474,982 (0.3%).
+
+**native-dpdk at 700K PPS, 64B**: 696,104 RX (0.6% drop) — consistent with Run #29's 698,821 (0.2%).
+
+**tokio-dpdk**: Caps at ~305K PPS — consistent with Run #29's 313,334 and Run #28's 303,180, confirming the async compat layer ceiling is unchanged.
+
+**Conclusion**: The `dpdk-stdlib-quic` foundational types unit tests are performance-neutral. Adding tests and a validation constructor to a workspace crate introduces no measurable overhead — the existing DPDK hot path is completely untouched.
+
+---
+
 ## Run #29: dpdk-stdlib-quic Crate Skeleton — No Regression
 
 | Field | Value |
