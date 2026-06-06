@@ -31,3 +31,4 @@ pub use error::DpdkQuicError;
 pub use provider::{DpdkProvider, ProviderBuilder};
 pub use rx::{parse_to_rx_datagram, DpdkRxQueue};
 pub use stats::ProviderHandle;
+pub use tx::DpdkTxQueue;
