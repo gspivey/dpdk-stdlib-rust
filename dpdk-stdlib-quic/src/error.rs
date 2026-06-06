@@ -20,3 +20,29 @@ pub enum DpdkQuicError {
     #[error("Event loop terminated unexpectedly: {0}")]
     EventLoopCrash(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn error_is_send_and_sync() {
+        _assert_send::<DpdkQuicError>();
+        _assert_sync::<DpdkQuicError>();
+    }
+
+    #[test]
+    fn error_is_static() {
+        fn _assert_static<T: 'static>() {}
+        _assert_static::<DpdkQuicError>();
+    }
+
+    #[test]
+    fn error_display() {
+        let e = DpdkQuicError::UnsupportedAddressFamily;
+        assert!(e.to_string().contains("IPv6"));
+    }
+}
