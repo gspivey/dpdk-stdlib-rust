@@ -6,6 +6,84 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #32: dpdk-stdlib-quic RX Queue — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-06 |
+| **Git Hash** | `374231e1` |
+| **Branch** | `agent/quic-rx-queue` |
+| **PR** | [#69](https://github.com/gspivey/dpdk-stdlib-rust/pull/69) |
+| **GH Actions Run** | [27056481602](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27056481602) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #31
+
+1. **`374231e1` — Implement `DpdkRxQueue` with `io::rx::Queue` trait.** New `parse_to_rx_datagram` function in `dpdk-stdlib-quic` reuses `parse_udp_packet_ref` from `dpdk-udp`, extracts TOS for ECN, constructs s2n-quic `Header` with `DpdkPathHandle`. 6 new unit tests. No existing function signatures modified — purely additive to the quic crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,989 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,950 | 0.8% | 138,999 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,719 | 0.4% | 347,005 | 0.9% | 350,000 | 0.0% |
+| 700,000 | 698,332 | 0.2% | 426,507 | 39.1% | 699,800 | 0.03% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,994 | 0.7% | 138,982 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,842 | 0.3% | 346,478 | 1.0% | 350,000 | 0.0% |
+| 700,000 | 697,091 | 0.4% | 416,231 | 40.5% | 699,954 | 0.01% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,997 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,986 | 0.7% | 138,951 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,979 | 0.3% | 341,856 | 2.3% | 350,000 | 0.0% |
+| 700,000 | 472,499 | 0.9% | 395,944 | 16.9% | 476,396 | 0.06% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 60,806 | 13.1% | 69,999 | 0.0% |
+| 140,000 | 73,611 | 6.0% | 75,853 | 3.2% | 74,403 | 5.0% |
+| 350,000 | 77,493 | 1.1% | 75,792 | 3.3% | 77,077 | 1.6% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 138,994 | 0.7% |
+| 350,000 | 313,803 | 10.3% |
+| 700,000 | 314,857 | 55.0% |
+
+### Analysis
+
+**No performance regression from RX queue implementation.** The change adds `DpdkRxQueue` and `parse_to_rx_datagram` to the `dpdk-stdlib-quic` crate — purely additive with no modifications to existing hot paths in `dpdk-udp` or the DPDK backend.
+
+**rust-dpdk at 700K PPS, 64B**: 698,332 RX (0.2% drop) — identical to Run #31's 698,334. No change.
+
+**native-dpdk at 700K PPS, 64B**: 699,800 RX (0.03% drop) — consistent with Run #31's 699,722 (0.04%).
+
+**native-dpdk zero-drop through 350K PPS**: Achieves 0.0% drop at all packet sizes up to 350K PPS — identical to Run #31.
+
+**tokio-dpdk**: Caps at ~315K PPS at high rates — consistent with Run #31's ~300K ceiling.
+
+**Conclusion**: Adding `DpdkRxQueue` and `parse_to_rx_datagram` is performance-neutral as expected — the new code lives in `dpdk-stdlib-quic` and is not invoked on any existing UDP hot path.
+
+---
+
 ## Run #31: dpdk-stdlib-quic Frame Building with TOS/ECN — No Regression
 
 | Field | Value |
