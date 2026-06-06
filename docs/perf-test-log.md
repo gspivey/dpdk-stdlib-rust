@@ -6,6 +6,84 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #31: dpdk-stdlib-quic Frame Building with TOS/ECN — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-06 |
+| **Git Hash** | `842244d2` |
+| **Branch** | `agent/quic-frame-tos-ecn` |
+| **PR** | [#68](https://github.com/gspivey/dpdk-stdlib-rust/pull/68) |
+| **GH Actions Run** | [27052647422](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27052647422) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #30
+
+1. **`842244d2` — Add `build_udp_frame_into_with_tos` for TOS/ECN support.** New public function in `dpdk-udp` identical to `build_udp_frame_into` but accepts a `tos: u8` parameter (sets IPv4 TOS byte, recomputes checksum). `dpdk-stdlib-quic/src/frame.rs` re-exports it and provides a `build_quic_frame` convenience wrapper. 7 new unit tests. No existing function signatures modified.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,999 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,913 | 0.8% | 138,997 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,522 | 0.4% | 317,748 | 9.2% | 349,999 | 0.0% |
+| 700,000 | 698,334 | 0.2% | 460,774 | 34.2% | 699,722 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,981 | 1.5% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,961 | 0.7% | 138,990 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,862 | 0.3% | 318,576 | 9.0% | 350,000 | 0.0% |
+| 700,000 | 697,773 | 0.3% | 443,569 | 36.6% | 699,389 | 0.1% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,998 | 1.4% | 68,976 | 1.5% | 70,000 | 0.0% |
+| 140,000 | 138,921 | 0.8% | 138,975 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,741 | 0.4% | 298,778 | 14.6% | 350,000 | 0.0% |
+| 700,000 | 474,737 | 0.3% | 432,204 | 9.3% | 476,681 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,989 | 1.4% | 51,984 | 25.7% | 69,999 | 0.0% |
+| 140,000 | 76,601 | 2.2% | 77,326 | 1.3% | 76,860 | 1.9% |
+| 350,000 | 76,737 | 2.1% | 76,198 | 2.7% | 76,891 | 1.9% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 68,994 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 300,602 | 14.1% |
+| 700,000 | 299,189 | 57.3% |
+
+### Analysis
+
+**No performance regression from frame building with TOS/ECN support.** The change adds a new `build_udp_frame_into_with_tos` function to `dpdk-udp` — it is purely additive (no existing function modified) and not called on any existing hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 698,334 RX (0.2% drop) — consistent with Run #30's 694,451 (0.8%) and Run #29's 696,849 (0.5%). Slight improvement within normal ENA variance.
+
+**rust-dpdk at 700K PPS, 512B**: 697,773 RX (0.3% drop) — consistent with Run #30's 692,253 (1.1%). Within normal variance.
+
+**native-dpdk at 700K PPS, 64B**: 699,722 RX (0.04% drop) — consistent with Run #30's 696,104 (0.6%).
+
+**tokio-dpdk**: Caps at ~300K PPS at high rates — consistent with Run #30's ~305K ceiling.
+
+**Conclusion**: Adding `build_udp_frame_into_with_tos` is performance-neutral as expected — it's a new function that doesn't alter existing code paths. The DPDK hot path remains untouched.
+
+---
+
 ## Run #30: dpdk-stdlib-quic Foundational Types — No Regression
 
 | Field | Value |
