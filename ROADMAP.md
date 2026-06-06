@@ -58,7 +58,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 `DpdkTxQueue` implementing `s2n_quic_core::io::tx::Queue`. Constants: `SUPPORTS_ECN = true`, `SUPPORTS_PACING = false`, `SUPPORTS_FLOW_LABELS = false`. GSO: call `message.can_gso(segment_len, segment_count)`, loop `write_payload(buf, gso_offset)` advancing gso_offset. `drain()` method yields pending frames. Unit tests: single segment, GSO multi-segment correct frame count, capacity decrements, drain empties, ECN TOS byte correct.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `6.1`, `6.2`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #70
 
 ---
 
