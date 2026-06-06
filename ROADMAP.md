@@ -67,7 +67,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 `ProviderStats` atomic counters + `StatsSnapshot::snapshot()`. `ProviderHandle` with `Arc<AtomicBool>` shutdown flag, `JoinHandle`, and `shutdown()` method. `ProviderBuilder::with_gateway_mac([u8; 6])` + kernel ARP cache fallback via `seed_arp_cache_from_kernel` pattern. `LoopbackBackend` implementing all 8 `PacketBackend` methods (send enqueues to `Mutex<VecDeque>`, recv drains). Unit tests for all 8 `LoopbackBackend` methods.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `8.1`, `8.2`, `8.3`, `8.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #71
 
 ---
 

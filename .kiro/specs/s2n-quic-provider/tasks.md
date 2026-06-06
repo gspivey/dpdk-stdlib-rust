@@ -123,7 +123,7 @@ All tasks must pass `cargo build && cargo test` from the workspace root without 
   - Ensure `cargo build && cargo test -p dpdk-stdlib-quic` passes. Ask the user if questions arise.
 
 - [ ] 8. Implement stats, gateway-MAC acquisition, and loopback backend
-  - [ ] 8.1 Implement `ProviderStats` and `ProviderHandle` in `dpdk-stdlib-quic/src/stats.rs`
+  - [x] 8.1 Implement `ProviderStats` and `ProviderHandle` in `dpdk-stdlib-quic/src/stats.rs`
     - Atomic counters: `rx_burst_calls`, `tx_burst_calls`, `datagrams_received`, `datagrams_transmitted`, `rx_drops`, `tx_drops`, `timer_wakeups`
     - `StatsSnapshot` struct with plain u64 fields
     - `snapshot()` method loads all atomics with `Ordering::Relaxed`
@@ -131,12 +131,12 @@ All tasks must pass `cargo build && cargo test` from the workspace root without 
     - `ProviderHandle::shutdown()` sets flag, joins thread
     - Both Arcs created in `build()`, not `start()`
     - _Requirements: 9.1, 9.2, 8.4_
-  - [ ] 8.2 Implement gateway-MAC acquisition in `dpdk-stdlib-quic/src/provider.rs`
+  - [x] 8.2 Implement gateway-MAC acquisition in `dpdk-stdlib-quic/src/provider.rs`
     - Builder method: `with_gateway_mac(mac: [u8; 6])` for explicit configuration
     - Fallback: read kernel ARP cache via `seed_arp_cache_from_kernel` pattern (same as dpdk-udp) and look up default gateway IP
     - Store resolved MAC in provider config for use by TxQueue
     - _Requirements: 2.5_
-  - [ ] 8.3 Implement `LoopbackBackend` in `dpdk-stdlib-quic/src/loopback.rs`
+  - [x] 8.3 Implement `LoopbackBackend` in `dpdk-stdlib-quic/src/loopback.rs`
     - Implement ALL 8 `PacketBackend` methods:
       - `send_frame()` enqueues frame into `Mutex<VecDeque<Vec<u8>>>`
       - `recv_frames()` drains all enqueued frames (up to max_frames)
@@ -146,7 +146,7 @@ All tasks must pass `cargo build && cargo test` from the workspace root without 
       - `set_allmulticast()` / `is_allmulticast()` — store in `AtomicBool`
     - This enables full QUIC handshake testing without DPDK
     - _Requirements: 10.3_
-  - [ ]* 8.4 Write unit tests for LoopbackBackend
+  - [x]* 8.4 Write unit tests for LoopbackBackend
     - Test send then recv returns same frame
     - Test recv on empty returns empty vec
     - Test multiple sends are returned in order
