@@ -936,6 +936,83 @@ pub fn build_udp_frame_into(
     Ok(total_len)
 }
 
+/// Build a UDP frame with a specified TOS/DSCP byte into a caller-provided buffer.
+///
+/// Identical to [`build_udp_frame_into`] except `frame[ip + 1] = tos` instead of
+/// `0x00`. The IPv4 header checksum is recomputed in software after setting TOS.
+/// This enables ECN marking for QUIC and other protocols that use the TOS field.
+pub fn build_udp_frame_into_with_tos(
+    out: &mut Vec<u8>,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    ttl: u8,
+    tos: u8,
+) -> UdpResult<usize> {
+    let max_payload = MAX_FRAME_SIZE - TOTAL_HEADER_LEN;
+    if payload.len() > max_payload {
+        return Err(UdpError::PayloadTooLarge {
+            max: max_payload,
+            actual: payload.len(),
+        });
+    }
+
+    let total_len = TOTAL_HEADER_LEN + payload.len();
+    let ip_total_len = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+    let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+    out.resize(total_len, 0);
+
+    let src_ip_bytes = src_ip.octets();
+    let dst_ip_bytes = dst_ip.octets();
+
+    // === Ethernet Header (14 bytes) ===
+    out[0..6].copy_from_slice(dst_mac);
+    out[6..12].copy_from_slice(src_mac);
+    out[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+
+    // === IPv4 Header (20 bytes) ===
+    let ip = ETH_HEADER_LEN;
+    out[ip] = 0x45;
+    out[ip + 1] = tos;
+    out[ip + 2..ip + 4].copy_from_slice(&ip_total_len.to_be_bytes());
+    out[ip + 4..ip + 6].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 6..ip + 8].copy_from_slice(&[0x40, 0x00]);
+    out[ip + 8] = ttl;
+    out[ip + 9] = IP_PROTO_UDP;
+    out[ip + 10..ip + 12].copy_from_slice(&[0x00, 0x00]);
+    out[ip + 12..ip + 16].copy_from_slice(&src_ip_bytes);
+    out[ip + 16..ip + 20].copy_from_slice(&dst_ip_bytes);
+
+    let ip_cksum = ipv4_checksum(&out[ip..ip + IPV4_HEADER_LEN]);
+    out[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // === UDP Header (8 bytes) ===
+    let udp_off = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+    out[udp_off..udp_off + 2].copy_from_slice(&src_port.to_be_bytes());
+    out[udp_off + 2..udp_off + 4].copy_from_slice(&dst_port.to_be_bytes());
+    out[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // === Payload ===
+    out[TOTAL_HEADER_LEN..].copy_from_slice(payload);
+
+    // UDP checksum
+    let udp_cksum = udp_checksum(
+        &src_ip_bytes,
+        &dst_ip_bytes,
+        &out[udp_off..udp_off + UDP_HEADER_LEN],
+        payload,
+    );
+    out[udp_off + 6..udp_off + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
+    Ok(total_len)
+}
+
 /// Build a UDP frame with an 802.1Q VLAN tag into a caller-provided buffer.
 ///
 /// Identical to `build_udp_frame_into` but inserts a 4-byte VLAN tag between
@@ -8123,5 +8200,98 @@ mod tests {
         let socket = UdpSocket::bind("[::1]:0").unwrap();
         assert_eq!(socket.address_family(), AddressFamily::IPv6);
         assert!(matches!(socket.local_addr().unwrap(), SocketAddr::V6(_)));
+    }
+
+    // ========================================================================
+    // build_udp_frame_into_with_tos tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_udp_frame_with_tos_byte_placement() {
+        let mut out = Vec::new();
+        let tos: u8 = 0b10101110; // DSCP + ECN bits
+        let len = build_udp_frame_into_with_tos(
+            &mut out,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            4433, 8080,
+            b"quic payload",
+            64,
+            tos,
+        ).unwrap();
+
+        assert_eq!(out.len(), len);
+        // TOS byte is at IPv4 header offset + 1 (byte index ETH_HEADER_LEN + 1)
+        assert_eq!(out[ETH_HEADER_LEN + 1], tos);
+    }
+
+    #[test]
+    fn test_build_udp_frame_with_tos_checksum_valid() {
+        let mut out = Vec::new();
+        build_udp_frame_into_with_tos(
+            &mut out,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 2),
+            5000, 6000,
+            b"tos checksum test",
+            64,
+            0x02, // ECT(0)
+        ).unwrap();
+
+        // Verify IP checksum validates to 0 (correct checksum)
+        let ip_start = ETH_HEADER_LEN;
+        let ip_verify = ipv4_checksum(&out[ip_start..ip_start + IPV4_HEADER_LEN]);
+        assert_eq!(ip_verify, 0, "IPv4 checksum should verify to 0 after TOS set");
+    }
+
+    #[test]
+    fn test_build_udp_frame_with_tos_ecn_round_trip() {
+        // Verify ECN bits survive: set TOS → parse TOS byte → extract ECN matches
+        for ecn_bits in [0b00u8, 0b01, 0b10, 0b11] {
+            let tos = ecn_bits; // pure ECN, no DSCP
+            let mut out = Vec::new();
+            build_udp_frame_into_with_tos(
+                &mut out,
+                &[0x01; 6],
+                &[0x02; 6],
+                Ipv4Addr::new(192, 168, 1, 1),
+                Ipv4Addr::new(192, 168, 1, 2),
+                1234, 5678,
+                b"ecn",
+                64,
+                tos,
+            ).unwrap();
+
+            let recovered_tos = out[ETH_HEADER_LEN + 1];
+            assert_eq!(recovered_tos & 0x03, ecn_bits, "ECN bits must survive round-trip");
+        }
+    }
+
+    #[test]
+    fn test_build_udp_frame_with_tos_zero_matches_original() {
+        // With TOS=0, output should be identical to build_udp_frame_into
+        let src_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let src_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let dst_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let payload = b"match test";
+
+        let mut out_original = Vec::new();
+        build_udp_frame_into(
+            &mut out_original, &src_mac, &dst_mac,
+            src_ip, dst_ip, 4433, 8080, payload, 64,
+        ).unwrap();
+
+        let mut out_tos = Vec::new();
+        build_udp_frame_into_with_tos(
+            &mut out_tos, &src_mac, &dst_mac,
+            src_ip, dst_ip, 4433, 8080, payload, 64, 0x00,
+        ).unwrap();
+
+        assert_eq!(out_original, out_tos, "TOS=0 should produce identical frame");
     }
 }
