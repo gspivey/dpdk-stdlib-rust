@@ -76,7 +76,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 `event_loop` function: check shutdown flag → `poll_wakeups` (break on `CloseError`) → RX (`recv_frames` → ICMP dispatch → `parse_to_rx_datagram` → `endpoint.receive`) → TX (`endpoint.transmit` → `drain()` → `send_frame`) → busy-poll-with-cooldown (sleep until `min(endpoint.timeout(), now + 1ms)` after idle budget exceeded). Increment stats at each stage. ICMP dispatch: check `frame[ETH_HEADER_LEN+9] == IP_PROTO_ICMP` → `icmp_handler.process_icmp_full()`.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `9.1`, `9.2`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #72
 
 ---
 

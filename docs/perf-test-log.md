@@ -6,6 +6,95 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #35: dpdk-stdlib-quic Event Loop — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-08 |
+| **Git Hash** | `62b57264` |
+| **Branch** | `agent/quic-event-loop` |
+| **PR** | [#72](https://github.com/gspivey/dpdk-stdlib-rust/pull/72) |
+| **GH Actions Run** | [27132755311](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27132755311) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #34
+
+1. **`62b57264` — Implement `event_loop` function for dpdk-stdlib-quic.** The event loop drives the s2n-quic endpoint: checks shutdown flag → `poll_wakeups` (break on `CloseError`) → RX (`recv_frames` → ICMP dispatch → `parse_to_rx_datagram` → `endpoint.receive`) → TX (`endpoint.transmit` → `drain()` → `send_frame`) → busy-poll-with-cooldown. Increments `ProviderStats` at each stage. No existing function signatures modified — purely additive to the quic crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,982 | 1.5% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,873 | 0.8% | 138,974 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,705 | 0.4% | 346,286 | 1.1% | 350,000 | 0.0% |
+| 700,000 | 670,070 | 4.3% | 437,931 | 37.4% | 691,915 | 1.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,994 | 1.4% | 68,989 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,949 | 0.8% | 138,972 | 0.7% | 139,991 | 0.0% |
+| 350,000 | 348,748 | 0.4% | 344,645 | 1.5% | 349,926 | 0.0% |
+| 700,000 | 662,447 | 5.4% | 409,725 | 41.5% | 672,479 | 3.9% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,990 | 1.4% | 68,999 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,955 | 0.7% | 138,946 | 0.8% | 139,997 | 0.0% |
+| 350,000 | 348,836 | 0.3% | 339,084 | 3.1% | 349,999 | 0.0% |
+| 700,000 | 473,526 | 0.7% | 382,958 | 19.6% | 468,735 | 1.7% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 41,768 | 40.3% | 69,990 | 0.0% |
+| 140,000 | 77,157 | 1.5% | 77,780 | 0.7% | 77,455 | 1.1% |
+| 350,000 | 77,687 | 0.8% | 73,238 | 6.5% | 77,922 | 0.5% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 138,978 | 0.7% |
+| 350,000 | 303,583 | 13.3% |
+| 700,000 | 311,394 | 55.5% |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | **OK** | 0 / 0 / 0 | 403,273 / 403,273 / 0 | 0 / 0 / 0 |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 275,717 / 275,717 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression.** This PR implements the `event_loop` function in `dpdk-stdlib-quic` — purely additive code in a workspace crate that is not invoked on any existing UDP hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 670,070 RX (4.3% drop) — lower than Run #34's 698,349 (0.2%), but native-dpdk also dropped from 699,750 to 691,915 this run (1.2% vs 0.04%). Both DPDK configs show similar degradation, indicating ENA instance-level variance rather than a code regression.
+
+**rust-dpdk at 350K PPS**: 348,705–348,836 RX across all packet sizes with <0.4% drop — identical to Run #34's 348,784–348,989. Sub-saturation performance is unchanged.
+
+**rust-dpdk at 700K PPS, 1400B**: 473,526 RX (0.7% drop) — consistent with Run #34's 475,058 (0.3%). Both are line-rate capped at ~476K.
+
+**tokio-dpdk**: Caps at ~311K PPS at high rates — consistent with Run #34's ~323K ceiling and within normal async path variance.
+
+**Instrumentation self-check**: All OK, zero drift. `imissed = 0` and `rx_nombuf = 0` confirm zero software-attributable drops.
+
+**Conclusion**: The `event_loop` implementation is performance-neutral as expected — the new code lives in `dpdk-stdlib-quic` and is not invoked on any existing UDP hot path.
+
+---
+
 ## Run #34: dpdk-stdlib-quic Stats, Gateway-MAC, LoopbackBackend — No Regression
 
 | Field | Value |
