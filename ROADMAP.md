@@ -131,7 +131,7 @@ Trigger: `gh workflow run perf-tests.yml --ref <branch>` after all CI passes. Wa
 Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, CI gates must fail for `dpdk-stdlib-udp` and `tokio` dependencies). `SpscByteRing` (power-of-2 byte buffer, Acquire/Release atomics). `SeqNum(u32)` (modular arithmetic, no `Ord`). `TcpError` enum + `From<TcpError> for io::Error`. `TcpFlags` bitfield, `TcpOptions` (MSS/WScale/SACK-Perm/Timestamps/SACK/NOP/EOL), `ParsedTcpSegment`, `TcpFrameParams`. Constants: `MAX_TCP_PAYLOAD = 1460`, `DEFAULT_PEER_MSS = 536`.
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.5`, `3.6`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #78
 
 ---
 
