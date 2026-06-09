@@ -6,6 +6,78 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #37: dpdk-stdlib-quic Loopback Integration Tests — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-09 |
+| **Git Hash** | `aee373a` |
+| **Branch** | `agent/quic-loopback-integration-tests` |
+| **PR** | [#74](https://github.com/gspivey/dpdk-stdlib-rust/pull/74) |
+| **GH Actions Run** | [27183786621](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27183786621) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #36
+
+1. **`aee373a` — Loopback integration tests for `dpdk-stdlib-quic`.** Four integration tests: full QUIC handshake over PairedLoopback with rcgen TLS, provider init in stub mode, ECN round-trip for all 4 codepoints, and GSO segmentation correctness. Added `ProviderBuilder::with_backend()` for test backend injection. Added `bytes` dev-dependency. No changes to the packet processing hot path.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,993 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,953 | 0.7% | 138,994 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,732 | 0.4% | 346,284 | 1.1% | 349,988 | 0.0% |
+| 700,000 | 693,562 | 0.9% | 384,646 | 45.1% | 689,065 | 1.6% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,992 | 1.4% | 68,993 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,980 | 0.7% | 138,981 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,755 | 0.4% | 345,235 | 1.4% | 350,000 | 0.0% |
+| 700,000 | 690,024 | 1.4% | 330,260 | 52.8% | 695,204 | 0.7% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,993 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,922 | 0.8% | 138,954 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,755 | 0.4% | 346,038 | 1.1% | 349,961 | 0.0% |
+| 700,000 | 567,701 | 18.9% | 389,111 | 44.4% | 658,091 | 6.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 34,983 | 50.0% | 69,997 | 0.0% |
+| 140,000 | 124,167 | 0.8% | 124,330 | 0.8% | 125,304 | 0.0% |
+| 350,000 | 123,314 | 1.6% | 117,963 | 5.9% | 123,331 | 1.5% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 324,441 | 7.3% |
+| 700,000 | 325,382 | 53.5% |
+
+### Analysis
+
+**No performance regression from QUIC loopback integration tests.** This PR adds test code only — no changes to the packet processing hot path.
+
+**native-dpdk at 350K PPS**: 0% drop across all packet sizes (64B, 512B, 1400B) with 64–86µs avg latency — consistent with Run #36.
+
+**rust-dpdk at 700K PPS, 64B**: 693,562 RX (0.9% drop) — improved over Run #36's 692,044 (1.1%). Within normal ENA variance.
+
+**rust-dpdk at 700K PPS, 512B**: 690,024 RX (1.4% drop) — consistent with Run #36's 692,750 (1.0%).
+
 ## Run #36: dpdk-stdlib-quic Provider and Builder — No Regression
 
 | Field | Value |

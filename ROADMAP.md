@@ -94,7 +94,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 Four integration tests using `LoopbackBackend` (no DPDK required): (a) full QUIC handshake — server + client, `rcgen` TLS, open stream, send data, echo, verify integrity; (b) provider init in stub mode — no error, IPv6 address → `UnsupportedAddressFamily`; (c) ECN round-trip — build frame with ECN via TX path, parse via RX path, verify codepoint preserved for all 4 values; (d) GSO segmentation — payload > MSS with `can_gso=true` → correct frame count + payload boundaries.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `12.1`, `12.2`, `12.3`, `12.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #74
 
 ---
 
