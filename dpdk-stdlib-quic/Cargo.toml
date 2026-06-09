@@ -15,12 +15,15 @@ dpdk-udp = { version = "0.2.0", path = "../dpdk-udp", package = "dpdk-stdlib-udp
 dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
 thiserror = { workspace = true }
 futures = "0.3"
-
-[dev-dependencies]
 tokio = { workspace = true }
 rcgen = "0.13"
 bytes = "1"
 
+
 [[bin]]
 name = "quic-smoke"
 path = "src/bin/quic-smoke.rs"
+
+[[bin]]
+name = "quic-bench"
+path = "src/bin/bench.rs"
