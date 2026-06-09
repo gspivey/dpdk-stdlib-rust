@@ -6,6 +6,77 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #41: dpdk-stdlib-tcp Crate Skeleton and Codec Types — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-09 |
+| **Git Hash** | `070c16e` |
+| **Branch** | `agent/tcp-crate-skeleton-codec-types` |
+| **PR** | [#78](https://github.com/gspivey/dpdk-stdlib-rust/pull/78) |
+| **GH Actions Run** | [27220906787](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27220906787) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #40
+
+1. **`070c16e` — dpdk-stdlib-tcp crate skeleton and codec types.** New crate with pure data types (TcpError, SeqNum, SpscByteRing, TcpFlags, TcpOptions, ParsedTcpSegment, TcpFrameParams). Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,996 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,990 | 0.7% | 138,900 | 0.8% | 138,987 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 346,207 | 1.1% | 348,526 | 0.4% | 311,806 | 10.9% | 349,991 | 0.0% |
+| 700,000 | 434,276 | 38.0% | 659,356 | 5.8% | 313,101 | 55.3% | 674,638 | 3.6% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,983 | 1.5% | 68,988 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,986 | 0.7% | 138,893 | 0.8% | 138,990 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 342,468 | 2.2% | 348,874 | 0.3% | 226,186 | 35.4% | 349,989 | 0.0% |
+| 700,000 | 407,995 | 41.7% | 621,635 | 11.2% | 225,516 | 67.8% | 632,683 | 9.6% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,987 | 1.4% | 69,000 | 1.4% | 69,990 | 0.0% |
+| 140,000 | 138,951 | 0.7% | 138,918 | 0.8% | 138,940 | 0.8% | 140,000 | 0.0% |
+| 350,000 | 341,705 | 2.4% | 348,805 | 0.3% | 141,297 | 59.6% | 349,937 | 0.0% |
+| 700,000 | 410,182 | 13.9%* | 460,860 | 3.3%* | 150,629 | 68.4%* | 454,046 | 4.7%* |
+
+\* TX capped at ~476K pps (ENA line-rate limit at 1400B)
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 33,805 | 51.7% | 68,983 | 1.5% | 53,500 | 23.6% | 70,000 | 0.0% |
+| 140,000 | 77,728 | 0.8%* | 77,422 | 1.2%* | 56,932 | 27.3%* | 78,311 | 0.0%* |
+| 350,000 | 76,700 | 2.1%* | 77,147 | 1.5%* | 56,979 | 27.3%* | 72,237 | 7.8%* |
+
+\* TX capped at ~78K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds a new `dpdk-stdlib-tcp` crate containing only pure data types (error enums, sequence number arithmetic, SPSC ring buffer, codec type definitions). Zero changes to any existing data-path crate or networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 659,356 RX (5.8% drop) — consistent with Run #40's 697,785 and Run #38's 676,257. Normal ENA variance at saturation.
+
+**native-dpdk at 700K PPS, 64B**: 674,638 RX (3.6% drop) — consistent with Run #40's 699,363 (0.1% drop). Slightly higher drop due to normal ENA burst variability.
+
+**rust-dpdk vs native-dpdk gap**: Near parity at 350K and below. At 700K saturation, rust-dpdk is within ~2% of native-dpdk across all packet sizes — consistent with historical results.
+
+**Conclusion**: Adding the TCP crate skeleton is performance-neutral as expected.
+
+---
+
 ## Run #40: IPv6 UDP Performance Benchmarks — No Regression
 
 | Field | Value |

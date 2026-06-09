@@ -11,3 +11,4 @@ description = "DPDK-accelerated TCP stack for dpdk-stdlib-rust"
 [dependencies]
 dpdk-stdlib-net = { version = "0.2.0", path = "../dpdk-stdlib-net" }
 dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
+thiserror = { workspace = true }
