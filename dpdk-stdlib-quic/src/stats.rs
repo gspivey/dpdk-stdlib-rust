@@ -1,7 +1,7 @@
 //! Provider stats and handle for shutdown/observability.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Atomic counters for provider observability.
@@ -53,18 +53,22 @@ pub struct StatsSnapshot {
     pub timer_wakeups: u64,
 }
 
+/// Shared thread handle that allows the provider's `start()` method
+/// to store the spawned thread for the handle's `shutdown()` to join.
+pub(crate) type SharedThread = Arc<Mutex<Option<JoinHandle<()>>>>;
+
 /// Handle for controlling and observing a running provider.
 pub struct ProviderHandle {
     pub(crate) stats: Arc<ProviderStats>,
     pub(crate) shutdown: Arc<AtomicBool>,
-    pub(crate) thread: Option<JoinHandle<()>>,
+    pub(crate) thread: SharedThread,
 }
 
 impl ProviderHandle {
     /// Signal the event loop to stop and wait for the thread to exit.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(handle) = self.thread.take() {
+        if let Some(handle) = self.thread.lock().unwrap().take() {
             let _ = handle.join();
         }
     }

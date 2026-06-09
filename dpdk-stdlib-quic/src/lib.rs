@@ -27,6 +27,7 @@ pub mod rx;
 pub mod stats;
 pub mod tx;
 
+pub use dpdk_udp::BackendConfig;
 pub use error::DpdkQuicError;
 pub use provider::{DpdkProvider, ProviderBuilder};
 pub use rx::{parse_to_rx_datagram, DpdkRxQueue};

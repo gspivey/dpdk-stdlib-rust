@@ -265,7 +265,7 @@ pub fn event_loop_with_tx_queue<E: Endpoint<PathHandle = DpdkPathHandle>>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::loopback::LoopbackBackend;
     use dpdk_udp::build_udp_frame_into_with_tos;
@@ -278,17 +278,24 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicU32;
 
+    /// Create a mock endpoint for use in provider tests.
+    pub fn make_mock_endpoint(close_after: Option<u32>) -> MockEndpoint {
+        let mut ep = MockEndpoint::new();
+        ep.close_after = close_after;
+        ep
+    }
+
     /// Minimal mock endpoint for testing the event loop.
-    struct MockEndpoint {
-        received_count: Arc<AtomicU32>,
-        transmit_count: Arc<AtomicU32>,
-        wakeup_count: Arc<AtomicU32>,
-        close_after: Option<u32>,
-        timeout_val: Option<Timestamp>,
+    pub struct MockEndpoint {
+        pub received_count: Arc<AtomicU32>,
+        pub transmit_count: Arc<AtomicU32>,
+        pub wakeup_count: Arc<AtomicU32>,
+        pub close_after: Option<u32>,
+        pub timeout_val: Option<Timestamp>,
     }
 
     impl MockEndpoint {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 received_count: Arc::new(AtomicU32::new(0)),
                 transmit_count: Arc::new(AtomicU32::new(0)),
@@ -297,10 +304,16 @@ mod tests {
                 timeout_val: None,
             }
         }
+
+        pub fn new_with_close_after(n: u32) -> Self {
+            let mut ep = Self::new();
+            ep.close_after = Some(n);
+            ep
+        }
     }
 
     /// Minimal no-op subscriber
-    struct NoopSubscriber;
+    pub struct NoopSubscriber;
 
     impl event::Subscriber for NoopSubscriber {
         type ConnectionContext = ();
