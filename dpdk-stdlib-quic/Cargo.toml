@@ -27,3 +27,11 @@ path = "src/bin/quic-smoke.rs"
 [[bin]]
 name = "quic-bench"
 path = "src/bin/bench.rs"
+
+[[bin]]
+name = "quic-echo-server"
+path = "src/bin/quic-echo-server.rs"
+
+[[bin]]
+name = "quic-test-client"
+path = "src/bin/quic-test-client.rs"

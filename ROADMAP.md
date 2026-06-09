@@ -112,7 +112,7 @@ Four integration tests using `LoopbackBackend` (no DPDK required): (a) full QUIC
 Extend `quic-integration-tests.yml` to two EC2 instances (server + client with DPDK), full handshake + bidirectional throughput test, JUnit XML artifacts, PR-comment summary. Add a benchmark job running `bench --provider=stock` and `bench --provider=native-dpdk` side by side. Remove `continue-on-error: true` once 5+ consecutive runs pass.
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `15.1`, `15.2`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #76
 
 ---
 
