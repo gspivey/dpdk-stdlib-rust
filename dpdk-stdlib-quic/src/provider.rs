@@ -21,6 +21,7 @@ pub struct ProviderConfig {
     pub gateway_mac: Option<[u8; 6]>,
     pub max_rx_burst: usize,
     pub max_tx_burst: usize,
+    pub backend_override: Option<Arc<dyn PacketBackend>>,
 }
 
 /// The native DPDK I/O provider for s2n-quic.
@@ -42,6 +43,7 @@ pub struct ProviderBuilder {
     gateway_mac: Option<[u8; 6]>,
     max_rx_burst: usize,
     max_tx_burst: usize,
+    backend_override: Option<Arc<dyn PacketBackend>>,
 }
 
 impl ProviderBuilder {
@@ -53,6 +55,7 @@ impl ProviderBuilder {
             gateway_mac: None,
             max_rx_burst: 32,
             max_tx_burst: 32,
+            backend_override: None,
         }
     }
 
@@ -86,6 +89,15 @@ impl ProviderBuilder {
         self
     }
 
+    /// Inject a pre-created backend for testing (e.g. LoopbackBackend).
+    ///
+    /// When set, `start()` uses this backend instead of creating one
+    /// from the `BackendConfig`.
+    pub fn with_backend(mut self, backend: Arc<dyn PacketBackend>) -> Self {
+        self.backend_override = Some(backend);
+        self
+    }
+
     /// Build the provider and its control handle.
     ///
     /// Both `Arc`s (stats + shutdown) are created here so the handle
@@ -103,6 +115,7 @@ impl ProviderBuilder {
                 gateway_mac: self.gateway_mac,
                 max_rx_burst: self.max_rx_burst,
                 max_tx_burst: self.max_tx_burst,
+                backend_override: self.backend_override,
             },
             stats: Arc::clone(&stats),
             shutdown: Arc::clone(&shutdown),
@@ -203,8 +216,10 @@ impl s2n_quic::provider::io::Provider for DpdkProvider {
         };
 
         // 2. Initialize backend
-        let backend: Arc<dyn PacketBackend> =
-            dpdk_udp::create_backend(&self.config.backend_config)?;
+        let backend: Arc<dyn PacketBackend> = match self.config.backend_override {
+            Some(b) => b,
+            None => dpdk_udp::create_backend(&self.config.backend_config)?,
+        };
 
         // 3. Resolve gateway MAC
         let gateway_mac = resolve_gateway_mac(self.config.gateway_mac, local_ip);
