@@ -6,6 +6,95 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #36: dpdk-stdlib-quic Provider and Builder — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-09 |
+| **Git Hash** | `205ed61e` |
+| **Branch** | `agent/quic-provider-builder` |
+| **PR** | [#73](https://github.com/gspivey/dpdk-stdlib-rust/pull/73) |
+| **GH Actions Run** | [27177086098](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27177086098) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #35
+
+1. **`205ed61e` — Implement `io::Provider` for `DpdkProvider`.** Added `with_backend_config()` to `ProviderBuilder`. Implemented `s2n_quic::provider::io::Provider::start()`: initializes backend via `create_backend`, resolves gateway MAC (explicit or `/proc/net/route` + `/proc/net/arp` fallback), spawns `event_loop_with_tx_queue` on a dedicated thread. Uses `SharedThread` (`Arc<Mutex<Option<JoinHandle>>>`) for shutdown join. IPv6 bind addresses rejected with `UnsupportedAddressFamily`. Re-exports `BackendConfig` from lib.rs.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,971 | 1.5% | 68,988 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,976 | 0.7% | 138,988 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,732 | 0.4% | 330,427 | 5.6% | 350,000 | 0.0% |
+| 700,000 | 698,303 | 0.2% | 351,834 | 49.7% | 699,652 | 0.05% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,969 | 1.5% | 68,995 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,906 | 0.8% | 138,992 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,438 | 0.4% | 319,410 | 8.7% | 349,995 | 0.0% |
+| 700,000 | 695,375 | 0.7% | 323,474 | 53.8% | 698,964 | 0.15% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,990 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,898 | 0.8% | 138,942 | 0.8% | 139,990 | 0.01% |
+| 350,000 | 348,627 | 0.4% | 326,366 | 6.8% | 350,000 | 0.0% |
+| 700,000 | 474,866 | 0.4% | 343,543 | 27.9% | 476,629 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,997 | 1.4% | 35,798 | 48.9% | 70,000 | 0.0% |
+| 140,000 | 75,364 | 3.8% | 74,840 | 4.4% | 76,156 | 2.8% |
+| 350,000 | 77,394 | 1.2% | 75,642 | 3.4% | 74,648 | 4.7% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 303,979 | 13.1% |
+| 700,000 | 302,130 | 56.8% |
+
+### NIC Drops Instrumentation Self-Check
+
+| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |
+|--------|--------|--------------------------------|----------------------------------|-----------------------------------|
+| native-dpdk | no instrumentation | — | — | — |
+| rust-dpdk | **OK** | 0 / 0 / 0 | 403,288 / 403,288 / 0 | 0 / 0 / 0 |
+| tokio-dpdk | **OK** | 0 / 0 / 0 | 263,924 / 263,924 / 0 | 0 / 0 / 0 |
+| plain-rust | no instrumentation | — | — | — |
+
+### Analysis
+
+**No performance regression.** This PR implements `io::Provider` for `DpdkProvider` in `dpdk-stdlib-quic` — purely additive code that is not invoked on any existing UDP hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 698,303 RX (0.2% drop) — identical to Run #34's 698,349 (0.2%). No regression.
+
+**native-dpdk at 700K PPS, 64B**: 699,652 RX (0.05% drop) — consistent with Run #34's 699,750 (0.04%) and improved vs Run #35's 691,915 (1.2%).
+
+**rust-dpdk at 350K PPS**: 348,438–348,732 RX across all non-jumbo sizes with <0.5% drop — identical to Run #34–35 baselines.
+
+**tokio-dpdk**: Caps at ~303K PPS at high rates — consistent with Run #34's ~323K and Run #35's ~311K ceiling. Normal async-path variance.
+
+**Instrumentation self-check**: All OK, zero drift.
+
+**Conclusion**: The `io::Provider` implementation is performance-neutral as expected — the new code lives in `dpdk-stdlib-quic` and is not invoked on any existing UDP hot path.
+
+---
+
 ## Run #35: dpdk-stdlib-quic Event Loop — No Regression
 
 | Field | Value |
