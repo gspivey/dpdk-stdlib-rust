@@ -10,6 +10,11 @@ pub mod error;
 pub mod ring;
 pub mod seq;
 
+// Re-export codec public API at crate root for convenience.
+pub use codec::{
+    build_tcp_frame, build_tcp_packet, compute_mss, parse_tcp_packet, tcp_checksum,
+};
+
 // --- Constants ---
 
 /// Maximum TCP payload for IPv4 (MTU 1500 - 20 IPv4 - 20 TCP).
