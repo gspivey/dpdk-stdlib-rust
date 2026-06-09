@@ -85,7 +85,7 @@ Add `build_udp_frame_into_with_tos(tos: u8, ...)` to `dpdk-stdlib-udp` — non-b
 `ProviderBuilder` with `with_addr`, `with_eal_args`, `with_rx_burst` (default 32), `with_tx_burst` (default 32), `with_backend_config`, `with_gateway_mac`. `build()` creates shared `Arc<ProviderStats>` + `Arc<AtomicBool>`, returns `(DpdkProvider, ProviderHandle)`. `DpdkProvider::start(self, endpoint)`: initialize backend → resolve gateway MAC → bind address → clone stats/shutdown into thread → `std::thread::spawn(event_loop)`. Shutdown: `AtomicBool` flag (primary) + `CloseError` from `poll_wakeups` (secondary).
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `10.1`, `10.2`, `10.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #73
 
 ---
 
