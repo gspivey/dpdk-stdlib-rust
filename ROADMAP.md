@@ -103,7 +103,7 @@ Four integration tests using `LoopbackBackend` (no DPDK required): (a) full QUIC
 `dpdk-stdlib-quic/src/bin/bench.rs`: CLI args `--provider=stock|native-dpdk`, `--duration=<secs>`, `--streams=<n>`, `--payload-size=<bytes>`. Both providers run N-stream echo workload. Reports: throughput (Gbps), PPS, handshake latency P50/P99, provider stats counters. TLS via `rcgen`. Uses `tokio` dev-dep for the app-side executor. Must compile in stub mode (won't fully run without DPDK).
 
 - Spec: `.kiro/specs/s2n-quic-provider/` · tasks `14.1`, `14.2`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #75
 
 ---
 
