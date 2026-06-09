@@ -36,6 +36,7 @@ RATE_STEPS="70000,140000,350000,700000"
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
 CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
 JSON_SUMMARY=false
+IP_VERSION="4"
 
 CDK_STACK_NAME="${CDK_STACK_NAME:-PerfTestStack}"
 CDK_DIR="$REPO_ROOT/deploy/cdk"
@@ -69,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --duration)       DURATION="$2"; shift 2 ;;
         --rate-steps)     RATE_STEPS="$2"; shift 2 ;;
         --configs)        CONFIGS="$2"; shift 2 ;;
+        --ip-version)     IP_VERSION="$2"; shift 2 ;;
         --json-summary)   JSON_SUMMARY=true; shift ;;
         -h|--help)
             head -25 "$0" | grep -E '^#' | sed 's/^# \?//'
@@ -910,8 +912,9 @@ start_dut_rust_dpdk() {
     # --perf-interval 10 enables PerfReporter so [PERF] lines (rx_pps, rx_drops,
     # rx_buf_drops, latencies) appear in the app log every 10s. The harness tails
     # this log into the perf PR comment so the numbers can be compared to TRex.
+    local bind_ip="${DUT_DATA_ENI_IP}"
     ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
-        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-rust-dpdk.log 2>&1 &"
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${bind_ip} --port 9000 --perf-interval 10 > /var/log/echo-rust-dpdk.log 2>&1 &"
     sleep 15
 
     # Verify it's running (retry up to 3 times — SSM can be slow)
@@ -2005,6 +2008,78 @@ $cfn_events
     # DUT ENI starts in kernel mode — orchestrator binds as needed per config.
     wait_and_bind_eni "$DUT_INSTANCE_ID" "DUT" "ena" \
         || { log_error "DUT ENI attachment failed"; exit 2; }
+
+    # ── Phase 2c: IPv6 address setup (when IP_VERSION=6) ─────────────────────
+    if [[ "$IP_VERSION" == "6" ]]; then
+        log_info "Phase 2c: Configuring IPv6 addresses on data ENIs..."
+
+        # Discover ENI IDs from CFN outputs
+        local trex_data_eni_id dut_data_eni_id
+        trex_data_eni_id=$(aws cloudformation describe-stacks \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='TrexDataEniId'].OutputValue" \
+            --output text)
+        dut_data_eni_id=$(aws cloudformation describe-stacks \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='DutDataEniId'].OutputValue" \
+            --output text)
+
+        # Assign IPv6 addresses to ENIs (AWS auto-assigns from subnet IPv6 CIDR)
+        # If the VPC/subnet doesn't have IPv6, this will fail — which is expected
+        # and caught below.
+        local trex_ipv6 dut_ipv6
+
+        # Try to assign IPv6 addresses. If subnet has no IPv6 CIDR, use
+        # link-local with static fd00::/64 ULA addresses configured manually.
+        trex_ipv6=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$trex_data_eni_id" \
+            --query "NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address" \
+            --output text 2>/dev/null) || true
+
+        if [[ -z "$trex_ipv6" || "$trex_ipv6" == "None" ]]; then
+            # No IPv6 on the subnet — assign via AWS API
+            aws ec2 assign-ipv6-addresses \
+                --network-interface-id "$trex_data_eni_id" \
+                --ipv6-address-count 1 2>/dev/null || true
+            aws ec2 assign-ipv6-addresses \
+                --network-interface-id "$dut_data_eni_id" \
+                --ipv6-address-count 1 2>/dev/null || true
+            sleep 5
+
+            trex_ipv6=$(aws ec2 describe-network-interfaces \
+                --network-interface-ids "$trex_data_eni_id" \
+                --query "NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address" \
+                --output text 2>/dev/null) || true
+        fi
+
+        dut_ipv6=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$dut_data_eni_id" \
+            --query "NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address" \
+            --output text 2>/dev/null) || true
+
+        if [[ -z "$trex_ipv6" || "$trex_ipv6" == "None" || -z "$dut_ipv6" || "$dut_ipv6" == "None" ]]; then
+            # Fallback: use ULA addresses configured on the interfaces directly.
+            # This works for L2-direct traffic between instances in the same subnet.
+            log_info "No VPC IPv6 available — using ULA addresses (fd00::/64)"
+            trex_ipv6="fd00::100"
+            dut_ipv6="fd00::200"
+
+            # Configure ULA addresses on the data interfaces via SSM
+            ssm_run_command "$TREX_INSTANCE_ID" 30 \
+                "IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip -6 addr add fd00::100/64 dev \$IFACE 2>/dev/null || true; echo IPV6_CONFIGURED_ON_\$IFACE; else echo NO_IFACE; fi" || true
+            ssm_run_command "$DUT_INSTANCE_ID" 30 \
+                "IFACE=\$(ls /sys/bus/pci/devices/0000:00:06.0/net/ 2>/dev/null | head -1); if [ -n \"\$IFACE\" ]; then ip -6 addr add fd00::200/64 dev \$IFACE 2>/dev/null || true; echo IPV6_CONFIGURED_ON_\$IFACE; else echo NO_IFACE; fi" || true
+        fi
+
+        # Override the traffic IPs for IPv6
+        TREX_DATA_ENI_IP="$trex_ipv6"
+        DUT_DATA_ENI_IP="$dut_ipv6"
+        log_info "IPv6 addresses: TRex=$trex_ipv6, DUT=$dut_ipv6"
+
+        post_pr_comment "## [Perf] IPv6 Configuration
+- TRex IPv6: \`$trex_ipv6\`
+- DUT IPv6: \`$dut_ipv6\`"
+    fi
 
     # ── Phase 3: Collect baseline environment info ───────────────────────────
 

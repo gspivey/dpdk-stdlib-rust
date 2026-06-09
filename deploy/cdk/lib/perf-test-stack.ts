@@ -63,6 +63,23 @@ export class PerfTestStack extends cdk.Stack {
       ],
     });
 
+    // Enable IPv6 on VPC for IPv6 perf tests
+    const cfnVpc = vpc.node.defaultChild as ec2.CfnVPC;
+    const ipv6Cidr = new ec2.CfnVPCCidrBlock(this, 'Ipv6Cidr', {
+      vpcId: vpc.vpcId,
+      amazonProvidedIpv6CidrBlock: true,
+    });
+
+    // Assign IPv6 CIDR to private subnet (used by data-plane ENIs)
+    const privateSubnet = vpc.privateSubnets[0];
+    const cfnPrivateSubnet = privateSubnet.node.defaultChild as ec2.CfnSubnet;
+    cfnPrivateSubnet.ipv6CidrBlock = cdk.Fn.select(0, cdk.Fn.cidr(
+      cdk.Fn.select(0, vpc.vpcIpv6CidrBlocks),
+      2, // 2 subnets
+      '64', // /64 subnets
+    ));
+    cfnPrivateSubnet.addDependency(ipv6Cidr);
+
     // VPC Interface Endpoints for SSM
     vpc.addInterfaceEndpoint('SsmEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.SSM,
@@ -102,6 +119,12 @@ export class PerfTestStack extends cdk.Stack {
       dataSecurityGroup,
       ec2.Port.allIcmp(),
       'ICMP traffic between TRex and DUT'
+    );
+    // IPv6 ICMP (NDP, etc.)
+    dataSecurityGroup.addIngressRule(
+      dataSecurityGroup,
+      ec2.Port.allTraffic(),
+      'All IPv6 traffic between TRex and DUT (NDP + data)'
     );
     // Allow traffic from mgmt to data plane (for kernel-mode tests)
     dataSecurityGroup.addIngressRule(
@@ -396,18 +419,21 @@ export class PerfTestStack extends cdk.Stack {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane TX interface',
+      ipv6AddressCount: 1,
     });
 
     const trexDataEniRx = new ec2.CfnNetworkInterface(this, 'TrexDataEniRx', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane RX interface',
+      ipv6AddressCount: 1,
     });
 
     const dutDataEni = new ec2.CfnNetworkInterface(this, 'DutDataEni', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'DUT data plane interface',
+      ipv6AddressCount: 1,
     });
 
     // NOTE: ENA Express (SRD) requires MTU ≤ 8900 and c6in.8xlarge+.
