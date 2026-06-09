@@ -122,7 +122,7 @@ Run TRex at 64/512/1400 B with IPv6 UDP traffic. Compare against the IPv4 baseli
 
 Trigger: `gh workflow run perf-tests.yml --ref <branch>` after all CI passes. Wait for the check_run delivery — do not poll manually.
 
-- [ ] Complete · PR: —
+- [x] Complete · PR: #77
 
 ---
 
