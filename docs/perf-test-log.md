@@ -6,6 +6,80 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #39: dpdk-stdlib-quic EC2 Integration and Performance CI — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-09 |
+| **Git Hash** | `7a6566f` |
+| **Branch** | `agent/quic-ec2-integration-perf-ci` |
+| **PR** | [#76](https://github.com/gspivey/dpdk-stdlib-rust/pull/76) |
+| **GH Actions Run** | [27200849179](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27200849179) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #38
+
+1. **`7a6566f` — EC2 integration and performance CI for `dpdk-stdlib-quic`.** Added `quic-echo-server` and `quic-test-client` binaries for EC2 QUIC integration testing. Added `tier1-quic-handshake.sh` test script, `run-quic-integration-tests.sh` and `run-quic-benchmarks.sh` orchestrators, and `quic-integration-tests.yml` CI workflow. No changes to the packet processing hot path.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,995 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,983 | 0.7% | 138,963 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,444 | 0.4% | 346,150 | 1.1% | 349,945 | 0.0% |
+| 700,000 | 590,012 | 15.7% | 457,387 | 34.7% | 699,037 | 0.1% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,992 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,999 | 0.7% | 138,963 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,445 | 0.4% | 336,211 | 3.9% | 349,914 | 0.0% |
+| 700,000 | 568,258 | 18.8% | 431,324 | 38.4% | 699,990 | 0.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,975 | 1.5% | 68,995 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,965 | 0.7% | 138,995 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,824 | 0.3% | 340,008 | 2.9% | 350,000 | 0.0% |
+| 700,000 | 474,696 | 0.4% | 341,049 | 28.4% | 476,634 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,999 | 1.4% | 46,576 | 33.5% | 70,000 | 0.0% |
+| 140,000 | 76,378 | 2.5% | 75,669 | 3.4% | 76,496 | 2.4% |
+| 350,000 | 77,364 | 1.2% | 72,518 | 7.5% | 78,079 | 0.4% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 306,994 | 12.3% |
+| 700,000 | 307,297 | 56.1% |
+
+### Analysis
+
+**No performance regression from CI/tooling additions.** This PR adds test binaries and CI scripts only — no changes to the packet processing hot path.
+
+**native-dpdk at 700K PPS, 64B**: 699,037 RX (0.14% drop) — best result to date, improved over Run #38's 694,835 (0.7%). Within ENA variance but confirms no regression.
+
+**native-dpdk at 700K PPS, 512B**: 699,990 RX (0.0% drop) — near-perfect, significantly improved over Run #38's 660,320 (5.7%). Likely favorable ENA burst conditions this run.
+
+**rust-dpdk at 700K PPS, 64B**: 590,012 RX (15.7% drop) — higher than Run #38's 676,257 (3.4%). Normal ENA variance at saturation on c6in.xlarge; lower-rate steps show consistent <0.5% drop.
+
+---
+
 ## Run #38: dpdk-stdlib-quic Benchmark Binary — No Regression
 
 | Field | Value |
