@@ -6,6 +6,77 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #42: dpdk-stdlib-tcp Contract Types, TcpState, Clock, IsnGenerator — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-13 |
+| **Git Hash** | `22c0cd5` |
+| **Branch** | `agent/tcp-contract-types-state-clock-isn` |
+| **PR** | [#80](https://github.com/gspivey/dpdk-stdlib-rust/pull/80) |
+| **GH Actions Run** | [27476064107](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27476064107) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #41
+
+1. **`22c0cd5` — dpdk-stdlib-tcp contract types, TcpState, Clock, and IsnGenerator.** New modules: `state.rs` (TcpState enum + FourTuple), `clock.rs` (Clock trait + SystemClock + MockClock), `isn.rs` (IsnGenerator per RFC 6528), `contract.rs` (ConnectionHandle, EngineCommand, SocketOption, CommandSender, OneshotSender/Receiver, EngineWakeup, AtomicWaker). Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,997 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,985 | 0.3% | 348,990 | 0.3% | 311,544 | 11.0% | 349,973 | 0.0% |
+| 700,000 | 381,095 | 45.6% | 658,996 | 5.9% | 312,244 | 55.4% | 656,738 | 6.2% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,978 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,815 | 0.3% | 348,990 | 0.3% | 231,845 | 33.8% | 349,978 | 0.0% |
+| 700,000 | 398,868 | 43.0% | 620,084 | 11.4% | 231,659 | 66.9% | 598,345 | 14.5% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,990 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,770 | 0.4% | 349,000 | 0.3% | 150,532 | 57.0% | 349,998 | 0.0% |
+| 700,000 | 447,288 | 6.0%* | 466,142 | 2.0%* | 160,320 | 66.3%* | 460,415 | 3.1%* |
+
+\* TX capped at ~476K pps (ENA line-rate limit at 1400B)
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 38,549 | 44.9% | 69,000 | 1.4% | 55,327 | 21.0% | 70,000 | 0.0% |
+| 140,000 | 77,780 | 0.7%* | 77,724 | 0.8%* | 58,906 | 24.8%* | 78,266 | 0.0%* |
+| 350,000 | 77,905 | 0.5%* | 77,900 | 0.6%* | 59,005 | 24.7%* | 77,960 | 0.4%* |
+
+\* TX capped at ~78K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds new contract types, state machine enum, clock abstraction, and ISN generator to `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 658,996 RX (5.9% drop) — consistent with Run #41's 659,356 (5.8% drop). Within normal ENA variance.
+
+**native-dpdk at 700K PPS, 64B**: 656,738 RX (6.2% drop) — consistent with Run #41's 674,638 (3.6% drop). Normal saturation-point variance.
+
+**rust-dpdk vs native-dpdk gap**: Near parity at 350K and below across all packet sizes. At 700K saturation, rust-dpdk tracks native-dpdk closely.
+
+**Conclusion**: Adding TCP contract types is performance-neutral as expected.
+
+---
+
 ## Run #41: dpdk-stdlib-tcp Crate Skeleton and Codec Types — No Regression
 
 | Field | Value |
