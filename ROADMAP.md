@@ -140,7 +140,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `build_tcp_frame(params) -> Vec<u8>` (Eth + IPv4 + TCP; SYN/SYN-ACK frames include MSS, WScale, SACK-Perm, Timestamps). `tcp_checksum` with parameterized pseudo-header. `compute_mss(mtu, ip_hdr_len)`. `parse_tcp_packet` (validate data-offset ≥5, parse all options). `build_tcp_packet(mbuf, params)` (zero-copy DPDK path, byte-identical to `build_tcp_frame`). 7 property tests: round-trip, Mbuf equivalence, invalid frame rejection, SYN required options, MSS bound, checksum flip fails, sequence transitivity. (~500 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `3.7`, `3.8`, `3.9`, `3.10`, `3.11`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #79
 
 ---
 
@@ -149,7 +149,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `ConnectionHandle` (rx_ring/tx_ring SpscByteRing, AtomicU8 state, AtomicBool eof, Mutex error, condvar + notify_lock, AtomicWaker × 2, app_refcount, cmd_tx, key, linger). `EngineCommand` enum. `SocketOption` enum. `CommandSender` (wraps mpsc::Sender + Arc<EngineWakeup>; every send signals engine_wakeup). `OneshotSender/Receiver`. `TcpState` (11 states). `FourTuple`. `SystemClock` + `MockClock` (with `advance()`). `IsnGenerator` (RFC 6528: 128-bit per-boot secret via `getrandom`, SipHash-2-4 of FourTuple, M = elapsed µs / 4). (~400 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.1`, `5.2`, `5.3`, `5.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #80
 
 ---
 
