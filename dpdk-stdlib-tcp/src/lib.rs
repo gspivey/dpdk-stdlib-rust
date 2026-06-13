@@ -7,12 +7,15 @@
 
 pub mod clock;
 pub mod codec;
+pub mod congestion;
 pub mod contract;
 pub mod error;
 pub mod isn;
 pub mod ring;
 pub mod seq;
 pub mod state;
+pub mod tcb;
+pub mod timer;
 
 // Re-export codec public API at crate root for convenience.
 pub use codec::{
