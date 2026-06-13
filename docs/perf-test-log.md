@@ -6,6 +6,75 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #43: dpdk-stdlib-tcp TimerWheel, CongestionState, and Tcb — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-13 |
+| **Git Hash** | `4119661` |
+| **Branch** | `agent/timer-congestion-tcb` |
+| **PR** | [#81](https://github.com/gspivey/dpdk-stdlib-rust/pull/81) |
+| **GH Actions Run** | [27481076743](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27481076743) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #42
+
+1. **`4119661` — dpdk-stdlib-tcp TimerWheel, CongestionState, and Tcb.** New modules: `timer.rs` (TimerWheel with 6 timer types, 1ms granularity), `congestion.rs` (CongestionState with RFC 5681/6298 slow-start, CA, fast retransmit, NewReno), `tcb.rs` (full Transmission Control Block struct). Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,550 | 0.4% | 348,999 | 0.3% | 307,550 | 12.1% | 350,000 | 0.0% |
+| 700,000 | 478,143 | 31.7% | 688,471 | 1.6% | 308,126 | 56.0% | 671,702 | 4.0% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 347,458 | 0.7% | 348,993 | 0.3% | 219,666 | 37.2% | 350,000 | 0.0% |
+| 700,000 | 465,058 | 33.6% | 682,881 | 2.4% | 217,872 | 68.9% | 686,174 | 2.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,999 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 347,912 | 0.6% | 349,000 | 0.3% | 141,418 | 59.6% | 350,000 | 0.0% |
+| 700,000 | 397,161 | 43.3% | 554,573 | 20.8% | 141,373 | 79.8% | 664,236 | 5.1% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 33,974 | 51.5% | 69,000 | 1.4% | 53,549 | 23.5% | 70,000 | 0.0% |
+| 140,000 | 124,232 | 0.8%* | 124,272 | 0.8%* | 56,991 | 54.5%* | 125,324 | 0.0%* |
+| 350,000 | 124,342 | 0.7%* | 123,262 | 1.6%* | 57,015 | 54.5%* | 125,072 | 0.2%* |
+
+\* TX capped at ~125K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds new timer wheel, congestion control, and TCB struct modules to `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 688,471 RX (1.6% drop) — consistent with Run #42's 658,996 (5.9% drop) and Run #41's 659,356 (5.8% drop). Better result this run likely due to favorable ENA burst conditions.
+
+**native-dpdk at 700K PPS, 64B**: 671,702 RX (4.0% drop) — consistent with Run #42's 656,738 (6.2% drop). Normal saturation-point variance.
+
+**rust-dpdk at 700K PPS, 512B**: 682,881 RX (2.4% drop) — consistent with Run #42's 620,084 (11.4% drop). Improved over previous run.
+
+**Conclusion**: Adding TCP TimerWheel, CongestionState, and Tcb is performance-neutral as expected.
+
+---
+
 ## Run #42: dpdk-stdlib-tcp Contract Types, TcpState, Clock, IsnGenerator — No Regression
 
 | Field | Value |

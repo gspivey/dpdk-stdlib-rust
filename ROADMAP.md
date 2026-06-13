@@ -158,7 +158,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `TimerWheel` (1 ms granularity, 6 timer types: RTO/Persist/Keepalive/TimeWait/FinWait2/DelayedAck; insert/cancel/tick-advance). `CongestionState`: `initial_window` (min(10×MSS, max(2×MSS, 14600))), RFC 6298 RTT/RTO (α=1/8, β=1/4, Karn's, clamped [1s,60s]), `on_ack` (slow-start + CA), `on_triple_dup_ack` (fast retransmit), `on_partial_ack`, `on_recovery_exit`, `effective_window`. `Tcb` struct (all fields as spec: snd/rcv sequence state, scales, MSS values, timers, retransmit_queue, reorder_buffer, send_buf, Nagle state, socket options, src_mac/dst_mac, handle). (~500 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.5`, `5.6`, `5.7`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #81
 
 ---
 
