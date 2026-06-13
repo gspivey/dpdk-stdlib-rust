@@ -5,10 +5,14 @@
 //!
 //! Depends on `dpdk-stdlib-net` for `PacketBackend` — does NOT depend on `dpdk-udp`.
 
+pub mod clock;
 pub mod codec;
+pub mod contract;
 pub mod error;
+pub mod isn;
 pub mod ring;
 pub mod seq;
+pub mod state;
 
 // Re-export codec public API at crate root for convenience.
 pub use codec::{
