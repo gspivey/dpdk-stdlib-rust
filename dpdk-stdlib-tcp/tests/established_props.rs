@@ -78,10 +78,14 @@ fn setup_established(
 }
 
 // === Property 9: In-order ACK correctness ===
+// With delayed-ACK: the engine defers ACKs for the first segment and sends
+// on every-other-segment. Property 9 validates that the ACK ack_num is correct
+// when it is finally sent (after the 2nd segment arrives).
 
 proptest! {
-    /// For any in-order payload (1..1460 bytes), the engine produces an ACK
-    /// with ack_num == rcv_nxt + payload_len.
+    /// For any in-order payload (1..1460 bytes), the engine defers the first
+    /// segment's ACK and sends a cumulative ACK after the second segment,
+    /// with ack_num == rcv_nxt + payload_len * 2.
     #[test]
     fn prop_inorder_ack_correctness(payload_len in 1usize..=1460) {
         let (mut engine, _clock) = make_engine();
@@ -91,10 +95,9 @@ proptest! {
         let rcv_nxt = tcb.rcv_nxt;
         let snd_nxt = tcb.snd_nxt;
 
-        // Generate payload
-        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 256) as u8).collect();
-
-        let data_seg = ParsedTcpSegment {
+        // First segment: delayed (no ACK produced)
+        let payload1: Vec<u8> = (0..payload_len).map(|i| (i % 256) as u8).collect();
+        let seg1 = ParsedTcpSegment {
             src: four_tuple.remote,
             dst: four_tuple.local,
             seq: rcv_nxt,
@@ -102,30 +105,49 @@ proptest! {
             flags: TcpFlags::ACK | TcpFlags::PSH,
             window: 65535,
             options: TcpOptions::default(),
-            payload: payload.clone(),
+            payload: payload1.clone(),
         };
-        let frames = engine.on_segment(&data_seg);
+        let frames = engine.on_segment(&seg1);
+        prop_assert_eq!(frames.len(), 0); // Delayed-ACK: deferred
+
+        // Second segment: every-other-segment rule → immediate ACK
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt2 = tcb.rcv_nxt;
+        let payload2: Vec<u8> = (0..payload_len).map(|i| ((i + payload_len) % 256) as u8).collect();
+        let seg2 = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt2,
+            ack: snd_nxt,
+            flags: TcpFlags::ACK | TcpFlags::PSH,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: payload2.clone(),
+        };
+        let frames = engine.on_segment(&seg2);
 
         // Must produce exactly one ACK
         prop_assert_eq!(frames.len(), 1);
         let ack = parse_tcp_packet(&frames[0]).unwrap();
         prop_assert!(ack.flags.contains(TcpFlags::ACK));
 
-        // ACK number must equal rcv_nxt + payload_len
-        let expected_ack = rcv_nxt.add(payload_len as u32);
+        // ACK number covers both segments
+        let expected_ack = rcv_nxt.add((payload_len * 2) as u32);
         prop_assert_eq!(ack.ack, expected_ack);
 
-        // Data must be in rx_ring
-        let mut buf = vec![0u8; payload_len + 1];
+        // All data must be in rx_ring
+        let mut buf = vec![0u8; payload_len * 2 + 1];
         let n = handle.rx_ring.read(&mut buf);
-        prop_assert_eq!(n, payload_len);
-        prop_assert_eq!(&buf[..n], &payload[..]);
+        prop_assert_eq!(n, payload_len * 2);
+        prop_assert_eq!(&buf[..payload_len], &payload1[..]);
+        prop_assert_eq!(&buf[payload_len..payload_len*2], &payload2[..]);
     }
 
-    /// Multiple consecutive in-order segments produce correct cumulative ACKs.
+    /// Multiple consecutive in-order segments produce correct cumulative ACKs
+    /// following the delayed-ACK every-other-segment rule.
     #[test]
     fn prop_inorder_multiple_segments(
-        seg_count in 1usize..=8,
+        seg_count in 2usize..=8,
         seg_size in 1usize..=500,
     ) {
         let (mut engine, _clock) = make_engine();
@@ -137,6 +159,7 @@ proptest! {
 
         let mut expected_rcv_nxt = initial_rcv_nxt;
         let mut total_payload = Vec::new();
+        let mut ack_count = 0u32;
 
         for i in 0..seg_count {
             let payload: Vec<u8> = (0..seg_size).map(|j| ((i * seg_size + j) % 256) as u8).collect();
@@ -153,12 +176,21 @@ proptest! {
                 payload: payload.clone(),
             };
             let frames = engine.on_segment(&seg);
-            prop_assert_eq!(frames.len(), 1);
-
-            let ack = parse_tcp_packet(&frames[0]).unwrap();
             expected_rcv_nxt = expected_rcv_nxt.add(seg_size as u32);
-            prop_assert_eq!(ack.ack, expected_rcv_nxt);
+
+            // With delayed-ACK: ACK on every 2nd segment (i=1,3,5,...)
+            if (i + 1) % 2 == 0 {
+                prop_assert_eq!(frames.len(), 1);
+                let ack = parse_tcp_packet(&frames[0]).unwrap();
+                prop_assert_eq!(ack.ack, expected_rcv_nxt);
+                ack_count += 1;
+            } else {
+                prop_assert_eq!(frames.len(), 0);
+            }
         }
+
+        // Verify we got the expected number of ACKs
+        prop_assert_eq!(ack_count, (seg_count / 2) as u32);
 
         // All data should be readable from rx_ring
         let mut buf = vec![0u8; total_payload.len() + 1];

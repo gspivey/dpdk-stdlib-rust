@@ -6,6 +6,73 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #47: dpdk-stdlib-tcp Engine — Nagle, Delayed-ACK, and SWS Avoidance — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-14 |
+| **Git Hash** | `c5a295ab` |
+| **Branch** | `agent/tcp-nagle-delayed-ack-sws` |
+| **PR** | [#86](https://github.com/gspivey/dpdk-stdlib-rust/pull/86) |
+| **GH Actions Run** | [27500539255](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27500539255) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #46
+
+1. **`c5a295ab` — dpdk-stdlib-tcp Engine — Nagle, delayed-ACK, and SWS avoidance.** Delayed-ACK every-other-segment rule (200ms timer), Nagle algorithm (`nagle_should_send` helper), receiver-side SWS avoidance in `encode_established_window`. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,990 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 349,000 | 0.3% | 308,666 | 11.8% | 350,000 | 0.0% |
+| 700,000 | 446,645 | 36.2% | 698,091 | 0.3% | 310,745 | 55.6% | 699,803 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 138,978 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,779 | 0.3% | 349,000 | 0.3% | 227,043 | 35.1% | 350,000 | 0.0% |
+| 700,000 | 406,349 | 42.0% | 696,111 | 0.6% | 225,897 | 67.7% | 692,950 | 1.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,992 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,480 | 0.4% | 349,000 | 0.3% | 146,532 | 58.1% | 350,000 | 0.0% |
+| 700,000 | 418,818 | 40.2% | 561,249 | 19.8% | 146,081 | 79.1% | 689,334 | 1.5% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 33,386 | 52.3% | 69,000 | 1.4% | 54,264 | 22.5% | 70,000 | 0.0% |
+| 140,000 | 124,308 | 0.7%* | 124,278 | 0.8%* | 57,848 | 53.8%* | 125,250 | 0.0%* |
+| 350,000 | 124,524 | 0.6%* | 123,309 | 1.6%* | 57,784 | 53.8%* | 122,302 | 2.3%* |
+
+\* TX capped at ~125K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds Nagle algorithm, delayed-ACK, and SWS avoidance to `TcpEngine::on_segment` in `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or UDP networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 698,091 RX (0.27% drop) — consistent with Run #46's 698,582 (0.2% drop). Normal ENA burst variance.
+
+**native-dpdk at 700K PPS, 64B**: 699,803 RX (0.03% drop) — improved vs Run #46's 670,526 (4.2% drop). Normal burst variance.
+
+**Conclusion**: Adding TCP engine Nagle/delayed-ACK/SWS logic is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #46: dpdk-stdlib-tcp Engine — FIN Teardown and RST Validation — No Regression
 
 | Field | Value |

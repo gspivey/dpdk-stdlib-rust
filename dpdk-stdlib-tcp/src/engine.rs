@@ -31,6 +31,9 @@ pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(120);
 /// FIN_WAIT_2 timeout to prevent indefinite resource consumption.
 pub const FIN_WAIT2_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Delayed-ACK timeout: coalesce ACKs up to 200ms.
+pub const DELAYED_ACK_TIMEOUT: Duration = Duration::from_millis(200);
+
 // --- Engine configuration ---
 
 /// Configuration for the TCP engine.
@@ -551,6 +554,8 @@ impl TcpEngine {
 
                 // Drain contiguous segments from reorder_buffer.
                 // Rebase keys by subtracting `written`, then drain key==0 entries.
+                // Each drained entry counts toward the delayed-ACK segment counter.
+                let mut drained_count = 0u32;
                 if !tcb.reorder_buffer.is_empty() {
                     let mut rebased: BTreeMap<u32, Vec<u8>> = std::mem::take(&mut tcb.reorder_buffer)
                         .into_iter()
@@ -560,6 +565,7 @@ impl TcpEngine {
                     while let Some(data) = rebased.remove(&0) {
                         let w = tcb.handle.rx_ring.write(&data);
                         tcb.rcv_nxt = tcb.rcv_nxt.add(w as u32);
+                        drained_count += 1;
                         if w > 0 && !rebased.is_empty() {
                             rebased = rebased
                                 .into_iter()
@@ -574,30 +580,47 @@ impl TcpEngine {
                 // Wake app readers
                 tcb.handle.notify_all();
 
-                // Send ACK for received data (including any drained OOO segments)
-                let ack_frame = build_tcp_frame(&TcpFrameParams {
-                    src_mac: tcb.src_mac,
-                    dst_mac: tcb.dst_mac,
-                    src: tcb.key.local,
-                    dst: tcb.key.remote,
-                    seq: tcb.snd_nxt,
-                    ack: tcb.rcv_nxt,
-                    flags: TcpFlags::ACK,
-                    window: encode_established_window(tcb),
-                    options: TcpOptions::default(),
-                    payload: Vec::new(),
-                    ttl: tcb.ttl,
-                });
+                // Delayed-ACK: coalesce ACKs up to 200ms or every-other-segment.
+                // Count this segment plus any drained reorder buffer entries.
+                tcb.segments_since_ack += 1 + drained_count;
 
-                if let Ok(frame) = ack_frame {
-                    outbound.push(frame);
+                if tcb.segments_since_ack >= 2 {
+                    // Every-other-segment rule: send ACK immediately
+                    tcb.segments_since_ack = 0;
+                    tcb.delayed_ack_deadline = None;
+
+                    let ack_frame = build_tcp_frame(&TcpFrameParams {
+                        src_mac: tcb.src_mac,
+                        dst_mac: tcb.dst_mac,
+                        src: tcb.key.local,
+                        dst: tcb.key.remote,
+                        seq: tcb.snd_nxt,
+                        ack: tcb.rcv_nxt,
+                        flags: TcpFlags::ACK,
+                        window: encode_established_window(tcb),
+                        options: TcpOptions::default(),
+                        payload: Vec::new(),
+                        ttl: tcb.ttl,
+                    });
+
+                    if let Ok(frame) = ack_frame {
+                        outbound.push(frame);
+                    }
+                } else if tcb.delayed_ack_deadline.is_none() {
+                    // Arm 200ms delayed-ACK timer
+                    tcb.delayed_ack_deadline =
+                        Some(self.clock.now() + DELAYED_ACK_TIMEOUT);
                 }
             } else if seg.seq.gt(tcb.rcv_nxt) {
                 // Out-of-order: buffer in reorder_buffer keyed on seq.diff(rcv_nxt)
                 let offset = seg.seq.diff(tcb.rcv_nxt);
                 tcb.reorder_buffer.insert(offset, seg.payload.clone());
 
-                // Send dup-ACK with ack_num == rcv_nxt
+                // Send immediate ACK for OOO (dup-ACK with ack_num == rcv_nxt)
+                // Delayed-ACK spec: send immediately on out-of-order segments
+                tcb.segments_since_ack = 0;
+                tcb.delayed_ack_deadline = None;
+
                 let dup_ack = build_tcp_frame(&TcpFrameParams {
                     src_mac: tcb.src_mac,
                     dst_mac: tcb.dst_mac,
@@ -632,6 +655,10 @@ impl TcpEngine {
                 tcb.state = TcpState::CloseWait;
                 tcb.handle.set_state(TcpState::CloseWait);
                 tcb.handle.notify_all();
+
+                // FIN triggers immediate ACK — cancel delayed-ACK
+                tcb.segments_since_ack = 0;
+                tcb.delayed_ack_deadline = None;
 
                 // Send ACK for the FIN (replaces any data ACK already in outbound)
                 outbound.clear();
@@ -1112,11 +1139,22 @@ fn is_in_window(seq: SeqNum, rcv_nxt: SeqNum, rcv_wnd: u32) -> bool {
 }
 
 /// Encode receive window for an established connection (apply window scale).
-/// Reports available rx_ring space, capped by rcv_wnd, right-shifted by rcv_scale.
+/// Implements Silly Window Syndrome (SWS) avoidance on the receiver side:
+/// withhold window update until available space >= min(MSS, half buffer).
+/// This prevents the receiver from advertising tiny window increments.
 #[inline]
 fn encode_established_window(tcb: &Tcb) -> u16 {
     let available = tcb.handle.rx_ring.available_write() as u32;
-    let wnd = std::cmp::min(available, tcb.rcv_wnd);
+    let half_buffer = (tcb.recv_buf_size as u32) / 2;
+    let mss = tcb.effective_mss() as u32;
+    let threshold = std::cmp::min(mss, half_buffer);
+
+    // SWS avoidance: if available space is below threshold, advertise zero window
+    let wnd = if available < threshold {
+        0u32
+    } else {
+        std::cmp::min(available, tcb.rcv_wnd)
+    };
     let scaled = wnd >> tcb.rcv_scale;
     std::cmp::min(scaled, u16::MAX as u32) as u16
 }
@@ -1931,32 +1969,52 @@ mod tests {
         let rcv_nxt = tcb.rcv_nxt;
         let snd_nxt = tcb.snd_nxt;
 
-        // Peer sends data in-order
-        let payload = b"Hello, TCP!";
-        let data_seg = make_data_segment(
+        // First segment: delayed-ACK defers the ACK
+        let payload1 = b"Hello";
+        let seg1 = make_data_segment(
             four_tuple.remote,
             four_tuple.local,
             rcv_nxt.0,
             snd_nxt.0,
-            payload,
+            payload1,
         );
-        let frames = engine.on_segment(&data_seg);
+        let frames = engine.on_segment(&seg1);
+        assert!(frames.is_empty()); // Delayed-ACK: no immediate ACK
+
+        // Data should still be delivered to rx_ring
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, payload1.len());
+        assert_eq!(&buf[..n], payload1);
+
+        // Second segment: every-other-segment rule → immediate ACK
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt2 = tcb.rcv_nxt;
+        let payload2 = b", TCP!";
+        let seg2 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt2.0,
+            snd_nxt.0,
+            payload2,
+        );
+        let frames = engine.on_segment(&seg2);
 
         // Should produce exactly one ACK
         assert_eq!(frames.len(), 1);
         let ack_parsed = parse_tcp_packet(&frames[0]).unwrap();
         assert!(ack_parsed.flags.contains(TcpFlags::ACK));
-        assert_eq!(ack_parsed.ack, rcv_nxt.add(payload.len() as u32));
+        assert_eq!(
+            ack_parsed.ack,
+            rcv_nxt.add((payload1.len() + payload2.len()) as u32)
+        );
 
-        // rcv_nxt should advance
+        // rcv_nxt should have advanced past both payloads
         let tcb = engine.tcbs.get(&four_tuple).unwrap();
-        assert_eq!(tcb.rcv_nxt, rcv_nxt.add(payload.len() as u32));
-
-        // Data should be in rx_ring
-        let mut buf = vec![0u8; 1024];
-        let n = handle.rx_ring.read(&mut buf);
-        assert_eq!(n, payload.len());
-        assert_eq!(&buf[..n], payload);
+        assert_eq!(
+            tcb.rcv_nxt,
+            rcv_nxt.add((payload1.len() + payload2.len()) as u32)
+        );
     }
 
     #[test]
@@ -2067,23 +2125,48 @@ mod tests {
         let mut rcv_nxt = tcb.rcv_nxt;
         let snd_nxt = tcb.snd_nxt;
 
-        // Send 3 segments in order
+        // Send 3 segments in order. With delayed-ACK:
+        // seg 1: deferred (segments_since_ack = 1)
+        // seg 2: immediate ACK (every-other-segment, segments_since_ack resets to 0)
+        // seg 3: deferred (segments_since_ack = 1)
         let payloads = [b"AAA".as_slice(), b"BBBB".as_slice(), b"CC".as_slice()];
-        for payload in &payloads {
-            let seg = make_data_segment(
-                four_tuple.remote,
-                four_tuple.local,
-                rcv_nxt.0,
-                snd_nxt.0,
-                payload,
-            );
-            let frames = engine.on_segment(&seg);
-            assert_eq!(frames.len(), 1);
 
-            let ack = parse_tcp_packet(&frames[0]).unwrap();
-            rcv_nxt = rcv_nxt.add(payload.len() as u32);
-            assert_eq!(ack.ack, rcv_nxt);
-        }
+        // Segment 1: deferred
+        let seg1 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            payloads[0],
+        );
+        let frames = engine.on_segment(&seg1);
+        assert!(frames.is_empty()); // Delayed
+        rcv_nxt = rcv_nxt.add(payloads[0].len() as u32);
+
+        // Segment 2: immediate ACK (every-other-segment)
+        let seg2 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            payloads[1],
+        );
+        let frames = engine.on_segment(&seg2);
+        assert_eq!(frames.len(), 1);
+        rcv_nxt = rcv_nxt.add(payloads[1].len() as u32);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt);
+
+        // Segment 3: deferred (counter reset after seg 2)
+        let seg3 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            payloads[2],
+        );
+        let frames = engine.on_segment(&seg3);
+        assert!(frames.is_empty()); // Delayed
 
         // All data should be in rx_ring
         let mut buf = vec![0u8; 1024];
@@ -2996,5 +3079,286 @@ mod tests {
 
         assert!(!engine.tcbs.contains_key(&four_tuple));
         assert_eq!(handle.tcp_state(), TcpState::Closed);
+    }
+
+    // === Delayed-ACK tests (task 5.13) ===
+
+    #[test]
+    fn delayed_ack_first_segment_defers_ack() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // First in-order data segment: ACK should be deferred
+        let seg = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"hello",
+        );
+        let frames = engine.on_segment(&seg);
+
+        // No immediate ACK — delayed
+        assert!(frames.is_empty());
+
+        // delayed_ack_deadline should be armed
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.delayed_ack_deadline.is_some());
+        assert_eq!(tcb.segments_since_ack, 1);
+
+        // Verify deadline is ~200ms from now
+        let deadline = tcb.delayed_ack_deadline.unwrap();
+        let expected = clock.now() + DELAYED_ACK_TIMEOUT;
+        assert_eq!(deadline, expected);
+    }
+
+    #[test]
+    fn delayed_ack_second_segment_triggers_immediate_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // First segment: deferred
+        let seg1 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"hello",
+        );
+        let frames = engine.on_segment(&seg1);
+        assert!(frames.is_empty());
+
+        // Second segment: every-other-segment rule → immediate ACK
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt2 = tcb.rcv_nxt;
+        let seg2 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt2.0,
+            snd_nxt.0,
+            b"world",
+        );
+        let frames = engine.on_segment(&seg2);
+
+        // Should produce an ACK
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack.ack, rcv_nxt.add(10)); // "hello" + "world" = 10 bytes
+
+        // Counter reset, deadline cleared
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.segments_since_ack, 0);
+        assert!(tcb.delayed_ack_deadline.is_none());
+    }
+
+    #[test]
+    fn delayed_ack_ooo_sends_immediate_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Out-of-order segment (gap of 10 bytes)
+        let seg = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0 + 10, // gap
+            snd_nxt.0,
+            b"world",
+        );
+        let frames = engine.on_segment(&seg);
+
+        // OOO → immediate dup-ACK
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack.ack, rcv_nxt); // dup-ACK: still at old rcv_nxt
+
+        // Counter and deadline reset
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.segments_since_ack, 0);
+        assert!(tcb.delayed_ack_deadline.is_none());
+    }
+
+    #[test]
+    fn delayed_ack_fin_sends_immediate_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // First segment to arm delayed-ACK timer
+        let seg = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"data",
+        );
+        engine.on_segment(&seg);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.delayed_ack_deadline.is_some());
+        let rcv_nxt_after = tcb.rcv_nxt;
+
+        // FIN arrives (immediately after data)
+        let fin = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt_after,
+            ack: SeqNum(snd_nxt.0),
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&fin);
+
+        // FIN → immediate ACK (delayed-ACK cancelled)
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.segments_since_ack, 0);
+        assert!(tcb.delayed_ack_deadline.is_none());
+        assert_eq!(tcb.state, TcpState::CloseWait);
+    }
+
+    // === Nagle algorithm tests (task 5.13) ===
+
+    #[test]
+    fn nagle_buffers_small_write_when_unacked_data() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.has_unacked_data = true;
+
+        // Small write (< MSS) with unacked data → should buffer
+        assert!(!tcb.nagle_should_send(100));
+    }
+
+    #[test]
+    fn nagle_sends_when_no_unacked_data() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.has_unacked_data = false;
+
+        // No unacked data → send immediately regardless of size
+        assert!(tcb.nagle_should_send(100));
+    }
+
+    #[test]
+    fn nagle_sends_when_nodelay_set() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.has_unacked_data = true;
+        tcb.nodelay = true;
+
+        // TCP_NODELAY → always send
+        assert!(tcb.nagle_should_send(1));
+    }
+
+    #[test]
+    fn nagle_sends_when_data_fills_mss() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.has_unacked_data = true;
+        tcb.nodelay = false;
+
+        // Data fills MSS → send even with unacked data
+        assert!(tcb.nagle_should_send(1460));
+        assert!(tcb.nagle_should_send(2000));
+    }
+
+    // === SWS avoidance tests (task 5.13) ===
+
+    #[test]
+    fn sws_avoidance_withholds_small_window() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.rcv_scale = 0; // No scaling for simpler test
+        tcb.rcv_wnd = 65535;
+        tcb.recv_buf_size = 65536;
+
+        // Fill rx_ring almost completely — leave only a small amount free
+        // rx_ring capacity is 65536. Write enough to leave < min(MSS, half_buf)
+        // half_buf = 32768, MSS = 1460, threshold = min(1460, 32768) = 1460
+        // Need to fill ring so available_write < 1460
+        let fill_data = vec![0u8; 65536 - 1000]; // Leave only 1000 bytes free
+        tcb.handle.rx_ring.write(&fill_data);
+
+        let window = encode_established_window(tcb);
+
+        // SWS avoidance: available (1000) < threshold (1460) → advertise 0
+        assert_eq!(window, 0);
+    }
+
+    #[test]
+    fn sws_avoidance_opens_window_above_threshold() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.rcv_scale = 0;
+        tcb.rcv_wnd = 65535;
+        tcb.recv_buf_size = 65536;
+
+        // Leave more than threshold free
+        // threshold = min(1460, 32768) = 1460
+        let fill_data = vec![0u8; 65536 - 2000]; // Leave 2000 bytes free
+        tcb.handle.rx_ring.write(&fill_data);
+
+        let window = encode_established_window(tcb);
+
+        // Available (2000) >= threshold (1460) → advertise actual window
+        assert!(window > 0);
+        assert_eq!(window, 2000); // min(2000, 65535) >> 0 = 2000
+    }
+
+    #[test]
+    fn sws_avoidance_empty_ring_advertises_full_window() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.rcv_scale = 0;
+        tcb.rcv_wnd = 65535;
+        tcb.recv_buf_size = 65536;
+
+        // Empty ring → full window
+        let window = encode_established_window(tcb);
+        assert!(window > 0);
+        // available = 65536, min(65536, 65535) = 65535, >> 0 = 65535
+        assert_eq!(window, 65535);
     }
 }
