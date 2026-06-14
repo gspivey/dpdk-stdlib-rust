@@ -25,6 +25,12 @@ use crate::seq::SeqNum;
 use crate::state::{FourTuple, TcpState};
 use crate::tcb::Tcb;
 
+/// 2×MSL timeout for TIME_WAIT state (RFC 9293: 120 seconds).
+pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(120);
+
+/// FIN_WAIT_2 timeout to prevent indefinite resource consumption.
+pub const FIN_WAIT2_TIMEOUT: Duration = Duration::from_secs(60);
+
 // --- Engine configuration ---
 
 /// Configuration for the TCP engine.
@@ -361,7 +367,13 @@ impl TcpEngine {
                 }
             }
             TcpState::Established => self.handle_established(seg, four_tuple),
-            _ => Vec::new(), // Future tasks handle other states
+            TcpState::FinWait1 => self.handle_fin_wait_1(seg, four_tuple),
+            TcpState::FinWait2 => self.handle_fin_wait_2(seg, four_tuple),
+            TcpState::CloseWait => self.handle_close_wait(seg, four_tuple),
+            TcpState::LastAck => self.handle_last_ack(seg, four_tuple),
+            TcpState::Closing => self.handle_closing(seg, four_tuple),
+            TcpState::TimeWait => self.handle_time_wait(seg, four_tuple),
+            _ => Vec::new(),
         }
     }
 
@@ -607,10 +619,275 @@ impl TcpEngine {
             // else: seg.seq < rcv_nxt — retransmitted/old data, silently drop
         }
 
+        // --- FIN handling in ESTABLISHED state ---
+        // FIN occupies the seq number after the last data byte.
+        // After in-order data delivery, rcv_nxt has advanced past the data.
+        // The FIN is valid if seg.seq + payload.len() == rcv_nxt (FIN is in-order).
+        if seg.flags.contains(TcpFlags::FIN) {
+            let fin_seq = seg.seq.add(seg.payload.len() as u32);
+            if fin_seq == tcb.rcv_nxt {
+                // FIN received: advance rcv_nxt past the FIN, set EOF, transition to CLOSE_WAIT
+                tcb.rcv_nxt = tcb.rcv_nxt.add(1); // FIN consumes one sequence number
+                tcb.handle.set_eof();
+                tcb.state = TcpState::CloseWait;
+                tcb.handle.set_state(TcpState::CloseWait);
+                tcb.handle.notify_all();
+
+                // Send ACK for the FIN (replaces any data ACK already in outbound)
+                outbound.clear();
+                let ack_frame = build_tcp_frame(&TcpFrameParams {
+                    src_mac: tcb.src_mac,
+                    dst_mac: tcb.dst_mac,
+                    src: tcb.key.local,
+                    dst: tcb.key.remote,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: TcpFlags::ACK,
+                    window: encode_established_window(tcb),
+                    options: TcpOptions::default(),
+                    payload: Vec::new(),
+                    ttl: tcb.ttl,
+                });
+                if let Ok(frame) = ack_frame {
+                    outbound.push(frame);
+                }
+            }
+        }
+
         outbound
     }
 
-    // ===== RST handling =====
+    // ===== FIN teardown state handlers (task 5.11) =====
+
+    /// FIN_WAIT_1: We sent FIN, waiting for ACK of our FIN.
+    /// Possible transitions:
+    /// - ACK of our FIN → FIN_WAIT_2
+    /// - FIN from peer (simultaneous close) → CLOSING
+    /// - FIN+ACK from peer → TIME_WAIT (our FIN acked + peer FIN)
+    fn handle_fin_wait_1(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut outbound = Vec::new();
+
+        // Process ACK — check if it acknowledges our FIN
+        let our_fin_acked = if seg.flags.contains(TcpFlags::ACK) {
+            // Our FIN's seq is snd_nxt - 1 (FIN was the last thing we sent).
+            // ACK for our FIN means ack >= snd_nxt.
+            if seg.ack.gt(tcb.snd_una) && seg.ack.le(tcb.snd_nxt) {
+                let bytes_acked = seg.ack.diff(tcb.snd_una);
+                tcb.snd_una = seg.ack;
+                tcb.retransmit_queue.retain(|entry| {
+                    entry.seq.add(entry.len as u32).gt(tcb.snd_una)
+                });
+                let mss = tcb.effective_mss();
+                tcb.congestion.on_ack(bytes_acked, mss);
+            }
+            seg.ack == tcb.snd_nxt
+        } else {
+            false
+        };
+
+        // Deliver any data payload before processing FIN
+        if !seg.payload.is_empty() && seg.seq == tcb.rcv_nxt {
+            let written = tcb.handle.rx_ring.write(&seg.payload);
+            tcb.rcv_nxt = tcb.rcv_nxt.add(written as u32);
+            tcb.handle.notify_all();
+        }
+
+        // Check for peer's FIN (FIN is at seg.seq + payload.len())
+        let fin_seq = seg.seq.add(seg.payload.len() as u32);
+        let peer_fin = seg.flags.contains(TcpFlags::FIN) && fin_seq == tcb.rcv_nxt;
+
+        if our_fin_acked && peer_fin {
+            // Both FINs: ACK our FIN + peer FIN → TIME_WAIT
+            tcb.rcv_nxt = tcb.rcv_nxt.add(1); // FIN consumes one seq
+            tcb.handle.set_eof();
+            tcb.state = TcpState::TimeWait;
+            tcb.handle.set_state(TcpState::TimeWait);
+            tcb.time_wait_deadline = Some(self.clock.now() + TIME_WAIT_DURATION);
+            tcb.handle.notify_all();
+
+            let ack = build_ack_for_tcb(tcb);
+            if let Ok(frame) = ack {
+                outbound.push(frame);
+            }
+        } else if our_fin_acked {
+            // Only our FIN acked → FIN_WAIT_2
+            tcb.state = TcpState::FinWait2;
+            tcb.handle.set_state(TcpState::FinWait2);
+            tcb.fin_wait2_deadline = Some(self.clock.now() + FIN_WAIT2_TIMEOUT);
+            tcb.rto_deadline = None;
+        } else if peer_fin {
+            // Only peer's FIN (simultaneous close) → CLOSING
+            tcb.rcv_nxt = tcb.rcv_nxt.add(1);
+            tcb.handle.set_eof();
+            tcb.state = TcpState::Closing;
+            tcb.handle.set_state(TcpState::Closing);
+            tcb.handle.notify_all();
+
+            let ack = build_ack_for_tcb(tcb);
+            if let Ok(frame) = ack {
+                outbound.push(frame);
+            }
+        }
+
+        outbound
+    }
+
+    /// FIN_WAIT_2: Our FIN was acked, waiting for peer's FIN.
+    fn handle_fin_wait_2(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut outbound = Vec::new();
+
+        // Deliver any data payload
+        if !seg.payload.is_empty() && seg.seq == tcb.rcv_nxt {
+            let written = tcb.handle.rx_ring.write(&seg.payload);
+            tcb.rcv_nxt = tcb.rcv_nxt.add(written as u32);
+            tcb.handle.notify_all();
+
+            let ack = build_ack_for_tcb(tcb);
+            if let Ok(frame) = ack {
+                outbound.push(frame);
+            }
+        }
+
+        // Check for peer's FIN (FIN is at seg.seq + payload.len())
+        let fin_seq = seg.seq.add(seg.payload.len() as u32);
+        if seg.flags.contains(TcpFlags::FIN) && fin_seq == tcb.rcv_nxt {
+            tcb.rcv_nxt = tcb.rcv_nxt.add(1);
+            tcb.handle.set_eof();
+            tcb.state = TcpState::TimeWait;
+            tcb.handle.set_state(TcpState::TimeWait);
+            tcb.time_wait_deadline = Some(self.clock.now() + TIME_WAIT_DURATION);
+            tcb.fin_wait2_deadline = None;
+            tcb.handle.notify_all();
+
+            // Replace any data ACK with a FIN ACK covering everything
+            outbound.clear();
+            let ack = build_ack_for_tcb(tcb);
+            if let Ok(frame) = ack {
+                outbound.push(frame);
+            }
+        }
+
+        outbound
+    }
+
+    /// CLOSE_WAIT: Peer sent FIN, we haven't sent ours yet.
+    /// Process ACKs for outstanding data. The app will eventually close/shutdown
+    /// which sends our FIN (via on_command → Shutdown/Close).
+    fn handle_close_wait(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        // Process ACKs (advance snd_una, free retransmit entries)
+        if seg.flags.contains(TcpFlags::ACK) {
+            if seg.ack.gt(tcb.snd_una) && seg.ack.le(tcb.snd_nxt) {
+                let bytes_acked = seg.ack.diff(tcb.snd_una);
+                tcb.snd_una = seg.ack;
+                tcb.retransmit_queue.retain(|entry| {
+                    entry.seq.add(entry.len as u32).gt(tcb.snd_una)
+                });
+                let mss = tcb.effective_mss();
+                tcb.congestion.on_ack(bytes_acked, mss);
+                tcb.handle.write_waker.wake();
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// LAST_ACK: We sent our FIN (after being in CLOSE_WAIT), waiting for ACK.
+    fn handle_last_ack(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        // ACK of our FIN → CLOSED, remove TCB
+        if seg.flags.contains(TcpFlags::ACK) && seg.ack == tcb.snd_nxt {
+            let handle = tcb.handle.clone();
+            handle.set_state(TcpState::Closed);
+            handle.notify_all();
+            self.tcbs.remove(four_tuple);
+        }
+
+        Vec::new()
+    }
+
+    /// CLOSING: Simultaneous close — waiting for ACK of our FIN.
+    fn handle_closing(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        // ACK of our FIN → TIME_WAIT
+        if seg.flags.contains(TcpFlags::ACK) && seg.ack == tcb.snd_nxt {
+            tcb.state = TcpState::TimeWait;
+            tcb.handle.set_state(TcpState::TimeWait);
+            tcb.time_wait_deadline = Some(self.clock.now() + TIME_WAIT_DURATION);
+            tcb.rto_deadline = None;
+        }
+
+        Vec::new()
+    }
+
+    /// TIME_WAIT: Both FINs exchanged, holding TCB for 2*MSL.
+    /// Only ACKs (retransmitted FIN) should arrive here; respond with ACK and restart timer.
+    fn handle_time_wait(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        // If peer retransmits FIN, re-ACK and restart the timer
+        if seg.flags.contains(TcpFlags::FIN) {
+            tcb.time_wait_deadline = Some(self.clock.now() + TIME_WAIT_DURATION);
+            let ack = build_ack_for_tcb(tcb);
+            return match ack {
+                Ok(frame) => vec![frame],
+                Err(_) => Vec::new(),
+            };
+        }
+
+        Vec::new()
+    }
+
+    // ===== RST handling (RFC 5961) =====
 
     fn handle_rst(
         &mut self,
@@ -646,12 +923,71 @@ impl TcpEngine {
                         self.tcbs.remove(four_tuple);
                     }
                 }
-                _ => {
-                    // Other states: future task 5.12 (RFC 5961 RST validation)
+                TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait => {
+                    // RFC 5961 RST validation for established/close states
+                    return self.handle_rst_rfc5961(seg, four_tuple);
                 }
+                _ => {}
             }
         }
         Vec::new()
+    }
+
+    /// RFC 5961 RST validation for established and close-state connections.
+    /// - Exact seq (== rcv_nxt) → abort connection, latch ConnectionReset
+    /// - In-window non-exact → send challenge ACK
+    /// - Out-of-window → silently drop
+    fn handle_rst_rfc5961(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let rcv_nxt = tcb.rcv_nxt;
+        let rcv_wnd = tcb.rcv_wnd;
+
+        if seg.seq == rcv_nxt {
+            // Exact match: abort connection immediately
+            let handle = tcb.handle.clone();
+            handle.latch_error(TcpError::ConnectionReset);
+            handle.set_state(TcpState::Closed);
+            handle.set_eof();
+            handle.notify_all();
+            self.tcbs.remove(four_tuple);
+            Vec::new()
+        } else if is_in_window(seg.seq, rcv_nxt, rcv_wnd) {
+            // In-window but not exact: send challenge ACK
+            let challenge_ack = build_tcp_frame(&TcpFrameParams {
+                src_mac: tcb.src_mac,
+                dst_mac: tcb.dst_mac,
+                src: tcb.key.local,
+                dst: tcb.key.remote,
+                seq: tcb.snd_nxt,
+                ack: tcb.rcv_nxt,
+                flags: TcpFlags::ACK,
+                window: encode_established_window(tcb),
+                options: TcpOptions::default(),
+                payload: Vec::new(),
+                ttl: tcb.ttl,
+            });
+            match challenge_ack {
+                Ok(frame) => vec![frame],
+                Err(_) => Vec::new(),
+            }
+        } else {
+            // Out-of-window: silently drop
+            Vec::new()
+        }
     }
 
     // ===== Frame builders =====
@@ -744,6 +1080,36 @@ impl TcpEngine {
 }
 
 // ===== Helpers =====
+
+/// Build a plain ACK frame for the given TCB state.
+/// Free function to avoid borrow conflicts when tcb is borrowed from self.tcbs.
+fn build_ack_for_tcb(tcb: &Tcb) -> Result<Vec<u8>, TcpError> {
+    build_tcp_frame(&TcpFrameParams {
+        src_mac: tcb.src_mac,
+        dst_mac: tcb.dst_mac,
+        src: tcb.key.local,
+        dst: tcb.key.remote,
+        seq: tcb.snd_nxt,
+        ack: tcb.rcv_nxt,
+        flags: TcpFlags::ACK,
+        window: encode_established_window(tcb),
+        options: TcpOptions::default(),
+        payload: Vec::new(),
+        ttl: tcb.ttl,
+    })
+}
+
+/// Check if a sequence number falls within the receive window [rcv_nxt, rcv_nxt + rcv_wnd).
+/// Uses modular arithmetic for wrap-around safety.
+#[inline]
+fn is_in_window(seq: SeqNum, rcv_nxt: SeqNum, rcv_wnd: u32) -> bool {
+    if rcv_wnd == 0 {
+        return seq == rcv_nxt;
+    }
+    let rcv_end = rcv_nxt.add(rcv_wnd);
+    // seq is in window if rcv_nxt <= seq < rcv_end (modular comparison)
+    seq == rcv_nxt || (seq.gt(rcv_nxt) && rcv_end.gt(seq))
+}
 
 /// Encode receive window for an established connection (apply window scale).
 /// Reports available rx_ring space, capped by rcv_wnd, right-shifted by rcv_scale.
@@ -2049,5 +2415,586 @@ mod tests {
         let n = handle.rx_ring.read(&mut buf);
         assert_eq!(n, 5);
         assert_eq!(&buf[..n], b"HELLO");
+    }
+
+    // === FIN teardown tests (task 5.11) ===
+
+    fn make_fin_segment(
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: u32,
+    ) -> ParsedTcpSegment {
+        ParsedTcpSegment {
+            src,
+            dst,
+            seq: SeqNum(seq),
+            ack: SeqNum(ack),
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        }
+    }
+
+    fn make_fin_data_segment(
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: u32,
+        payload: &[u8],
+    ) -> ParsedTcpSegment {
+        ParsedTcpSegment {
+            src,
+            dst,
+            seq: SeqNum(seq),
+            ack: SeqNum(ack),
+            flags: TcpFlags::FIN | TcpFlags::ACK | TcpFlags::PSH,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn established_fin_transitions_to_close_wait() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Peer sends FIN
+        let fin = make_fin_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+        );
+        let frames = engine.on_segment(&fin);
+
+        // Should produce ACK for the FIN
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack.ack, rcv_nxt.add(1)); // FIN consumes 1 seq
+
+        // State should be CLOSE_WAIT
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::CloseWait);
+        assert_eq!(handle.tcp_state(), TcpState::CloseWait);
+
+        // EOF should be set
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn established_fin_with_data_delivers_data_then_eof() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Peer sends FIN with data
+        let fin_data = make_fin_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"final data",
+        );
+        let frames = engine.on_segment(&fin_data);
+
+        // Should produce ACK covering data + FIN
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt.add(10 + 1)); // 10 bytes data + 1 FIN
+
+        // Data should be in rx_ring
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], b"final data");
+
+        // EOF should be set
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(handle.tcp_state(), TcpState::CloseWait);
+    }
+
+    #[test]
+    fn fin_wait_1_ack_of_fin_transitions_to_fin_wait_2() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate: our side sends FIN (transition to FIN_WAIT_1)
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait1;
+        tcb.snd_nxt = tcb.snd_nxt.add(1); // FIN consumes 1 seq
+        handle.set_state(TcpState::FinWait1);
+
+        let snd_nxt = tcb.snd_nxt;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer ACKs our FIN
+        let ack = make_ack_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0, // acks our FIN
+        );
+        engine.on_segment(&ack);
+
+        // Should transition to FIN_WAIT_2
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait2);
+        assert_eq!(handle.tcp_state(), TcpState::FinWait2);
+        // FIN_WAIT_2 timer should be armed
+        assert!(tcb.fin_wait2_deadline.is_some());
+    }
+
+    #[test]
+    fn fin_wait_1_peer_fin_simultaneous_close_transitions_to_closing() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate: our side sends FIN (transition to FIN_WAIT_1)
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait1;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        handle.set_state(TcpState::FinWait1);
+
+        let snd_una = tcb.snd_una;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer sends FIN without ACKing our FIN (simultaneous close)
+        let fin = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_una, // Does NOT ack our FIN
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&fin);
+
+        // Should send ACK for peer's FIN
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack.ack, rcv_nxt.add(1));
+
+        // Should transition to CLOSING
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::Closing);
+        assert_eq!(handle.tcp_state(), TcpState::Closing);
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn fin_wait_1_peer_fin_ack_transitions_to_time_wait() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate FIN_WAIT_1
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait1;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        handle.set_state(TcpState::FinWait1);
+
+        let snd_nxt = tcb.snd_nxt;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer sends FIN+ACK that also ACKs our FIN
+        let fin_ack = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_nxt, // ACKs our FIN
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&fin_ack);
+
+        // Should send ACK and transition to TIME_WAIT
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        assert_eq!(handle.tcp_state(), TcpState::TimeWait);
+        assert!(tcb.time_wait_deadline.is_some());
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn fin_wait_2_peer_fin_transitions_to_time_wait() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate FIN_WAIT_2
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait2;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        tcb.snd_una = tcb.snd_nxt;
+        handle.set_state(TcpState::FinWait2);
+
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Peer sends FIN
+        let fin = make_fin_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+        );
+        let frames = engine.on_segment(&fin);
+
+        // Should ACK and transition to TIME_WAIT
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt.add(1));
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        assert!(tcb.time_wait_deadline.is_some());
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn closing_ack_of_our_fin_transitions_to_time_wait() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate CLOSING state
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::Closing;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        handle.set_state(TcpState::Closing);
+
+        let snd_nxt = tcb.snd_nxt;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer ACKs our FIN
+        let ack = make_ack_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+        );
+        engine.on_segment(&ack);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        assert!(tcb.time_wait_deadline.is_some());
+    }
+
+    #[test]
+    fn last_ack_ack_of_our_fin_removes_tcb() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate LAST_ACK state
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::LastAck;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        handle.set_state(TcpState::LastAck);
+
+        let snd_nxt = tcb.snd_nxt;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer ACKs our FIN
+        let ack = make_ack_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+        );
+        engine.on_segment(&ack);
+
+        // TCB should be removed
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn time_wait_retransmitted_fin_restarts_timer_and_acks() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Simulate TIME_WAIT
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::TimeWait;
+        let now = clock.now();
+        tcb.time_wait_deadline = Some(now + super::TIME_WAIT_DURATION);
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        tcb.snd_una = tcb.snd_nxt;
+        handle.set_state(TcpState::TimeWait);
+
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Advance time a bit
+        clock.advance(Duration::from_secs(30));
+
+        // Peer retransmits FIN
+        let fin = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: SeqNum(rcv_nxt.0.wrapping_sub(1)), // FIN's seq is one before rcv_nxt
+            ack: SeqNum(snd_nxt.0),
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&fin);
+
+        // Should re-ACK
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+
+        // Timer should be restarted (deadline > previous)
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.time_wait_deadline.unwrap() > now + Duration::from_secs(30));
+        assert_eq!(tcb.state, TcpState::TimeWait);
+    }
+
+    #[test]
+    fn close_wait_processes_acks() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        // Simulate CLOSE_WAIT with data in flight
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::CloseWait;
+        let snd_una_before = tcb.snd_una;
+        tcb.snd_nxt = tcb.snd_nxt.add(100);
+        tcb.retransmit_queue.push(crate::tcb::RetransmitEntry {
+            seq: snd_una_before,
+            offset: 0,
+            len: 100,
+            sent_at: std::time::Instant::now(),
+            retransmit_count: 0,
+        });
+
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Peer ACKs some data
+        let ack = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_una_before.add(50),
+            flags: TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&ack);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_una, snd_una_before.add(50));
+        assert_eq!(tcb.state, TcpState::CloseWait); // Stays in CLOSE_WAIT
+    }
+
+    // === RST validation tests (task 5.12 — RFC 5961) ===
+
+    #[test]
+    fn rst_exact_seq_aborts_established_connection() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // RST with exact seq == rcv_nxt
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt, // Exact match
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&rst);
+
+        // Should produce no outbound frames
+        assert!(frames.is_empty());
+
+        // TCB should be removed
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+
+        // Handle should have ConnectionReset latched
+        assert!(matches!(
+            handle.peek_error(),
+            Some(TcpError::ConnectionReset)
+        ));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn rst_in_window_non_exact_sends_challenge_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // RST with seq in window but not exact (rcv_nxt + 5)
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt.add(5), // In-window but not exact
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&rst);
+
+        // Should send challenge ACK
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert!(!ack.flags.contains(TcpFlags::RST));
+        assert_eq!(ack.ack, rcv_nxt); // Challenge ACK has current rcv_nxt
+
+        // TCB should still exist (not aborted)
+        assert!(engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Established);
+        assert!(handle.peek_error().is_none());
+    }
+
+    #[test]
+    fn rst_out_of_window_silently_dropped() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let rcv_wnd = tcb.rcv_wnd;
+
+        // RST with seq way out of window
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt.add(rcv_wnd + 1000), // Out of window
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&rst);
+
+        // Should produce no output (silently dropped)
+        assert!(frames.is_empty());
+
+        // TCB should still exist
+        assert!(engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Established);
+        assert!(handle.peek_error().is_none());
+    }
+
+    #[test]
+    fn rst_exact_seq_aborts_fin_wait_1() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Move to FIN_WAIT_1
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait1;
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        handle.set_state(TcpState::FinWait1);
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // RST with exact seq
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&rst);
+
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert!(matches!(handle.peek_error(), Some(TcpError::ConnectionReset)));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn rst_in_window_non_exact_in_fin_wait_2_sends_challenge_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Move to FIN_WAIT_2
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait2;
+        handle.set_state(TcpState::FinWait2);
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // RST in-window non-exact
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt.add(10),
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&rst);
+
+        // Challenge ACK
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert!(engine.tcbs.contains_key(&four_tuple));
+    }
+
+    #[test]
+    fn rst_exact_seq_aborts_time_wait() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Move to TIME_WAIT
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::TimeWait;
+        handle.set_state(TcpState::TimeWait);
+        let rcv_nxt = tcb.rcv_nxt;
+
+        let rst = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: SeqNum(0),
+            flags: TcpFlags::RST,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&rst);
+
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
     }
 }

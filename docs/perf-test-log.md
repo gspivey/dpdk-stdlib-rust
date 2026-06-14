@@ -6,6 +6,77 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #46: dpdk-stdlib-tcp Engine — FIN Teardown and RST Validation — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-14 |
+| **Git Hash** | `ff396176` |
+| **Branch** | `agent/tcp-fin-rst-validation` |
+| **PR** | [#85](https://github.com/gspivey/dpdk-stdlib-rust/pull/85) |
+| **GH Actions Run** | [27496199872](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27496199872) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #45
+
+1. **`ff396176` — dpdk-stdlib-tcp Engine — FIN teardown and RST validation.** FIN state transitions (FIN_WAIT_1/2, CLOSE_WAIT, LAST_ACK, CLOSING, TIME_WAIT), RST validation per RFC 5961 (exact seq → abort, in-window → challenge ACK, out-of-window → drop). Plus `set_eof` on ConnectionHandle. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,908 | 0.3% | 349,000 | 0.3% | 308,697 | 11.8% | 350,000 | 0.0% |
+| 700,000 | 517,233 | 26.1% | 698,582 | 0.2% | 308,206 | 56.0% | 670,526 | 4.2% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,921 | 0.3% | 349,000 | 0.3% | 228,662 | 34.7% | 350,000 | 0.0% |
+| 700,000 | 482,981 | 31.0% | 697,237 | 0.4% | 226,240 | 67.7% | 698,705 | 0.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,992 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,982 | 0.3% | 349,000 | 0.3% | 147,419 | 57.9% | 350,000 | 0.0% |
+| 700,000 | 460,745 | 3.3%* | 474,081 | 0.5%* | 157,467 | 66.9%* | 475,708 | 0.1%* |
+
+\* TX capped at ~476K pps (30 Gbps ENA burst limit at 1400B)
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 29,444 | 57.9% | 69,000 | 1.4% | 54,099 | 22.7% | 70,000 | 0.0% |
+| 140,000 | 77,727 | 0.7%* | 77,743 | 0.8%* | 57,796 | 26.2%* | 78,298 | 0.0%* |
+| 350,000 | 77,535 | 1.0%* | 77,324 | 1.3%* | 57,859 | 26.1%* | 77,793 | 0.7%* |
+
+\* TX capped at ~78K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds FIN teardown state handlers and RFC 5961 RST validation to `TcpEngine::on_segment` in `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or UDP networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 698,582 RX (0.2% drop) — improved vs Run #45's 648,686 (7.3% drop). Normal ENA burst variance; confirms no regression.
+
+**rust-dpdk at 700K PPS, 512B**: 697,237 RX (0.4% drop) — improved vs Run #45's 620,449 (11.4% drop). Normal variance.
+
+**native-dpdk at 700K PPS, 64B**: 670,526 RX (4.2% drop) — consistent with Run #45's 667,175 (4.7% drop).
+
+**Conclusion**: Adding TCP engine FIN/RST handling is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #45: dpdk-stdlib-tcp Engine — OOO Reorder Buffer — No Regression
 
 | Field | Value |
