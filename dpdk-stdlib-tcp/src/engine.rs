@@ -1,10 +1,9 @@
 //! TCP protocol engine — stateful segment processing.
 //!
 //! The engine owns all TCBs and processes inbound segments via `on_segment`.
-//! This module implements the handshake path (task 5.8):
-//! - SYN → SYN_RECEIVED (send SYN-ACK)
-//! - SYN-ACK → ESTABLISHED (send ACK, wake connect oneshot)
-//! - RST in SYN_SENT → ConnectionRefused
+//! Timer-driven behavior is serviced via `on_tick` (tasks 5.14, 5.15):
+//! - TX drain: tx_ring → send_buf → segment (respecting effective_window) → transmit
+//! - RTO: retransmit oldest unacked segment, exponential backoff, abort after max_retries
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -23,7 +22,7 @@ use crate::error::TcpError;
 use crate::isn::IsnGenerator;
 use crate::seq::SeqNum;
 use crate::state::{FourTuple, TcpState};
-use crate::tcb::Tcb;
+use crate::tcb::{RetransmitEntry, Tcb};
 
 /// 2×MSL timeout for TIME_WAIT state (RFC 9293: 120 seconds).
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(120);
@@ -51,6 +50,8 @@ pub struct EngineConfig {
     pub default_rcv_scale: u8,
     /// Default RTO for initial SYN retransmit.
     pub initial_rto: Duration,
+    /// Maximum retransmission attempts before aborting with TimedOut.
+    pub max_retries: u32,
 }
 
 impl Default for EngineConfig {
@@ -62,6 +63,7 @@ impl Default for EngineConfig {
             default_rcv_wnd: 65535,
             default_rcv_scale: 7,
             initial_rto: Duration::from_secs(1),
+            max_retries: 15,
         }
     }
 }
@@ -172,9 +174,201 @@ impl TcpEngine {
         }
     }
 
-    /// Service timers (placeholder for task 5.14+).
-    pub fn on_tick(&mut self, _now: std::time::Instant) -> Vec<Vec<u8>> {
-        Vec::new()
+    /// Service timers: drain tx_rings, segment and transmit, handle RTO.
+    pub fn on_tick(&mut self, now: std::time::Instant) -> Vec<Vec<u8>> {
+        let mut outbound = Vec::new();
+
+        // Collect keys to iterate (avoid borrow conflict with &mut self).
+        let keys: Vec<FourTuple> = self.tcbs.keys().copied().collect();
+
+        for key in keys {
+            // --- RTO check (task 5.15) ---
+            // Must run before tx-drain so aborted connections don't send new data.
+            if let Some(tcb) = self.tcbs.get(&key) {
+                if let Some(deadline) = tcb.rto_deadline {
+                    if now >= deadline && !tcb.retransmit_queue.is_empty() {
+                        // RTO expired — retransmit or abort
+                        let tcb = self.tcbs.get_mut(&key).unwrap();
+                        tcb.retransmit_count += 1;
+
+                        if tcb.retransmit_count > self.config.max_retries {
+                            // Abort: latch TimedOut, remove TCB
+                            tcb.handle.latch_error(TcpError::TimedOut);
+                            tcb.handle.set_state(TcpState::Closed);
+                            tcb.handle.set_eof();
+                            tcb.handle.notify_all();
+
+                            // Fulfil pending connect if any
+                            if let Some(pending) = self.pending_connects.remove(&key) {
+                                pending.response.send(Err(TcpError::TimedOut));
+                            }
+
+                            self.tcbs.remove(&key);
+                            continue;
+                        }
+
+                        // Retransmit oldest unacked segment
+                        let flight_size = tcb.flight_size();
+                        let mss = tcb.effective_mss();
+                        tcb.congestion.on_rto(flight_size, mss);
+                        tcb.congestion.backoff_rto();
+
+                        // Rearm RTO with backed-off value
+                        tcb.rto_deadline = Some(now + tcb.congestion.rto);
+
+                        // Build retransmit frame from first entry
+                        if let Some(entry) = tcb.retransmit_queue.first() {
+                            let seq = entry.seq;
+                            let offset = entry.offset;
+                            let len = entry.len;
+                            // Extract payload from send_buf
+                            let payload: Vec<u8> = tcb.send_buf
+                                .iter()
+                                .skip(offset)
+                                .take(len)
+                                .copied()
+                                .collect();
+
+                            if !payload.is_empty() {
+                                let frame = build_tcp_frame(&TcpFrameParams {
+                                    src_mac: tcb.src_mac,
+                                    dst_mac: tcb.dst_mac,
+                                    src: tcb.key.local,
+                                    dst: tcb.key.remote,
+                                    seq,
+                                    ack: tcb.rcv_nxt,
+                                    flags: TcpFlags::ACK,
+                                    window: encode_established_window(tcb),
+                                    options: TcpOptions::default(),
+                                    payload,
+                                    ttl: tcb.ttl,
+                                });
+                                if let Ok(f) = frame {
+                                    outbound.push(f);
+                                }
+                            }
+                        }
+
+                        continue;
+                    }
+                }
+            }
+
+            // --- TX drain (task 5.14) ---
+            // Only drain for ESTABLISHED connections (or CLOSE_WAIT where app can still write).
+            let tcb = match self.tcbs.get_mut(&key) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            if tcb.state != TcpState::Established && tcb.state != TcpState::CloseWait {
+                continue;
+            }
+
+            // Step 1: Drain tx_ring → send_buf
+            let mut drain_buf = [0u8; 4096];
+            loop {
+                let n = tcb.handle.tx_ring.read(&mut drain_buf);
+                if n == 0 {
+                    break;
+                }
+                tcb.send_buf.extend(&drain_buf[..n]);
+            }
+
+            // Step 2: Segment send_buf and transmit respecting effective_window + Nagle
+            let prev_available = tcb.available_send_window();
+            let mss = tcb.effective_mss() as usize;
+
+            loop {
+                let available_window = tcb.available_send_window() as usize;
+                if available_window == 0 || tcb.send_buf.is_empty() {
+                    break;
+                }
+
+                // Compute bytes already sent but not yet in retransmit queue
+                // send_buf tracks all unsent data. The retransmit_queue tracks
+                // already-sent bytes (by offset into send_buf).
+                let already_sent_offset = tcb.retransmit_queue.last()
+                    .map(|e| e.offset + e.len)
+                    .unwrap_or(0);
+                let unsent_in_buf = tcb.send_buf.len().saturating_sub(already_sent_offset);
+
+                if unsent_in_buf == 0 {
+                    break;
+                }
+
+                // Nagle check: should we send now?
+                if !tcb.nagle_should_send(unsent_in_buf) {
+                    break;
+                }
+
+                let segment_len = std::cmp::min(
+                    std::cmp::min(unsent_in_buf, mss),
+                    available_window,
+                );
+
+                if segment_len == 0 {
+                    break;
+                }
+
+                // Extract payload from send_buf at the appropriate offset
+                let payload: Vec<u8> = tcb.send_buf
+                    .iter()
+                    .skip(already_sent_offset)
+                    .take(segment_len)
+                    .copied()
+                    .collect();
+
+                let seq = tcb.snd_nxt;
+                let frame = build_tcp_frame(&TcpFrameParams {
+                    src_mac: tcb.src_mac,
+                    dst_mac: tcb.dst_mac,
+                    src: tcb.key.local,
+                    dst: tcb.key.remote,
+                    seq,
+                    ack: tcb.rcv_nxt,
+                    flags: TcpFlags::ACK,
+                    window: encode_established_window(tcb),
+                    options: TcpOptions::default(),
+                    payload,
+                    ttl: tcb.ttl,
+                });
+
+                if let Ok(f) = frame {
+                    outbound.push(f);
+                }
+
+                // Update send state
+                tcb.snd_nxt = tcb.snd_nxt.add(segment_len as u32);
+                tcb.has_unacked_data = true;
+
+                // Add to retransmit queue
+                tcb.retransmit_queue.push(RetransmitEntry {
+                    seq,
+                    offset: already_sent_offset,
+                    len: segment_len,
+                    sent_at: now,
+                    retransmit_count: 0,
+                });
+
+                // Arm RTO if not already armed
+                if tcb.rto_deadline.is_none() {
+                    tcb.rto_deadline = Some(now + tcb.congestion.rto);
+                }
+            }
+
+            // Step 3: Wake write_waker + condvar if send window opened
+            // (i.e., if the tx_ring has space now that we drained it)
+            let new_available = tcb.available_send_window();
+            if new_available > 0 && (prev_available == 0 || tcb.handle.tx_ring.available_write() > 0) {
+                tcb.handle.write_waker.wake();
+                // Also notify via condvar for blocking writers
+                let _guard = tcb.handle.notify_lock.lock().unwrap();
+                tcb.handle.condvar.notify_all();
+            }
+        }
+
+        outbound
     }
 
     // ===== Handshake: Active Open (Connect) =====
@@ -3360,5 +3554,419 @@ mod tests {
         assert!(window > 0);
         // available = 65536, min(65536, 65535) = 65535, >> 0 = 65535
         assert_eq!(window, 65535);
+    }
+
+    // === on_tick: TX drain tests (task 5.14) ===
+
+    #[test]
+    fn on_tick_drains_tx_ring_and_sends_segments() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Set up peer_mss so effective_mss is 1460
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+
+        // App writes data to tx_ring
+        let data = b"Hello, world!";
+        handle.tx_ring.write(data);
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // Should produce one data frame
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+        assert_eq!(parsed.payload, data);
+    }
+
+    #[test]
+    fn on_tick_respects_effective_window() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 10; // Very small receiver window
+
+        // Write more data than the window allows
+        let data = vec![0xAA; 100];
+        handle.tx_ring.write(&data);
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // Should only send up to effective_window bytes
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(parsed.payload.len(), 10); // Limited by snd_wnd
+    }
+
+    #[test]
+    fn on_tick_segments_at_mss_boundary() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 100; // Small MSS for testing
+        tcb.snd_wnd = 65535;
+        tcb.nodelay = true; // Disable Nagle so all segments go out
+
+        // Write data larger than one MSS
+        let data = vec![0xBB; 250];
+        handle.tx_ring.write(&data);
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // Should produce 3 segments: 100 + 100 + 50
+        assert_eq!(frames.len(), 3);
+        let p1 = parse_tcp_packet(&frames[0]).unwrap();
+        let p2 = parse_tcp_packet(&frames[1]).unwrap();
+        let p3 = parse_tcp_packet(&frames[2]).unwrap();
+        assert_eq!(p1.payload.len(), 100);
+        assert_eq!(p2.payload.len(), 100);
+        assert_eq!(p3.payload.len(), 50);
+    }
+
+    #[test]
+    fn on_tick_arms_rto_on_first_send() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        // Clear any existing RTO deadline from the handshake
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"test data");
+
+        let now = clock.now();
+        engine.on_tick(now);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.rto_deadline.is_some());
+        // RTO should be armed at now + congestion.rto
+        assert_eq!(tcb.rto_deadline.unwrap(), now + tcb.congestion.rto);
+    }
+
+    #[test]
+    fn on_tick_populates_retransmit_queue() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"segment data");
+
+        let now = clock.now();
+        engine.on_tick(now);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.retransmit_queue.len(), 1);
+        assert_eq!(tcb.retransmit_queue[0].len, 12); // "segment data".len()
+        assert_eq!(tcb.retransmit_queue[0].retransmit_count, 0);
+    }
+
+    #[test]
+    fn on_tick_advances_snd_nxt() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        let snd_nxt_before = tcb.snd_nxt;
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"hello");
+
+        let now = clock.now();
+        engine.on_tick(now);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_nxt, snd_nxt_before.add(5));
+    }
+
+    #[test]
+    fn on_tick_wakes_write_waker_when_window_open() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+
+        static WOKEN: AtomicBool = AtomicBool::new(false);
+
+        fn clone_fn(ptr: *const ()) -> RawWaker { RawWaker::new(ptr, &VTABLE) }
+        fn wake_fn(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+        fn wake_by_ref_fn(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+        fn drop_fn(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
+
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+
+        // Register a write waker
+        let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        handle.write_waker.register(&waker);
+        WOKEN.store(false, Ordering::Release);
+
+        handle.tx_ring.write(b"data");
+
+        let now = clock.now();
+        engine.on_tick(now);
+
+        // Write waker should have been woken (window is open after drain)
+        assert!(WOKEN.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn on_tick_no_send_when_zero_window() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 0; // Zero receiver window
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"data that should not be sent");
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // No frames should be sent when window is zero
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn on_tick_nagle_buffers_small_write() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.nodelay = false; // Nagle enabled
+        tcb.has_unacked_data = true; // Data in flight
+        tcb.rto_deadline = None;
+
+        // Small write (< MSS) with unacked data → Nagle buffers it
+        handle.tx_ring.write(b"hi");
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // Nagle should prevent sending
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn on_tick_nodelay_sends_immediately() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.nodelay = true; // TCP_NODELAY set
+        tcb.has_unacked_data = true;
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"hi");
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // TCP_NODELAY → send immediately regardless of Nagle
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(parsed.payload, b"hi");
+    }
+
+    // === on_tick: RTO tests (task 5.15) ===
+
+    #[test]
+    fn on_tick_rto_retransmits_oldest_segment() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+
+        // Send initial data
+        handle.tx_ring.write(b"retransmit me");
+        let t0 = clock.now();
+        engine.on_tick(t0);
+
+        // Verify data was sent
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.retransmit_queue.len(), 1);
+        let rto = tcb.congestion.rto;
+
+        // Advance clock past RTO
+        clock.advance(rto + Duration::from_millis(1));
+        let t1 = clock.now();
+
+        let frames = engine.on_tick(t1);
+
+        // Should retransmit
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(parsed.payload, b"retransmit me");
+    }
+
+    #[test]
+    fn on_tick_rto_doubles_on_each_retransmit() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"data");
+        let t0 = clock.now();
+        engine.on_tick(t0);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let initial_rto = tcb.congestion.rto; // Should be 1s (initial)
+
+        // First RTO expiry
+        clock.advance(initial_rto + Duration::from_millis(1));
+        engine.on_tick(clock.now());
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.retransmit_count, 1);
+        // RTO should have doubled
+        assert_eq!(tcb.congestion.rto, (initial_rto * 2).min(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn on_tick_rto_aborts_after_max_retries() {
+        let (mut engine, clock) = make_engine();
+        let mut config = EngineConfig::default();
+        config.max_retries = 3; // Low for testing
+        engine.config = config.clone();
+
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+
+        handle.tx_ring.write(b"will timeout");
+        engine.on_tick(clock.now());
+
+        // Expire RTO max_retries + 1 times to trigger abort
+        for _ in 0..=config.max_retries {
+            let tcb = engine.tcbs.get(&four_tuple);
+            if tcb.is_none() {
+                break; // Already aborted
+            }
+            let rto = tcb.unwrap().congestion.rto;
+            clock.advance(rto + Duration::from_millis(1));
+            engine.on_tick(clock.now());
+        }
+
+        // TCB should be removed
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+
+        // Handle should have TimedOut error latched
+        assert!(matches!(handle.peek_error(), Some(TcpError::TimedOut)));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn on_tick_rto_collapses_cwnd() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.rto_deadline = None;
+        let initial_cwnd = tcb.congestion.cwnd;
+
+        handle.tx_ring.write(b"data");
+        engine.on_tick(clock.now());
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rto = tcb.congestion.rto;
+
+        // Trigger RTO
+        clock.advance(rto + Duration::from_millis(1));
+        engine.on_tick(clock.now());
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        // cwnd should have collapsed to 1 MSS
+        assert_eq!(tcb.congestion.cwnd, tcb.effective_mss() as u32);
+        // ssthresh should be max(flight/2, 2*MSS)
+        assert!(tcb.congestion.ssthresh >= 2 * tcb.effective_mss() as u32);
+        // cwnd was at initial, so after collapse it's 1 MSS < initial
+        assert!(tcb.congestion.cwnd < initial_cwnd);
+    }
+
+    #[test]
+    fn on_tick_no_rto_when_retransmit_queue_empty() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        // Set an RTO deadline but with empty retransmit queue
+        tcb.rto_deadline = Some(clock.now());
+        tcb.retransmit_queue.clear();
+
+        clock.advance(Duration::from_secs(2));
+        let frames = engine.on_tick(clock.now());
+
+        // No retransmit should fire with empty queue
+        assert!(frames.is_empty());
+        // TCB should still exist
+        assert!(engine.tcbs.contains_key(&four_tuple));
+    }
+
+    #[test]
+    fn on_tick_only_runs_for_established_connections() {
+        let (mut engine, clock) = make_engine();
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let four_tuple = FourTuple { local, remote };
+        let handle = make_handle(four_tuple);
+        let (resp_tx, _resp_rx) = oneshot_channel();
+
+        // Set up a connection in SYN_SENT state
+        engine.on_command(EngineCommand::Connect {
+            local,
+            remote,
+            src_mac: [0x02, 0, 0, 0, 0, 1],
+            dst_mac: [0x02, 0, 0, 0, 0, 2],
+            handle: handle.clone(),
+            response: resp_tx,
+        });
+
+        // Write data to tx_ring
+        handle.tx_ring.write(b"should not be sent");
+
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+
+        // Should NOT send data in SYN_SENT state (tx-drain only for ESTABLISHED/CLOSE_WAIT)
+        assert!(frames.is_empty());
     }
 }
