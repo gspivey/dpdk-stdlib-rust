@@ -176,7 +176,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `on_segment` established path: in-order data delivery (verify seq == rcv_nxt, push payload to rx_ring, ACK with ack_num = rcv_nxt + len). Cumulative ACK: advance snd_una, free matching retransmit entries. Apply peer's window scale to advertised window. Wake condvar + read_waker after rx_ring push. Property tests: in-order ACK correctness (ack_num matches), window-scaling round-trip (encode+decode bounds effective send window). (~400 LOC per spec)
 
 - Spec: `.kiro/specs/tcp-support/` · task `5.9`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #83
 
 ---
 

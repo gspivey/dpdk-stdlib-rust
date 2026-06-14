@@ -4299,3 +4299,79 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **rust-dpdk at 700K PPS, 1400B**: 469,166 RX (1.6% drop) — consistent with Run #26's 558,263 (20.2%). TX was capped at 476K by ENA bandwidth limits in both runs.
 
 **IPv6 synthetic benchmark**: IPv6 TX at 64B is ~28% slower than IPv4 in the CPU-only benchmark, which is expected due to the larger IPv6 header (40B vs 20B) and mandatory UDP checksum computation. RX performance is equivalent. This confirms no unexpected software overhead was introduced by the IPv6 implementation.
+
+---
+
+## Run #28: TCP Engine — Established In-Order Data and ACK
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-14 |
+| **Git Hash** | `2d3a1dcf` |
+| **Branch** | `agent/tcp-established-inorder-data` |
+| **PR** | [#83](https://github.com/gspivey/dpdk-stdlib-rust/pull/83) |
+| **GH Actions Run** | [27488472932](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27488472932) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #27
+
+1. **`2d3a1dcf` — TCP engine established in-order data and ACK.** Implements `on_segment` established path: in-order data delivery to rx_ring, cumulative ACK processing (advance snd_una, free retransmit entries), window-scale application, and condvar/waker notification. This is TCP-only code with no changes to the UDP hot path.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,994 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 673,979 | 3.7% | 613,821 | 12.3% | 695,577 | 0.6% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,992 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,989 | 0.3% | 348,897 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 628,841 | 10.2% | 566,207 | 19.1% | 682,104 | 2.6% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,990 | 0.3% | 348,784 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 471,805 | 1.0% | 446,580 | 6.3% | 475,029 | 0.3% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,999 | 1.4% | 34,622 | 50.5% | 70,000 | 0.0% |
+| 140,000 | 77,612 | 0.9% | 77,712 | 0.8% | 76,718 | 2.0% |
+| 350,000 | 77,807 | 0.6% | 77,976 | 0.4% | 77,912 | 0.5% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 319,306 | 8.8% |
+| 700,000 | 319,896 | 54.3% |
+
+### Analysis
+
+**No performance regression from TCP engine changes.** This PR adds TCP engine code only — no changes to the UDP packet processing hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 673,979 RX (3.7% drop) — consistent with Run #27's 689,799 (1.5%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 1400B**: 471,805 RX (1.0% drop) — consistent with Run #27's 469,166 (1.6%). TX capped at ~476K by ENA bandwidth limits.
+
+**tokio-dpdk at 350K PPS, 64B**: 319,306 RX (8.8% drop) — consistent with Run #27's 305,967 (12.6%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP engine implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
