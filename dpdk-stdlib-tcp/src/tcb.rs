@@ -98,6 +98,11 @@ pub struct Tcb {
     /// FIN has been requested but not yet sent (flush-before-FIN).
     pub fin_pending: bool,
 
+    // --- Delayed-ACK state ---
+    /// Number of data segments received since last ACK was sent.
+    /// Used for the "every-other-segment" rule: send ACK when this reaches 2.
+    pub segments_since_ack: u32,
+
     // --- Socket options ---
     pub keepalive: Option<KeepaliveConfig>,
     pub linger: Option<Duration>,
@@ -157,6 +162,7 @@ impl Tcb {
             nodelay: false,
             has_unacked_data: false,
             fin_pending: false,
+            segments_since_ack: 0,
             keepalive: None,
             linger: None,
             recv_buf_size: 65536,
@@ -186,6 +192,25 @@ impl Tcb {
     pub fn available_send_window(&self) -> u32 {
         let effective = self.congestion.effective_window(self.snd_wnd);
         effective.saturating_sub(self.flight_size())
+    }
+
+    /// Nagle algorithm decision: should we send data now?
+    /// Returns true if data should be sent immediately, false to buffer.
+    #[inline]
+    pub fn nagle_should_send(&self, pending_bytes: usize) -> bool {
+        // Always send immediately if TCP_NODELAY is set
+        if self.nodelay {
+            return true;
+        }
+        // Send if no unacked data (nothing in flight)
+        if !self.has_unacked_data {
+            return true;
+        }
+        // Send if the pending data fills a full MSS segment
+        if pending_bytes >= self.effective_mss() as usize {
+            return true;
+        }
+        false
     }
 }
 
