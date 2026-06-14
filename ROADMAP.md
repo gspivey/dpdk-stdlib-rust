@@ -203,7 +203,7 @@ FIN teardown state transitions: FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, CL
 Nagle algorithm: if unacked data AND new write < MSS, buffer; send immediately if `nodelay` || no unacked bytes || write fills MSS. Delayed-ACK: coalesce ACKs up to 200 ms or every-other-segment; send immediately on OOO. SWS avoidance: withhold window update until available space ≥ min(MSS, half buffer). (~350 LOC per spec)
 
 - Spec: `.kiro/specs/tcp-support/` · task `5.13`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #86
 
 ---
 
