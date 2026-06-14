@@ -6,7 +6,7 @@
 //! - SYN-ACK → ESTABLISHED (send ACK, wake connect oneshot)
 //! - RST in SYN_SENT → ConnectionRefused
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -507,7 +507,6 @@ impl TcpEngine {
 
                 // Free acknowledged retransmit entries
                 tcb.retransmit_queue.retain(|entry| {
-                    // Keep entries whose end seq is beyond the new snd_una
                     let entry_end = entry.seq.add(entry.len as u32);
                     entry_end.gt(tcb.snd_una)
                 });
@@ -521,8 +520,6 @@ impl TcpEngine {
             }
 
             // Update send window from peer's advertisement (apply window scale)
-            // RFC 9293: update window if (seg.seq > snd_wl1) or
-            //           (seg.seq == snd_wl1 and seg.ack >= snd_wl2)
             if seg.seq.gt(tcb.snd_wl1)
                 || (seg.seq == tcb.snd_wl1 && seg.ack.le(tcb.snd_nxt) && seg.ack.gt(tcb.snd_wl2)
                     || seg.ack == tcb.snd_wl2)
@@ -533,19 +530,39 @@ impl TcpEngine {
             }
         }
 
-        // --- Process in-order data delivery ---
+        // --- Process data delivery (in-order + out-of-order) ---
         if !seg.payload.is_empty() {
             if seg.seq == tcb.rcv_nxt {
                 // In-order: deliver payload to rx_ring
                 let written = tcb.handle.rx_ring.write(&seg.payload);
-
-                // Advance rcv_nxt by the amount delivered
                 tcb.rcv_nxt = tcb.rcv_nxt.add(written as u32);
 
-                // Wake app readers (condvar + async waker)
+                // Drain contiguous segments from reorder_buffer.
+                // Rebase keys by subtracting `written`, then drain key==0 entries.
+                if !tcb.reorder_buffer.is_empty() {
+                    let mut rebased: BTreeMap<u32, Vec<u8>> = std::mem::take(&mut tcb.reorder_buffer)
+                        .into_iter()
+                        .map(|(k, v)| (k - written as u32, v))
+                        .collect();
+
+                    while let Some(data) = rebased.remove(&0) {
+                        let w = tcb.handle.rx_ring.write(&data);
+                        tcb.rcv_nxt = tcb.rcv_nxt.add(w as u32);
+                        if w > 0 && !rebased.is_empty() {
+                            rebased = rebased
+                                .into_iter()
+                                .map(|(k, v)| (k - w as u32, v))
+                                .collect();
+                        }
+                    }
+
+                    tcb.reorder_buffer = rebased;
+                }
+
+                // Wake app readers
                 tcb.handle.notify_all();
 
-                // Send ACK for received data
+                // Send ACK for received data (including any drained OOO segments)
                 let ack_frame = build_tcp_frame(&TcpFrameParams {
                     src_mac: tcb.src_mac,
                     dst_mac: tcb.dst_mac,
@@ -563,8 +580,31 @@ impl TcpEngine {
                 if let Ok(frame) = ack_frame {
                     outbound.push(frame);
                 }
+            } else if seg.seq.gt(tcb.rcv_nxt) {
+                // Out-of-order: buffer in reorder_buffer keyed on seq.diff(rcv_nxt)
+                let offset = seg.seq.diff(tcb.rcv_nxt);
+                tcb.reorder_buffer.insert(offset, seg.payload.clone());
+
+                // Send dup-ACK with ack_num == rcv_nxt
+                let dup_ack = build_tcp_frame(&TcpFrameParams {
+                    src_mac: tcb.src_mac,
+                    dst_mac: tcb.dst_mac,
+                    src: tcb.key.local,
+                    dst: tcb.key.remote,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: TcpFlags::ACK,
+                    window: encode_established_window(tcb),
+                    options: TcpOptions::default(),
+                    payload: Vec::new(),
+                    ttl: tcb.ttl,
+                });
+
+                if let Ok(frame) = dup_ack {
+                    outbound.push(frame);
+                }
             }
-            // else: out-of-order — handled in future task 5.10
+            // else: seg.seq < rcv_nxt — retransmitted/old data, silently drop
         }
 
         outbound
@@ -1766,5 +1806,248 @@ mod tests {
         // snd_una unchanged
         let tcb = engine.tcbs.get(&four_tuple).unwrap();
         assert_eq!(tcb.snd_una, snd_una_before);
+    }
+
+    // === Out-of-order reorder buffer tests (task 5.10) ===
+
+    #[test]
+    fn ooo_segment_buffered_and_dup_ack_sent() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Send segment 2 before segment 1 (gap at rcv_nxt)
+        let ooo_payload = b"WORLD";
+        let ooo_seg = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(5).0, // Skip 5 bytes ahead
+            snd_nxt.0,
+            ooo_payload,
+        );
+        let frames = engine.on_segment(&ooo_seg);
+
+        // Should produce dup-ACK with ack_num == rcv_nxt (unchanged)
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack.ack, rcv_nxt); // dup-ACK: ack_num == rcv_nxt
+
+        // rcv_nxt should NOT advance
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.rcv_nxt, rcv_nxt);
+
+        // Segment should be buffered
+        assert_eq!(tcb.reorder_buffer.len(), 1);
+        assert!(tcb.reorder_buffer.contains_key(&5));
+
+        // rx_ring should be empty
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn gap_fill_drains_reorder_buffer() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Send segment 2 (OOO)
+        let seg2 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(5).0,
+            snd_nxt.0,
+            b"WORLD",
+        );
+        engine.on_segment(&seg2);
+
+        // Now send segment 1 (fills the gap)
+        let seg1 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"HELLO",
+        );
+        let frames = engine.on_segment(&seg1);
+
+        // Should produce ACK covering both segments
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt.add(10)); // 5 + 5 = 10
+
+        // rcv_nxt should advance past both segments
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.rcv_nxt, rcv_nxt.add(10));
+
+        // Reorder buffer should be empty
+        assert!(tcb.reorder_buffer.is_empty());
+
+        // All data should be in rx_ring in correct order
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], b"HELLOWORLD");
+    }
+
+    #[test]
+    fn multiple_ooo_segments_reassembled_correctly() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Send segments 3, 2 (out of order), then 1 (fills gap)
+        // Segment 3: offset 8..11
+        let seg3 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(8).0,
+            snd_nxt.0,
+            b"CCC",
+        );
+        engine.on_segment(&seg3);
+
+        // Segment 2: offset 4..8
+        let seg2 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(4).0,
+            snd_nxt.0,
+            b"BBBB",
+        );
+        engine.on_segment(&seg2);
+
+        // Reorder buffer should have 2 entries
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.reorder_buffer.len(), 2);
+
+        // Segment 1: offset 0..4 (fills the gap)
+        let seg1 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"AAAA",
+        );
+        let frames = engine.on_segment(&seg1);
+
+        // ACK should cover all three segments
+        assert_eq!(frames.len(), 1);
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt.add(11));
+
+        // Reorder buffer empty
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.reorder_buffer.is_empty());
+
+        // Data reassembled in order
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..n], b"AAAABBBBCCC");
+    }
+
+    #[test]
+    fn partial_gap_fill_drains_only_contiguous() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Buffer seg at offset 3 and seg at offset 10
+        let seg_near = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(3).0,
+            snd_nxt.0,
+            b"BBB",
+        );
+        engine.on_segment(&seg_near);
+
+        let seg_far = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.add(10).0,
+            snd_nxt.0,
+            b"DDD",
+        );
+        engine.on_segment(&seg_far);
+
+        // Fill the first gap (bytes 0..3)
+        let seg_fill = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"AAA",
+        );
+        let frames = engine.on_segment(&seg_fill);
+
+        // ACK should cover only up to where contiguous data ends (offset 6)
+        let ack = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(ack.ack, rcv_nxt.add(6)); // AAA + BBB = 6 bytes
+
+        // Reorder buffer should still have the far segment (now at offset 4)
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.reorder_buffer.len(), 1);
+        assert!(tcb.reorder_buffer.contains_key(&4)); // 10 - 6 = 4
+
+        // rx_ring has the first 6 bytes
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 6);
+        assert_eq!(&buf[..n], b"AAABBB");
+    }
+
+    #[test]
+    fn retransmitted_segment_below_rcv_nxt_ignored() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Deliver an in-order segment first
+        let seg1 = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            b"HELLO",
+        );
+        engine.on_segment(&seg1);
+
+        // Now send a retransmit of the same data (seq < rcv_nxt)
+        let retransmit = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0, // Old seq, now < rcv_nxt
+            snd_nxt.0,
+            b"HELLO",
+        );
+        let frames = engine.on_segment(&retransmit);
+
+        // Should produce no output (silently dropped)
+        assert!(frames.is_empty());
+
+        // rx_ring should only have the original data
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"HELLO");
     }
 }
