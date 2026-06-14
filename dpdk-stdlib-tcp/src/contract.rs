@@ -316,6 +316,11 @@ impl ConnectionHandle {
         }
     }
 
+    /// Set the EOF flag (called by engine after final bytes enqueued on FIN receipt).
+    pub fn set_eof(&self) {
+        self.eof.store(true, Ordering::Release);
+    }
+
     /// Peek at the latched error (clone, never take).
     pub fn peek_error(&self) -> Option<TcpError> {
         self.error.lock().unwrap().clone()
