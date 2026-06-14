@@ -360,6 +360,7 @@ impl TcpEngine {
                     Vec::new()
                 }
             }
+            TcpState::Established => self.handle_established(seg, four_tuple),
             _ => Vec::new(), // Future tasks handle other states
         }
     }
@@ -479,6 +480,94 @@ impl TcpEngine {
         }
 
         Vec::new()
+    }
+
+    // ===== Established state: in-order data delivery + cumulative ACK =====
+
+    fn handle_established(
+        &mut self,
+        seg: &ParsedTcpSegment,
+        four_tuple: &FourTuple,
+    ) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(four_tuple) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut outbound = Vec::new();
+
+        // --- Process ACK (cumulative acknowledgment) ---
+        if seg.flags.contains(TcpFlags::ACK) {
+            // Validate: ack must be in range (snd_una, snd_nxt]
+            if seg.ack.gt(tcb.snd_una) && seg.ack.le(tcb.snd_nxt) {
+                let bytes_acked = seg.ack.diff(tcb.snd_una);
+
+                // Advance snd_una
+                tcb.snd_una = seg.ack;
+
+                // Free acknowledged retransmit entries
+                tcb.retransmit_queue.retain(|entry| {
+                    // Keep entries whose end seq is beyond the new snd_una
+                    let entry_end = entry.seq.add(entry.len as u32);
+                    entry_end.gt(tcb.snd_una)
+                });
+
+                // Update congestion control
+                let mss = tcb.effective_mss();
+                tcb.congestion.on_ack(bytes_acked, mss);
+
+                // Wake write_waker — send window may have opened
+                tcb.handle.write_waker.wake();
+            }
+
+            // Update send window from peer's advertisement (apply window scale)
+            // RFC 9293: update window if (seg.seq > snd_wl1) or
+            //           (seg.seq == snd_wl1 and seg.ack >= snd_wl2)
+            if seg.seq.gt(tcb.snd_wl1)
+                || (seg.seq == tcb.snd_wl1 && seg.ack.le(tcb.snd_nxt) && seg.ack.gt(tcb.snd_wl2)
+                    || seg.ack == tcb.snd_wl2)
+            {
+                tcb.snd_wnd = (seg.window as u32) << tcb.snd_scale;
+                tcb.snd_wl1 = seg.seq;
+                tcb.snd_wl2 = seg.ack;
+            }
+        }
+
+        // --- Process in-order data delivery ---
+        if !seg.payload.is_empty() {
+            if seg.seq == tcb.rcv_nxt {
+                // In-order: deliver payload to rx_ring
+                let written = tcb.handle.rx_ring.write(&seg.payload);
+
+                // Advance rcv_nxt by the amount delivered
+                tcb.rcv_nxt = tcb.rcv_nxt.add(written as u32);
+
+                // Wake app readers (condvar + async waker)
+                tcb.handle.notify_all();
+
+                // Send ACK for received data
+                let ack_frame = build_tcp_frame(&TcpFrameParams {
+                    src_mac: tcb.src_mac,
+                    dst_mac: tcb.dst_mac,
+                    src: tcb.key.local,
+                    dst: tcb.key.remote,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: TcpFlags::ACK,
+                    window: encode_established_window(tcb),
+                    options: TcpOptions::default(),
+                    payload: Vec::new(),
+                    ttl: tcb.ttl,
+                });
+
+                if let Ok(frame) = ack_frame {
+                    outbound.push(frame);
+                }
+            }
+            // else: out-of-order — handled in future task 5.10
+        }
+
+        outbound
     }
 
     // ===== RST handling =====
@@ -615,6 +704,16 @@ impl TcpEngine {
 }
 
 // ===== Helpers =====
+
+/// Encode receive window for an established connection (apply window scale).
+/// Reports available rx_ring space, capped by rcv_wnd, right-shifted by rcv_scale.
+#[inline]
+fn encode_established_window(tcb: &Tcb) -> u16 {
+    let available = tcb.handle.rx_ring.available_write() as u32;
+    let wnd = std::cmp::min(available, tcb.rcv_wnd);
+    let scaled = wnd >> tcb.rcv_scale;
+    std::cmp::min(scaled, u16::MAX as u32) as u16
+}
 
 /// Encode receive window for the TCP header (right-shift by scale during active connection).
 /// During SYN/SYN-ACK exchange, window scale is not yet active (use unscaled).
@@ -1360,5 +1459,312 @@ mod tests {
         let parsed = parse_tcp_packet(&frames[0]).unwrap();
         assert!(parsed.flags.contains(TcpFlags::SYN));
         assert!(parsed.flags.contains(TcpFlags::ACK));
+    }
+
+    // === Established state tests (task 5.9) ===
+
+    /// Helper: complete a three-way handshake and return the engine + four_tuple.
+    /// The client side connects and transitions to Established.
+    fn setup_established_connection(
+        engine: &mut TcpEngine,
+    ) -> (FourTuple, Arc<ConnectionHandle>) {
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let four_tuple = FourTuple { local, remote };
+        let handle = make_handle(four_tuple);
+        let (resp_tx, _resp_rx) = oneshot_channel();
+
+        engine.on_command(EngineCommand::Connect {
+            local,
+            remote,
+            src_mac: [0x02, 0, 0, 0, 0, 1],
+            dst_mac: [0x02, 0, 0, 0, 0, 2],
+            handle: handle.clone(),
+            response: resp_tx,
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let iss = tcb.iss;
+
+        // SYN-ACK from peer
+        let syn_ack = make_syn_ack_segment(remote, local, 2000, iss.add(1).0);
+        engine.on_segment(&syn_ack);
+
+        assert_eq!(
+            engine.tcbs.get(&four_tuple).unwrap().state,
+            TcpState::Established
+        );
+        (four_tuple, handle)
+    }
+
+    fn make_data_segment(
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: u32,
+        payload: &[u8],
+    ) -> ParsedTcpSegment {
+        ParsedTcpSegment {
+            src,
+            dst,
+            seq: SeqNum(seq),
+            ack: SeqNum(ack),
+            flags: TcpFlags::ACK | TcpFlags::PSH,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn established_in_order_data_delivers_to_rx_ring_and_acks() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Peer sends data in-order
+        let payload = b"Hello, TCP!";
+        let data_seg = make_data_segment(
+            four_tuple.remote,
+            four_tuple.local,
+            rcv_nxt.0,
+            snd_nxt.0,
+            payload,
+        );
+        let frames = engine.on_segment(&data_seg);
+
+        // Should produce exactly one ACK
+        assert_eq!(frames.len(), 1);
+        let ack_parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(ack_parsed.flags.contains(TcpFlags::ACK));
+        assert_eq!(ack_parsed.ack, rcv_nxt.add(payload.len() as u32));
+
+        // rcv_nxt should advance
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.rcv_nxt, rcv_nxt.add(payload.len() as u32));
+
+        // Data should be in rx_ring
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf[..n], payload);
+    }
+
+    #[test]
+    fn established_cumulative_ack_advances_snd_una_and_frees_retransmit() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        let snd_una_before = tcb.snd_una;
+        let rcv_nxt = tcb.rcv_nxt;
+
+        // Simulate sent data by advancing snd_nxt and adding retransmit entry
+        tcb.snd_nxt = tcb.snd_nxt.add(100);
+        tcb.retransmit_queue.push(crate::tcb::RetransmitEntry {
+            seq: snd_una_before,
+            offset: 0,
+            len: 50,
+            sent_at: std::time::Instant::now(),
+            retransmit_count: 0,
+        });
+        tcb.retransmit_queue.push(crate::tcb::RetransmitEntry {
+            seq: snd_una_before.add(50),
+            offset: 50,
+            len: 50,
+            sent_at: std::time::Instant::now(),
+            retransmit_count: 0,
+        });
+
+        // Peer ACKs the first 50 bytes
+        let ack_seg = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_una_before.add(50),
+            flags: TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&ack_seg);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        // snd_una should advance to ack value
+        assert_eq!(tcb.snd_una, snd_una_before.add(50));
+        // First retransmit entry should be freed, second retained
+        assert_eq!(tcb.retransmit_queue.len(), 1);
+        assert_eq!(tcb.retransmit_queue[0].seq, snd_una_before.add(50));
+    }
+
+    #[test]
+    fn established_window_scale_applied_to_peer_window() {
+        let (mut engine, _clock) = make_engine();
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let four_tuple = FourTuple { local, remote };
+        let handle = make_handle(four_tuple);
+        let (resp_tx, _resp_rx) = oneshot_channel();
+
+        engine.on_command(EngineCommand::Connect {
+            local,
+            remote,
+            src_mac: [0x02, 0, 0, 0, 0, 1],
+            dst_mac: [0x02, 0, 0, 0, 0, 2],
+            handle,
+            response: resp_tx,
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let iss = tcb.iss;
+
+        // SYN-ACK with wscale=5 and window=512
+        let mut syn_ack = make_syn_ack_segment(remote, local, 2000, iss.add(1).0);
+        syn_ack.options.window_scale = Some(5);
+        syn_ack.window = 512;
+        engine.on_segment(&syn_ack);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_scale, 5);
+        // After handshake, snd_wnd = window << scale = 512 << 5 = 16384
+        assert_eq!(tcb.snd_wnd, 512 << 5);
+
+        // Now in established: peer sends data with updated window
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+        let data_seg = ParsedTcpSegment {
+            src: remote,
+            dst: local,
+            seq: rcv_nxt,
+            ack: SeqNum(snd_nxt.0),
+            flags: TcpFlags::ACK | TcpFlags::PSH,
+            window: 1024, // raw window in header
+            options: TcpOptions::default(),
+            payload: b"x".to_vec(),
+        };
+        engine.on_segment(&data_seg);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        // snd_wnd updated with scale: 1024 << 5 = 32768
+        assert_eq!(tcb.snd_wnd, 1024 << 5);
+    }
+
+    #[test]
+    fn established_multiple_in_order_segments() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let mut rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Send 3 segments in order
+        let payloads = [b"AAA".as_slice(), b"BBBB".as_slice(), b"CC".as_slice()];
+        for payload in &payloads {
+            let seg = make_data_segment(
+                four_tuple.remote,
+                four_tuple.local,
+                rcv_nxt.0,
+                snd_nxt.0,
+                payload,
+            );
+            let frames = engine.on_segment(&seg);
+            assert_eq!(frames.len(), 1);
+
+            let ack = parse_tcp_packet(&frames[0]).unwrap();
+            rcv_nxt = rcv_nxt.add(payload.len() as u32);
+            assert_eq!(ack.ack, rcv_nxt);
+        }
+
+        // All data should be in rx_ring
+        let mut buf = vec![0u8; 1024];
+        let n = handle.rx_ring.read(&mut buf);
+        assert_eq!(n, 9); // 3 + 4 + 2
+        assert_eq!(&buf[..n], b"AAABBBBCC");
+    }
+
+    #[test]
+    fn established_pure_ack_no_data_produces_no_response() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_una = tcb.snd_una;
+
+        // Peer sends pure ACK (no data) — should produce no response
+        let pure_ack = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_una, // Not advancing (same as current snd_una)
+            flags: TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        let frames = engine.on_segment(&pure_ack);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn established_ack_beyond_snd_nxt_ignored() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_una_before = tcb.snd_una;
+        let snd_nxt = tcb.snd_nxt;
+
+        // Peer sends ACK for data we never sent (ack > snd_nxt)
+        let bad_ack = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_nxt.add(1000), // Way beyond what we sent
+            flags: TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&bad_ack);
+
+        // snd_una should NOT advance
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_una, snd_una_before);
+    }
+
+    #[test]
+    fn established_ack_below_snd_una_ignored() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        // Simulate: advance snd_una past initial
+        tcb.snd_nxt = tcb.snd_nxt.add(100);
+        tcb.snd_una = tcb.snd_una.add(50);
+        let snd_una_before = tcb.snd_una;
+
+        // Peer sends old ACK (ack <= snd_una — duplicate/stale)
+        let old_ack = ParsedTcpSegment {
+            src: four_tuple.remote,
+            dst: four_tuple.local,
+            seq: rcv_nxt,
+            ack: snd_una_before, // Same as current snd_una, not advancing
+            flags: TcpFlags::ACK,
+            window: 65535,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+        };
+        engine.on_segment(&old_ack);
+
+        // snd_una unchanged
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_una, snd_una_before);
     }
 }
