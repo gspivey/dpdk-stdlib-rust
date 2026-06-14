@@ -167,7 +167,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `TcpEngine::on_segment` handshake path: SYN → SYN_RECEIVED (send SYN-ACK with all required options, transition state). SYN-ACK → ESTABLISHED (send ACK, transition state, wake connect oneshot). RST in SYN_SENT → latch `ConnectionRefused` on handle. Accept-side: populate `Tcb.src_mac/dst_mac` from parsed frame. Property test: state machine validity (any valid event sequence → one of 11 `TcpState` values). (~450 LOC per spec)
 
 - Spec: `.kiro/specs/tcp-support/` · task `5.8`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #82
 
 ---
 

@@ -6,6 +6,77 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #44: dpdk-stdlib-tcp Engine — SYN Handshake — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-13 |
+| **Git Hash** | `a2b5379` |
+| **Branch** | `agent/tcp-engine-syn-handshake` |
+| **PR** | [#82](https://github.com/gspivey/dpdk-stdlib-rust/pull/82) |
+| **GH Actions Run** | [27484868691](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27484868691) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #43
+
+1. **`a2b5379` — dpdk-stdlib-tcp Engine — SYN handshake.** New `engine.rs` module: `TcpEngine` struct with `on_segment` handshake processing (active open SYN→SYN-ACK→ACK, passive open SYN→SYN-ACK, RST handling, accept queue delivery, max_tcbs/backlog enforcement). Plus property tests. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,974 | 0.3% | 349,000 | 0.3% | 317,731 | 9.2% | 350,000 | 0.0% |
+| 700,000 | 391,540 | 44.1% | 692,836 | 1.0% | 316,407 | 54.8% | 693,690 | 0.9% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 138,982 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,799 | 0.3% | 349,000 | 0.3% | 231,738 | 33.8% | 349,998 | 0.0% |
+| 700,000 | 386,091 | 44.8% | 690,647 | 1.3% | 230,716 | 67.0% | 682,389 | 2.5% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,627 | 0.4% | 349,000 | 0.3% | 148,722 | 57.5% | 350,000 | 0.0% |
+| 700,000 | 433,091 | 9.1%* | 475,674 | 0.2%* | 158,201 | 66.8%* | 475,844 | 0.1%* |
+
+\* TX capped at ~476K pps (30 Gbps ENA burst limit at 1400B)
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 35,364 | 49.5% | 69,000 | 1.4% | 55,212 | 21.1% | 70,000 | 0.0% |
+| 140,000 | 77,718 | 0.7%* | 77,690 | 0.8%* | 58,501 | 25.3%* | 78,261 | 0.0%* |
+| 350,000 | 76,568 | 2.3%* | 77,985 | 0.4%* | 58,595 | 25.2%* | 78,133 | 0.2%* |
+
+\* TX capped at ~78K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds the `TcpEngine` module with SYN handshake processing to `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 692,836 RX (1.0% drop) — consistent with Run #43's 688,471 (1.6% drop). Slightly better this run.
+
+**rust-dpdk at 700K PPS, 512B**: 690,647 RX (1.3% drop) — consistent with Run #43's 682,881 (2.4% drop).
+
+**native-dpdk at 700K PPS, 64B**: 693,690 RX (0.9% drop) — improved vs Run #43's 671,702 (4.0% drop). Normal ENA burst variance.
+
+**Conclusion**: Adding TCP engine SYN handshake is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #43: dpdk-stdlib-tcp TimerWheel, CongestionState, and Tcb — No Regression
 
 | Field | Value |
