@@ -194,7 +194,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 FIN teardown state transitions: FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, CLOSING (simultaneous close), TIME_WAIT (2×MSL = 120s). Set eof flag on `ConnectionHandle` after final bytes enqueued. RST validation per RFC 5961: exact seq → abort + latch `ConnectionReset`; in-window non-exact → send challenge ACK; out-of-window → silently drop. Property tests: TIME_WAIT/FIN_WAIT_2 cleanup (TCB transitions to CLOSED after timeout), RST validation. (~550 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.11`, `5.12`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #85
 
 ---
 
