@@ -185,7 +185,7 @@ Create `dpdk-stdlib-tcp/` crate (depends on `dpdk-stdlib-net` + `dpdk-stdlib`, C
 `on_segment` OOO path: buffer segment in `reorder_buffer` (BTreeMap keyed on seq.diff(rcv_nxt)), send dup-ACK with ack_num == rcv_nxt. When a gap fills, drain contiguous data from reorder_buffer to rx_ring, advancing rcv_nxt. Property tests: OOO dup-ACK has ack_num == rcv_nxt, reorder buffer soundness (OOO including sequence-number wrap-around produces byte-identical output to in-order assembly). (~350 LOC per spec)
 
 - Spec: `.kiro/specs/tcp-support/` · task `5.10`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #84
 
 ---
 

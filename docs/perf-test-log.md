@@ -6,6 +6,77 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #45: dpdk-stdlib-tcp Engine — OOO Reorder Buffer — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-14 |
+| **Git Hash** | `58197fc` |
+| **Branch** | `agent/tcp-ooo-reorder-buffer` |
+| **PR** | [#84](https://github.com/gspivey/dpdk-stdlib-rust/pull/84) |
+| **GH Actions Run** | [27492117971](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27492117971) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #44
+
+1. **`58197fc` — dpdk-stdlib-tcp Engine — out-of-order reorder buffer.** OOO segment buffering in `reorder_buffer` (BTreeMap keyed on seq.diff(rcv_nxt)), dup-ACK generation, gap-fill drain logic, retransmit drop. Plus property tests. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,962 | 0.7% | 139,000 | 0.7% | 138,978 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,650 | 0.4% | 348,974 | 0.3% | 316,429 | 9.6% | 349,960 | 0.0% |
+| 700,000 | 393,980 | 43.7% | 648,686 | 7.3% | 316,421 | 54.8% | 667,175 | 4.7% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 139,999 | 0.0% |
+| 350,000 | 348,785 | 0.3% | 348,917 | 0.3% | 228,878 | 34.6% | 349,865 | 0.0% |
+| 700,000 | 441,429 | 36.9% | 620,449 | 11.4% | 227,738 | 67.5% | 627,577 | 10.3% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,999 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 69,994 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 138,989 | 0.7% | 139,993 | 0.0% |
+| 350,000 | 348,683 | 0.4% | 348,991 | 0.3% | 148,576 | 57.5% | 349,860 | 0.0% |
+| 700,000 | 443,130 | 7.0%* | 475,040 | 0.3%* | 157,077 | 67.0%* | 463,210 | 2.6%* |
+
+\* TX capped at ~476K pps (30 Gbps ENA burst limit at 1400B)
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 33,678 | 51.9% | 69,000 | 1.4% | 54,450 | 22.2% | 69,995 | 0.0% |
+| 140,000 | 75,428 | 3.7%* | 75,407 | 3.7%* | 57,866 | 26.1%* | 75,903 | 3.1%* |
+| 350,000 | 77,795 | 0.6%* | 77,873 | 0.6%* | 57,989 | 26.0%* | 78,061 | 0.3%* |
+
+\* TX capped at ~78K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds out-of-order reorder buffer logic to the `TcpEngine::handle_established` method in `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or UDP networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 648,686 RX (7.3% drop) — slightly lower than Run #44's 692,836 (1.0% drop). Normal ENA burst variance; the engine change is in a separate crate with no impact on the UDP path.
+
+**native-dpdk at 700K PPS, 64B**: 667,175 RX (4.7% drop) — consistent with typical variance range (Run #44: 693,690, Run #43: 671,702).
+
+**rust-dpdk at 700K PPS, 512B**: 620,449 RX (11.4% drop) — slightly lower than Run #44's 690,647 (1.3% drop). This is within observed ENA burst variance bounds; the TCP engine OOO code is not in the UDP data path.
+
+**Conclusion**: Adding TCP engine OOO reorder buffer is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #44: dpdk-stdlib-tcp Engine — SYN Handshake — No Regression
 
 | Field | Value |
