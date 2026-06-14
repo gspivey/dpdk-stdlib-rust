@@ -9,6 +9,7 @@ pub mod clock;
 pub mod codec;
 pub mod congestion;
 pub mod contract;
+pub mod engine;
 pub mod error;
 pub mod isn;
 pub mod ring;
