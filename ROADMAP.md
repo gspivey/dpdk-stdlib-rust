@@ -230,7 +230,7 @@ Persist timer: send 1-byte zero-window probe at exponentially backed-off interva
 Connect: allocate TCB, populate src_mac/dst_mac from command, send SYN with all required options, transition to SYN_SENT, arm RTO. Listen: register listener in listen_map with bounded accept queue (default 128). Accept: dequeue via oneshot, park if empty. Enforce max-TCBs limit → RST on new connection when at capacity. Enforce accept backlog limit → RST on new SYN when queue full. Teardown: Shutdown (set fin_pending, flush tx_ring → send_buf → FIN). Close (honor SO_LINGER: timeout=0 → RST, timeout>0 → wait/timeout). SetOption → update Tcb fields. (~600 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.18`, `5.19`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #89
 
 ---
 

@@ -6,6 +6,75 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #49: dpdk-stdlib-tcp Engine — on_command (Shutdown, Close, SetOption) — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-16 |
+| **Git Hash** | `d665282` |
+| **Branch** | `agent/tcp-engine-on-command` |
+| **PR** | [#89](https://github.com/gspivey/dpdk-stdlib-rust/pull/89) |
+| **GH Actions Run** | [27631328603](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27631328603) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #48
+
+1. **`d665282` — TCP engine on_command: Shutdown, Close, SetOption.** Implements flush-before-FIN (Shutdown::Write/Both drains tx_ring → send_buf, sets fin_pending, on_tick emits FIN after all data sent), Shutdown::Read (sets EOF), Close (linger=0 → RST, else graceful FIN), and SetOption for all engine-relevant socket options. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,828 | 0.3% | 348,998 | 0.3% | 289,419 | 17.3% | 350,000 | 0.0% |
+| 700,000 | 393,213 | 43.8% | 690,032 | 1.4% | 289,064 | 58.7% | 700,000 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,935 | 0.3% | 349,000 | 0.3% | 211,988 | 39.4% | 350,000 | 0.0% |
+| 700,000 | 469,045 | 33.0% | 698,685 | 0.2% | 212,969 | 69.6% | 697,984 | 0.3% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,996 | 0.7% | 139,000 | 0.7% | 138,663 | 1.0% | 140,000 | 0.0% |
+| 350,000 | 348,757 | 0.4% | 349,000 | 0.3% | 138,010 | 60.6% | 350,000 | 0.0% |
+| 700,000 | 487,153 | 30.4% | 559,098 | 20.1% | 138,983 | 80.1% | 643,991 | 8.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 37,040 | 47.1% | 69,000 | 1.4% | 52,724 | 24.7% | 70,000 | 0.0% |
+| 140,000 | 124,022 | 1.0%* | 124,388 | 0.7%* | 56,082 | 55.3%* | 125,308 | 0.0%* |
+| 350,000 | 124,118 | 1.0%* | 123,766 | 1.2%* | 56,186 | 55.1%* | 124,304 | 0.8%* |
+
+\* TX capped at ~125K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds Shutdown/Close/SetOption command handling to `TcpEngine::on_command` in `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or UDP networking code.
+
+**native-dpdk at 700K PPS, 64B**: 700,000 RX (0.0% drop) — best result yet, consistent with Run #48's 698,382 (0.2% drop). Normal ENA burst variance.
+
+**rust-dpdk at 700K PPS, 64B**: 690,032 RX (1.4% drop) — consistent with Run #48's 696,014 (0.6% drop). Within normal variance.
+
+**rust-dpdk at 700K PPS, 512B**: 698,685 RX (0.19% drop) — slightly better than Run #48's 693,807 (0.9% drop).
+
+**Conclusion**: Adding TCP engine on_command logic is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #48: dpdk-stdlib-tcp Engine — on_tick (persist, keepalive, TIME_WAIT, delayed-ACK) — No Regression
 
 | Field | Value |
