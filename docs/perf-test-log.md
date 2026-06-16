@@ -6,6 +6,75 @@ Each entry captures the git context, test configuration, results, and analysis.
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
+## Run #48: dpdk-stdlib-tcp Engine — on_tick (persist, keepalive, TIME_WAIT, delayed-ACK) — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-16 |
+| **Git Hash** | `0cc5da0` |
+| **Branch** | `agent/tcp-on-tick-persist-keepalive-timewait` |
+| **PR** | [#88](https://github.com/gspivey/dpdk-stdlib-rust/pull/88) |
+| **GH Actions Run** | [27619949999](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27619949999) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #47
+
+1. **`0cc5da0` — TCP engine on_tick: persist, keepalive, TIME_WAIT, delayed-ACK.** Implements persist timer (1-byte zero-window probe, exponential backoff capped 60s, never aborts), keepalive (probe after idle, abort after max probes → TimedOut), TIME_WAIT → CLOSED after 2*MSL, FIN_WAIT_2 timeout → free TCB, delayed-ACK timer fire → send cumulative ACK. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,996 | 0.3% | 349,000 | 0.3% | 310,888 | 11.2% | 350,000 | 0.0% |
+| 700,000 | 406,591 | 41.9% | 696,014 | 0.6% | 311,764 | 55.5% | 698,382 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 138,999 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,768 | 0.4% | 348,990 | 0.3% | 229,152 | 34.5% | 350,000 | 0.0% |
+| 700,000 | 406,804 | 41.9% | 693,807 | 0.9% | 230,630 | 67.1% | 696,705 | 0.5% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,987 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,691 | 0.4% | 349,000 | 0.3% | 146,732 | 58.1% | 350,000 | 0.0% |
+| 700,000 | 386,659 | 44.8% | 565,314 | 19.2% | 146,357 | 79.1% | 687,182 | 1.8% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 39,182 | 44.0% | 69,000 | 1.4% | 53,102 | 24.1% | 70,000 | 0.0% |
+| 140,000 | 124,311 | 0.7%* | 124,377 | 0.7%* | 56,329 | 55.0%* | 125,201 | 0.0%* |
+| 350,000 | 118,884 | 5.1%* | 122,832 | 1.9%* | 56,454 | 54.9%* | 124,664 | 0.5%* |
+
+\* TX capped at ~125K pps (30 Gbps ENA burst limit at 8500B)
+
+### Analysis
+
+**No performance regression.** This PR adds persist timer, keepalive, TIME_WAIT/FIN_WAIT_2 expiry, and delayed-ACK timer fire to `TcpEngine::on_tick` in `dpdk-stdlib-tcp`. Zero changes to any existing data-path crate or UDP networking code.
+
+**rust-dpdk at 700K PPS, 64B**: 696,014 RX (0.57% drop) — consistent with Run #47's 698,091 (0.27% drop). Normal ENA burst variance.
+
+**native-dpdk at 700K PPS, 64B**: 698,382 RX (0.23% drop) — consistent with Run #47's 699,803 (0.03% drop). Normal burst variance.
+
+**rust-dpdk at 700K PPS, 512B**: 693,807 RX (0.88% drop) — consistent with Run #47's 696,111 (0.56% drop).
+
+**Conclusion**: Adding TCP engine persist/keepalive/TIME_WAIT/delayed-ACK logic is performance-neutral as expected — the engine module is in a separate crate with no changes to the UDP data path.
+
+---
+
 ## Run #47: dpdk-stdlib-tcp Engine — Nagle, Delayed-ACK, and SWS Avoidance — No Regression
 
 | Field | Value |

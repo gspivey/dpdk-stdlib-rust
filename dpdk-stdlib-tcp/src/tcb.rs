@@ -98,6 +98,16 @@ pub struct Tcb {
     /// FIN has been requested but not yet sent (flush-before-FIN).
     pub fin_pending: bool,
 
+    // --- Persist timer state ---
+    /// Current persist timer backoff duration. Starts at RTO, doubles each probe, capped at 60s.
+    pub persist_backoff: Duration,
+
+    // --- Keepalive state ---
+    /// Number of keepalive probes sent without receiving any data.
+    pub keepalive_probes_sent: u32,
+    /// Timestamp of the last received data segment (for keepalive idle detection).
+    pub last_data_received: Option<Instant>,
+
     // --- Delayed-ACK state ---
     /// Number of data segments received since last ACK was sent.
     /// Used for the "every-other-segment" rule: send ACK when this reaches 2.
@@ -162,6 +172,9 @@ impl Tcb {
             nodelay: false,
             has_unacked_data: false,
             fin_pending: false,
+            persist_backoff: Duration::from_secs(1),
+            keepalive_probes_sent: 0,
+            last_data_received: None,
             segments_since_ack: 0,
             keepalive: None,
             linger: None,

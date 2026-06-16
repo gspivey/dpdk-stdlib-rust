@@ -1,9 +1,14 @@
 //! TCP protocol engine — stateful segment processing.
 //!
 //! The engine owns all TCBs and processes inbound segments via `on_segment`.
-//! Timer-driven behavior is serviced via `on_tick` (tasks 5.14, 5.15):
+//! Timer-driven behavior is serviced via `on_tick` (tasks 5.14–5.17):
 //! - TX drain: tx_ring → send_buf → segment (respecting effective_window) → transmit
 //! - RTO: retransmit oldest unacked segment, exponential backoff, abort after max_retries
+//! - Persist: zero-window probe at exponential backoff (capped 60s), NEVER aborts
+//! - Keepalive: probe after idle timeout, abort after max probes → TimedOut
+//! - TIME_WAIT: transition to CLOSED after 2*MSL, free TCB
+//! - FIN_WAIT_2: timeout → free TCB
+//! - Delayed-ACK: send cumulative ACK at 200ms deadline
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -174,13 +179,47 @@ impl TcpEngine {
         }
     }
 
-    /// Service timers: drain tx_rings, segment and transmit, handle RTO.
+    /// Service timers: drain tx_rings, segment and transmit, handle RTO,
+    /// persist probes, keepalive, TIME_WAIT/FIN_WAIT_2 expiry, delayed-ACK.
     pub fn on_tick(&mut self, now: std::time::Instant) -> Vec<Vec<u8>> {
         let mut outbound = Vec::new();
 
         // Collect keys to iterate (avoid borrow conflict with &mut self).
         let keys: Vec<FourTuple> = self.tcbs.keys().copied().collect();
 
+        // --- Pass 1: TIME_WAIT / FIN_WAIT_2 expiry (task 5.17) ---
+        // These remove TCBs, so process them first.
+        let mut expired_keys = Vec::new();
+        for key in &keys {
+            if let Some(tcb) = self.tcbs.get(key) {
+                // TIME_WAIT → CLOSED after 2*MSL
+                if tcb.state == TcpState::TimeWait {
+                    if let Some(deadline) = tcb.time_wait_deadline {
+                        if now >= deadline {
+                            expired_keys.push(*key);
+                        }
+                    }
+                }
+                // FIN_WAIT_2 timeout → free TCB
+                if tcb.state == TcpState::FinWait2 {
+                    if let Some(deadline) = tcb.fin_wait2_deadline {
+                        if now >= deadline {
+                            expired_keys.push(*key);
+                        }
+                    }
+                }
+            }
+        }
+        for key in &expired_keys {
+            if let Some(tcb) = self.tcbs.remove(key) {
+                tcb.handle.set_state(TcpState::Closed);
+                tcb.handle.set_eof();
+                tcb.handle.notify_all();
+            }
+        }
+
+        // --- Pass 2: Per-TCB timer processing ---
+        let keys: Vec<FourTuple> = self.tcbs.keys().copied().collect();
         for key in keys {
             // --- RTO check (task 5.15) ---
             // Must run before tx-drain so aborted connections don't send new data.
@@ -250,6 +289,107 @@ impl TcpEngine {
                         }
 
                         continue;
+                    }
+                }
+            }
+
+            // --- Persist timer (task 5.16) ---
+            // Send 1-byte zero-window probe; exponential backoff capped 60s; NEVER abort.
+            if let Some(tcb) = self.tcbs.get(&key) {
+                if let Some(deadline) = tcb.persist_deadline {
+                    if now >= deadline {
+                        let tcb = self.tcbs.get_mut(&key).unwrap();
+                        // Send a 1-byte window probe (seq = snd_una - 1, carries no new data).
+                        // The probe uses snd_nxt as seq to be a valid segment the peer can ACK.
+                        let probe_seq = tcb.snd_una.add(tcb.flight_size());
+                        let frame = build_tcp_frame(&TcpFrameParams {
+                            src_mac: tcb.src_mac,
+                            dst_mac: tcb.dst_mac,
+                            src: tcb.key.local,
+                            dst: tcb.key.remote,
+                            seq: probe_seq,
+                            ack: tcb.rcv_nxt,
+                            flags: TcpFlags::ACK,
+                            window: encode_established_window(tcb),
+                            options: TcpOptions::default(),
+                            payload: vec![0u8; 1],
+                            ttl: tcb.ttl,
+                        });
+                        if let Ok(f) = frame {
+                            outbound.push(f);
+                        }
+
+                        // Double backoff, cap at 60s
+                        tcb.persist_backoff = std::cmp::min(
+                            tcb.persist_backoff * 2,
+                            Duration::from_secs(60),
+                        );
+                        // Rearm persist timer — NEVER abort
+                        tcb.persist_deadline = Some(now + tcb.persist_backoff);
+                        continue;
+                    }
+                }
+            }
+
+            // --- Keepalive timer (task 5.16) ---
+            // Send probe after idle timeout, abort after max probes → TimedOut.
+            if let Some(tcb) = self.tcbs.get(&key) {
+                if let Some(deadline) = tcb.keepalive_deadline {
+                    if now >= deadline && tcb.keepalive.is_some() {
+                        let tcb = self.tcbs.get_mut(&key).unwrap();
+                        let ka = tcb.keepalive.unwrap();
+
+                        tcb.keepalive_probes_sent += 1;
+
+                        if tcb.keepalive_probes_sent > ka.count {
+                            // Max probes exceeded → abort with TimedOut
+                            tcb.handle.latch_error(TcpError::TimedOut);
+                            tcb.handle.set_state(TcpState::Closed);
+                            tcb.handle.set_eof();
+                            tcb.handle.notify_all();
+                            self.tcbs.remove(&key);
+                            continue;
+                        }
+
+                        // Send keepalive probe: ACK with seq = snd_una - 1
+                        let probe_seq = tcb.snd_una.add(u32::MAX); // snd_una - 1
+                        let frame = build_tcp_frame(&TcpFrameParams {
+                            src_mac: tcb.src_mac,
+                            dst_mac: tcb.dst_mac,
+                            src: tcb.key.local,
+                            dst: tcb.key.remote,
+                            seq: probe_seq,
+                            ack: tcb.rcv_nxt,
+                            flags: TcpFlags::ACK,
+                            window: encode_established_window(tcb),
+                            options: TcpOptions::default(),
+                            payload: Vec::new(),
+                            ttl: tcb.ttl,
+                        });
+                        if let Ok(f) = frame {
+                            outbound.push(f);
+                        }
+
+                        // Rearm at interval
+                        tcb.keepalive_deadline = Some(now + ka.interval);
+                        continue;
+                    }
+                }
+            }
+
+            // --- Delayed-ACK timer fire (task 5.17) ---
+            // Send cumulative ACK when 200ms deadline expires.
+            if let Some(tcb) = self.tcbs.get(&key) {
+                if let Some(deadline) = tcb.delayed_ack_deadline {
+                    if now >= deadline {
+                        let tcb = self.tcbs.get_mut(&key).unwrap();
+                        tcb.delayed_ack_deadline = None;
+                        tcb.segments_since_ack = 0;
+                        let frame = build_ack_for_tcb(tcb);
+                        if let Ok(f) = frame {
+                            outbound.push(f);
+                        }
+                        // Don't continue — still need to run tx-drain for this TCB
                     }
                 }
             }
@@ -355,6 +495,34 @@ impl TcpEngine {
                 if tcb.rto_deadline.is_none() {
                     tcb.rto_deadline = Some(now + tcb.congestion.rto);
                 }
+            }
+
+            // Arm persist timer if window is zero and there's unsent data.
+            // Also ensure we don't double-arm if persist is already running.
+            let has_unsent = {
+                let already_sent_offset = tcb.retransmit_queue.last()
+                    .map(|e| e.offset + e.len)
+                    .unwrap_or(0);
+                tcb.send_buf.len() > already_sent_offset
+            };
+            if tcb.available_send_window() == 0 && has_unsent && tcb.persist_deadline.is_none() {
+                tcb.persist_backoff = tcb.congestion.rto;
+                tcb.persist_deadline = Some(now + tcb.persist_backoff);
+            }
+
+            // Clear persist timer if window opened
+            if tcb.available_send_window() > 0 && tcb.persist_deadline.is_some() {
+                tcb.persist_deadline = None;
+                tcb.persist_backoff = Duration::from_secs(1);
+            }
+
+            // Arm keepalive timer for established connections with keepalive enabled.
+            if tcb.state == TcpState::Established
+                && tcb.keepalive.is_some()
+                && tcb.keepalive_deadline.is_none()
+            {
+                let ka = tcb.keepalive.unwrap();
+                tcb.keepalive_deadline = Some(now + ka.idle);
             }
 
             // Step 3: Wake write_waker + condvar if send window opened
@@ -741,6 +909,14 @@ impl TcpEngine {
 
         // --- Process data delivery (in-order + out-of-order) ---
         if !seg.payload.is_empty() {
+            // Reset keepalive state on data receipt (connection is active)
+            tcb.last_data_received = Some(self.clock.now());
+            tcb.keepalive_probes_sent = 0;
+            if tcb.keepalive.is_some() {
+                let ka = tcb.keepalive.unwrap();
+                tcb.keepalive_deadline = Some(self.clock.now() + ka.idle);
+            }
+
             if seg.seq == tcb.rcv_nxt {
                 // In-order: deliver payload to rx_ring
                 let written = tcb.handle.rx_ring.write(&seg.payload);
@@ -1512,7 +1688,7 @@ mod tests {
     use super::*;
     use crate::clock::MockClock;
     use crate::codec::parse_tcp_packet;
-    use crate::contract::{oneshot_channel, CommandSender, EngineWakeup};
+    use crate::contract::{oneshot_channel, CommandSender, EngineWakeup, KeepaliveConfig};
     use std::sync::mpsc;
 
     fn make_engine() -> (TcpEngine, Arc<MockClock>) {
@@ -3968,5 +4144,351 @@ mod tests {
 
         // Should NOT send data in SYN_SENT state (tx-drain only for ESTABLISHED/CLOSE_WAIT)
         assert!(frames.is_empty());
+    }
+
+    // === on_tick: Persist timer tests (task 5.16) ===
+
+    #[test]
+    fn on_tick_persist_sends_probe_when_zero_window() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 0; // Zero window from peer
+
+        // App writes data that can't be sent (window = 0)
+        handle.tx_ring.write(b"Hello");
+
+        // First tick: drains tx_ring into send_buf, detects zero window, arms persist
+        let now = clock.now();
+        let frames = engine.on_tick(now);
+        assert!(frames.is_empty()); // No data sent (zero window)
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.persist_deadline.is_some());
+        let persist_deadline = tcb.persist_deadline.unwrap();
+
+        // Advance past persist deadline
+        clock.advance(persist_deadline.duration_since(now) + Duration::from_millis(1));
+        let now2 = clock.now();
+        let frames = engine.on_tick(now2);
+
+        // Should send a 1-byte probe
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert_eq!(parsed.payload.len(), 1);
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+    }
+
+    #[test]
+    fn on_tick_persist_exponential_backoff_capped_60s() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 0;
+
+        handle.tx_ring.write(b"data");
+
+        // Arm persist
+        let now = clock.now();
+        engine.on_tick(now);
+
+        // Fire persist multiple times and check backoff
+        let mut last_backoff = Duration::from_secs(0);
+        for i in 0..10 {
+            let tcb = engine.tcbs.get(&four_tuple).unwrap();
+            let deadline = tcb.persist_deadline.unwrap();
+            let backoff = deadline.duration_since(clock.now());
+            // Each backoff should be <= 60s
+            assert!(backoff <= Duration::from_secs(60));
+
+            if i > 0 {
+                // Backoff should be roughly double the previous (or capped)
+                assert!(backoff >= last_backoff || backoff == Duration::from_secs(60));
+            }
+            last_backoff = backoff;
+
+            clock.advance(backoff + Duration::from_millis(1));
+            let frames = engine.on_tick(clock.now());
+            assert_eq!(frames.len(), 1); // Probe sent
+        }
+
+        // After many probes, backoff should be capped at 60s
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.persist_backoff <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn on_tick_persist_never_aborts() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 0;
+
+        handle.tx_ring.write(b"data");
+        engine.on_tick(clock.now());
+
+        // Fire 100 persist probes — connection must NOT be aborted
+        for _ in 0..100 {
+            let tcb = engine.tcbs.get(&four_tuple).unwrap();
+            let deadline = tcb.persist_deadline.unwrap();
+            let advance = deadline.duration_since(clock.now()) + Duration::from_millis(1);
+            clock.advance(advance);
+            engine.on_tick(clock.now());
+        }
+
+        // TCB still exists and not TimedOut
+        assert!(engine.tcbs.contains_key(&four_tuple));
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::Established);
+        assert!(handle.peek_error().is_none());
+    }
+
+    #[test]
+    fn on_tick_persist_cleared_when_window_opens() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 0;
+
+        handle.tx_ring.write(b"data");
+        engine.on_tick(clock.now());
+
+        // Persist should be armed
+        assert!(engine.tcbs.get(&four_tuple).unwrap().persist_deadline.is_some());
+
+        // Peer opens window (via ACK with non-zero window)
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.snd_wnd = 65535;
+
+        clock.advance(Duration::from_millis(1));
+        engine.on_tick(clock.now());
+
+        // Persist should be cleared since window opened
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.persist_deadline.is_none());
+    }
+
+    // === on_tick: Keepalive tests (task 5.16) ===
+
+    #[test]
+    fn on_tick_keepalive_sends_probe_after_idle() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.keepalive = Some(KeepaliveConfig {
+            idle: Duration::from_secs(10),
+            interval: Duration::from_secs(2),
+            count: 3,
+        });
+
+        // First tick arms keepalive
+        engine.on_tick(clock.now());
+        assert!(engine.tcbs.get(&four_tuple).unwrap().keepalive_deadline.is_some());
+
+        // Advance past idle timeout
+        clock.advance(Duration::from_secs(11));
+        let frames = engine.on_tick(clock.now());
+
+        // Should send a keepalive probe
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+        assert!(parsed.payload.is_empty()); // Keepalive probe has no payload
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.keepalive_probes_sent, 1);
+    }
+
+    #[test]
+    fn on_tick_keepalive_aborts_after_max_probes() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.keepalive = Some(KeepaliveConfig {
+            idle: Duration::from_secs(5),
+            interval: Duration::from_secs(1),
+            count: 3,
+        });
+
+        // Arm keepalive
+        engine.on_tick(clock.now());
+
+        // Fire idle timeout + 3 interval probes + 1 more (exceeds count)
+        clock.advance(Duration::from_secs(6)); // past idle
+        engine.on_tick(clock.now()); // probe 1
+
+        clock.advance(Duration::from_secs(2)); // past interval
+        engine.on_tick(clock.now()); // probe 2
+
+        clock.advance(Duration::from_secs(2));
+        engine.on_tick(clock.now()); // probe 3
+
+        clock.advance(Duration::from_secs(2));
+        engine.on_tick(clock.now()); // probe 4 → exceeds count(3), abort
+
+        // Connection should be removed and TimedOut latched
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert!(matches!(handle.peek_error(), Some(TcpError::TimedOut)));
+    }
+
+    #[test]
+    fn on_tick_keepalive_reset_on_data_receipt() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+        tcb.keepalive = Some(KeepaliveConfig {
+            idle: Duration::from_secs(5),
+            interval: Duration::from_secs(1),
+            count: 3,
+        });
+
+        // Arm keepalive
+        engine.on_tick(clock.now());
+
+        // Advance past idle timeout and send one probe
+        clock.advance(Duration::from_secs(6));
+        engine.on_tick(clock.now());
+        assert_eq!(engine.tcbs.get(&four_tuple).unwrap().keepalive_probes_sent, 1);
+
+        // Now receive data from peer — should reset keepalive
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+        let data_seg = make_data_segment(remote, local, rcv_nxt.0, snd_nxt.0, b"hello");
+        engine.on_segment(&data_seg);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.keepalive_probes_sent, 0);
+        assert!(tcb.last_data_received.is_some());
+    }
+
+    // === on_tick: TIME_WAIT / FIN_WAIT_2 expiry tests (task 5.17) ===
+
+    #[test]
+    fn on_tick_time_wait_expires_after_2msl() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Transition to TIME_WAIT manually
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::TimeWait;
+        tcb.handle.set_state(TcpState::TimeWait);
+        tcb.time_wait_deadline = Some(clock.now() + TIME_WAIT_DURATION);
+
+        // Advance just short of 2*MSL — TCB should still exist
+        clock.advance(TIME_WAIT_DURATION - Duration::from_millis(1));
+        engine.on_tick(clock.now());
+        assert!(engine.tcbs.contains_key(&four_tuple));
+
+        // Advance past 2*MSL
+        clock.advance(Duration::from_millis(2));
+        engine.on_tick(clock.now());
+
+        // TCB should be removed and state set to CLOSED
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn on_tick_fin_wait2_expires_after_timeout() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Transition to FIN_WAIT_2 manually
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::FinWait2;
+        tcb.handle.set_state(TcpState::FinWait2);
+        tcb.fin_wait2_deadline = Some(clock.now() + FIN_WAIT2_TIMEOUT);
+
+        // Advance just short — still exists
+        clock.advance(FIN_WAIT2_TIMEOUT - Duration::from_millis(1));
+        engine.on_tick(clock.now());
+        assert!(engine.tcbs.contains_key(&four_tuple));
+
+        // Advance past timeout
+        clock.advance(Duration::from_millis(2));
+        engine.on_tick(clock.now());
+
+        // TCB should be removed
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+    }
+
+    // === on_tick: Delayed-ACK timer fire tests (task 5.17) ===
+
+    #[test]
+    fn on_tick_delayed_ack_fires_at_200ms() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        // Receive one data segment — should arm delayed-ACK (not immediate)
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+        let data_seg = make_data_segment(remote, local, rcv_nxt.0, snd_nxt.0, b"hello");
+        let frames = engine.on_segment(&data_seg);
+        // First segment: no immediate ACK (delayed-ACK defers)
+        assert!(frames.is_empty());
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.delayed_ack_deadline.is_some());
+
+        // Advance to 200ms deadline
+        clock.advance(DELAYED_ACK_TIMEOUT + Duration::from_millis(1));
+        let frames = engine.on_tick(clock.now());
+
+        // Should send cumulative ACK
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+        assert!(parsed.payload.is_empty());
+
+        // delayed_ack_deadline should be cleared
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.delayed_ack_deadline.is_none());
+        assert_eq!(tcb.segments_since_ack, 0);
+    }
+
+    #[test]
+    fn on_tick_delayed_ack_not_before_deadline() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let rcv_nxt = tcb.rcv_nxt;
+        let snd_nxt = tcb.snd_nxt;
+        let data_seg = make_data_segment(remote, local, rcv_nxt.0, snd_nxt.0, b"hi");
+        engine.on_segment(&data_seg);
+
+        // Advance less than 200ms
+        clock.advance(Duration::from_millis(100));
+        let frames = engine.on_tick(clock.now());
+
+        // No ACK should fire (not yet at deadline)
+        assert!(frames.is_empty());
+        assert!(engine.tcbs.get(&four_tuple).unwrap().delayed_ack_deadline.is_some());
     }
 }
