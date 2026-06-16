@@ -4584,3 +4584,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 319,306 RX (8.8% drop) — consistent with Run #27's 305,967 (12.6%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP engine implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
+
+---
+
+## Run #29: TCP Engine — on_tick (tx-drain and RTO)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-16 |
+| **Git Hash** | `c30b6ff` |
+| **Branch** | `agent/tcp-on-tick-tx-drain-rto` |
+| **PR** | [#87](https://github.com/gspivey/dpdk-stdlib-rust/pull/87) |
+| **GH Actions Run** | [27612906579](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27612906579) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #28
+
+1. **`c30b6ff` — TCP engine on_tick: tx-drain and RTO.** Implements `on_tick` tx-drain path (drain tx_ring → send_buf → segment respecting effective_window → transmit, wake condvar + write_waker when send window opens) and RTO path (retransmit oldest unacked segment on expiry, exponential backoff, abort after max retries → latch TimedOut). This is TCP-only code with no changes to the UDP hot path.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,999 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,993 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 692,551 | 1.1% | 424,794 | 39.3% | 700,000 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,951 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 698,955 | 0.1% | 498,669 | 28.8% | 699,987 | 0.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,993 | 0.3% | 348,914 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 568,792 | 18.7% | 495,340 | 29.2% | 680,837 | 2.7% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 36,803 | 47.4% | 70,000 | 0.0% |
+| 140,000 | 124,256 | 0.8% | 124,320 | 0.7% | 125,205 | 0.0% |
+| 350,000 | 123,597 | 1.3% | 123,966 | 1.0% | 125,144 | 0.1% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 320,015 | 8.6% |
+| 700,000 | 322,596 | 53.9% |
+
+### Analysis
+
+**No performance regression from TCP engine on_tick changes.** This PR adds TCP engine code only — no changes to the UDP packet processing hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 692,551 RX (1.1% drop) — improved from Run #28's 673,979 (3.7%). Within normal ENA scheduling variance; confirms no degradation.
+
+**rust-dpdk at 700K PPS, 512B**: 698,955 RX (0.1% drop) — significantly improved from Run #28's 628,841 (10.2%). Likely favorable ENA burst scheduling on this run.
+
+**rust-dpdk at 700K PPS, 1400B**: 568,792 RX (18.7% drop) — higher drop than Run #28's 471,805 (1.0% drop, which was TX-capped at ~476K). This run achieved higher TX throughput but hit ENA bandwidth limits at a different point. The lower-rate steps (70K–350K) are consistent.
+
+**tokio-dpdk at 350K PPS, 64B**: 320,015 RX (8.6% drop) — consistent with Run #28's 319,306 (8.8%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP engine on_tick implementation (tx-drain + RTO) has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).

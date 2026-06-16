@@ -212,7 +212,7 @@ Nagle algorithm: if unacked data AND new write < MSS, buffer; send immediately i
 `on_tick` tx-drain: drain `tx_ring` → `send_buf` → segment respecting `effective_window(rwnd)` → transmit; wake condvar + write_waker when send window opens. `on_tick` RTO: retransmit oldest unacked segment on RTO expiry, double RTO (exponential backoff), abort after max retries → latch `TimedOut`. (~450 LOC; implement tx-drain first — most engine tests depend on the TX path)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.14`, `5.15`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #87
 
 ---
 

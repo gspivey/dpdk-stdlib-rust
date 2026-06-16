@@ -216,13 +216,13 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - **Property 9 (coalescing aspect)**
     - _Requirements: 13.4_
 
-  - [ ] 5.14 Implement TcpEngine::on_tick — tx-drain + segmentation + wakes
+  - [x] 5.14 Implement TcpEngine::on_tick — tx-drain + segmentation + wakes
     - Drain tx_rings → send_buf → segment and transmit (respecting effective_window)
     - Wake Condvar and write_waker after send window opens
     - This lands first — most tests need the tx path
     - _Requirements: 5.1, 5.2, 5.4_
 
-  - [ ] 5.15 Implement TcpEngine::on_tick — RTO + backoff + max-retries
+  - [x] 5.15 Implement TcpEngine::on_tick — RTO + backoff + max-retries
     - Retransmit oldest unacked segment on RTO expiry
     - Double RTO (exponential backoff) on each retransmit
     - Abort after max retries → latch TimedOut
