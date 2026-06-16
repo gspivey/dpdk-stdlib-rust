@@ -11,7 +11,7 @@
 //! - Delayed-ACK: send cumulative ACK at 200ms deadline
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::codec::{
 };
 use crate::congestion::CongestionState;
 use crate::contract::{
-    ConnectionHandle, EngineCommand, OneshotSender,
+    ConnectionHandle, EngineCommand, OneshotSender, SocketOption,
 };
 use crate::error::TcpError;
 use crate::isn::IsnGenerator;
@@ -175,7 +175,12 @@ impl TcpEngine {
                 self.handle_accept(listen_addr, response);
                 Vec::new()
             }
-            _ => Vec::new(), // Shutdown, SetOption, Close — future tasks
+            EngineCommand::Shutdown { key, how } => self.handle_shutdown(key, how),
+            EngineCommand::SetOption { key, option } => {
+                self.handle_set_option(key, option);
+                Vec::new()
+            }
+            EngineCommand::Close { key, linger } => self.handle_close(key, linger),
         }
     }
 
@@ -525,6 +530,23 @@ impl TcpEngine {
                 tcb.keepalive_deadline = Some(now + ka.idle);
             }
 
+            // Step 2b: If fin_pending and all data has been sent, emit FIN.
+            if tcb.fin_pending {
+                let already_sent_offset = tcb.retransmit_queue.last()
+                    .map(|e| e.offset + e.len)
+                    .unwrap_or(0);
+                let unsent = tcb.send_buf.len().saturating_sub(already_sent_offset);
+                if unsent == 0 && tcb.handle.tx_ring.available_read() == 0 {
+                    // All data flushed — send FIN now.
+                    let fin_frames = self.send_fin(&key);
+                    outbound.extend(fin_frames);
+                    // Re-borrow tcb after &mut self method call.
+                    // The TCB may still exist (transitioned to FinWait1/LastAck).
+                    // Skip the wake step below — connection is closing.
+                    continue;
+                }
+            }
+
             // Step 3: Wake write_waker + condvar if send window opened
             // (i.e., if the tx_ring has space now that we drained it)
             let new_available = tcb.available_send_window();
@@ -537,6 +559,204 @@ impl TcpEngine {
         }
 
         outbound
+    }
+
+    // ===== Shutdown (task 5.19) =====
+
+    /// Handle Shutdown command: set fin_pending, flush tx_ring → send_buf → FIN.
+    fn handle_shutdown(&mut self, key: FourTuple, how: Shutdown) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(&key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        match how {
+            Shutdown::Write | Shutdown::Both => {
+                // Only initiate FIN if in a state that allows sending.
+                match tcb.state {
+                    TcpState::Established | TcpState::CloseWait => {}
+                    _ => return Vec::new(),
+                }
+
+                // Set fin_pending — on_tick will drain tx_ring → send_buf,
+                // transmit all remaining data, then emit FIN.
+                tcb.fin_pending = true;
+
+                // Drain any remaining tx_ring data into send_buf now.
+                let mut drain_buf = [0u8; 4096];
+                loop {
+                    let n = tcb.handle.tx_ring.read(&mut drain_buf);
+                    if n == 0 {
+                        break;
+                    }
+                    tcb.send_buf.extend(&drain_buf[..n]);
+                }
+
+                // If send_buf is empty (no unsent data), emit FIN immediately.
+                let already_sent_offset = tcb.retransmit_queue.last()
+                    .map(|e| e.offset + e.len)
+                    .unwrap_or(0);
+                let unsent = tcb.send_buf.len().saturating_sub(already_sent_offset);
+
+                if unsent == 0 {
+                    return self.send_fin(&key);
+                }
+                // Otherwise, on_tick will send remaining data then FIN.
+            }
+            Shutdown::Read => {
+                // Shutdown(Read): set EOF so reads return 0. No FIN sent.
+                tcb.handle.set_eof();
+                tcb.handle.notify_all();
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Emit a FIN segment and transition state appropriately.
+    fn send_fin(&mut self, key: &FourTuple) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get_mut(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        tcb.fin_pending = false;
+
+        let new_state = match tcb.state {
+            TcpState::Established => TcpState::FinWait1,
+            TcpState::CloseWait => TcpState::LastAck,
+            _ => return Vec::new(),
+        };
+
+        let seq = tcb.snd_nxt;
+        let frame = build_tcp_frame(&TcpFrameParams {
+            src_mac: tcb.src_mac,
+            dst_mac: tcb.dst_mac,
+            src: tcb.key.local,
+            dst: tcb.key.remote,
+            seq,
+            ack: tcb.rcv_nxt,
+            flags: TcpFlags::FIN | TcpFlags::ACK,
+            window: encode_established_window(tcb),
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+            ttl: tcb.ttl,
+        });
+
+        // FIN consumes one sequence number.
+        tcb.snd_nxt = tcb.snd_nxt.add(1);
+        tcb.state = new_state;
+        tcb.handle.set_state(new_state);
+
+        // Arm RTO for the FIN.
+        if tcb.rto_deadline.is_none() {
+            tcb.rto_deadline = Some(self.clock.now() + tcb.congestion.rto);
+        }
+
+        match frame {
+            Ok(f) => vec![f],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // ===== Close (task 5.19) =====
+
+    /// Handle Close command: honor SO_LINGER semantics.
+    /// - linger = None (default): initiate graceful FIN (same as Shutdown::Write).
+    /// - linger = Some(Duration::ZERO): send RST, discard unsent data.
+    /// - linger = Some(t) where t > 0: same as graceful FIN (blocking handled app-side).
+    fn handle_close(&mut self, key: FourTuple, linger: Option<Duration>) -> Vec<Vec<u8>> {
+        if let Some(dur) = linger {
+            if dur.is_zero() {
+                // SO_LINGER with timeout=0 → RST, discard unsent data.
+                return self.handle_close_rst(key);
+            }
+        }
+        // Default / non-zero linger: graceful FIN (flush-before-FIN).
+        self.handle_shutdown(key, Shutdown::Write)
+    }
+
+    /// Close with RST: discard all pending data, send RST, remove TCB.
+    fn handle_close_rst(&mut self, key: FourTuple) -> Vec<Vec<u8>> {
+        let tcb = match self.tcbs.get(&key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        // Build RST segment.
+        let frame = build_tcp_frame(&TcpFrameParams {
+            src_mac: tcb.src_mac,
+            dst_mac: tcb.dst_mac,
+            src: tcb.key.local,
+            dst: tcb.key.remote,
+            seq: tcb.snd_nxt,
+            ack: tcb.rcv_nxt,
+            flags: TcpFlags::RST | TcpFlags::ACK,
+            window: 0,
+            options: TcpOptions::default(),
+            payload: Vec::new(),
+            ttl: tcb.ttl,
+        });
+
+        // Notify handle and remove TCB.
+        let handle = tcb.handle.clone();
+        handle.latch_error(TcpError::ConnectionAborted);
+        handle.set_state(TcpState::Closed);
+        handle.set_eof();
+        handle.notify_all();
+        self.tcbs.remove(&key);
+
+        match frame {
+            Ok(f) => vec![f],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // ===== SetOption (task 5.19) =====
+
+    /// Handle SetOption command: update Tcb fields for the specified socket option.
+    fn handle_set_option(&mut self, key: FourTuple, option: SocketOption) {
+        let tcb = match self.tcbs.get_mut(&key) {
+            Some(t) => t,
+            None => return,
+        };
+
+        match option {
+            SocketOption::Nodelay(val) => {
+                tcb.nodelay = val;
+            }
+            SocketOption::Keepalive(config) => {
+                tcb.keepalive = config;
+                if config.is_none() {
+                    // Disable keepalive: clear timer.
+                    tcb.keepalive_deadline = None;
+                    tcb.keepalive_probes_sent = 0;
+                }
+            }
+            SocketOption::Linger(val) => {
+                tcb.linger = val;
+                // Also update the handle so Drop can read it.
+                *tcb.handle.linger.lock().unwrap() = val;
+            }
+            SocketOption::RecvBufSize(size) => {
+                // Cannot resize ring post-creation; update rwnd cap.
+                tcb.recv_buf_size = size;
+                tcb.rcv_wnd = std::cmp::min(tcb.rcv_wnd, size as u32);
+            }
+            SocketOption::SendBufSize(size) => {
+                tcb.send_buf_size = size;
+            }
+            SocketOption::ReuseAddr(val) => {
+                tcb.reuseaddr = val;
+            }
+            SocketOption::Ttl(val) => {
+                tcb.ttl = val;
+            }
+            SocketOption::ReadTimeout(_) | SocketOption::WriteTimeout(_) | SocketOption::Nonblocking(_) => {
+                // These are handled app-side (condvar wait_timeout / WouldBlock).
+                // No engine-side action needed.
+            }
+        }
     }
 
     // ===== Handshake: Active Open (Connect) =====
@@ -1688,7 +1908,7 @@ mod tests {
     use super::*;
     use crate::clock::MockClock;
     use crate::codec::parse_tcp_packet;
-    use crate::contract::{oneshot_channel, CommandSender, EngineWakeup, KeepaliveConfig};
+    use crate::contract::{oneshot_channel, CommandSender, EngineWakeup, KeepaliveConfig, SocketOption};
     use std::sync::mpsc;
 
     fn make_engine() -> (TcpEngine, Arc<MockClock>) {
@@ -4490,5 +4710,500 @@ mod tests {
         // No ACK should fire (not yet at deadline)
         assert!(frames.is_empty());
         assert!(engine.tcbs.get(&four_tuple).unwrap().delayed_ack_deadline.is_some());
+    }
+
+    // === on_command: Shutdown tests (task 5.18/5.19) ===
+
+    #[test]
+    fn shutdown_write_with_empty_send_buf_sends_fin_immediately() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        // FIN should be sent immediately (no pending data)
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::FIN));
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+
+        // State should transition to FIN_WAIT_1
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait1);
+        assert_eq!(handle.tcp_state(), TcpState::FinWait1);
+        assert!(!tcb.fin_pending); // Should be cleared after FIN sent
+    }
+
+    #[test]
+    fn shutdown_write_in_close_wait_transitions_to_last_ack() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Move to CLOSE_WAIT (peer sent FIN)
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.state = TcpState::CloseWait;
+        handle.set_state(TcpState::CloseWait);
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        // FIN should be sent
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::FIN));
+
+        // State should be LAST_ACK
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::LastAck);
+        assert_eq!(handle.tcp_state(), TcpState::LastAck);
+    }
+
+    #[test]
+    fn shutdown_write_with_pending_data_sets_fin_pending() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Write data to tx_ring that hasn't been drained yet
+        handle.tx_ring.write(b"pending data");
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        // No FIN yet — data needs to be sent first
+        assert!(frames.is_empty());
+
+        // fin_pending should be set
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.fin_pending);
+        // Data should have been drained from tx_ring to send_buf
+        assert!(!tcb.send_buf.is_empty());
+        assert_eq!(tcb.send_buf.len(), 12); // "pending data"
+
+        // on_tick should drain data then send FIN
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+
+        let frames = engine.on_tick(clock.now());
+        // Should send data segment + FIN
+        assert!(frames.len() >= 1);
+
+        // After draining, FIN should have been sent
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait1);
+    }
+
+    #[test]
+    fn shutdown_read_sets_eof() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Read,
+        });
+
+        // No outbound frames for read shutdown
+        assert!(frames.is_empty());
+
+        // EOF should be set
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+
+        // State should remain ESTABLISHED
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::Established);
+    }
+
+    #[test]
+    fn shutdown_both_sends_fin() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Both,
+        });
+
+        // FIN should be sent (no pending data)
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::FIN));
+
+        // State should be FIN_WAIT_1
+        assert_eq!(handle.tcp_state(), TcpState::FinWait1);
+    }
+
+    #[test]
+    fn shutdown_on_nonexistent_key_does_nothing() {
+        let (mut engine, _clock) = make_engine();
+        let fake_key = FourTuple {
+            local: "1.1.1.1:9999".parse().unwrap(),
+            remote: "2.2.2.2:8888".parse().unwrap(),
+        };
+
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: fake_key,
+            how: Shutdown::Write,
+        });
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn shutdown_in_syn_sent_does_nothing() {
+        let (mut engine, _clock) = make_engine();
+        let local: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let four_tuple = FourTuple { local, remote };
+        let handle = make_handle(four_tuple);
+        let (resp_tx, _resp_rx) = oneshot_channel();
+
+        engine.on_command(EngineCommand::Connect {
+            local,
+            remote,
+            src_mac: [0x02, 0, 0, 0, 0, 1],
+            dst_mac: [0x02, 0, 0, 0, 0, 2],
+            handle: handle.clone(),
+            response: resp_tx,
+        });
+
+        // Shutdown in SYN_SENT should do nothing
+        let frames = engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+        assert!(frames.is_empty());
+        assert_eq!(handle.tcp_state(), TcpState::SynSent);
+    }
+
+    #[test]
+    fn shutdown_fin_consumes_sequence_number() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        let snd_nxt_before = tcb.snd_nxt;
+
+        engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.snd_nxt, snd_nxt_before.add(1)); // FIN = 1 seq
+    }
+
+    #[test]
+    fn shutdown_arms_rto_for_fin() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        // Clear any existing RTO
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.rto_deadline = None;
+
+        engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.rto_deadline.is_some());
+    }
+
+    // === on_command: Close tests (task 5.19) ===
+
+    #[test]
+    fn close_default_linger_sends_fin() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Close {
+            key: four_tuple,
+            linger: None,
+        });
+
+        // Default close → graceful FIN
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::FIN));
+        assert_eq!(handle.tcp_state(), TcpState::FinWait1);
+    }
+
+    #[test]
+    fn close_linger_nonzero_sends_fin() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Close {
+            key: four_tuple,
+            linger: Some(Duration::from_secs(5)),
+        });
+
+        // Non-zero linger → graceful FIN (blocking handled app-side)
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::FIN));
+        assert_eq!(handle.tcp_state(), TcpState::FinWait1);
+    }
+
+    #[test]
+    fn close_linger_zero_sends_rst() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let frames = engine.on_command(EngineCommand::Close {
+            key: four_tuple,
+            linger: Some(Duration::ZERO),
+        });
+
+        // Linger=0 → RST, discard data
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::RST));
+        assert!(parsed.flags.contains(TcpFlags::ACK));
+
+        // TCB removed
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+
+        // Error latched as ConnectionAborted
+        assert!(matches!(handle.peek_error(), Some(TcpError::ConnectionAborted)));
+        assert_eq!(handle.tcp_state(), TcpState::Closed);
+        assert!(handle.eof.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn close_linger_zero_discards_pending_data() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        // Write data that hasn't been sent
+        handle.tx_ring.write(b"unsent data that should be discarded");
+
+        let frames = engine.on_command(EngineCommand::Close {
+            key: four_tuple,
+            linger: Some(Duration::ZERO),
+        });
+
+        // RST sent, data discarded
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(parsed.flags.contains(TcpFlags::RST));
+        assert!(!engine.tcbs.contains_key(&four_tuple));
+    }
+
+    #[test]
+    fn close_on_nonexistent_key_does_nothing() {
+        let (mut engine, _clock) = make_engine();
+        let fake_key = FourTuple {
+            local: "1.1.1.1:9999".parse().unwrap(),
+            remote: "2.2.2.2:8888".parse().unwrap(),
+        };
+
+        let frames = engine.on_command(EngineCommand::Close {
+            key: fake_key,
+            linger: None,
+        });
+        assert!(frames.is_empty());
+    }
+
+    // === on_command: SetOption tests (task 5.19) ===
+
+    #[test]
+    fn set_option_nodelay() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        assert!(!engine.tcbs.get(&four_tuple).unwrap().nodelay);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::Nodelay(true),
+        });
+
+        assert!(engine.tcbs.get(&four_tuple).unwrap().nodelay);
+    }
+
+    #[test]
+    fn set_option_keepalive() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        assert!(engine.tcbs.get(&four_tuple).unwrap().keepalive.is_none());
+
+        let ka = KeepaliveConfig {
+            idle: Duration::from_secs(60),
+            interval: Duration::from_secs(10),
+            count: 5,
+        };
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::Keepalive(Some(ka)),
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.keepalive, Some(ka));
+    }
+
+    #[test]
+    fn set_option_keepalive_disable_clears_timer() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        // Enable keepalive and arm timer
+        let ka = KeepaliveConfig {
+            idle: Duration::from_secs(60),
+            interval: Duration::from_secs(10),
+            count: 5,
+        };
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.keepalive = Some(ka);
+        tcb.keepalive_deadline = Some(clock.now() + Duration::from_secs(60));
+        tcb.keepalive_probes_sent = 2;
+
+        // Disable keepalive
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::Keepalive(None),
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.keepalive.is_none());
+        assert!(tcb.keepalive_deadline.is_none());
+        assert_eq!(tcb.keepalive_probes_sent, 0);
+    }
+
+    #[test]
+    fn set_option_linger_updates_tcb_and_handle() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::Linger(Some(Duration::from_secs(10))),
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.linger, Some(Duration::from_secs(10)));
+        assert_eq!(*handle.linger.lock().unwrap(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn set_option_ttl() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::Ttl(128),
+        });
+
+        assert_eq!(engine.tcbs.get(&four_tuple).unwrap().ttl, 128);
+    }
+
+    #[test]
+    fn set_option_reuseaddr() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::ReuseAddr(true),
+        });
+
+        assert!(engine.tcbs.get(&four_tuple).unwrap().reuseaddr);
+    }
+
+    #[test]
+    fn set_option_recv_buf_size() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::RecvBufSize(32768),
+        });
+
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.recv_buf_size, 32768);
+    }
+
+    #[test]
+    fn set_option_send_buf_size() {
+        let (mut engine, _clock) = make_engine();
+        let (four_tuple, _handle) = setup_established_connection(&mut engine);
+
+        engine.on_command(EngineCommand::SetOption {
+            key: four_tuple,
+            option: SocketOption::SendBufSize(16384),
+        });
+
+        assert_eq!(engine.tcbs.get(&four_tuple).unwrap().send_buf_size, 16384);
+    }
+
+    #[test]
+    fn set_option_on_nonexistent_key_does_nothing() {
+        let (mut engine, _clock) = make_engine();
+        let fake_key = FourTuple {
+            local: "1.1.1.1:9999".parse().unwrap(),
+            remote: "2.2.2.2:8888".parse().unwrap(),
+        };
+
+        // Should not panic
+        engine.on_command(EngineCommand::SetOption {
+            key: fake_key,
+            option: SocketOption::Nodelay(true),
+        });
+    }
+
+    // === Flush-before-FIN integration (task 5.19) ===
+
+    #[test]
+    fn shutdown_flushes_tx_ring_before_fin() {
+        let (mut engine, clock) = make_engine();
+        let (four_tuple, handle) = setup_established_connection(&mut engine);
+
+        let tcb = engine.tcbs.get_mut(&four_tuple).unwrap();
+        tcb.peer_mss = 1460;
+        tcb.snd_wnd = 65535;
+
+        // App writes data then calls shutdown
+        handle.tx_ring.write(b"flush me first");
+
+        engine.on_command(EngineCommand::Shutdown {
+            key: four_tuple,
+            how: Shutdown::Write,
+        });
+
+        // fin_pending should be set since there's data in send_buf
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert!(tcb.fin_pending);
+        assert_eq!(tcb.state, TcpState::Established); // Not yet transitioned
+
+        // on_tick should send data then FIN
+        let frames = engine.on_tick(clock.now());
+
+        // Should have data segment + FIN
+        assert!(frames.len() >= 2);
+
+        // First frame should be data
+        let data_frame = parse_tcp_packet(&frames[0]).unwrap();
+        assert!(data_frame.flags.contains(TcpFlags::ACK));
+        assert!(!data_frame.flags.contains(TcpFlags::FIN));
+        assert_eq!(data_frame.payload, b"flush me first");
+
+        // Last frame should be FIN
+        let fin_frame = parse_tcp_packet(frames.last().unwrap()).unwrap();
+        assert!(fin_frame.flags.contains(TcpFlags::FIN));
+
+        // State transitioned
+        let tcb = engine.tcbs.get(&four_tuple).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait1);
     }
 }
