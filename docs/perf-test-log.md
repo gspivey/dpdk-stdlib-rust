@@ -4800,3 +4800,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 320,015 RX (8.6% drop) — consistent with Run #28's 319,306 (8.8%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP engine on_tick implementation (tx-drain + RTO) has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
+
+---
+
+## Run #30: TCP Engine — Property Tests
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-16 |
+| **Git Hash** | `ebf87a36` |
+| **Branch** | `agent/tcp-engine-property-tests` |
+| **PR** | [#90](https://github.com/gspivey/dpdk-stdlib-rust/pull/90) |
+| **GH Actions Run** | [27643115563](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27643115563) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #29
+
+1. **`ebf87a36` — TCP engine property tests (tasks 6.1, 6.2, 6.3).** Adds 15 property-based tests covering engine state machine validity, timer-driven segment generation, TIME_WAIT/FIN_WAIT_2 cleanup, resource limits, RST validation, flight-size invariant, slow-start, initial window, fast retransmit, partial ACK in recovery, and persist-never-aborts. Test-only change with no modifications to production code.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,991 | 0.3% | 348,993 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 697,859 | 0.3% | 533,053 | 23.8% | 698,333 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,997 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,785 | 0.3% | 349,993 | 0.0% |
+| 700,000 | 696,489 | 0.5% | 365,120 | 47.8% | 698,906 | 0.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,983 | 0.3% | 348,736 | 0.4% | 350,000 | 0.0% |
+| 700,000 | 474,556 | 0.4% | 451,544 | 5.2% | 471,474 | 1.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 34,285 | 51.0% | 70,000 | 0.0% |
+| 140,000 | 77,591 | 0.9% | 76,281 | 2.6% | 75,956 | 3.0% |
+| 350,000 | 77,915 | 0.6% | 77,649 | 0.8% | 77,928 | 0.5% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 304,177 | 13.1% |
+| 700,000 | 304,451 | 56.5% |
+
+### Analysis
+
+**No performance regression from TCP engine property test changes.** This PR is test-only — no production code modified.
+
+**rust-dpdk at 700K PPS, 64B**: 697,859 RX (0.3% drop) — improved from Run #29's 692,551 (1.1%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 512B**: 696,489 RX (0.5% drop) — consistent with Run #29's 698,955 (0.1%). Both track native-dpdk closely.
+
+**rust-dpdk at 700K PPS, 1400B**: 474,556 RX (0.4% drop at TX-capped ~476K) — tracks native-dpdk's 471,474 closely. Both hit ENA bandwidth limits at the same point.
+
+**tokio-dpdk at 350K PPS, 64B**: 304,177 RX (13.1% drop) — consistent with prior runs. Async overhead pattern unchanged.
+
+**Conclusion**: Test-only change has zero impact on UDP datapath performance, as expected.

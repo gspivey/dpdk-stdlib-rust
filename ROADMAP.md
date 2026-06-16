@@ -239,7 +239,7 @@ Connect: allocate TCB, populate src_mac/dst_mac from command, send SYN with all 
 Seven property-based tests covering the full engine: (1) state machine validity, (2) in-order ACK correctness, (3) OOO dup-ACK, (4) timer-driven segment generation (expired timer → outbound segment without app call), (5) TIME_WAIT/FIN_WAIT_2 cleanup, (6) resource limit enforcement (max_tcbs/backlog exceeded → RST), (7) RST validation per RFC 5961. Plus: (8) flight-size invariant (unacked ≤ min(cwnd, rwnd)), (9) slow-start cwnd growth, (10) initial window formula, (11) fast retransmit formula, (12) partial ACK in recovery, (13) persist-never-aborts. (~400 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `6.1`, `6.2`, `6.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #90
 
 ---
 
