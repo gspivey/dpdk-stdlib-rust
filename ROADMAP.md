@@ -221,7 +221,7 @@ Nagle algorithm: if unacked data AND new write < MSS, buffer; send immediately i
 Persist timer: send 1-byte zero-window probe at exponentially backed-off intervals (capped 60s); NEVER abort. Keepalive: send probe after idle timeout, abort after max probes → latch `TimedOut`. TIME_WAIT expiry → CLOSED, free TCB. FIN_WAIT_2 timeout → free TCB. Delayed-ACK timer fire → send cumulative ACK. (~400 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `5.16`, `5.17`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #88
 
 ---
 
