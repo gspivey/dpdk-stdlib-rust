@@ -258,7 +258,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
   - Validates data path before remaining protocol complexity lands
   - Ensure all tests pass, ask the user if questions arise.
 
-  - [ ] 6.1 Write property tests for engine state machine
+  - [x] 6.1 Write property tests for engine state machine
     - **Property 8: State machine validity** — any sequence of valid events produces one of 11 TcpState values
     - **Property 9: In-order ACK correctness** — in-order segments produce ACK with correct ack_num
     - **Property 10: Out-of-order dup-ACK** — OOO segments produce dup-ACK with ack_num == rcv_nxt
@@ -268,7 +268,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - **Property 14: RST validation per RFC 5961** — exact seq aborts, in-window challenges, out-of-window drops
     - **Validates: Requirements 4.1, 4.5, 4.6, 5.4, 4.14, 4.15, 5.6, 12.1, 12.2, 4.12, 12.4**
 
-  - [ ] 6.2 Write property tests for congestion control
+  - [x] 6.2 Write property tests for congestion control
     - **Property 15: Flight-size invariant** — unacked bytes never exceed min(cwnd, rwnd)
     - **Property 16: Slow-start cwnd growth** — each ACK in slow-start increases cwnd by MSS
     - **Property 17: Initial window formula** — IW = min(10*MSS, max(2*MSS, 14600))
@@ -277,7 +277,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - **Property 25: Persist never aborts** — zero-window probes indefinitely without TimedOut
     - **Validates: Requirements 6.4, 6.1, 6.3, 6.5, 4.9**
 
-  - [ ] 6.3 Write property tests for reorder buffer and window scaling
+  - [x] 6.3 Write property tests for reorder buffer and window scaling
     - **Property 21: Reorder buffer soundness** — OOO segments including wrap-around produce byte-identical output to in-order assembly
     - **Property 23: Window scaling encoding round-trip** — encode then decode correctly bounds effective send window
     - **Validates: Requirements 4.5, 4.16, 11.3, 11.4**
