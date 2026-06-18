@@ -257,7 +257,7 @@ Seven property-based tests covering the full engine: (1) state machine validity,
 `TcpStream` enum `Inner { Dpdk(DpdkTcpStream), Std(std::net::TcpStream) }` with full `std::net::TcpStream` surface: `connect<A: ToSocketAddrs>` (v4 → DPDK, v6 → kernel fallback), `shutdown`, `peer_addr`, `local_addr`, `set_read_timeout`, `set_write_timeout`, `read_timeout`, `write_timeout`, `set_nodelay`, `nodelay`, `set_ttl`, `ttl`, `set_linger`, `linger`, `set_nonblocking`, `take_error`, `peek`, `try_clone` (Unsupported on DPDK arm). `impl Read for &TcpStream` / `impl Write for &TcpStream` (serialized via read_mutex/write_mutex). `TcpListener` enum with `bind`, `accept() -> (TcpStream, SocketAddr)`, `local_addr`, `set_ttl`, `incoming`. (~400 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `8.4`, `8.5`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #92
 
 ---
 

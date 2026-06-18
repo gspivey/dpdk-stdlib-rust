@@ -309,7 +309,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - Implement `Drop` for DpdkTcpStream: decrement app_refcount, send Close on last handle
     - _Requirements: 9.4, 9.5, 9.8, 9.11, 9.13, 9.14_
 
-  - [ ] 8.4 Implement TcpStream public API
+  - [x] 8.4 Implement TcpStream public API
     - Implement `TcpStream` with enum `Inner { Dpdk(DpdkTcpStream), Std(std::net::TcpStream) }`
     - Implement `connect<A: ToSocketAddrs>` with v4/v6 dispatch (v4 → DPDK, v6 → kernel fallback)
     - Implement `shutdown(how: Shutdown)`, `peer_addr()`, `local_addr()`
@@ -320,7 +320,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - Implement `peek(buf)` — non-destructive ring read
     - _Requirements: 9.1, 9.4, 9.5, 9.6, 9.7, 9.8, 9.10, 9.11, 9.12_
 
-  - [ ] 8.5 Implement TcpListener public API
+  - [x] 8.5 Implement TcpListener public API
     - Implement `TcpListener` with enum `Inner { Dpdk(DpdkTcpListener), Std(std::net::TcpListener) }`
     - Implement `bind<A: ToSocketAddrs>` with v4/v6 dispatch
     - Implement `accept() -> io::Result<(TcpStream, SocketAddr)>` — via oneshot to engine
