@@ -4956,3 +4956,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 319,238 RX (8.8% drop) — slightly improved from Run #30's 304,177 (13.1%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP sync socket implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
+
+---
+
+## Run #32: TCP Sync Socket — TcpStream and TcpListener Public API
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-18 |
+| **Git Hash** | `42a1497` |
+| **Branch** | `agent/tcp-public-api` |
+| **PR** | [#92](https://github.com/gspivey/dpdk-stdlib-rust/pull/92) |
+| **GH Actions Run** | [27773053334](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27773053334) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #31
+
+1. **`42a1497` — TCP sync socket: TcpStream and TcpListener public API (tasks 8.4, 8.5).** Adds `TcpStream` enum wrapper with v4→DPDK / v6→kernel dispatch and full `std::net::TcpStream` surface (connect, connect_timeout, shutdown, peer_addr, local_addr, timeouts, nodelay, ttl, linger, set_nonblocking, take_error, peek, try_clone). Adds `TcpListener` with bind, accept, local_addr, set_ttl, incoming. Adds `peek()` to `SpscByteRing`. Adds `TcpContext` + `init_tcp_context()` for process-wide engine bootstrapping.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,966 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,997 | 0.3% | 348,961 | 0.3% | 349,963 | 0.0% |
+| 700,000 | 698,338 | 0.2% | 612,429 | 12.5% | 699,621 | 0.1% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,995 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,721 | 0.4% | 348,887 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 697,424 | 0.4% | 530,897 | 24.2% | 699,773 | 0.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,965 | 0.7% | 138,995 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,999 | 0.3% | 348,676 | 0.4% | 349,900 | 0.0% |
+| 700,000 | 475,762 | 0.2% | 435,708 | 8.6% | 476,507 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,995 | 1.4% | 36,429 | 48.0% | 69,994 | 0.0% |
+| 140,000 | 77,727 | 0.8% | 76,576 | 2.3% | 77,163 | 1.5% |
+| 350,000 | 70,632 | 9.8% | 71,249 | 9.1% | 75,230 | 4.0% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 138,997 | 0.7% |
+| 350,000 | 310,526 | 11.3% |
+| 700,000 | 307,918 | 56.0% |
+
+### Analysis
+
+**No performance regression from TcpStream/TcpListener public API changes.** This PR adds public API wrapper types to `dpdk-stdlib-tcp` — a separate crate from the UDP datapath with no shared hot-path code.
+
+**rust-dpdk at 700K PPS, 64B**: 698,338 RX (0.2% drop) — consistent with Run #31's 698,965 (0.1%). Within normal ENA variance.
+
+**rust-dpdk at 700K PPS, 512B**: 697,424 RX (0.4% drop) — consistent with Run #31's 698,847 (0.2%). Near-zero drop at line rate.
+
+**rust-dpdk at 700K PPS, 1400B**: 475,762 RX (0.2% drop at TX-capped ~476K) — ENA bandwidth ceiling reached, matching native-dpdk's 476,507.
+
+**tokio-dpdk at 350K PPS, 64B**: 310,526 RX (11.3% drop) — consistent with Run #31's 319,238 (8.8%). Async overhead pattern unchanged.
+
+**Conclusion**: TcpStream/TcpListener public API implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).

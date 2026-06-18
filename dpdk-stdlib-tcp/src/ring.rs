@@ -114,6 +114,38 @@ impl SpscByteRing {
     pub fn is_empty(&self) -> bool {
         self.available_read() == 0
     }
+
+    /// Peek at available bytes without advancing the read pointer.
+    /// Returns the number of bytes copied into `buf`.
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let available = head.wrapping_sub(tail);
+        let n = buf.len().min(available);
+        if n == 0 {
+            return 0;
+        }
+
+        let mask = self.capacity - 1;
+        let start = tail & mask;
+        let first_chunk = n.min(self.capacity - start);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buf.as_ptr().add(start),
+                buf.as_mut_ptr(),
+                first_chunk,
+            );
+            if first_chunk < n {
+                std::ptr::copy_nonoverlapping(
+                    self.buf.as_ptr(),
+                    buf.as_mut_ptr().add(first_chunk),
+                    n - first_chunk,
+                );
+            }
+        }
+        n
+    }
 }
 
 // Safety: SpscByteRing is Send+Sync because atomic operations guard head/tail,
