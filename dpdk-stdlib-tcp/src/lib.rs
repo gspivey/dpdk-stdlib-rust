@@ -17,12 +17,18 @@ pub mod seq;
 pub mod state;
 pub mod stream;
 pub mod tcb;
+pub mod tcp_listener;
+pub mod tcp_stream;
 pub mod timer;
 
 // Re-export codec public API at crate root for convenience.
 pub use codec::{
     build_tcp_frame, build_tcp_packet, compute_mss, parse_tcp_packet, tcp_checksum,
 };
+
+// Re-export public socket API types.
+pub use tcp_stream::{TcpStream, TcpContext, init_tcp_context};
+pub use tcp_listener::{TcpListener, Incoming};
 
 // --- Constants ---
 
