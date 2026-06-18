@@ -15,6 +15,7 @@ pub mod isn;
 pub mod ring;
 pub mod seq;
 pub mod state;
+pub mod stream;
 pub mod tcb;
 pub mod timer;
 

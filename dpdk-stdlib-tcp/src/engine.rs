@@ -124,6 +124,36 @@ impl TcpEngine {
         }
     }
 
+    /// Get a reference to the engine's clock.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Compute the earliest timer deadline across all TCBs.
+    /// Returns `None` if no timers are armed.
+    pub fn next_timer_deadline(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        let mut earliest: Option<std::time::Instant> = None;
+        for tcb in self.tcbs.values() {
+            for deadline in [
+                tcb.rto_deadline,
+                tcb.persist_deadline,
+                tcb.keepalive_deadline,
+                tcb.time_wait_deadline,
+                tcb.fin_wait2_deadline,
+                tcb.delayed_ack_deadline,
+            ] {
+                if let Some(d) = deadline {
+                    earliest = Some(match earliest {
+                        Some(e) if d < e => d,
+                        Some(e) => e,
+                        None => d,
+                    });
+                }
+            }
+        }
+        earliest
+    }
+
     /// Process a parsed inbound TCP segment. Returns outbound frames to send.
     pub fn on_segment(&mut self, seg: &ParsedTcpSegment) -> Vec<Vec<u8>> {
         let four_tuple = FourTuple {
