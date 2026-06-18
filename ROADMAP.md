@@ -248,7 +248,7 @@ Seven property-based tests covering the full engine: (1) state machine validity,
 `engine_loop(backend, engine, cmd_rx, wakeup)`: select on `rx_readiness` | `engine_wakeup` | timer deadline; dispatch each arm (`parse_tcp_packet` → `on_segment`, `cmd_rx.try_recv()` → `on_command`, `on_tick(clock.now())`); send outbound frames via `backend.send_frame`. `DpdkTcpStream`: `io::Read` with P0-B recheck-under-lock (check error → try rx_ring.read → check eof → lock notify_lock → recheck → condvar.wait). `io::Write`: push to tx_ring, signal engine_wakeup, block if full. Honor `set_nonblocking` (→ `WouldBlock`) and `read_timeout`/`write_timeout` (condvar.wait_timeout). `Drop` → decrement app_refcount, send Close on last handle. (~500 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `8.1`, `8.2`, `8.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #91
 
 ---
 

@@ -4878,3 +4878,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 304,177 RX (13.1% drop) — consistent with prior runs. Async overhead pattern unchanged.
 
 **Conclusion**: Test-only change has zero impact on UDP datapath performance, as expected.
+
+---
+
+## Run #31: TCP Sync Socket — Engine Loop and DpdkTcpStream
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-18 |
+| **Git Hash** | `6afc251` |
+| **Branch** | `agent/tcp-sync-socket-engine-loop` |
+| **PR** | [#91](https://github.com/gspivey/dpdk-stdlib-rust/pull/91) |
+| **GH Actions Run** | [27758389425](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27758389425) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #30
+
+1. **`6afc251` — TCP sync socket: engine loop and DpdkTcpStream (tasks 8.1, 8.2, 8.3).** Adds `engine_loop` (select on rx_readiness | engine_wakeup | timer_deadline), `connect_v4`/`connect_timeout` (MAC resolution + oneshot park), and `DpdkTcpStream` (blocking io::Read/Write with P0-B recheck-under-lock, nonblocking/timeout support, Drop→Close). Also adds `clock()` and `next_timer_deadline()` to TcpEngine, and `wakeup()` to CommandSender.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,971 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,965 | 0.3% | 349,988 | 0.0% |
+| 700,000 | 698,965 | 0.1% | 617,063 | 11.8% | 699,812 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,991 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,915 | 0.3% | 349,972 | 0.0% |
+| 700,000 | 698,847 | 0.2% | 579,988 | 17.1% | 699,936 | 0.0% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,996 | 0.3% | 348,834 | 0.3% | 349,998 | 0.0% |
+| 700,000 | 567,333 | 18.9% | 570,843 | 18.5% | 670,048 | 4.3% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 34,373 | 50.9% | 69,995 | 0.0% |
+| 140,000 | 124,363 | 0.7% | 124,409 | 0.7% | 125,256 | 0.0% |
+| 350,000 | 122,622 | 2.1% | 116,323 | 7.2% | 123,879 | 1.1% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 319,238 | 8.8% |
+| 700,000 | 319,440 | 54.4% |
+
+### Analysis
+
+**No performance regression from TCP sync socket changes.** This PR adds the engine loop, connect helpers, and DpdkTcpStream to the `dpdk-stdlib-tcp` crate — a separate crate from the UDP datapath with no shared hot-path code.
+
+**rust-dpdk at 700K PPS, 64B**: 698,965 RX (0.1% drop) — improved from Run #30's 697,859 (0.3%). Within normal ENA scheduling variance, tracking native-dpdk closely.
+
+**rust-dpdk at 700K PPS, 512B**: 698,847 RX (0.2% drop) — consistent with Run #30's 696,489 (0.5%). Both near-zero drop at line rate.
+
+**rust-dpdk at 700K PPS, 1400B**: 567,333 RX (18.9% drop at TX-capped ~700K) — both rust-dpdk and kernel hit ENA bandwidth limits at the same point. native-dpdk fares slightly better (4.3% drop) due to dedicated poll-mode driver.
+
+**tokio-dpdk at 350K PPS, 64B**: 319,238 RX (8.8% drop) — slightly improved from Run #30's 304,177 (13.1%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP sync socket implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
