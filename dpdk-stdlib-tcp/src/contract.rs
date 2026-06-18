@@ -76,6 +76,11 @@ impl CommandSender {
         self.wakeup.signal();
         result
     }
+
+    /// Get a reference to the engine wakeup signal.
+    pub fn wakeup(&self) -> &Arc<EngineWakeup> {
+        &self.wakeup
+    }
 }
 
 // --- Oneshot channel ---
