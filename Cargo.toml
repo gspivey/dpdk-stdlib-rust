@@ -13,6 +13,10 @@ members = [
   "apps/tokio-echo",
   "apps/plain-echo",
   "apps/synthetic-bench",
+  "apps/tcp-echo",
+  "apps/tcp-test-client",
+  "apps/tokio-tcp-echo",
+  "apps/tcp-synthetic-bench",
 ]
 
 [workspace.package]

@@ -1,0 +1,14 @@
+[package]
+name = "tokio-tcp-echo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["dpdk"]
+dpdk = ["dpdk-tokio/dpdk"]
+
+[dependencies]
+dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
