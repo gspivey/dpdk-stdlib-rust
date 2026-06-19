@@ -275,7 +275,7 @@ Socket options via `EngineCommand::SetOption`: `set_nodelay`, `set_keepalive`, `
 `dpdk-tokio/src/compat/tcp.rs` — async `TcpStream`: `AsyncRead` with register-first-then-recheck (register waker → try rx_ring.read → check eof/error → Poll::Pending), `AsyncWrite` with same pattern. `TcpStream::connect(addr).await` (DPDK-first, tokio-fallback for v6). Async `TcpListener` with `bind(addr).await` and `accept().await`. `OwnedReadHalf` (AsyncRead) + `OwnedWriteHalf` (AsyncWrite + shutdown-on-drop) for async split. Property test: `AtomicWaker` signaling under register-first-then-recheck (data → rx_ring + waker registered → waker called; no data between register and recheck without wake). (~350 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `10.1`, `10.2`, `10.3`, `10.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #94
 
 ---
 

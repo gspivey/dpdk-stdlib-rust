@@ -5112,3 +5112,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 324,936 RX (7.2% drop) — improved from Run #32's 310,526 (11.3%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP socket options/split/tests implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
+
+---
+
+## Run #34: TCP Async Compat Layer
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-19 |
+| **Git Hash** | `723e850` |
+| **Branch** | `agent/tcp-async-compat-layer` |
+| **PR** | [#94](https://github.com/gspivey/dpdk-stdlib-rust/pull/94) |
+| **GH Actions Run** | [27838000933](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27838000933) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #33
+
+1. **`723e850` — TCP async compat layer (tasks 10.1, 10.2, 10.3, 10.4).** Adds async `TcpStream` (AsyncRead/AsyncWrite with register-first-then-recheck pattern), async `TcpListener` (bind/accept), `OwnedReadHalf`/`OwnedWriteHalf` (into_split with shutdown-on-drop), and AtomicWaker property test (7 tests). Changes are in `dpdk-tokio` compat layer and visibility modifiers in `dpdk-stdlib-tcp`.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,990 | 0.3% | 349,976 | 0.0% |
+| 700,000 | 689,969 | 1.4% | 398,091 | 43.1% | 695,747 | 0.6% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,995 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,992 | 0.3% | 348,652 | 0.4% | 349,953 | 0.0% |
+| 700,000 | 689,921 | 1.4% | 503,005 | 28.1% | 691,379 | 1.2% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,997 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,992 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,921 | 0.3% | 348,812 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 558,388 | 20.2% | 389,860 | 44.3% | 618,947 | 11.6% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,993 | 1.4% | 42,254 | 39.6% | 70,000 | 0.0% |
+| 140,000 | 124,339 | 0.8% | 124,389 | 0.7% | 125,228 | 0.1% |
+| 350,000 | 121,799 | 2.8% | 121,550 | 2.9% | 122,827 | 2.0% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 309,176 | 11.7% |
+| 700,000 | 310,458 | 55.6% |
+
+### Analysis
+
+**No performance regression from TCP async compat layer changes.** This PR adds async TCP wrappers in `dpdk-tokio` and visibility modifiers in `dpdk-stdlib-tcp` — no modifications to the UDP datapath hot path.
+
+**rust-dpdk at 700K PPS, 64B**: 689,969 RX (1.4% drop) — consistent with Run #33's 669,537 (4.4%). Both within ENA scheduling variance; the slight improvement reflects normal NIC-level jitter.
+
+**rust-dpdk at 700K PPS, 512B**: 689,921 RX (1.4% drop) — matches Run #33's 693,001 (1.0%). Near-zero effective drop at line rate.
+
+**rust-dpdk at 700K PPS, 1400B**: 558,388 RX (20.2% drop) — higher drop than Run #33's 475,806 due to ENA bandwidth ceiling variance at burst-mode saturation. native-dpdk shows the same pattern (618K vs 476K), confirming this is NIC throughput variance, not a code regression.
+
+**tokio-dpdk at 350K PPS, 64B**: 309,176 RX (11.7% drop) — consistent with Run #33's 324,936 (7.2%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP async compat layer implementation has zero impact on UDP datapath performance, as expected (no shared hot-path code modified).

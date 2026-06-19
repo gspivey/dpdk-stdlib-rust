@@ -21,26 +21,29 @@ use crate::stream::{connect_timeout, connect_v4, DpdkTcpStream};
 /// Provides the full `std::net::TcpStream` API surface. IPv4 addresses use
 /// the DPDK userspace path; IPv6 addresses fall back to the kernel stack.
 pub struct TcpStream {
-    inner: Inner,
+    inner: TcpStreamInner,
 }
 
 impl std::fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.inner {
-            Inner::Dpdk(s) => f.debug_struct("TcpStream")
+            TcpStreamInner::Dpdk(s) => f.debug_struct("TcpStream")
                 .field("local", &s.local_addr())
                 .field("peer", &s.peer_addr())
                 .field("backend", &"dpdk")
                 .finish(),
-            Inner::Std(s) => f.debug_struct("TcpStream")
+            TcpStreamInner::Std(s) => f.debug_struct("TcpStream")
                 .field("inner", s)
                 .finish(),
         }
     }
 }
 
-enum Inner {
+/// Inner representation of TcpStream — DPDK or kernel.
+pub enum TcpStreamInner {
+    /// DPDK userspace TCP path.
     Dpdk(DpdkTcpStream),
+    /// Standard library kernel TCP path (IPv6 fallback).
     Std(net::TcpStream),
 }
 
@@ -94,12 +97,12 @@ impl TcpStream {
                     remote, local, &ctx.backend, &ctx.resolver, &ctx.cmd_tx, &ctx.wakeup,
                 )?;
                 Ok(TcpStream {
-                    inner: Inner::Dpdk(DpdkTcpStream::new(handle, FourTuple { local, remote })),
+                    inner: TcpStreamInner::Dpdk(DpdkTcpStream::new(handle, FourTuple { local, remote })),
                 })
             }
             SocketAddr::V6(_) => {
                 let s = net::TcpStream::connect(remote)?;
-                Ok(TcpStream { inner: Inner::Std(s) })
+                Ok(TcpStream { inner: TcpStreamInner::Std(s) })
             }
         }
     }
@@ -118,12 +121,12 @@ impl TcpStream {
                     *addr, local, timeout, &ctx.backend, &ctx.resolver, &ctx.cmd_tx, &ctx.wakeup,
                 )?;
                 Ok(TcpStream {
-                    inner: Inner::Dpdk(DpdkTcpStream::new(handle, FourTuple { local, remote: *addr })),
+                    inner: TcpStreamInner::Dpdk(DpdkTcpStream::new(handle, FourTuple { local, remote: *addr })),
                 })
             }
             SocketAddr::V6(_) => {
                 let s = net::TcpStream::connect_timeout(addr, timeout)?;
-                Ok(TcpStream { inner: Inner::Std(s) })
+                Ok(TcpStream { inner: TcpStreamInner::Std(s) })
             }
         }
     }
@@ -131,51 +134,58 @@ impl TcpStream {
     /// Construct a `TcpStream` from an already-established DPDK connection.
     pub(crate) fn from_dpdk(stream: DpdkTcpStream) -> Self {
         TcpStream {
-            inner: Inner::Dpdk(stream),
+            inner: TcpStreamInner::Dpdk(stream),
         }
     }
 
     /// Construct a `TcpStream` from a standard library stream (IPv6 fallback).
     pub(crate) fn from_std(stream: net::TcpStream) -> Self {
         TcpStream {
-            inner: Inner::Std(stream),
+            inner: TcpStreamInner::Std(stream),
         }
+    }
+
+    /// Consume the stream and return the inner representation.
+    ///
+    /// Used by the async compat layer to extract the handle for `AsyncRead`/`AsyncWrite`.
+    pub fn into_inner(self) -> TcpStreamInner {
+        self.inner
     }
 
     /// Shut down the read, write, or both halves of this connection.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::Shutdown {
                     key: s.key,
                     how,
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.shutdown(how),
+            TcpStreamInner::Std(s) => s.shutdown(how),
         }
     }
 
     /// Returns the socket address of the remote peer.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.peer_addr()),
-            Inner::Std(s) => s.peer_addr(),
+            TcpStreamInner::Dpdk(s) => Ok(s.peer_addr()),
+            TcpStreamInner::Std(s) => s.peer_addr(),
         }
     }
 
     /// Returns the socket address of the local half.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.local_addr()),
-            Inner::Std(s) => s.local_addr(),
+            TcpStreamInner::Dpdk(s) => Ok(s.local_addr()),
+            TcpStreamInner::Std(s) => s.local_addr(),
         }
     }
 
     /// Sets the read timeout.
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 // Safety: we need interior mutability; DpdkTcpStream stores these as atomic-like.
                 // For now we route through the engine via SetOption.
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
@@ -184,91 +194,91 @@ impl TcpStream {
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.set_read_timeout(dur),
+            TcpStreamInner::Std(s) => s.set_read_timeout(dur),
         }
     }
 
     /// Sets the write timeout.
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::WriteTimeout(dur),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.set_write_timeout(dur),
+            TcpStreamInner::Std(s) => s.set_write_timeout(dur),
         }
     }
 
     /// Returns the read timeout.
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.read_timeout()),
-            Inner::Std(s) => s.read_timeout(),
+            TcpStreamInner::Dpdk(s) => Ok(s.read_timeout()),
+            TcpStreamInner::Std(s) => s.read_timeout(),
         }
     }
 
     /// Returns the write timeout.
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.write_timeout()),
-            Inner::Std(s) => s.write_timeout(),
+            TcpStreamInner::Dpdk(s) => Ok(s.write_timeout()),
+            TcpStreamInner::Std(s) => s.write_timeout(),
         }
     }
 
     /// Sets TCP_NODELAY (disables Nagle's algorithm).
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::Nodelay(nodelay),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.set_nodelay(nodelay),
+            TcpStreamInner::Std(s) => s.set_nodelay(nodelay),
         }
     }
 
     /// Gets the TCP_NODELAY value.
     pub fn nodelay(&self) -> io::Result<bool> {
         match &self.inner {
-            Inner::Dpdk(_) => {
+            TcpStreamInner::Dpdk(_) => {
                 // TODO: query engine for current nodelay state
                 Ok(false)
             }
-            Inner::Std(s) => s.nodelay(),
+            TcpStreamInner::Std(s) => s.nodelay(),
         }
     }
 
     /// Sets the TTL value.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::Ttl(ttl as u8),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.set_ttl(ttl),
+            TcpStreamInner::Std(s) => s.set_ttl(ttl),
         }
     }
 
     /// Gets the TTL value.
     pub fn ttl(&self) -> io::Result<u32> {
         match &self.inner {
-            Inner::Dpdk(_) => Ok(64), // Default TTL
-            Inner::Std(s) => s.ttl(),
+            TcpStreamInner::Dpdk(_) => Ok(64), // Default TTL
+            TcpStreamInner::Std(s) => s.ttl(),
         }
     }
 
     /// Sets SO_LINGER.
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 *s.handle.linger.lock().unwrap() = linger;
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
@@ -276,7 +286,7 @@ impl TcpStream {
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(_) => {
+            TcpStreamInner::Std(_) => {
                 // std::net::TcpStream::set_linger is unstable; for the kernel
                 // fallback path we accept the limitation silently.
                 Ok(())
@@ -287,8 +297,8 @@ impl TcpStream {
     /// Gets SO_LINGER.
     pub fn linger(&self) -> io::Result<Option<Duration>> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.handle.linger.lock().unwrap().clone()),
-            Inner::Std(_) => {
+            TcpStreamInner::Dpdk(s) => Ok(s.handle.linger.lock().unwrap().clone()),
+            TcpStreamInner::Std(_) => {
                 // std::net::TcpStream::linger is unstable; return None for kernel path.
                 Ok(None)
             }
@@ -298,85 +308,85 @@ impl TcpStream {
     /// Sets non-blocking mode.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::Nonblocking(nonblocking),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(s) => s.set_nonblocking(nonblocking),
+            TcpStreamInner::Std(s) => s.set_nonblocking(nonblocking),
         }
     }
 
     /// Sets TCP keepalive configuration.
     pub fn set_keepalive(&self, config: Option<KeepaliveConfig>) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::Keepalive(config),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(_) => Ok(()), // Kernel handles keepalive internally
+            TcpStreamInner::Std(_) => Ok(()), // Kernel handles keepalive internally
         }
     }
 
     /// Sets SO_REUSEADDR.
     pub fn set_reuseaddr(&self, reuseaddr: bool) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::ReuseAddr(reuseaddr),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(_) => Ok(()),
+            TcpStreamInner::Std(_) => Ok(()),
         }
     }
 
     /// Sets the receive buffer size.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::RecvBufSize(size),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(_) => Ok(()),
+            TcpStreamInner::Std(_) => Ok(()),
         }
     }
 
     /// Sets the send buffer size.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 s.handle.cmd_tx.send(EngineCommand::SetOption {
                     key: s.key,
                     option: SocketOption::SendBufSize(size),
                 }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
                 Ok(())
             }
-            Inner::Std(_) => Ok(()),
+            TcpStreamInner::Std(_) => Ok(()),
         }
     }
 
     /// Returns the pending socket error, if any.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         match &self.inner {
-            Inner::Dpdk(s) => Ok(s.handle.peek_error().map(|e| e.into())),
-            Inner::Std(s) => s.take_error(),
+            TcpStreamInner::Dpdk(s) => Ok(s.handle.peek_error().map(|e| e.into())),
+            TcpStreamInner::Std(s) => s.take_error(),
         }
     }
 
     /// Receives data without removing it from the buffer.
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 // Peek: read from rx_ring without advancing the read pointer.
                 let n = s.handle.rx_ring.peek(buf);
                 if n > 0 {
@@ -392,7 +402,7 @@ impl TcpStream {
                 // when empty (same behavior as nonblocking).
                 Err(io::Error::new(io::ErrorKind::WouldBlock, "no data available to peek"))
             }
-            Inner::Std(s) => s.peek(buf),
+            TcpStreamInner::Std(s) => s.peek(buf),
         }
     }
 
@@ -401,12 +411,12 @@ impl TcpStream {
     /// On the DPDK arm, this returns `Unsupported` — use `into_split()` instead.
     pub fn try_clone(&self) -> io::Result<TcpStream> {
         match &self.inner {
-            Inner::Dpdk(_) => Err(io::Error::new(
+            TcpStreamInner::Dpdk(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "try_clone not supported for DPDK TCP streams; use into_split()",
             )),
-            Inner::Std(s) => Ok(TcpStream {
-                inner: Inner::Std(s.try_clone()?),
+            TcpStreamInner::Std(s) => Ok(TcpStream {
+                inner: TcpStreamInner::Std(s.try_clone()?),
             }),
         }
     }
@@ -414,13 +424,13 @@ impl TcpStream {
     /// Split this stream into owned read and write halves.
     pub fn into_split(self) -> io::Result<(crate::split::OwnedReadHalf, crate::split::OwnedWriteHalf)> {
         match self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 let handle = s.handle.clone();
                 let key = s.key;
                 std::mem::forget(s);
                 Ok(crate::split::into_split_dpdk(handle, key))
             }
-            Inner::Std(_) => Err(io::Error::new(
+            TcpStreamInner::Std(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "into_split not supported for kernel TCP streams; use try_clone()",
             )),
@@ -431,8 +441,8 @@ impl TcpStream {
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
-            Inner::Dpdk(s) => s.read(buf),
-            Inner::Std(s) => s.read(buf),
+            TcpStreamInner::Dpdk(s) => s.read(buf),
+            TcpStreamInner::Std(s) => s.read(buf),
         }
     }
 }
@@ -440,15 +450,15 @@ impl Read for TcpStream {
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match &mut self.inner {
-            Inner::Dpdk(s) => s.write(buf),
-            Inner::Std(s) => s.write(buf),
+            TcpStreamInner::Dpdk(s) => s.write(buf),
+            TcpStreamInner::Std(s) => s.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.inner {
-            Inner::Dpdk(s) => s.flush(),
-            Inner::Std(s) => s.flush(),
+            TcpStreamInner::Dpdk(s) => s.flush(),
+            TcpStreamInner::Std(s) => s.flush(),
         }
     }
 }
@@ -456,7 +466,7 @@ impl Write for TcpStream {
 impl Read for &TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 // Serialize via read_mutex (P0-C).
                 let _guard = s.handle.read_mutex.lock().unwrap();
                 let deadline = s.read_timeout().map(|d| std::time::Instant::now() + d);
@@ -496,7 +506,7 @@ impl Read for &TcpStream {
                     }
                 }
             }
-            Inner::Std(s) => (&*s).read(buf),
+            TcpStreamInner::Std(s) => (&*s).read(buf),
         }
     }
 }
@@ -504,7 +514,7 @@ impl Read for &TcpStream {
 impl Write for &TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match &self.inner {
-            Inner::Dpdk(s) => {
+            TcpStreamInner::Dpdk(s) => {
                 // Serialize via write_mutex (P0-C).
                 let _guard = s.handle.write_mutex.lock().unwrap();
                 let deadline = s.write_timeout().map(|d| std::time::Instant::now() + d);
@@ -541,14 +551,14 @@ impl Write for &TcpStream {
                     }
                 }
             }
-            Inner::Std(s) => (&*s).write(buf),
+            TcpStreamInner::Std(s) => (&*s).write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match &self.inner {
-            Inner::Dpdk(_) => Ok(()),
-            Inner::Std(s) => (&*s).flush(),
+            TcpStreamInner::Dpdk(_) => Ok(()),
+            TcpStreamInner::Std(s) => (&*s).flush(),
         }
     }
 }
@@ -564,8 +574,13 @@ pub fn init_tcp_context(ctx: TcpContext) {
     TCP_CONTEXT.get_or_init(|| Arc::new(ctx));
 }
 
+/// Check if the TCP context has been initialized.
+pub fn is_tcp_context_initialized() -> bool {
+    TCP_CONTEXT.get().is_some()
+}
+
 /// Get the global TCP context.
-pub(crate) fn get_tcp_context() -> io::Result<Arc<TcpContext>> {
+pub fn get_tcp_context() -> io::Result<Arc<TcpContext>> {
     TCP_CONTEXT
         .get()
         .cloned()

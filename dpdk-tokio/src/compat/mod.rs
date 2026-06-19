@@ -52,7 +52,13 @@
 
 pub mod net;
 pub mod tokio;
+pub mod tcp;
+pub mod tcp_listener;
+pub mod tcp_split;
 
 // Re-export for convenience
 pub use net::UdpSocket as StdUdpSocket;
 pub use tokio::UdpSocket as TokioUdpSocket;
+pub use tcp::TcpStream;
+pub use tcp_listener::TcpListener;
+pub use tcp_split::{OwnedReadHalf, OwnedWriteHalf};
