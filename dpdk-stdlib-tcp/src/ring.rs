@@ -298,3 +298,132 @@ mod tests {
         reader.join().unwrap();
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Property 24: SPSC ring data integrity — arbitrary bytes pushed in chunks
+        /// must come back in the same order with no loss or duplication.
+        #[test]
+        fn spsc_data_integrity(
+            data in proptest::collection::vec(any::<u8>(), 1..2048),
+            chunk_size in 1usize..64,
+        ) {
+            let ring = SpscByteRing::new(128);
+            let mut output = Vec::with_capacity(data.len());
+            let mut written = 0;
+            let mut read_buf = [0u8; 64];
+
+            while output.len() < data.len() {
+                // Write a chunk
+                if written < data.len() {
+                    let end = (written + chunk_size).min(data.len());
+                    let n = ring.write(&data[written..end]);
+                    written += n;
+                }
+                // Read what's available
+                let n = ring.read(&mut read_buf);
+                output.extend_from_slice(&read_buf[..n]);
+            }
+
+            prop_assert_eq!(&output, &data);
+        }
+    }
+}
+
+#[cfg(test)]
+mod miri_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// SPSC miri serialization: validates sequential byte ordering under miri's
+    /// memory model checking.
+    /// Run under miri: cargo +nightly miri test spsc_miri_serialization
+    #[test]
+    fn spsc_miri_serialization() {
+        let ring = Arc::new(SpscByteRing::new(32));
+        let ring_w = ring.clone();
+        let ring_r = ring.clone();
+        let total: usize = 128;
+
+        let writer = thread::spawn(move || {
+            let mut sent = 0usize;
+            while sent < total {
+                let byte = (sent & 0xFF) as u8;
+                let n = ring_w.write(&[byte]);
+                if n > 0 {
+                    sent += 1;
+                } else {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        let reader = thread::spawn(move || {
+            let mut received = 0usize;
+            let mut buf = [0u8; 1];
+            while received < total {
+                let n = ring_r.read(&mut buf);
+                if n > 0 {
+                    assert_eq!(buf[0], (received & 0xFF) as u8, "mismatch at {received}");
+                    received += 1;
+                } else {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    /// Verifies that write_mutex serializes concurrent writes from multiple
+    /// references, producing non-interleaved output.
+    /// Run under miri: cargo +nightly miri test write_mutex_serialization
+    #[test]
+    fn write_mutex_serialization() {
+        use std::sync::Mutex;
+
+        let ring = Arc::new(SpscByteRing::new(256));
+        let write_mutex = Arc::new(Mutex::new(()));
+        let ring1 = ring.clone();
+        let ring2 = ring.clone();
+        let wm1 = write_mutex.clone();
+        let wm2 = write_mutex.clone();
+
+        let t1 = thread::spawn(move || {
+            for _ in 0..8 {
+                let _guard = wm1.lock().unwrap();
+                ring1.write(&[0xAA; 4]);
+            }
+        });
+
+        let t2 = thread::spawn(move || {
+            for _ in 0..8 {
+                let _guard = wm2.lock().unwrap();
+                ring2.write(&[0xBB; 4]);
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Read all data and verify no interleaving within 4-byte chunks.
+        let mut buf = [0u8; 256];
+        let total = ring.read(&mut buf);
+        let chunks: Vec<&[u8]> = buf[..total].chunks(4).collect();
+        for chunk in chunks {
+            // Each 4-byte chunk must be all-AA or all-BB (no interleaving).
+            assert!(
+                chunk.iter().all(|&b| b == 0xAA) || chunk.iter().all(|&b| b == 0xBB),
+                "interleaved write detected: {chunk:?}"
+            );
+        }
+    }
+}

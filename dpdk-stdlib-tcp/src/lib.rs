@@ -14,6 +14,7 @@ pub mod error;
 pub mod isn;
 pub mod ring;
 pub mod seq;
+pub mod split;
 pub mod state;
 pub mod stream;
 pub mod tcb;
@@ -29,6 +30,7 @@ pub use codec::{
 // Re-export public socket API types.
 pub use tcp_stream::{TcpStream, TcpContext, init_tcp_context};
 pub use tcp_listener::{TcpListener, Incoming};
+pub use split::{OwnedReadHalf, OwnedWriteHalf};
 
 // --- Constants ---
 

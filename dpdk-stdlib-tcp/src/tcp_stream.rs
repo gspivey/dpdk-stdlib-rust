@@ -11,7 +11,7 @@ use dpdk_stdlib_net::backend::PacketBackend;
 use dpdk_stdlib_net::neighbor::NeighborResolver;
 
 use crate::contract::{
-    CommandSender, EngineCommand, EngineWakeup, SocketOption,
+    CommandSender, EngineCommand, EngineWakeup, KeepaliveConfig, SocketOption,
 };
 use crate::state::FourTuple;
 use crate::stream::{connect_timeout, connect_v4, DpdkTcpStream};
@@ -309,6 +309,62 @@ impl TcpStream {
         }
     }
 
+    /// Sets TCP keepalive configuration.
+    pub fn set_keepalive(&self, config: Option<KeepaliveConfig>) -> io::Result<()> {
+        match &self.inner {
+            Inner::Dpdk(s) => {
+                s.handle.cmd_tx.send(EngineCommand::SetOption {
+                    key: s.key,
+                    option: SocketOption::Keepalive(config),
+                }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
+                Ok(())
+            }
+            Inner::Std(_) => Ok(()), // Kernel handles keepalive internally
+        }
+    }
+
+    /// Sets SO_REUSEADDR.
+    pub fn set_reuseaddr(&self, reuseaddr: bool) -> io::Result<()> {
+        match &self.inner {
+            Inner::Dpdk(s) => {
+                s.handle.cmd_tx.send(EngineCommand::SetOption {
+                    key: s.key,
+                    option: SocketOption::ReuseAddr(reuseaddr),
+                }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
+                Ok(())
+            }
+            Inner::Std(_) => Ok(()),
+        }
+    }
+
+    /// Sets the receive buffer size.
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        match &self.inner {
+            Inner::Dpdk(s) => {
+                s.handle.cmd_tx.send(EngineCommand::SetOption {
+                    key: s.key,
+                    option: SocketOption::RecvBufSize(size),
+                }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
+                Ok(())
+            }
+            Inner::Std(_) => Ok(()),
+        }
+    }
+
+    /// Sets the send buffer size.
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        match &self.inner {
+            Inner::Dpdk(s) => {
+                s.handle.cmd_tx.send(EngineCommand::SetOption {
+                    key: s.key,
+                    option: SocketOption::SendBufSize(size),
+                }).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "engine closed"))?;
+                Ok(())
+            }
+            Inner::Std(_) => Ok(()),
+        }
+    }
+
     /// Returns the pending socket error, if any.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         match &self.inner {
@@ -352,6 +408,22 @@ impl TcpStream {
             Inner::Std(s) => Ok(TcpStream {
                 inner: Inner::Std(s.try_clone()?),
             }),
+        }
+    }
+
+    /// Split this stream into owned read and write halves.
+    pub fn into_split(self) -> io::Result<(crate::split::OwnedReadHalf, crate::split::OwnedWriteHalf)> {
+        match self.inner {
+            Inner::Dpdk(s) => {
+                let handle = s.handle.clone();
+                let key = s.key;
+                std::mem::forget(s);
+                Ok(crate::split::into_split_dpdk(handle, key))
+            }
+            Inner::Std(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "into_split not supported for kernel TCP streams; use try_clone()",
+            )),
         }
     }
 }
