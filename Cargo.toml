@@ -17,6 +17,7 @@ members = [
   "apps/tcp-test-client",
   "apps/tokio-tcp-echo",
   "apps/tcp-synthetic-bench",
+  "apps/plain-tcp-echo",
 ]
 
 [workspace.package]
