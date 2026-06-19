@@ -5190,3 +5190,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 309,176 RX (11.7% drop) — consistent with Run #33's 324,936 (7.2%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP async compat layer implementation has zero impact on UDP datapath performance, as expected (no shared hot-path code modified).
+
+---
+
+## Run #35: TCP DUT Test Binaries and Synthetic Benchmark
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-19 |
+| **Git Hash** | `9cac2d1` |
+| **Branch** | `agent/tcp-dut-binaries-bench` |
+| **PR** | [#95](https://github.com/gspivey/dpdk-stdlib-rust/pull/95) |
+| **GH Actions Run** | [27845201493](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27845201493) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #34
+
+1. **`9cac2d1` — TCP DUT test binaries and synthetic benchmark (tasks 12.1, 12.2, 13.1, 13.2, 13.3).** Adds `tcp-echo` (sync echo server), `tcp-test-client` (4 test modes), `tokio-tcp-echo` (async echo via dpdk-tokio), and `tcp-synthetic-bench` (mock PacketBackend benchmark). New workspace members only — no changes to existing UDP/TCP engine code.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,974 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,893 | 0.3% | 348,926 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 694,115 | 0.8% | 604,192 | 13.7% | 699,435 | 0.1% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,980 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,985 | 0.3% | 348,812 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 693,133 | 1.0% | 314,470 | 55.1% | 697,607 | 0.3% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,997 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,898 | 0.3% | 348,196 | 0.5% | 349,995 | 0.0% |
+| 700,000 | 565,823 | 19.2% | 322,922 | 53.9% | 639,236 | 8.7% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 68,993 | 1.4% | 47,353 | 32.4% | 69,999 | 0.0% |
+| 140,000 | 124,305 | 0.8% | 124,266 | 0.8% | 125,234 | 0.0% |
+| 350,000 | 118,737 | 5.2% | 122,842 | 2.0% | 122,319 | 2.4% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 69,000 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 320,749 | 8.4% |
+| 700,000 | 320,776 | 54.2% |
+
+### Analysis
+
+**No performance regression from TCP DUT binary additions.** This PR adds new workspace member crates (tcp-echo, tcp-test-client, tokio-tcp-echo, tcp-synthetic-bench) — no modifications to existing UDP or TCP engine hot-path code.
+
+**rust-dpdk at 700K PPS, 64B**: 694,115 RX (0.8% drop) — improved over Run #34's 689,969 (1.4%). Within normal ENA scheduling variance.
+
+**rust-dpdk at 700K PPS, 512B**: 693,133 RX (1.0% drop) — consistent with Run #34's 689,921 (1.4%).
+
+**native-dpdk at 700K PPS, 64B**: 699,435 RX (0.1% drop) — excellent, near-zero-drop line rate.
+
+**tokio-dpdk at 350K PPS, 64B**: 320,749 RX (8.4% drop) — consistent with Run #34's 309,176 (11.7%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP DUT test binary additions have zero impact on UDP datapath performance, as expected (new crates only, no shared hot-path code modified).

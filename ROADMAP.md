@@ -284,7 +284,7 @@ Socket options via `EngineCommand::SetOption`: `set_nodelay`, `set_keepalive`, `
 Three binary crates: `apps/tcp-echo` (sync echo server, `--ip`/`--port`, graceful shutdown), `apps/tcp-test-client` (modes: `handshake`/`bidir`/`shutdown`/`std-parity`), `apps/tokio-tcp-echo` (async echo via dpdk-tokio). `apps/tcp-synthetic-bench`: mock `PacketBackend`, measures connection establishment latency + single-stream throughput + engine tick time, outputs markdown (stdout) + JSON (stderr). Add `tcp-synthetic-perf` job to `integration-tests.yml`: run bench on PR, post markdown comment, upload artifact (30-day retention).
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `12.1`, `12.2`, `13.1`, `13.2`, `13.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #95
 
 ---
 
