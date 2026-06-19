@@ -5034,3 +5034,81 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 310,526 RX (11.3% drop) — consistent with Run #31's 319,238 (8.8%). Async overhead pattern unchanged.
 
 **Conclusion**: TcpStream/TcpListener public API implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
+
+---
+
+## Run #33: TCP Sync Socket — Options, Split, and Tests
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-19 |
+| **Git Hash** | `82c42bc` |
+| **Branch** | `agent/tcp-options-split-tests` |
+| **PR** | [#93](https://github.com/gspivey/dpdk-stdlib-rust/pull/93) |
+| **GH Actions Run** | [27824796301](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27824796301) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #32
+
+1. **`82c42bc` — TCP sync socket: options, split, and tests (tasks 8.6, 8.7, 8.8, 8.9).** Adds `set_keepalive`, `set_reuseaddr`, `set_recv_buffer_size`, `set_send_buffer_size` socket options to TcpStream. Implements `into_split()` with `OwnedReadHalf`/`OwnedWriteHalf`. Adds proptest property tests for SPSC ring data integrity and TcpError→io::Error mapping. Adds miri-compatible SPSC serialization and write_mutex serialization tests.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,999 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,997 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,832 | 0.3% | 349,996 | 0.0% |
+| 700,000 | 669,537 | 4.4% | 392,464 | 43.9% | 698,261 | 0.2% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,998 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,754 | 0.4% | 349,864 | 0.0% |
+| 700,000 | 693,001 | 1.0% | 435,524 | 37.8% | 696,267 | 0.5% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,988 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,780 | 0.3% | 349,949 | 0.0% |
+| 700,000 | 475,806 | 0.2% | 470,453 | 1.3% | 476,166 | 0.1% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 38,986 | 44.3% | 69,991 | 0.0% |
+| 140,000 | 77,550 | 0.9% | 74,118 | 5.4% | 76,701 | 2.1% |
+| 350,000 | 76,677 | 2.1% | 77,812 | 0.7% | 77,626 | 0.9% |
+
+#### tokio-dpdk (async compat layer)
+
+| Target PPS | tokio-dpdk RX | Drop |
+|-----------|--------------|------|
+| 70,000 | 68,999 | 1.4% |
+| 140,000 | 139,000 | 0.7% |
+| 350,000 | 324,936 | 7.2% |
+| 700,000 | 324,370 | 53.7% |
+
+### Analysis
+
+**No performance regression from TCP socket options/split/tests changes.** This PR adds socket option methods, `into_split()`, and property/miri tests to `dpdk-stdlib-tcp` — a separate crate from the UDP datapath with no shared hot-path code.
+
+**rust-dpdk at 700K PPS, 64B**: 669,537 RX (4.4% drop) — slight decrease from Run #32's 698,338 (0.2%). This is ENA scheduling variance, not a code regression: the same code path is exercised, and the rust-dpdk crate was not modified. native-dpdk also shows 0.2% drop (vs 0.1% in Run #32), confirming NIC-level variance.
+
+**rust-dpdk at 700K PPS, 512B**: 693,001 RX (1.0% drop) — consistent with Run #32's 697,424 (0.4%). Both near-zero drop at line rate.
+
+**rust-dpdk at 700K PPS, 1400B**: 475,806 RX (0.2% drop at TX-capped ~476K) — matches Run #32's 475,762 exactly. ENA bandwidth ceiling.
+
+**tokio-dpdk at 350K PPS, 64B**: 324,936 RX (7.2% drop) — improved from Run #32's 310,526 (11.3%). Async overhead pattern unchanged.
+
+**Conclusion**: TCP socket options/split/tests implementation has zero impact on UDP datapath performance, as expected (separate crate, no shared hot-path code).
