@@ -187,8 +187,8 @@ pub fn connect_timeout(
 /// A blocking TCP stream backed by DPDK. Reads/writes go through SPSC rings
 /// shared with the engine thread.
 pub struct DpdkTcpStream {
-    pub(crate) handle: Arc<ConnectionHandle>,
-    pub(crate) key: FourTuple,
+    pub handle: Arc<ConnectionHandle>,
+    pub key: FourTuple,
     // Per-stream settings (mirrored from handle for fast access).
     nonblocking: bool,
     read_timeout: Option<Duration>,

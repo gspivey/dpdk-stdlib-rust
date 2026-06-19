@@ -28,7 +28,7 @@ pub use codec::{
 };
 
 // Re-export public socket API types.
-pub use tcp_stream::{TcpStream, TcpContext, init_tcp_context};
+pub use tcp_stream::{TcpStream, TcpContext, TcpStreamInner, init_tcp_context, is_tcp_context_initialized, get_tcp_context};
 pub use tcp_listener::{TcpListener, Incoming};
 pub use split::{OwnedReadHalf, OwnedWriteHalf};
 
