@@ -293,7 +293,7 @@ Three binary crates: `apps/tcp-echo` (sync echo server, `--ip`/`--port`, gracefu
 `scripts/perf-tests/tcp_echo_profile.py` (TRex TCP profile: connect, request-response, teardown; matches `udp_echo_profile.py` pattern). TCP benchmark runner covering 64/512/1400/65536 B payloads, P50/P90/P99 latency, CPS metrics. Structured JSON output schema (`test_name, backend, metric_name, metric_value, unit`). `plain-rust-tcp` DUT config using `std::net::TcpStream` for kernel comparison.
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `14.1`, `14.2`, `14.3`, `14.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #96
 
 ---
 
