@@ -85,3 +85,35 @@ mod tests {
         _assert_sync::<TcpError>();
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_tcp_error() -> impl Strategy<Value = (TcpError, io::ErrorKind)> {
+        prop_oneof![
+            Just((TcpError::ConnectionRefused, io::ErrorKind::ConnectionRefused)),
+            Just((TcpError::ConnectionReset, io::ErrorKind::ConnectionReset)),
+            Just((TcpError::ConnectionAborted, io::ErrorKind::ConnectionAborted)),
+            Just((TcpError::BrokenPipe, io::ErrorKind::BrokenPipe)),
+            Just((TcpError::NotConnected, io::ErrorKind::NotConnected)),
+            Just((TcpError::TimedOut, io::ErrorKind::TimedOut)),
+            Just((TcpError::AddrInUse, io::ErrorKind::AddrInUse)),
+            Just((TcpError::AddrNotAvailable, io::ErrorKind::AddrNotAvailable)),
+            ".*".prop_map(|s| (TcpError::InvalidPacket(s), io::ErrorKind::InvalidData)),
+            ".*".prop_map(|s| (TcpError::ResourceLimit(s), io::ErrorKind::Other)),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Property 19: Every TcpError variant maps to the correct io::ErrorKind.
+        #[test]
+        fn tcp_error_to_io_error_mapping((tcp_err, expected_kind) in arb_tcp_error()) {
+            let io_err: io::Error = tcp_err.into();
+            prop_assert_eq!(io_err.kind(), expected_kind);
+        }
+    }
+}

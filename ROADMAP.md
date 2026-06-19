@@ -266,7 +266,7 @@ Seven property-based tests covering the full engine: (1) state machine validity,
 Socket options via `EngineCommand::SetOption`: `set_nodelay`, `set_keepalive`, `set_linger`, `set_reuseaddr`, `set_recv_buffer_size`, `set_send_buffer_size`, `set_read_timeout`, `set_write_timeout`, `set_nonblocking`, `set_ttl`. `into_split`: set app_refcount = 2, create `OwnedReadHalf` (AsyncRead) + `OwnedWriteHalf` (AsyncWrite + Shutdown on drop). `mem::forget(self)` to avoid Drop→Close. Property tests: SPSC ring data integrity, `TcpError→io::Error` mapping. Loom/miri test: SPSC single-consumer invariant, read_mutex/write_mutex serialization. (~500 LOC)
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `8.6`, `8.7`, `8.8`, `8.9`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #93
 
 ---
 
