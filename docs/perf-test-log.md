@@ -3,6 +3,66 @@
 Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
+
+## Run #50: dpdk-stdlib-tcp TRex TCP Performance Profile and Benchmark Runner — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-19 |
+| **Git Hash** | `a955ce4` |
+| **Branch** | `agent/tcp-trex-perf-profile` |
+| **PR** | [#96](https://github.com/gspivey/dpdk-stdlib-rust/pull/96) |
+| **GH Actions Run** | [27851557307](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/27851557307) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #49
+
+1. **`a955ce4` — TCP TRex performance profile and benchmark runner.** Adds `tcp_echo_profile.py` (TRex ASTF TCP profile), `run_tcp_benchmark.py` (TCP benchmark runner with structured JSON output covering 64/512/1400/65536B payloads, P50/P90/P99 latency, CPS metrics), `plain-tcp-echo` kernel baseline DUT app, and `tcp-dut-configs.md`. Zero changes to any existing data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,994 | 0.7% | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,959 | 0.3% | 348,989 | 0.3% | 312,371 | 10.8% | 350,000 | 0.0% |
+| 700,000 | 597,558 | 14.6% | 675,214 | 3.5% | 326,711 | 53.3% | 677,629 | 3.2% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,975 | 0.7% | 139,000 | 0.7% | 138,997 | 0.7% | 139,967 | 0.0% |
+| 350,000 | 348,273 | 0.5% | 348,991 | 0.3% | 228,085 | 34.8% | 349,859 | 0.0% |
+| 700,000 | 429,936 | 38.6% | 624,461 | 10.8% | 228,976 | 67.3% | 654,924 | 6.4% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,998 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,957 | 0.7% | 139,000 | 0.7% | 138,982 | 0.7% | 139,996 | 0.0% |
+| 350,000 | 348,164 | 0.5% | 348,998 | 0.3% | 146,484 | 58.1% | 349,966 | 0.0% |
+| 700,000 | 442,823 | 6.8% | 464,944 | 2.3% | 155,406 | 67.4% | 471,457 | 1.0% |
+
+#### 8500-byte packets (jumbo, capped at 30 Gbps)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 31,926 | 54.4% | 68,992 | 1.4% | 54,458 | 22.2% | 69,994 | 0.0% |
+| 140,000 | 76,096 | 2.9% | 74,780 | 4.6% | 57,919 | 26.1% | 75,939 | 3.1% |
+| 350,000 | 77,828 | 0.7% | 73,087 | 6.7% | 57,648 | 26.4% | 76,665 | 2.1% |
+
+### Analysis
+
+No performance regression compared to Run #49. This PR adds TCP performance testing infrastructure (TRex ASTF profile, benchmark runner, kernel DUT baseline) with zero changes to any data-path crate. The UDP benchmark results confirm no collateral impact.
+
+---
+
 **Standard benchmarks** (include in every run entry):
 1. **Hardware PPS** — TRex on c6in.xlarge (measures NIC + DPDK + application stack)
 
