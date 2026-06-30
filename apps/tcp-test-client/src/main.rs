@@ -7,7 +7,7 @@
 //! - `std-parity`: compare dpdk-stdlib-tcp vs std::net::TcpStream byte-for-byte
 
 use clap::Parser;
-use dpdk_stdlib_tcp::TcpStream;
+use dpdk_stdlib_tcp::{init_dpdk_tcp_context, DpdkTcpRuntimeConfig, TcpStream};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::time::{Duration, Instant};
@@ -35,6 +35,31 @@ struct Args {
     /// Payload size in bytes (for bidir mode)
     #[arg(long, default_value_t = 64)]
     payload_size: usize,
+
+    /// Local source IPv4 for outbound DPDK connections (this client's data-ENI IP).
+    #[arg(long, default_value = "0.0.0.0")]
+    local_ip: String,
+
+    /// Gateway MAC (AA:BB:CC:DD:EE:FF) for AWS VPC (L3-routed). Required on EC2.
+    #[arg(long)]
+    gateway_mac: Option<String>,
+
+    /// Explicit DPDK EAL arguments (space-separated). Overrides DPDK_EAL_ARGS.
+    #[arg(long)]
+    eal_args: Option<String>,
+}
+
+/// Parse a colon-separated MAC string (`AA:BB:CC:DD:EE:FF`) into 6 octets.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn mode_handshake(target: &str, port: u16, count: u32) -> io::Result<()> {
@@ -183,6 +208,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("TCP Test Client");
     println!("Target: {}:{}", args.target, args.port);
+
+    // Stand up the DPDK TCP runtime before any DPDK connect. The std-parity mode
+    // also opens a std::net stream, which is unaffected.
+    let gateway_mac = match args.gateway_mac.as_deref() {
+        Some(s) => Some(parse_mac(s).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --gateway-mac: {s}"))
+        })?),
+        None => None,
+    };
+    init_dpdk_tcp_context(DpdkTcpRuntimeConfig {
+        port_id: 0,
+        local_ip: args.local_ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+        gateway_mac,
+        eal_args: args
+            .eal_args
+            .as_deref()
+            .map(|s| s.split_whitespace().map(String::from).collect()),
+        mtu: 9001,
+    })?;
 
     let result = match args.mode.as_str() {
         "handshake" => mode_handshake(&args.target, args.port, args.count),

@@ -10,5 +10,8 @@ dpdk = ["dpdk-tokio/dpdk"]
 
 [dependencies]
 dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio" }
+# Needed to initialise the shared DPDK TCP runtime/context before binding; the
+# compat listener reads the same process-wide context.
+dpdk-stdlib-tcp = { path = "../../dpdk-stdlib-tcp" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

@@ -108,10 +108,17 @@ pub struct TcpEngine {
     clock: Arc<dyn Clock>,
     /// Engine configuration.
     pub config: EngineConfig,
+    /// Real command sender, threaded into accept-side `ConnectionHandle`s so
+    /// the app can route Close/Shutdown/SetOption (and wake the engine on
+    /// writes). `None` in test/standalone use, where a dummy sender is used.
+    cmd_tx: Option<crate::contract::CommandSender>,
 }
 
 impl TcpEngine {
     /// Create a new engine with the given clock and config.
+    ///
+    /// Accept-side handles get a dummy command sender (no live engine loop).
+    /// For a running stack use [`TcpEngine::with_cmd_tx`].
     pub fn new(clock: Arc<dyn Clock>, config: EngineConfig) -> Self {
         let isn_gen = IsnGenerator::new(clock.as_ref());
         Self {
@@ -121,7 +128,23 @@ impl TcpEngine {
             isn_gen,
             clock,
             config,
+            cmd_tx: None,
         }
+    }
+
+    /// Create an engine wired to the live command sender.
+    ///
+    /// Accept-side `ConnectionHandle`s are built with `cmd_tx` (not a dummy),
+    /// so commands issued by accepted streams actually reach the engine loop
+    /// and writes signal its wakeup. The runtime bootstrap uses this.
+    pub fn with_cmd_tx(
+        clock: Arc<dyn Clock>,
+        config: EngineConfig,
+        cmd_tx: crate::contract::CommandSender,
+    ) -> Self {
+        let mut engine = Self::new(clock, config);
+        engine.cmd_tx = Some(cmd_tx);
+        engine
     }
 
     /// Get a reference to the engine's clock.
@@ -923,8 +946,10 @@ impl TcpEngine {
         //  and src_mac in the frame is the peer's MAC — we reverse them for outbound)
         let (src_mac, dst_mac) = extract_macs_from_segment(seg);
 
-        // Create a ConnectionHandle for this new connection
-        let cmd_tx = self.make_dummy_cmd_sender();
+        // Create a ConnectionHandle for this new connection. Use the real
+        // command sender when the engine is running under a live loop so the
+        // accepted stream can route commands and wake the engine on writes.
+        let cmd_tx = self.cmd_tx.clone().unwrap_or_else(|| self.make_dummy_cmd_sender());
         let handle = Arc::new(ConnectionHandle::new(65536, 65536, cmd_tx, *four_tuple));
 
         let mut tcb = Tcb::new(*four_tuple, iss, self.config.local_mss, handle.clone(), src_mac, dst_mac);
@@ -1905,7 +1930,8 @@ impl TcpEngine {
         let src_mac = frame_dst_mac;
         let dst_mac = frame_src_mac;
 
-        let cmd_tx = self.make_dummy_cmd_sender();
+        // Use the real command sender under a live engine loop (see handle_syn).
+        let cmd_tx = self.cmd_tx.clone().unwrap_or_else(|| self.make_dummy_cmd_sender());
         let handle = Arc::new(ConnectionHandle::new(65536, 65536, cmd_tx, *four_tuple));
 
         let mut tcb = Tcb::new(*four_tuple, iss, self.config.local_mss, handle.clone(), src_mac, dst_mac);
@@ -1953,6 +1979,43 @@ mod tests {
         let wakeup = Arc::new(EngineWakeup::new());
         let cmd_tx = CommandSender::new(tx, wakeup);
         Arc::new(ConnectionHandle::new(65536, 65536, cmd_tx, four_tuple))
+    }
+
+    #[test]
+    fn with_cmd_tx_threads_real_sender_to_accept_handle() {
+        // Regression: accept-side handles previously got a dead dummy
+        // CommandSender, so Close/Shutdown/SetOption from accepted streams went
+        // nowhere (and writes never woke the engine). With `with_cmd_tx`, the
+        // new TCB's handle must carry the live sender that reaches the engine.
+        let clock = Arc::new(MockClock::new());
+        let (raw_tx, rx) = mpsc::channel();
+        let wakeup = Arc::new(EngineWakeup::new());
+        let cmd_tx = CommandSender::new(raw_tx, wakeup);
+        let mut engine = TcpEngine::with_cmd_tx(clock, EngineConfig::default(), cmd_tx);
+
+        let listen_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (resp_tx, resp_rx) = oneshot_channel();
+        engine.on_command(EngineCommand::Listen {
+            addr: listen_addr,
+            backlog: 16,
+            response: resp_tx,
+        });
+        let _ = resp_rx.recv();
+
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let syn = make_syn_segment(peer, listen_addr, 1000);
+        let out = engine.on_segment_with_macs(&syn, [0xAA; 6], [0x02, 0, 0, 0, 0, 1]);
+        assert!(!out.is_empty(), "SYN should produce a SYN-ACK");
+
+        let four = FourTuple { local: listen_addr, remote: peer };
+        let tcb = engine.tcbs.get(&four).expect("TCB created for accepted SYN");
+        // The handle's cmd_tx must reach the engine's command channel, proving it
+        // is the live sender and not a dropped dummy.
+        tcb.handle
+            .cmd_tx
+            .send(EngineCommand::Close { key: four, linger: None })
+            .expect("send on accept-side handle cmd_tx");
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::Close { .. })));
     }
 
     fn make_syn_segment(src: SocketAddr, dst: SocketAddr, seq: u32) -> ParsedTcpSegment {

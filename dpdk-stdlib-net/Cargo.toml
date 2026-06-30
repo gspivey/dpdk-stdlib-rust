@@ -12,3 +12,8 @@ description = "Shared networking traits and backends for dpdk-stdlib crates"
 dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
 dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 libc = { workspace = true }
+
+[dev-dependencies]
+# DpdkBackend tests each init+drop a real EAL; the stub's EAL lifecycle state is
+# process-global, so these must not run concurrently.
+serial_test = { workspace = true }
