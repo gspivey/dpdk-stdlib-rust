@@ -29,6 +29,9 @@ async fn main() {
     let mut ip = String::from("0.0.0.0");
     let mut port: u16 = 4433;
     let mut gateway_mac: Option<[u8; 6]> = None;
+    let mut eal_args: Option<Vec<String>> = None;
+    let mut dpdk_port: u16 = 0;
+    let mut throughput = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -45,6 +48,19 @@ async fn main() {
             "--gateway-mac" => {
                 i += 1;
                 gateway_mac = Some(parse_mac(&args[i]));
+            }
+            "--eal-args" => {
+                i += 1;
+                eal_args = Some(args[i].split_whitespace().map(String::from).collect());
+            }
+            "--dpdk-port" => {
+                i += 1;
+                dpdk_port = args[i].parse().expect("invalid dpdk-port");
+            }
+            // Stream-echo each chunk as it arrives (for sustained-throughput
+            // clients that keep a stream open) instead of buffering until EOF.
+            "--throughput" => {
+                throughput = true;
             }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -68,9 +84,14 @@ async fn main() {
     println!("---END CERT PEM---");
 
     // Build the DPDK provider
-    let mut builder = DpdkProvider::builder().with_addr(addr);
+    let mut builder = DpdkProvider::builder()
+        .with_addr(addr)
+        .with_dpdk_port(dpdk_port);
     if let Some(mac) = gateway_mac {
         builder = builder.with_gateway_mac(mac);
+    }
+    if let Some(args) = eal_args {
+        builder = builder.with_eal_args(args);
     }
     let (provider, mut handle) = builder.build();
 
@@ -102,12 +123,24 @@ async fn main() {
         tokio::spawn(async move {
             while let Ok(Some(mut stream)) = conn.accept_bidirectional_stream().await {
                 tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    while let Ok(Some(chunk)) = stream.receive().await {
-                        buf.extend_from_slice(&chunk);
+                    if throughput {
+                        // Streaming echo: bounce each chunk back as it arrives so a
+                        // client can keep the stream open and sustain throughput.
+                        while let Ok(Some(chunk)) = stream.receive().await {
+                            if stream.send(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = stream.finish();
+                    } else {
+                        // Buffer-until-EOF echo (request/response correctness path).
+                        let mut buf = Vec::new();
+                        while let Ok(Some(chunk)) = stream.receive().await {
+                            buf.extend_from_slice(&chunk);
+                        }
+                        let _ = stream.send(bytes::Bytes::from(buf)).await;
+                        let _ = stream.finish();
                     }
-                    let _ = stream.send(bytes::Bytes::from(buf)).await;
-                    let _ = stream.finish();
                 });
             }
         });

@@ -4,7 +4,7 @@ use crate::event_loop::{event_loop_with_tx_queue, LoopConfig};
 use crate::path_handle::DpdkPathHandle;
 use crate::stats::{ProviderHandle, ProviderStats, SharedThread};
 use crate::tx::DpdkTxQueue;
-use dpdk_udp::{BackendConfig, IcmpHandler, PacketBackend};
+use dpdk_udp::{BackendConfig, BackendType, DpdkBackend, IcmpHandler, PacketBackend};
 use s2n_quic_core::endpoint::Endpoint;
 use s2n_quic_core::inet::{IpV4Address, SocketAddress};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -71,6 +71,15 @@ impl ProviderBuilder {
 
     pub fn with_backend_config(mut self, config: BackendConfig) -> Self {
         self.backend_config = config;
+        self
+    }
+
+    /// Select a real DPDK NIC by port id. Sets the backend type to `Dpdk` so
+    /// `start()` builds a real-NIC backend via `DpdkBackend::new_real_nic`
+    /// (which probes PCI for the vfio-bound ENI — unlike the `--no-pci` path).
+    pub fn with_dpdk_port(mut self, port_id: u16) -> Self {
+        self.backend_config.backend_type = BackendType::Dpdk;
+        self.backend_config.dpdk_port_id = port_id;
         self
     }
 
@@ -215,10 +224,21 @@ impl s2n_quic::provider::io::Provider for DpdkProvider {
             std::net::IpAddr::V6(_) => return Err(DpdkQuicError::UnsupportedAddressFamily),
         };
 
-        // 2. Initialize backend
+        // 2. Initialize backend.
+        // An injected backend (loopback bench / tests) takes precedence. Otherwise,
+        // for a real NIC we use DpdkBackend::new_real_nic — NOT create_backend /
+        // DpdkBackend::new, which init EAL with `--no-pci` and therefore never probe
+        // the vfio-pci ENI (a null device). new_real_nic honors `eal_args`, which
+        // were previously stored but never reached EAL.
         let backend: Arc<dyn PacketBackend> = match self.config.backend_override {
             Some(b) => b,
-            None => dpdk_udp::create_backend(&self.config.backend_config)?,
+            None => match self.config.backend_config.backend_type {
+                BackendType::Dpdk | BackendType::Auto => Arc::new(DpdkBackend::new_real_nic(
+                    self.config.backend_config.dpdk_port_id,
+                    self.config.eal_args.as_deref(),
+                )?) as Arc<dyn PacketBackend>,
+                _ => dpdk_udp::create_backend(&self.config.backend_config)?,
+            },
         };
 
         // 3. Resolve gateway MAC
@@ -272,6 +292,7 @@ impl s2n_quic::provider::io::Provider for DpdkProvider {
 mod tests {
     use super::*;
     use s2n_quic::provider::io::Provider;
+    use serial_test::serial;
 
     #[test]
     fn builder_defaults() {
@@ -330,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn provider_start_stub_mode() {
         let addr: SocketAddr = "10.0.0.1:4433".parse().unwrap();
         let (provider, mut handle) = DpdkProvider::builder()
@@ -363,6 +385,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn provider_handle_shutdown_joins_thread() {
         let addr: SocketAddr = "10.0.0.1:4433".parse().unwrap();
         let (provider, mut handle) = DpdkProvider::builder()
@@ -388,5 +411,29 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let snap_later = handle.stats();
         assert_eq!(snap_after.timer_wakeups, snap_later.timer_wakeups);
+    }
+
+    // With no backend override and a Dpdk/Auto backend type, start() must route
+    // through DpdkBackend::new_real_nic and reach the event loop. This also proves
+    // eal_args (previously dead config) flows through without breaking start().
+    #[test]
+    #[serial]
+    fn provider_start_real_backend_path_with_eal_args() {
+        let addr: SocketAddr = "10.0.0.1:4433".parse().unwrap();
+        let (provider, mut handle) = DpdkProvider::builder()
+            .with_addr(addr)
+            .with_dpdk_port(0)
+            .with_eal_args(vec!["dpdk-quic".into(), "--no-huge".into()])
+            .with_gateway_mac([0xaa; 6])
+            .build();
+
+        let endpoint = crate::event_loop::tests::make_mock_endpoint(None);
+        let result = provider.start(endpoint);
+        assert!(result.is_ok(), "real-backend start failed: {result:?}");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let snap = handle.stats();
+        assert!(snap.timer_wakeups > 0, "event loop did not tick");
+        handle.shutdown();
     }
 }

@@ -19,6 +19,8 @@ tokio = { workspace = true }
 rcgen = "0.13"
 bytes = "1"
 
+[dev-dependencies]
+serial_test = { workspace = true }
 
 [[bin]]
 name = "quic-smoke"
@@ -35,3 +37,7 @@ path = "src/bin/quic-echo-server.rs"
 [[bin]]
 name = "quic-test-client"
 path = "src/bin/quic-test-client.rs"
+
+[[bin]]
+name = "quic-perf-client"
+path = "src/bin/quic-perf-client.rs"
