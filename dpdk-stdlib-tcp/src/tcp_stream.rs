@@ -58,6 +58,27 @@ pub struct TcpContext {
 }
 
 impl TcpContext {
+    /// Build a new TCP context for the global singleton.
+    ///
+    /// Used by the runtime bootstrap (`init_dpdk_tcp_context`) after it has set
+    /// up the backend, neighbor resolver, command channel and engine wakeup.
+    pub fn new(
+        backend: Arc<dyn PacketBackend>,
+        resolver: Arc<dyn NeighborResolver>,
+        cmd_tx: CommandSender,
+        wakeup: Arc<EngineWakeup>,
+        local_ip: std::net::Ipv4Addr,
+    ) -> Self {
+        Self {
+            backend,
+            resolver,
+            cmd_tx,
+            wakeup,
+            local_ip,
+            next_port: std::sync::atomic::AtomicU16::new(49152),
+        }
+    }
+
     /// Allocate an ephemeral port for a new outbound connection.
     pub fn allocate_port(&self) -> u16 {
         // Simple incrementing ephemeral port allocator (49152..65535).

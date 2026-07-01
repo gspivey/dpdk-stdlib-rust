@@ -13,6 +13,7 @@ pub mod engine;
 pub mod error;
 pub mod isn;
 pub mod ring;
+pub mod runtime;
 pub mod seq;
 pub mod split;
 pub mod state;
@@ -31,6 +32,9 @@ pub use codec::{
 pub use tcp_stream::{TcpStream, TcpContext, TcpStreamInner, init_tcp_context, is_tcp_context_initialized, get_tcp_context};
 pub use tcp_listener::{TcpListener, Incoming};
 pub use split::{OwnedReadHalf, OwnedWriteHalf};
+
+// Re-export the DPDK runtime bootstrap.
+pub use runtime::{init_dpdk_tcp_context, DpdkTcpRuntimeConfig};
 
 // --- Constants ---
 

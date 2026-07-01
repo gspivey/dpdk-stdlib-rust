@@ -4,7 +4,7 @@
 //! shutdown via SIGTERM/SIGINT.
 
 use clap::Parser;
-use dpdk_stdlib_tcp::{TcpListener, TcpStream};
+use dpdk_stdlib_tcp::{init_dpdk_tcp_context, DpdkTcpRuntimeConfig, TcpListener, TcpStream};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
@@ -40,6 +40,32 @@ struct Args {
     /// Port to bind to
     #[arg(long, default_value_t = 9000)]
     port: u16,
+
+    /// Gateway MAC (AA:BB:CC:DD:EE:FF) for AWS VPC (L3-routed). Required on EC2:
+    /// all outbound frames use this as the Ethernet destination.
+    #[arg(long)]
+    gateway_mac: Option<String>,
+
+    /// Explicit DPDK EAL arguments (space-separated). Overrides DPDK_EAL_ARGS.
+    #[arg(long)]
+    eal_args: Option<String>,
+
+    /// Performance reporting interval in seconds (0 = disabled). Reserved.
+    #[arg(long, default_value_t = 0)]
+    perf_interval: u64,
+}
+
+/// Parse a colon-separated MAC string (`AA:BB:CC:DD:EE:FF`) into 6 octets.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn handle_client(mut stream: TcpStream) {
@@ -76,6 +102,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let bind_addr = format!("{}:{}", args.ip, args.port);
+
+    // Stand up the DPDK TCP runtime (EAL + backend + engine driver) before bind.
+    let gateway_mac = match args.gateway_mac.as_deref() {
+        Some(s) => Some(parse_mac(s).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --gateway-mac: {s}"))
+        })?),
+        None => None,
+    };
+    init_dpdk_tcp_context(DpdkTcpRuntimeConfig {
+        port_id: 0,
+        local_ip: args.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+        gateway_mac,
+        eal_args: args
+            .eal_args
+            .as_deref()
+            .map(|s| s.split_whitespace().map(String::from).collect()),
+        mtu: 9001,
+    })?;
+    if args.perf_interval > 0 {
+        eprintln!(
+            "perf reporting requested every {}s (not yet implemented for TCP)",
+            args.perf_interval
+        );
+    }
 
     let listener = TcpListener::bind(&bind_addr)?;
     eprintln!("tcp-echo listening on {}", listener.local_addr()?);

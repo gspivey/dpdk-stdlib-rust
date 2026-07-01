@@ -73,6 +73,72 @@ impl DpdkBackend {
         })
     }
 
+    /// Create a DPDK backend that drives a **real NIC** (a vfio-pci-bound ENI).
+    ///
+    /// Unlike [`DpdkBackend::new`], this does **not** pass `--no-pci`, so DPDK
+    /// performs PCI scanning and discovers the vfio-pci device. This is the
+    /// constructor the TCP/QUIC stacks must use for on-NIC operation; `new`
+    /// (with `--no-pci`) yields a null device that never probes a real port.
+    ///
+    /// EAL arguments are resolved in priority order: the explicit `eal_args`
+    /// slice, then the `DPDK_EAL_ARGS` environment variable, then a default of
+    /// `["dpdk-tcp", "-l", "0", "-n", "4"]`. This mirrors the real-NIC EAL setup
+    /// in `dpdk-stdlib-udp`'s `get_or_init_dpdk`.
+    pub fn new_real_nic(port_id: u16, eal_args: Option<&[String]>) -> io::Result<Self> {
+        // Resolve EAL args: explicit override > DPDK_EAL_ARGS env > default.
+        // NB: deliberately NO `--no-pci` — DPDK needs PCI scanning to find the
+        // vfio-pci device.
+        let args_owned: Vec<String> = if let Some(a) = eal_args {
+            a.to_vec()
+        } else if let Ok(s) = std::env::var("DPDK_EAL_ARGS") {
+            s.split_whitespace().map(String::from).collect()
+        } else {
+            vec![
+                "dpdk-tcp".to_string(),
+                "-l".to_string(),
+                "0".to_string(),
+                "-n".to_string(),
+                "4".to_string(),
+            ]
+        };
+        let args_ref: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+
+        let eal = dpdk::Eal::init(&args_ref)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("EAL init failed: {}", e)))?;
+
+        // Distinct mempool name from `new`'s "backend_pool" so the two can
+        // coexist without an rte_mempool name clash.
+        let mempool = Mempool::create_with_config(
+            "tcp_backend_pool",
+            &MempoolConfig::new()
+                .with_size(8192)
+                .with_cache_size(256)
+                .with_data_room_size(crate::JUMBO_DATA_ROOM_SIZE),
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mempool creation failed: {}", e)))?;
+
+        let port_config = PortConfig::default().with_mtu(9001);
+        let port = Port::init(port_id, port_config, &mempool)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port init failed: {}", e)))?;
+
+        let mac = port.mac_address().octets();
+
+        let mut port = port;
+        port.start()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Port start failed: {}", e)))?;
+
+        let promiscuous = port.is_promiscuous();
+        let allmulticast = port.is_allmulticast();
+
+        Ok(Self {
+            _eal: Some(eal),
+            port: Mutex::new(port),
+            mempool: Arc::new(mempool),
+            mac_address: mac,
+            promiscuous: AtomicBool::new(promiscuous),
+            allmulticast: AtomicBool::new(allmulticast),
+        })
+    }
+
     /// Create a DPDK backend from existing port and mempool.
     ///
     /// This allows reusing already-initialized DPDK resources.
@@ -188,8 +254,10 @@ impl PacketBackend for DpdkBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_dpdk_backend_creation() {
         // This test verifies the DpdkBackend can be created with stubs
         let backend = DpdkBackend::new(0);
@@ -204,6 +272,20 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_dpdk_backend_new_real_nic() {
+        // new_real_nic must construct successfully under stubs (no --no-pci path).
+        let backend = DpdkBackend::new_real_nic(0, None);
+        assert!(backend.is_ok());
+        assert_eq!(backend.unwrap().backend_name(), "dpdk");
+
+        // Explicit EAL args are accepted too.
+        let args = vec!["dpdk-tcp".to_string(), "--no-huge".to_string()];
+        assert!(DpdkBackend::new_real_nic(0, Some(&args)).is_ok());
+    }
+
+    #[test]
+    #[serial]
     fn test_dpdk_backend_send_frame() {
         let backend = DpdkBackend::new(0).unwrap();
 
@@ -223,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_dpdk_backend_recv_frames() {
         let backend = DpdkBackend::new(0).unwrap();
 
@@ -232,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_dpdk_backend_promiscuous() {
         let backend = DpdkBackend::new(0).unwrap();
 

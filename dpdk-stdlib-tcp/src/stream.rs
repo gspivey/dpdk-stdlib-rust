@@ -76,10 +76,20 @@ pub fn engine_loop(
         }
 
         // --- Process inbound frames ---
+        // Extract the Ethernet src/dst MAC from the raw frame and use
+        // `on_segment_with_macs` so accept-side TCBs reply to the real peer
+        // (gateway) MAC rather than zeros.
         if let Ok(frames) = backend.recv_frames(32) {
             for frame in &frames {
+                if frame.len() < 14 {
+                    continue;
+                }
+                let mut dst_mac = [0u8; 6];
+                let mut src_mac = [0u8; 6];
+                dst_mac.copy_from_slice(&frame[0..6]);
+                src_mac.copy_from_slice(&frame[6..12]);
                 if let Ok(seg) = parse_tcp_packet(frame) {
-                    let outbound = engine.on_segment(&seg);
+                    let outbound = engine.on_segment_with_macs(&seg, src_mac, dst_mac);
                     for out in outbound {
                         let _ = backend.send_frame(&out);
                     }
