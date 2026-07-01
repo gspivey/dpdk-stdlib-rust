@@ -113,9 +113,35 @@ post_pr_comment() {
 
 # ── SSM Helpers ───────────────────────────────────────────────────────────────
 
+# Single source of truth for the DUT app binaries the perf harness may launch.
+# Rust binaries live under target/release/; testpmd is a bare process name.
+# MUST include the TCP binaries — otherwise a stale process keeps the DPDK
+# primary-process lock and the next config's EAL init fails ("Cannot create
+# lock ... another primary process running"). Add a binary here and everything
+# below (regex, cleanup) composes from it automatically.
+DUT_RUST_BINS=(echo tokio-echo plain-echo tcp-echo tokio-tcp-echo plain-tcp-echo quic-echo-server quic-perf-client)
+DUT_OTHER_BINS=(testpmd dpdk-testpmd)
+DUT_KILL_GRACE_SECS=10   # seconds to wait for a graceful SIGTERM exit before SIGKILL
+
+# ERE matching any DUT process cmdline, composed from the lists above.
+DUT_APP_ERE="target/release/($(IFS='|'; echo "${DUT_RUST_BINS[*]}"))|$(IFS='|'; echo "${DUT_OTHER_BINS[*]}")"
+
+# Remote (POSIX-sh) cleanup snippet: SIGTERM all DUT apps, wait up to
+# DUT_KILL_GRACE_SECS for a graceful exit, then SIGKILL, then clear the DPDK
+# primary-process lock. The wait list is expanded LOCALLY via seq so the string
+# sent over SSM stays POSIX-portable (the remote shell may be dash, not bash).
+dut_kill_snippet() {
+    local ere="$DUT_APP_ERE" grace
+    grace="$(seq "$DUT_KILL_GRACE_SECS" | tr '\n' ' ')"
+    echo "set +e; pkill -TERM -f '$ere' 2>/dev/null; for i in $grace; do pgrep -f '$ere' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f '$ere' >/dev/null 2>&1; then pkill -9 -f '$ere' 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null"
+}
+
 ssm_run_command() {
     local instance_id="$1"
     local timeout_sec="$2"
+    # AWS SSM send-command rejects TimeoutSeconds < 30 (ParamValidation);
+    # clamp so short cleanup calls (e.g. 15s) don't hard-fail the step.
+    if [[ "$timeout_sec" -lt 30 ]]; then timeout_sec=30; fi
     shift 2
     local command="$*"
 
@@ -459,7 +485,7 @@ dut_bind_dpdk() {
     # Gracefully stop any running DPDK/echo apps first — SIGTERM lets DPDK run
     # rte_eal_cleanup() so vfio-pci devices are properly released.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo CLEANUP_DONE" || true
+        "$(dut_kill_snippet); echo CLEANUP_DONE" || true
 
     # Use sysfs driver_override — same method that works for TRex binding.
     # This avoids dpdk-devbind.py which can fail in edge cases.
@@ -478,7 +504,7 @@ dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
     # Gracefully stop any running DPDK/echo apps — SIGTERM lets DPDK cleanup run.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+        "$(dut_kill_snippet); echo CLEANUP_DONE" || true
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
@@ -498,7 +524,7 @@ dut_stop_all_apps() {
     # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
     # Only escalate to SIGKILL after 10s if the process won't die.
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f 'target/release/echo' 2>/dev/null; pkill -TERM -f 'target/release/tokio-echo' 2>/dev/null; pkill -TERM -f 'target/release/plain-echo' 2>/dev/null; pkill -TERM -f testpmd 2>/dev/null; pkill -TERM -f dpdk-testpmd 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f 'target/release/echo|target/release/tokio-echo|target/release/plain-echo|testpmd' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f 'target/release/echo' 2>/dev/null; pkill -9 -f 'target/release/tokio-echo' 2>/dev/null; pkill -9 -f 'target/release/plain-echo' 2>/dev/null; pkill -9 -f testpmd 2>/dev/null; pkill -9 -f dpdk-testpmd 2>/dev/null; sleep 3; fi; echo 'All apps stopped'") || true
+        "$(dut_kill_snippet); echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
     # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
     # the shared memory files persist and can cause the next DPDK app to fail
@@ -661,7 +687,11 @@ YAMLEOF
 }
 
 start_trex_server() {
-    log_info "Starting TRex server..."
+    local trex_mode="${1:-stl}"
+    local astf_flag=""
+    [[ "$trex_mode" == "astf" ]] && astf_flag="--astf"
+    CURRENT_TREX_MODE="$trex_mode"
+    log_info "Starting TRex server (mode: $trex_mode)..."
     local TX_PCI="0000:00:06.0"
     local RX_PCI="0000:00:07.0"
 
@@ -696,7 +726,7 @@ start_trex_server() {
     log_info "Starting TRex server..."
     local start_cmd_id
     start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 1; rm -f /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i $astf_flag --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.
@@ -731,6 +761,26 @@ start_trex_server() {
     return 1
 }
 
+# Ensure the TRex server is running in the requested mode (stl | astf),
+# restarting it if the current mode differs. STL drives stateless (UDP)
+# benchmarks; ASTF drives stateful (TCP) benchmarks. A single `t-rex-64 -i`
+# process serves only ONE mode, so mixing UDP and TCP configs in one run
+# restarts TRex between them.
+ensure_trex_mode() {
+    local want="$1"
+    if [[ "${CURRENT_TREX_MODE:-}" == "$want" ]]; then
+        return 0
+    fi
+    log_info "Switching TRex to '$want' mode (was: '${CURRENT_TREX_MODE:-none}')"
+    start_trex_server "$want"
+}
+
+# Derive the TRex mode (stl|astf) for a comma-separated config list: astf if any
+# token ends in -tcp (TCP -> ASTF), else stl (UDP -> STL). Unit-tested.
+trex_mode_for_configs() {
+    [[ ",$1," == *"-tcp,"* ]] && echo astf || echo stl
+}
+
 stop_trex_server() {
     log_info "Stopping TRex server..."
     ssm_run_command "$TREX_INSTANCE_ID" 30 \
@@ -748,6 +798,9 @@ run_benchmark_for_config() {
         run_tcp_benchmark_for_config "$config_name" "$dst_port"
         return $?
     fi
+
+    # UDP configs need TRex in STL (stateless) mode.
+    ensure_trex_mode stl || { log_error "Failed to start TRex in STL mode"; return 1; }
 
     log_info "Running TRex benchmark for config: $config_name"
 
@@ -913,13 +966,18 @@ $(head -5 "$RESULTS_DIR/${config_name}.json")
 # Run a TCP (ASTF/stateful) benchmark for a *-tcp config. Mirrors
 # run_benchmark_for_config but deploys run_tcp_benchmark.py and drives it with
 # --payload-sizes / --cps-rates (ASTFClient) instead of run_benchmark.py
-# (STLClient). TRex `t-rex-64 -i` serves both STL and ASTF, so no server-side
-# change is needed — only the python client class differs.
+# (STLClient). TRex must run in ASTF mode for this: ensure_trex_mode astf
+# (re)starts t-rex-64 with --astf before the ASTF client connects.
 run_tcp_benchmark_for_config() {
     local config_name="$1"
     local dst_port="${2:-9000}"
 
     log_info "Running TRex ASTF TCP benchmark for config: $config_name"
+
+    # TCP uses ASTF (stateful); (re)start TRex in ASTF mode if needed. A TRex
+    # server started in STL mode rejects ASTF clients ("RPC configuration
+    # mismatch - server 'STL', client 'ASTF'").
+    ensure_trex_mode astf || { log_error "Failed to start TRex in ASTF mode"; return 1; }
 
     local benchmark_b64
     benchmark_b64=$(base64 -w0 "$SCRIPT_DIR/perf-tests/trex/run_tcp_benchmark.py")
@@ -2411,7 +2469,11 @@ Starting TRex configuration (MAC discovery + NIC binding)..."
 - Gateway MAC: \`$TREX_GATEWAY_MAC\`
 Starting TRex server..."
 
-    if ! start_trex_server; then
+    # Start TRex in the mode of the first config type (astf if any *-tcp token,
+    # else stl) so a coherent all-TCP or all-UDP run needs no mid-run restart.
+    local initial_trex_mode
+    initial_trex_mode=$(trex_mode_for_configs "$CONFIGS")
+    if ! start_trex_server "$initial_trex_mode"; then
         # Grab TRex log and NIC state for diagnostics
         local trex_log
         local diag_pci="${TREX_PCI_ADDR:-0000:00:06.0}"
@@ -2694,4 +2756,7 @@ $summary
     log_info "=== All performance tests completed successfully ==="
 }
 
-main "$@"
+# Only run main when executed directly (not when sourced, e.g. by unit tests).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
