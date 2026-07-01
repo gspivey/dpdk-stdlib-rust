@@ -333,6 +333,99 @@ Add TCP integration test jobs to `integration-tests.yml` with `continue-on-error
 
 ---
 
+## Test Infrastructure & L2-Native Hardening
+
+Added 2026-07-01 after the first end-to-end perf proof (run [28509354005](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/28509354005)) validated the DPDK TCP engine on **real hardware** (`tcp-echo` did a real vfio/`net_ena` PCI probe via `new_real_nic` and listened on `10.0.1.10:9000`) but surfaced perf-harness bugs. Program sequence: **fix the perf/integration harness → kill the flake → expand per-PR functionality (Tier 1/2) coverage → publish crates → make TCP/QUIC L2-native + add Containerlab correctness testing → publish again.**
+
+Taxonomy reminder: **Tier 1/2 = functionality (correctness) tests** — fast, gate every PR. **Full perf suite = nightly**, non-blocking (its failure halts auto-PRs). The auto-run integration tiers exercise real wire behavior; the manual perf suites measure throughput/latency.
+
+### 37. Perf harness: TRex ASTF mode + SSM `TimeoutSeconds` fixes
+
+Run 28509354005 proved the stack works but all three TCP configs failed on **harness** bugs, not stack bugs:
+1. **TRex started in STL mode; the TCP benchmark speaks ASTF** → `RPC configuration mismatch - server 'STL', client 'ASTF'`. `t-rex-64 -i` does NOT serve both (the comment at `run-perf-tests.sh:916` is wrong). Fix: start/restart TRex with `--astf` for `*-tcp` configs; keep STL for UDP.
+2. **SSM `--timeout-seconds` passed `15`, below AWS's minimum `30`** in the DUT-stop path → the stop silently failed → the previous `tcp-echo` kept the DPDK primary-process lock → the next config's `tokio-tcp-echo` died with `Cannot create lock … another primary process running`. Fix: clamp every SSM `send-command` timeout to ≥30.
+3. `plain-rust-tcp` kernel re-bind timed out (60s) — likely the SSM/ENI flake compounded by (2); re-verify after (1)+(2).
+
+Acceptance: re-dispatch `configs=rust-dpdk-tcp,tokio-dpdk-tcp,plain-rust-tcp` → non-zero CPS/throughput in `perf-report.json`; then run `native-dpdk-v6,rust-dpdk-v6`, `quic-stock,quic-native-dpdk`, and `quic-native-dpdk-nic`.
+
+- Files: `scripts/run-perf-tests.sh`, `scripts/perf-tests/trex/run_tcp_benchmark.py`
+- [ ] Complete · PR: —
+
+### 38. Integration/perf harness: fix the SSM/ENI flake (the "trio")
+
+Integration CI flakes ~every other run on AWS SSM polling / ENI-bind timeouts (synthetic `0.000s` failure XML). Root cause: (a) `configure-eni.sh` installs a *competing* default route on the secondary ENI (both ENIs share the `/24` gateway), perturbing the SSM control path during bind/unbind → commands stall at `InProgress`; (b) the SSM poll loop has no `InProgress` handling — it spins to the budget and hard-fails (no cancel/resend/health-probe). Fix ("trio", all pushable bash): drop the competing default route (policy/on-link routing), add an `ssm_settle` health-gate (poll `PingStatus=Online` + trivial echo with backoff) after each ENI op, make the poll loop `InProgress`-resilient (cancel + idempotent resend with backoff). Also harden interface selection (`lspci | tail -1` → IMDS device-number) so bind/unbind can never tear down the SSM-bearing primary ENI. **Prerequisite for making new tiers blocking** (else flaky infra blocks PRs).
+
+- Files: `scripts/integration-tests/configure-eni.sh`, `scripts/run-integration-tests.sh`, `scripts/run-perf-tests.sh`
+- [ ] Complete · PR: —
+
+### 39. Tier 1/2 functionality tiers: wire QUIC + add TCP + UDP-v6
+
+Per-PR functionality coverage is UDP-only today; TCP/QUIC/IPv6 have ZERO. The DUT binaries already support the assertions, so this is mostly tier scripts + runner registration (no workflow-YAML edit — the runner is invoked with no `--tier`):
+- **QUIC:** wire the existing `tier1-quic-handshake.sh` (handshake + bidir echo) into `run-integration-tests.sh` — it is fully built but orphaned (nothing invokes it).
+- **TCP:** tier scripts driving `tcp-test-client` modes — Tier 1 `handshake` / `bidir` (byte-equality) / `shutdown` (FIN + clean-EOF); Tier 2 `std-parity` (dpdk-stdlib-tcp vs `std::net`, byte-identical).
+- **UDP IPv6:** `echo` v6 bind + NDP-seeded echo tier.
+
+Register **non-blocking** (`continue-on-error`) first; flip to blocking after ≥10 green runs. Prefer Containerlab (#46) where cheaper.
+
+- Spec: `.kiro/specs/tcp-support/` (15.1–15.3), `.kiro/specs/s2n-quic-provider/` (12)
+- [ ] Complete · PR: —
+
+### 40. Auto-run Tier 1/2 on PR + development merges; Graviton integration → nightly
+
+Run the Tier 1/2 functionality tiers on `pull_request` (already) AND on `push: [development]` (post-merge validation), and move the Graviton (arm64) integration run from per-PR to nightly to offset the added per-PR cost. Requires editing `integration-tests.yml` (add `push` trigger) + splitting Graviton to a scheduled workflow — **workflow-file edits need the maintainer's SSH push** (CI PAT lacks `workflow` scope); runner/tier changes are pushable.
+
+- Files: `.github/workflows/integration-tests.yml`, `integration-tests-graviton.yml` (SSH push)
+- [ ] Complete · PR: —
+
+### 41. Nightly perf schedule + durable result sink + auto-PR halt gate
+
+Add a nightly `schedule:` running the full perf suite (all `--configs` tokens). `development` has no PR, so post results to a durable sink — append `docs/perf-test-log.md` and/or a pinned tracking issue — not a PR comment. On nightly failure, the external agent-router halts new auto-PRs: it reads the nightly run conclusion (`gh run list --workflow=… --json conclusion`) at cron start and, if red, **pivots to fixing the failure** instead of generating features — wired in `prompts/agent-router.md`. Schedule/trigger = workflow-file edit (SSH push); the `agent-router.md` change is pushable.
+
+- Files: `.github/workflows/perf-tests.yml` (SSH push), `prompts/agent-router.md`, `docs/perf-test-log.md`
+- [ ] Complete · PR: —
+
+### 42. README badges: CI, crate versions, coverage
+
+Add badges: per-PR integration + nightly CI status, per-crate crates.io versions (`dpdk-stdlib-net/udp/tcp/quic/tokio`), docs.rs, license, and **code coverage** (a `cargo-llvm-cov` job → Codecov/lcov badge). The CI-status badge doubles as the human-visible surface of the nightly halt gate (#41).
+
+- Files: `README.md`, a coverage CI job
+- [ ] Complete · PR: —
+
+### 43. Publish crates — release 1 (TCP / QUIC / UDP-IPv6)
+
+Publish the `dpdk-stdlib-*` crates carrying the merged TCP engine (#99), IPv6 NDP (#98), and real-NIC QUIC (#100) work to crates.io (via `main`, per the publish convention). Bump versions, `cargo publish --dry-run` in dependency order (`net → udp → tcp → quic → tokio`), update CHANGELOG. **Gated on #37 (perf proven green).**
+
+- [ ] Complete · PR: —
+
+### 44. Unify ARP into `dpdk-stdlib-net` with active resolution (L2-native TCP/QUIC)
+
+`dpdk-udp` already has full active ARP (`UdpSocket::resolve_arp` sends a request, awaits the reply, caches, retries via `ArpHandler`), but the shared `dpdk-stdlib-net::ArpResolver` used by TCP/QUIC is a thinner reimplementation — cache + optional gateway-MAC override only, `resolve()` errors on a cold peer with no gateway. So a TCP/QUIC *client* dialing a cold peer on a flat L2 network fails (servers are fine — they learn the peer MAC from the inbound frame). Fix: lift `ArpHandler` into `dpdk-stdlib-net` and make `NeighborResolver::resolve()` send an ARP request through the backend and await the reply — **one ARP implementation shared by UDP and TCP/QUIC** (de-dup). Makes TCP/QUIC clients L2-native. Acceptance = the flat-L2 Containerlab topology (#46).
+
+- Files: `dpdk-stdlib-net/src/neighbor.rs`, `dpdk-udp/src/arp.rs`
+- [ ] Complete · PR: —
+
+### 45. Backend selection for TCP/QUIC (`--backend af_packet`) — Containerlab enabler
+
+The engine driver and QUIC event loop are already backend-generic (`Arc<dyn PacketBackend>`), but the runtimes hard-wire DPDK: TCP `runtime.rs` pins `DpdkBackend::new_real_nic`; QUIC `start()` builds it by default. Add a backend-generic entry (`init_tcp_context_with_backend` / a `BackendType` in `DpdkTcpRuntimeConfig`), a QUIC `--backend af_packet` path via `create_backend(RawSocket)`, and `--backend dpdk|af_packet` + `--iface` on the apps. Lets the same stack run over `veth` in containers with no DPDK/hugepages/vfio (`RawSocketBackend` already exists).
+
+- Files: `dpdk-stdlib-tcp/src/runtime.rs`, `dpdk-stdlib-quic/src/provider.rs`, `apps/*`
+- [ ] Complete · PR: —
+
+### 46. Containerlab functionality harness (L2/L3/overlay matrix, no AWS)
+
+Add a [Containerlab](https://containerlab.dev/)-based functionality harness that runs on a standard Linux GitHub Actions runner (cloud-free, no SSM/ENI flake) using `RawSocketBackend` over `veth`. Topologies: **flat-L2** (real ARP — the acceptance test for #44), **VLAN** (802.1Q), **VXLAN + Geneve** overlays (`vxlan.rs`/`geneve.rs`/`gue.rs`), **multi-hop L3** (router node, gateway-MAC routing), and **kernel-interop** (our app ↔ plain Linux socket via ext-bridge). A small Rust driver asserts handshake/echo/parity per topology. Migrate Tier 1/2 here from EC2; keep EC2 for the DPDK-datapath smoke + nightly perf. Stretch: run the real `DpdkBackend` over a `net_af_packet` vdev to exercise the DPDK path in containers; add GRE encap + tier if wanted. New workflow file needs the maintainer's SSH push; topologies + driver are pushable.
+
+- Files: `test/containerlab/*`, `.github/workflows/containerlab-tests.yml` (SSH push), a Rust test driver
+- [ ] Complete · PR: —
+
+### 47. Publish crates — release 2 (L2-native + Containerlab-validated)
+
+Second crates.io release after the ARP unification (#44) and Containerlab validation (#46): the stack is now fully L2-native (physical-network ready) and correctness-tested across L2/L3/overlay topologies. Bump versions, publish `net → udp → tcp → quic → tokio` via `main`, update CHANGELOG.
+
+- [ ] Complete · PR: —
+
+---
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
