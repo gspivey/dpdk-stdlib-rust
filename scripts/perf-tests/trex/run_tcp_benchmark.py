@@ -49,10 +49,13 @@ def build_tcp_profile(payload_size, src_ip, dst_ip, dst_port):
     prog_s.recv(payload_size)
     prog_s.send(payload)
 
-    ip_gen_c = ASTFIPGenDist(ip_range=src_ip, distribution="seq")
-    ip_gen_s = ASTFIPGenDist(ip_range=dst_ip, distribution="seq")
+    # TRex ASTFIPGenDist requires a 2-element [start, end] range, even for a
+    # single host — pass [ip, ip]. A bare string fails ArgVerify with
+    # "Bad IP range ... Range should contain two IPs".
+    ip_gen_c = ASTFIPGenDist(ip_range=[src_ip, src_ip], distribution="seq")
+    ip_gen_s = ASTFIPGenDist(ip_range=[dst_ip, dst_ip], distribution="seq")
     ip_gen = ASTFIPGen(
-        glob=ASTFIPGenDist(ip_range="0.0.0.0", distribution="seq"),
+        glob=ASTFIPGenDist(ip_range=["0.0.0.0", "0.0.0.0"], distribution="seq"),
         dist_client=ip_gen_c,
         dist_server=ip_gen_s,
     )
