@@ -81,6 +81,15 @@ if [[ "$ACMD" == *"--lro-disable"* ]]; then ok "astf launch includes --lro-disab
 if [[ "$SCMD" == *"--lro-disable"* ]]; then ok "stl launch includes --lro-disable"; else bad "stl launch includes --lro-disable"; fi
 if [[ "$SCMD" != *"--astf"* ]]; then ok "stl mode omits --astf"; else bad "stl mode omits --astf"; fi
 
+echo "== run_tcp_benchmark.py: ASTFIPGenDist ip_range must be a [start,end] list =="
+TCP_PY="$TEST_DIR/../trex/run_tcp_benchmark.py"
+if grep -nE 'ASTFIPGenDist\(ip_range=' "$TCP_PY" | grep -qvE 'ip_range=\['; then
+    bad "ASTFIPGenDist uses a single-IP ip_range (TRex needs [start,end]):"
+    grep -nE 'ASTFIPGenDist\(ip_range=' "$TCP_PY" | grep -vE 'ip_range=\['
+else
+    ok "all ASTFIPGenDist ip_range args are lists"
+fi
+
 # ── 3. TRex mode selection: stl for UDP, astf for any *-tcp ───────────────────
 echo "== TRex STL/ASTF mode selection =="
 for c in "rust-dpdk-tcp,tokio-dpdk-tcp,plain-rust-tcp" "rust-dpdk-tcp"; do
