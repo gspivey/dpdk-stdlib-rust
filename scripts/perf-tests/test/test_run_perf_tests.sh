@@ -59,13 +59,20 @@ ssm_run_command "i-test" 90 "echo hi" >/dev/null 2>&1
 if grep -q -- '--timeout-seconds 90' "$AWS_LOG"; then ok "valid 90s is passed through unchanged"; else bad "valid 90s is passed through unchanged"; fi
 
 # ── 2. DUT_APP_ERE matches every DUT binary (incl. TCP) but not TRex/sshd ─────
-echo "== DUT_APP_ERE kill-pattern coverage =="
-for b in echo tokio-echo plain-echo tcp-echo tokio-tcp-echo plain-tcp-echo quic-echo-server quic-perf-client; do
+echo "== DUT_APP_ERE composed from the source-of-truth lists =="
+for b in "${DUT_RUST_BINS[@]}"; do
     if ere_matches "./target/release/$b --ip 10.0.1.10 --port 9000"; then ok "matches $b"; else bad "matches $b (would leak a stale DUT process)"; fi
 done
-if ere_matches "/usr/local/bin/dpdk-testpmd -l 0-1 -- --forward-mode=5tswap"; then ok "matches dpdk-testpmd"; else bad "matches dpdk-testpmd"; fi
+for b in "${DUT_OTHER_BINS[@]}"; do
+    if ere_matches "/usr/local/bin/$b -l 0-1 -- --forward-mode=5tswap"; then ok "matches $b"; else bad "matches $b"; fi
+done
 if ere_matches "/opt/trex/_t-rex-64 -i --cfg /etc/trex_cfg.yaml"; then bad "must NOT match t-rex-64 (would kill the generator)"; else ok "does not match t-rex-64"; fi
 if ere_matches "/usr/sbin/sshd -D"; then bad "must NOT match sshd"; else ok "does not match sshd"; fi
+
+echo "== dut_kill_snippet composition (grace + lock cleanup) =="
+SNIP="$(dut_kill_snippet)"
+if [[ "$SNIP" == *"for i in 1 2 3 4 5 6 7 8 9 10"* ]]; then ok "grace list expands to DUT_KILL_GRACE_SECS ($DUT_KILL_GRACE_SECS)"; else bad "grace list expands to $DUT_KILL_GRACE_SECS"; fi
+if [[ "$SNIP" == *"rm -rf /var/run/dpdk/"* ]]; then ok "snippet clears the DPDK lock dir"; else bad "snippet clears the DPDK lock dir"; fi
 
 # ── 3. TRex mode selection: stl for UDP, astf for any *-tcp ───────────────────
 echo "== TRex STL/ASTF mode selection =="

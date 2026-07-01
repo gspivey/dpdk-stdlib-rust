@@ -113,11 +113,28 @@ post_pr_comment() {
 
 # ── SSM Helpers ───────────────────────────────────────────────────────────────
 
-# ERE matching every DUT app binary the perf harness may launch. MUST include
-# the TCP binaries (tcp-echo, tokio-tcp-echo, plain-tcp-echo) — otherwise a
-# stale process keeps the DPDK primary-process lock and the next config's EAL
-# init fails with "Cannot create lock ... another primary process running".
-DUT_APP_ERE='target/release/(tcp-echo|tokio-tcp-echo|plain-tcp-echo|tokio-echo|plain-echo|echo|quic-echo-server|quic-perf-client)|testpmd|dpdk-testpmd'
+# Single source of truth for the DUT app binaries the perf harness may launch.
+# Rust binaries live under target/release/; testpmd is a bare process name.
+# MUST include the TCP binaries — otherwise a stale process keeps the DPDK
+# primary-process lock and the next config's EAL init fails ("Cannot create
+# lock ... another primary process running"). Add a binary here and everything
+# below (regex, cleanup) composes from it automatically.
+DUT_RUST_BINS=(echo tokio-echo plain-echo tcp-echo tokio-tcp-echo plain-tcp-echo quic-echo-server quic-perf-client)
+DUT_OTHER_BINS=(testpmd dpdk-testpmd)
+DUT_KILL_GRACE_SECS=10   # seconds to wait for a graceful SIGTERM exit before SIGKILL
+
+# ERE matching any DUT process cmdline, composed from the lists above.
+DUT_APP_ERE="target/release/($(IFS='|'; echo "${DUT_RUST_BINS[*]}"))|$(IFS='|'; echo "${DUT_OTHER_BINS[*]}")"
+
+# Remote (POSIX-sh) cleanup snippet: SIGTERM all DUT apps, wait up to
+# DUT_KILL_GRACE_SECS for a graceful exit, then SIGKILL, then clear the DPDK
+# primary-process lock. The wait list is expanded LOCALLY via seq so the string
+# sent over SSM stays POSIX-portable (the remote shell may be dash, not bash).
+dut_kill_snippet() {
+    local ere="$DUT_APP_ERE" grace
+    grace="$(seq "$DUT_KILL_GRACE_SECS" | tr '\n' ' ')"
+    echo "set +e; pkill -TERM -f '$ere' 2>/dev/null; for i in $grace; do pgrep -f '$ere' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f '$ere' >/dev/null 2>&1; then pkill -9 -f '$ere' 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null"
+}
 
 ssm_run_command() {
     local instance_id="$1"
@@ -468,7 +485,7 @@ dut_bind_dpdk() {
     # Gracefully stop any running DPDK/echo apps first — SIGTERM lets DPDK run
     # rte_eal_cleanup() so vfio-pci devices are properly released.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f '${DUT_APP_ERE}' 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1; then pkill -9 -f '${DUT_APP_ERE}' 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+        "$(dut_kill_snippet); echo CLEANUP_DONE" || true
 
     # Use sysfs driver_override — same method that works for TRex binding.
     # This avoids dpdk-devbind.py which can fail in edge cases.
@@ -487,7 +504,7 @@ dut_bind_kernel() {
     log_info "Binding DUT secondary ENI to kernel driver (kernel mode)..."
     # Gracefully stop any running DPDK/echo apps — SIGTERM lets DPDK cleanup run.
     ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f '${DUT_APP_ERE}' 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1; then pkill -9 -f '${DUT_APP_ERE}' 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo CLEANUP_DONE" || true
+        "$(dut_kill_snippet); echo CLEANUP_DONE" || true
 
     local bind_out
     bind_out=$(ssm_run_command "$DUT_INSTANCE_ID" 60 \
@@ -507,7 +524,7 @@ dut_stop_all_apps() {
     # cleanup (rte_eal_cleanup via Drop) so vfio-pci devices are properly released.
     # Only escalate to SIGKILL after 10s if the process won't die.
     stop_result=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
-        "set +e; pkill -TERM -f '${DUT_APP_ERE}' 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1 || break; sleep 1; done; if pgrep -f '${DUT_APP_ERE}' >/dev/null 2>&1; then echo 'SIGTERM did not work, escalating to SIGKILL'; pkill -9 -f '${DUT_APP_ERE}' 2>/dev/null; sleep 3; fi; rm -rf /var/run/dpdk/ 2>/dev/null; echo 'All apps stopped'") || true
+        "$(dut_kill_snippet); echo 'All apps stopped'") || true
     log_info "Stop result: $stop_result"
     # Clean up stale DPDK shared memory — if the previous app was SIGKILL'd,
     # the shared memory files persist and can cause the next DPDK app to fail
