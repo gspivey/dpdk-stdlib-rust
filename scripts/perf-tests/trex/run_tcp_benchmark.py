@@ -35,6 +35,7 @@ from trex.astf.trex_astf_profile import (
     ASTFProgram,
     ASTFTemplate,
     ASTFAssociation,
+    ASTFAssociationRule,
 )
 
 
@@ -71,7 +72,7 @@ def build_tcp_profile(payload_size, src_ip, dst_ip, dst_port):
         ),
         server_template=ASTFTCPServerTemplate(
             program=prog_s,
-            assoc=ASTFAssociation(port=dst_port),
+            assoc=ASTFAssociation(rules=ASTFAssociationRule(port=dst_port)),
         ),
     )
 
