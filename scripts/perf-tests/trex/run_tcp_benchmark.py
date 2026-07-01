@@ -28,6 +28,7 @@ sys.path.insert(0, '/opt/trex/automation/trex_control_plane/interactive')
 from trex.astf.api import ASTFClient, ASTFProfile
 from trex.astf.trex_astf_profile import (
     ASTFIPGenDist,
+    ASTFIPGenGlobal,
     ASTFIPGen,
     ASTFTCPClientTemplate,
     ASTFTCPServerTemplate,
@@ -54,8 +55,10 @@ def build_tcp_profile(payload_size, src_ip, dst_ip, dst_port):
     # "Bad IP range ... Range should contain two IPs".
     ip_gen_c = ASTFIPGenDist(ip_range=[src_ip, src_ip], distribution="seq")
     ip_gen_s = ASTFIPGenDist(ip_range=[dst_ip, dst_ip], distribution="seq")
+    # ASTFIPGen.glob must be an ASTFIPGenGlobal (NOT an ASTFIPGenDist); dist_client
+    # / dist_server are the ASTFIPGenDist ranges above.
     ip_gen = ASTFIPGen(
-        glob=ASTFIPGenDist(ip_range=["0.0.0.0", "0.0.0.0"], distribution="seq"),
+        glob=ASTFIPGenGlobal(ip_offset="1.0.0.0"),
         dist_client=ip_gen_c,
         dist_server=ip_gen_s,
     )
@@ -63,6 +66,7 @@ def build_tcp_profile(payload_size, src_ip, dst_ip, dst_port):
     template = ASTFTemplate(
         client_template=ASTFTCPClientTemplate(
             program=prog_c,
+            ip_gen=ip_gen,
             port=dst_port,
         ),
         server_template=ASTFTCPServerTemplate(

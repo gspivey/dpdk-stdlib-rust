@@ -89,6 +89,7 @@ if grep -nE 'ASTFIPGenDist\(ip_range=' "$TCP_PY" | grep -qvE 'ip_range=\['; then
 else
     ok "all ASTFIPGenDist ip_range args are lists"
 fi
+if grep -qE 'glob=ASTFIPGenDist' "$TCP_PY"; then bad "ASTFIPGen glob must be ASTFIPGenGlobal, not ASTFIPGenDist"; else ok "ASTFIPGen glob is ASTFIPGenGlobal (not ASTFIPGenDist)"; fi
 
 # ── 3. TRex mode selection: stl for UDP, astf for any *-tcp ───────────────────
 echo "== TRex STL/ASTF mode selection =="
