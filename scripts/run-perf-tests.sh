@@ -32,6 +32,9 @@ SKIP_DEPLOY=false
 PACKET_SIZES="64,512,1400,8500"
 DURATION=30
 RATE_STEPS="70000,140000,350000,700000"
+# TCP (ASTF) benchmark params — used only for *-tcp config tokens.
+CPS_RATES="100,500,1000,5000"
+TCP_PAYLOAD_SIZES="64,512,1400,65536"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
 CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
@@ -69,6 +72,8 @@ while [[ $# -gt 0 ]]; do
         --packet-sizes)   PACKET_SIZES="$2"; shift 2 ;;
         --duration)       DURATION="$2"; shift 2 ;;
         --rate-steps)     RATE_STEPS="$2"; shift 2 ;;
+        --cps-rates)      CPS_RATES="$2"; shift 2 ;;
+        --tcp-payload-sizes) TCP_PAYLOAD_SIZES="$2"; shift 2 ;;
         --configs)        CONFIGS="$2"; shift 2 ;;
         --ip-version)     IP_VERSION="$2"; shift 2 ;;
         --json-summary)   JSON_SUMMARY=true; shift ;;
@@ -738,6 +743,12 @@ run_benchmark_for_config() {
     local config_name="$1"
     local dst_port="${2:-9000}"
 
+    # TCP configs (token suffix -tcp) use the ASTF (stateful) TRex runner.
+    if [[ "$config_name" == *-tcp ]]; then
+        run_tcp_benchmark_for_config "$config_name" "$dst_port"
+        return $?
+    fi
+
     log_info "Running TRex benchmark for config: $config_name"
 
     # Copy benchmark script to TRex instance using base64 encoding.
@@ -897,6 +908,122 @@ $(head -5 "$RESULTS_DIR/${config_name}.json")
     fi
 
     log_info "Results saved to $RESULTS_DIR/${config_name}.json"
+}
+
+# Run a TCP (ASTF/stateful) benchmark for a *-tcp config. Mirrors
+# run_benchmark_for_config but deploys run_tcp_benchmark.py and drives it with
+# --payload-sizes / --cps-rates (ASTFClient) instead of run_benchmark.py
+# (STLClient). TRex `t-rex-64 -i` serves both STL and ASTF, so no server-side
+# change is needed — only the python client class differs.
+run_tcp_benchmark_for_config() {
+    local config_name="$1"
+    local dst_port="${2:-9000}"
+
+    log_info "Running TRex ASTF TCP benchmark for config: $config_name"
+
+    local benchmark_b64
+    benchmark_b64=$(base64 -w0 "$SCRIPT_DIR/perf-tests/trex/run_tcp_benchmark.py")
+    ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "set +e; mkdir -p /opt/perf-tests; echo '$benchmark_b64' | base64 -d > /opt/perf-tests/run_tcp_benchmark.py; chmod +x /opt/perf-tests/run_tcp_benchmark.py; echo DEPLOY_OK" || {
+        log_error "Failed to copy TCP benchmark script to TRex"
+        return 1
+    }
+
+    log_info "TCP params: src=${TREX_DATA_ENI_IP} dst=${DUT_DATA_ENI_IP} port=${dst_port} payloads=${TCP_PAYLOAD_SIZES} cps=${CPS_RATES} duration=${DURATION}"
+
+    # Pre-flight: verify the TRex ASTF API is reachable.
+    local preflight
+    preflight=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "cd /opt/trex && python3 -c \"
+import sys
+sys.path.insert(0, '/opt/trex/automation/trex_control_plane/interactive')
+from trex.astf.api import ASTFClient
+c = ASTFClient(server='localhost')
+c.connect()
+print('TRex ASTF API OK')
+c.disconnect()
+print('PREFLIGHT_OK')
+\" 2>&1" 2>&1) || true
+    log_info "TRex ASTF preflight: $preflight"
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` ASTF preflight
+\`\`\`
+$preflight
+\`\`\`"
+    if [[ "$preflight" != *"PREFLIGHT_OK"* ]]; then
+        log_error "TRex ASTF preflight failed for $config_name"
+        return 1
+    fi
+
+    local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_tcp_benchmark.py \
+        --server localhost \
+        --config-name '$config_name' \
+        --src-ip '$TREX_DATA_ENI_IP' \
+        --dst-ip '$DUT_DATA_ENI_IP' \
+        --dst-mac '${TREX_GATEWAY_MAC}' \
+        --dst-port $dst_port \
+        --payload-sizes '$TCP_PAYLOAD_SIZES' \
+        --cps-rates '$CPS_RATES' \
+        --duration $DURATION \
+        --output '/tmp/perf-results/${config_name}.json' 2>&1; echo EXIT_CODE=\$?"
+
+    log_info "Starting TCP benchmark SSM command (timeout=${BENCHMARK_TIMEOUT}s)..."
+    local output
+    output=$(ssm_run_command "$TREX_INSTANCE_ID" "$BENCHMARK_TIMEOUT" "$bench_cmd")
+    local ssm_exit_code=$?
+    mkdir -p "$LOGS_DIR"
+    echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    log_info "TCP benchmark SSM exit code: $ssm_exit_code"
+
+    local output_tail
+    output_tail=$(echo "$output" | tail -30)
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` result
+SSM exit: $ssm_exit_code
+<details><summary>Output (last 30 lines)</summary>
+
+\`\`\`
+${output_tail}
+\`\`\`
+</details>"
+
+    if [[ $ssm_exit_code -ne 0 ]]; then
+        log_error "TCP benchmark SSM command failed for $config_name (exit=$ssm_exit_code)"
+        return 1
+    fi
+
+    # Download results.
+    local results_json
+    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "echo '---JSON_START---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
+    if [[ "$results_json" == *"FILE_NOT_FOUND"* ]]; then
+        log_error "TCP results file not found on TRex for $config_name"
+        return 1
+    fi
+    local json_content
+    json_content=$(echo "$results_json" | sed -n '/^---JSON_START---$/,$ p' | tail -n +2)
+    mkdir -p "$RESULTS_DIR"
+    echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
+
+    local json_check
+    json_check=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$RESULTS_DIR/${config_name}.json'))
+    n = len(d.get('results', []))
+    print(f'Valid TCP JSON: {n} result rows, config={d.get(\"config_name\", \"missing\")}')
+    if n == 0:
+        print('WARNING: no result rows')
+        sys.exit(1)
+except Exception as e:
+    print(f'JSON error: {e}')
+    sys.exit(1)
+" 2>&1)
+    local json_valid=$?
+    log_info "TCP JSON validation for $config_name: $json_check (exit=$json_valid)"
+    if [[ $json_valid -ne 0 ]]; then
+        log_error "Invalid/empty TCP JSON results for $config_name"
+        return 1
+    fi
+    log_info "TCP results saved to $RESULTS_DIR/${config_name}.json"
 }
 
 # ── DUT Config Runners ────────────────────────────────────────────────────────
@@ -1115,6 +1242,125 @@ start_dut_plain_rust() {
         return 1
     fi
     log_info "plain-rust echo server running"
+}
+
+# ── TCP / IPv6 DUT runners (perf token extensions) ────────────────────────────
+# Power the additive --configs tokens: rust-dpdk-tcp, tokio-dpdk-tcp,
+# plain-rust-tcp, rust-dpdk-v6 (native-dpdk-v6 reuses start_dut_native_dpdk —
+# testpmd 5tswap is IP-version-agnostic). They reuse the same vfio/kernel bind +
+# verify pattern as the UDP runners above. The DUT-side gateway MAC is the
+# subnet's VPC router MAC — identical to TREX_GATEWAY_MAC (same subnet/VPC) — so
+# we reuse it rather than re-discovering on the (now vfio-bound) DUT NIC.
+
+_dut_hugepages() {
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+}
+
+# _dut_verify_running <pgrep-pattern> <label> <logfile>
+_dut_verify_running() {
+    local pat="$1" label="$2" logf="$3"
+    local status="" verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f '$pat' >/dev/null && echo 'running' || echo 'not running'") || true
+        [[ "$status" == *"running"* ]] && break
+        log_warn "$label verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
+    if [[ "$status" != *"running"* ]]; then
+        log_error "$label failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 $logf 2>/dev/null" || true
+        return 1
+    fi
+    log_info "$label running"
+}
+
+start_dut_rust_dpdk_tcp() {
+    log_info "Starting DUT: rust-dpdk-tcp (tcp-echo server, DPDK backend)"
+    dut_bind_dpdk || return 1
+    _dut_hugepages
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tcp-echo --ip ${DUT_DATA_ENI_IP} --port 9000 --gateway-mac ${TREX_GATEWAY_MAC} --perf-interval 10 > /var/log/tcp-echo-rust-dpdk.log 2>&1 &"
+    sleep 15
+    _dut_verify_running 'target/release/tcp-echo' 'rust-dpdk-tcp' '/var/log/tcp-echo-rust-dpdk.log'
+}
+
+start_dut_tokio_dpdk_tcp() {
+    log_info "Starting DUT: tokio-dpdk-tcp (tokio-tcp-echo server, DPDK backend)"
+    dut_bind_dpdk || return 1
+    _dut_hugepages
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tokio-tcp-echo --ip ${DUT_DATA_ENI_IP} --port 9000 --gateway-mac ${TREX_GATEWAY_MAC} --perf-interval 10 > /var/log/tcp-echo-tokio-dpdk.log 2>&1 &"
+    sleep 15
+    _dut_verify_running 'target/release/tokio-tcp-echo' 'tokio-dpdk-tcp' '/var/log/tcp-echo-tokio-dpdk.log'
+}
+
+start_dut_plain_rust_tcp() {
+    log_info "Starting DUT: plain-rust-tcp (plain-tcp-echo, kernel std::net baseline)"
+    dut_bind_kernel || return 1
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/plain-tcp-echo --ip ${DUT_DATA_ENI_IP} --port 9000 > /var/log/tcp-echo-plain-rust.log 2>&1 &"
+    sleep 10
+    _dut_verify_running 'target/release/plain-tcp-echo' 'plain-rust-tcp' '/var/log/tcp-echo-plain-rust.log'
+}
+
+start_dut_rust_dpdk_v6() {
+    log_info "Starting DUT: rust-dpdk-v6 (echo server, DPDK backend, IPv6)"
+    dut_bind_dpdk || return 1
+    _dut_hugepages
+    # echo brackets the v6 literal itself; --gateway-mac/--peer-ip seed the NDP
+    # cache so the first reply routes via the gateway (RX-learning covers steady
+    # state). DUT_DATA_ENI_IP / TREX_DATA_ENI_IP are v6 addrs (set by Phase 2c).
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/echo --ip ${DUT_DATA_ENI_IP} --port 9000 --gateway-mac ${TREX_GATEWAY_MAC} --peer-ip ${TREX_DATA_ENI_IP} --perf-interval 10 > /var/log/echo-rust-dpdk-v6.log 2>&1 &"
+    sleep 15
+    _dut_verify_running 'target/release/echo' 'rust-dpdk-v6' '/var/log/echo-rust-dpdk-v6.log'
+}
+
+# ── QUIC perf dispatch ────────────────────────────────────────────────────────
+# QUIC perf uses a different model (app-to-app, DpdkTestStack) than the
+# TRex/PerfTestStack UDP/TCP path, so quic-* tokens short-circuit in main()
+# (before any PerfTestStack deploy) and delegate to the dedicated orchestrators:
+#   quic-stock / quic-native-dpdk  -> run-quic-benchmarks.sh (in-process loopback
+#                                     bench: stock vs native-dpdk providers)
+#   quic-native-dpdk-nic           -> run-quic-perf.sh (real-NIC, 2-instance)
+# PR_NUMBER / GITHUB_REPOSITORY / DPDK_AMI_ID are inherited via the environment.
+run_quic_suite() {
+    log_info "=== QUIC perf suite (configs: $CONFIGS) ==="
+
+    local c has_loop=false has_nic=false
+    local _qlist
+    IFS=',' read -ra _qlist <<< "$CONFIGS"
+    for c in "${_qlist[@]}"; do
+        case "$c" in
+            quic-stock|quic-native-dpdk) has_loop=true ;;
+            quic-native-dpdk-nic)        has_nic=true ;;
+            quic-*) log_error "Unknown quic config token: $c"; return 2 ;;
+            *) log_error "Cannot mix quic-* with non-QUIC config '$c' in one run"; return 2 ;;
+        esac
+    done
+
+    # When both suites run they share the DpdkTestStack: the loopback run keeps
+    # it up (no teardown) and the nic run reuses it (--skip-deploy) and owns
+    # teardown. Empty flag vars expand to zero words (safe under set -u since
+    # they are defined).
+    local rc=0
+    local nic_skip=""
+    if [[ "$has_loop" == "true" ]]; then
+        local loop_td=""
+        [[ "$TEARDOWN" == "true" && "$has_nic" == "false" ]] && loop_td="--teardown"
+        log_info "Running QUIC loopback benchmarks (stock + native-dpdk)... ${loop_td}"
+        bash "$SCRIPT_DIR/run-quic-benchmarks.sh" $loop_td || rc=$?
+        [[ "$has_nic" == "true" ]] && nic_skip="--skip-deploy"
+    fi
+    if [[ "$has_nic" == "true" ]]; then
+        local nic_td=""
+        [[ "$TEARDOWN" == "true" ]] && nic_td="--teardown"
+        log_info "Running QUIC real-NIC perf (2-instance)... ${nic_skip} ${nic_td}"
+        bash "$SCRIPT_DIR/run-quic-perf.sh" $nic_skip $nic_td || rc=$?
+    fi
+    return $rc
 }
 
 # ── Results Aggregation ───────────────────────────────────────────────────────
@@ -1411,7 +1657,12 @@ def annotate_with_app_drops(cfg_data):
         cfg_data["kernel_ethtool_delta"] = kernel_delta
     if not samples:
         return
-    for size_results in cfg_data.get("results", {}).values():
+    _results = cfg_data.get("results", {})
+    if not isinstance(_results, dict):
+        # TCP/QUIC configs use a list-shaped 'results'; they carry no UDP-style
+        # [PERF] app-drop instrumentation, so there is nothing to annotate.
+        return
+    for size_results in _results.values():
         for step in size_results:
             ts_start = step.get("ts_start_unix")
             ts_end = step.get("ts_end_unix")
@@ -1545,9 +1796,12 @@ else:
         lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC imissed | NIC ierrors | NIC nombuf | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
         lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|-----------|-----------|-------------|-------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
             cfg_data = configs.get(cfg_name, {})
-            size_results = cfg_data.get("results", {}).get(pkt_size, [])
+            size_results = cfg_data.get("results", {})
+            if not isinstance(size_results, dict):
+                continue
+            size_results = size_results.get(pkt_size, [])
 
             for r in size_results:
                 tx_pps = f"{r.get('tx_pps', 0):,}"
@@ -1581,6 +1835,34 @@ else:
 
         lines.append("")
 
+    # ── TCP (ASTF) results ──────────────────────────────────────────────
+    # TCP configs carry protocol='tcp' and a list-shaped 'results' (one row per
+    # payload x CPS step), so they get their own table rather than the UDP
+    # packet-size tables above.
+    tcp_configs = sorted(n for n, d in configs.items() if isinstance(d, dict) and d.get("protocol") == "tcp")
+    if tcp_configs:
+        lines.append("### TCP (ASTF) Results")
+        lines.append("")
+        lines.append("| Config | Payload | Target CPS | Actual CPS | Throughput (Mbps) | Lat P50 (us) | Lat P99 (us) | Retransmits | Conn Drops |")
+        lines.append("|--------|---------|-----------|-----------|-------------------|-------------|-------------|-------------|------------|")
+        for cfg_name in tcp_configs:
+            rows = configs[cfg_name].get("results", [])
+            if not isinstance(rows, list):
+                continue
+            for r in rows:
+                payload = f"{r.get('payload_size', 0):,}B"
+                tcps = f"{r.get('target_cps', 0):,}"
+                acps = f"{r.get('cps', 0):,.0f}"
+                mbps = f"{r.get('throughput_mbps', 0):.1f}"
+                p50 = r.get('lat_p50_us', -1)
+                p99 = r.get('lat_p99_us', -1)
+                p50s = f"{p50:.1f}" if isinstance(p50, (int, float)) and p50 >= 0 else "N/A"
+                p99s = f"{p99:.1f}" if isinstance(p99, (int, float)) and p99 >= 0 else "N/A"
+                rexmit = f"{r.get('tcp_retransmits', 0):,}"
+                cdrops = f"{r.get('tcp_conndrops', 0):,}"
+                lines.append(f"| {cfg_name} | {payload} | {tcps} | {acps} | {mbps} | {p50s} | {p99s} | {rexmit} | {cdrops} |")
+        lines.append("")
+
     # ── NIC drops instrumentation self-check ────────────────────────────
     # For every config that emitted [NIC-BASELINE]/[NIC-FINAL], compare
     # (FINAL - BASELINE) to the sum of per-tick [PERF] deltas. If the
@@ -1600,7 +1882,7 @@ else:
     lines.append("")
     lines.append("| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |")
     lines.append("|--------|--------|--------------------------------|----------------------------------|-----------------------------------|")
-    for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust"]:
+    for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
         cfg_data = configs.get(cfg_name, {})
         check = cfg_data.get("nic_consistency")
         if check is None:
@@ -1738,6 +2020,24 @@ main() {
     log_info "Packet sizes: $PACKET_SIZES"
     log_info "Rate steps: $RATE_STEPS"
     log_info "Duration per step: ${DURATION}s"
+
+    # ── QUIC dispatch shim ────────────────────────────────────────────────────
+    # QUIC perf uses a different model (app-to-app, DpdkTestStack) than the
+    # TRex/PerfTestStack UDP/TCP path, so quic-* tokens short-circuit here —
+    # before any PerfTestStack deploy — and delegate to the QUIC orchestrators.
+    # quic-* is mutually exclusive with TRex configs in a single dispatch.
+    if [[ ",$CONFIGS," == *",quic-"* ]]; then
+        run_quic_suite
+        exit $?
+    fi
+
+    # ── IPv6 auto-trigger ─────────────────────────────────────────────────────
+    # Any *-v6 token forces IPv6 mode so Phase 2c assigns v6 addresses and the
+    # traffic IPs become v6 (run_benchmark.py auto-detects v6 from --dst-ip).
+    if [[ ",$CONFIGS," == *"-v6,"* && "$IP_VERSION" != "6" ]]; then
+        log_info "Detected -v6 config token(s) — enabling IPv6 mode (IP_VERSION=6)"
+        IP_VERSION="6"
+    fi
 
     mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
@@ -2228,6 +2528,11 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
             native-dpdk)         start_dut_native_dpdk         || start_ok=false ;;
             rust-stdlib)         start_dut_rust_stdlib          || start_ok=false ;;
             plain-rust)          start_dut_plain_rust           || start_ok=false ;;
+            rust-dpdk-tcp)       start_dut_rust_dpdk_tcp        || start_ok=false ;;
+            tokio-dpdk-tcp)      start_dut_tokio_dpdk_tcp       || start_ok=false ;;
+            plain-rust-tcp)      start_dut_plain_rust_tcp       || start_ok=false ;;
+            rust-dpdk-v6)        start_dut_rust_dpdk_v6         || start_ok=false ;;
+            native-dpdk-v6)      start_dut_native_dpdk          || start_ok=false ;;
             *)
                 log_error "Unknown config: $config"
                 failed_configs+=("$config")
@@ -2300,6 +2605,11 @@ ${dut_diag}
             native-dpdk)         log_file="/var/log/testpmd.log" ;;
             rust-stdlib)         log_file="/var/log/echo-rust-stdlib.log" ;;
             plain-rust)          log_file="/var/log/plain-echo.log" ;;
+            rust-dpdk-tcp)       log_file="/var/log/tcp-echo-rust-dpdk.log" ;;
+            tokio-dpdk-tcp)      log_file="/var/log/tcp-echo-tokio-dpdk.log" ;;
+            plain-rust-tcp)      log_file="/var/log/tcp-echo-plain-rust.log" ;;
+            rust-dpdk-v6)        log_file="/var/log/echo-rust-dpdk-v6.log" ;;
+            native-dpdk-v6)      log_file="/var/log/testpmd.log" ;;
         esac
         if [[ -n "${log_file:-}" ]]; then
             local app_log
