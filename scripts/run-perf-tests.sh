@@ -758,6 +758,12 @@ ensure_trex_mode() {
     start_trex_server "$want"
 }
 
+# Derive the TRex mode (stl|astf) for a comma-separated config list: astf if any
+# token ends in -tcp (TCP -> ASTF), else stl (UDP -> STL). Unit-tested.
+trex_mode_for_configs() {
+    [[ ",$1," == *"-tcp,"* ]] && echo astf || echo stl
+}
+
 stop_trex_server() {
     log_info "Stopping TRex server..."
     ssm_run_command "$TREX_INSTANCE_ID" 30 \
@@ -2448,8 +2454,8 @@ Starting TRex server..."
 
     # Start TRex in the mode of the first config type (astf if any *-tcp token,
     # else stl) so a coherent all-TCP or all-UDP run needs no mid-run restart.
-    local initial_trex_mode=stl
-    [[ ",$CONFIGS," == *"-tcp,"* ]] && initial_trex_mode=astf
+    local initial_trex_mode
+    initial_trex_mode=$(trex_mode_for_configs "$CONFIGS")
     if ! start_trex_server "$initial_trex_mode"; then
         # Grab TRex log and NIC state for diagnostics
         local trex_log
@@ -2733,4 +2739,7 @@ $summary
     log_info "=== All performance tests completed successfully ==="
 }
 
-main "$@"
+# Only run main when executed directly (not when sourced, e.g. by unit tests).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
