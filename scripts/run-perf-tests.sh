@@ -686,10 +686,18 @@ YAMLEOF
     fi
 }
 
+# Build the TRex server launch command for a mode (stl|astf). AWS ENA has no
+# hardware TCP_LRO; ASTF requests it and TRex dies at startup ("Requested RX
+# offload TCP_LRO is not supported"), so pass --lro-disable. STL/UDP does not
+# request LRO, so --lro-disable is a harmless no-op there. Unit-tested.
+trex_launch_cmd() {
+    local mode="${1:-stl}" astf=""
+    [[ "$mode" == "astf" ]] && astf="--astf "
+    echo "cd /opt/trex && nohup /opt/trex/t-rex-64 -i ${astf}--lro-disable --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown"
+}
+
 start_trex_server() {
     local trex_mode="${1:-stl}"
-    local astf_flag=""
-    [[ "$trex_mode" == "astf" ]] && astf_flag="--astf"
     CURRENT_TREX_MODE="$trex_mode"
     log_info "Starting TRex server (mode: $trex_mode)..."
     local TX_PCI="0000:00:06.0"
@@ -726,7 +734,7 @@ start_trex_server() {
     log_info "Starting TRex server..."
     local start_cmd_id
     start_cmd_id=$(ssm_run_command_fire_and_forget "$TREX_INSTANCE_ID" 120 \
-        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; cd /opt/trex && nohup /opt/trex/t-rex-64 -i $astf_flag --cfg /etc/trex_cfg.yaml -c 2 </dev/null >/var/log/trex-server.log 2>&1 & disown")
+        "pkill -f t-rex-64 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true; $(trex_launch_cmd "$trex_mode")")
     log_info "TRex start command sent (cmd_id: ${start_cmd_id:-none})"
 
     # Wait for TRex to initialize DPDK and start its API server.
@@ -740,7 +748,7 @@ start_trex_server() {
         "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
     log_info "TRex check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
 
-    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* ]]; then
         log_info "TRex server is running"
         return 0
     fi
@@ -752,7 +760,7 @@ start_trex_server() {
         "LOG_SIZE=\$(wc -c < /var/log/trex-server.log 2>/dev/null || echo 0); echo LOG_SIZE:\$LOG_SIZE; pgrep -f t-rex >/dev/null 2>&1 && echo PROCESS_FOUND; ss -tlnp 2>/dev/null | grep 4501 && echo API_PORT; if [ \$LOG_SIZE -gt 100 ]; then echo LOG_GROWING; fi; tail -10 /var/log/trex-server.log 2>/dev/null" || echo "SSM_CHECK_FAILED")
     log_info "TRex retry check: $(echo "$check" | tr '\n' ' ' | head -c 500)"
 
-    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* || "$check" == *"LOG_GROWING"* ]]; then
+    if [[ "$check" == *"PROCESS_FOUND"* || "$check" == *"API_PORT"* ]]; then
         log_info "TRex server is running (after retry)"
         return 0
     fi
