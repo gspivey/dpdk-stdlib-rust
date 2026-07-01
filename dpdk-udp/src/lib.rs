@@ -3327,6 +3327,34 @@ impl UdpSocket {
             }
         }
 
+        // Handle NDP (Neighbor Solicitation / Advertisement) — the IPv6 analogue
+        // of ARP. This MUST be checked before the generic ICMPv6 branch below:
+        // `process_icmpv6_full` returns `None` for NS/NA and that branch then
+        // unconditionally `return None`s, which would swallow the solicitation
+        // without ever generating a Neighbor Advertisement. NDP messages are
+        // link-local, carry ICMPv6 directly with no extension headers, and use a
+        // 14-byte (untagged) Ethernet header — `parse_ndp_packet` validates all
+        // of that, so we detect via the next-header + ICMPv6 type bytes and let
+        // the handler do full validation.
+        if layout.ethertype == ETH_TYPE_IPV6
+            && self.auto_arp
+            && frame_data.len() > ETH_HEADER_LEN + IPV6_HEADER_LEN
+            && frame_data[ETH_HEADER_LEN + 6] == IP_PROTO_ICMPV6
+        {
+            let icmp_type = frame_data[ETH_HEADER_LEN + IPV6_HEADER_LEN];
+            if icmp_type == ndp::ICMPV6_TYPE_NEIGHBOR_SOLICITATION
+                || icmp_type == ndp::ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT
+            {
+                // Learns the sender's MAC and, for an NS aimed at one of our
+                // addresses, returns a unicast NA to send back.
+                if let Some(na_frame) = self.ndp_handler.process_ndp(frame_data) {
+                    let _ = self.socket_backend.send_frame(&na_frame, None);
+                }
+                perf_inc!(self.perf_counters.rx_arp_handled);
+                return None;
+            }
+        }
+
         // Handle ICMPv6 (echo reply + error messages)
         if layout.ethertype == ETH_TYPE_IPV6 && frame_data.len() > layout.l3_offset + IPV6_HEADER_LEN {
             if let Some(nh) = ipv6::walk_extension_headers(&frame_data[layout.l3_offset..]) {
@@ -3567,6 +3595,15 @@ impl UdpSocket {
 
             perf_inc!(self.perf_counters.rx_packets);
             perf_inc!(self.perf_counters.rx_bytes, parsed.payload.len() as u64);
+
+            // Learn the sender's MAC (IPv6 parity with the IPv4 ARP-cache insert
+            // above). Without this the echo reply via `send_to_v6` misses the
+            // neighbor cache and falls back to the broadcast MAC `[0xff; 6]`,
+            // which AWS VPC drops. In an L3-routed VPC `parsed.src_mac` is the
+            // gateway MAC — exactly what the routed reply needs.
+            self.ndp_handler
+                .cache
+                .insert_if_changed(&parsed.src_ip, &parsed.src_mac);
 
             if parsed.dst_port != local_port {
                 return None;
@@ -3917,6 +3954,31 @@ impl UdpSocket {
     /// This is useful for pre-populating the ARP cache before sending data.
     pub fn send_arp_request(&self, target_ip: Ipv4Addr) -> io::Result<()> {
         if let Some(frame) = self.arp_handler.make_request(target_ip) {
+            self.socket_backend.send_frame(&frame, None)?;
+        }
+        Ok(())
+    }
+
+    /// Get a reference to the NDP neighbor cache (IPv6).
+    pub fn ndp_cache(&self) -> &Arc<NdpCache> {
+        &self.ndp_handler.cache
+    }
+
+    /// Manually add an NDP neighbor-cache entry (IPv6 → MAC).
+    ///
+    /// IPv6 analogue of [`UdpSocket::add_arp_entry`]. In an AWS VPC (which is
+    /// L3-routed, not L2-switched) seed this with the *gateway* MAC for the
+    /// peer's IPv6 address so the first echo reply is routed via the gateway
+    /// instead of falling back to the broadcast MAC. Inbound traffic also
+    /// auto-populates this cache, so the seed only guards the first-packet race.
+    pub fn add_ndp_entry(&self, ip: Ipv6Addr, mac: [u8; 6]) {
+        self.ndp_handler.cache.insert(ip, mac);
+    }
+
+    /// Send an NDP Neighbor Solicitation for `target_ip` to pre-populate the
+    /// neighbor cache. IPv6 analogue of [`UdpSocket::send_arp_request`].
+    pub fn send_ndp_solicitation(&self, target_ip: Ipv6Addr) -> io::Result<()> {
+        if let Some(frame) = self.ndp_handler.make_solicitation(&target_ip) {
             self.socket_backend.send_frame(&frame, None)?;
         }
         Ok(())
@@ -8150,6 +8212,156 @@ mod tests {
         let (len, src_addr) = result.expect("should receive IPv6 frame");
         assert_eq!(&buf[..len], b"roundtrip");
         assert_eq!(src_addr, SocketAddr::V6(std::net::SocketAddrV6::new(src_ip, 7777, 0, 0)));
+    }
+
+    // ── IPv6 NDP RX wiring + neighbor-cache tests ──
+
+    /// Minimal `PacketBackend` that records every sent frame, so tests can
+    /// inspect the NA reply / echo-reply destination MAC. The stub DPDK backend
+    /// drops sends (tx_burst returns 0), so it can't be used for this.
+    struct CaptureBackend {
+        mac: [u8; 6],
+        sent: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+    impl CaptureBackend {
+        fn new(mac: [u8; 6]) -> Self {
+            Self { mac, sent: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+    impl PacketBackend for CaptureBackend {
+        fn send_frame(&self, frame: &[u8]) -> io::Result<usize> {
+            self.sent.lock().unwrap().push(frame.to_vec());
+            Ok(frame.len())
+        }
+        fn recv_frames(&self, _max: usize) -> io::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn mac_address(&self) -> [u8; 6] { self.mac }
+        fn backend_name(&self) -> &'static str { "capture" }
+        fn set_promiscuous(&self, _enable: bool) -> io::Result<()> { Ok(()) }
+        fn is_promiscuous(&self) -> bool { false }
+        fn set_allmulticast(&self, _enable: bool) -> io::Result<()> { Ok(()) }
+        fn is_allmulticast(&self) -> bool { false }
+        fn rx_readiness(&self) -> RxReadiness { RxReadiness::PollOnly }
+    }
+
+    fn v6_socket_with_capture(local_ip: &str, port: u16) -> (UdpSocket, Arc<CaptureBackend>) {
+        let ip: Ipv6Addr = local_ip.parse().unwrap();
+        let cap = Arc::new(CaptureBackend::new([0x02, 0, 0, 0, 0, 0x11]));
+        let socket = UdpSocket::bind_with_backend(
+            SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)),
+            cap.clone() as Arc<dyn PacketBackend>,
+        ).unwrap();
+        (socket, cap)
+    }
+
+    /// Regression: an inbound Neighbor Solicitation for our address must be
+    /// routed to `process_ndp` (which learns the solicitor's MAC and emits an
+    /// NA). Before the fix the generic ICMPv6 branch swallowed NS/NA frames.
+    #[test]
+    fn ndp_rx_answers_neighbor_solicitation_with_advertisement() {
+        use crate::ndp::{
+            build_neighbor_solicitation, parse_ndp_packet,
+            ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT,
+        };
+        let local_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let (socket, cap) = v6_socket_with_capture("2001:db8::1", 9000);
+
+        let solicitor_mac = [0x02, 0, 0, 0, 0, 0xAA];
+        let solicitor_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let ns = build_neighbor_solicitation(&solicitor_mac, &solicitor_ip, &local_ip);
+
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&ns, 9000, &mut buf, &mut result, None);
+
+        // The NS reached process_ndp (it learned the solicitor's MAC).
+        assert_eq!(
+            socket.ndp_cache().lookup(&solicitor_ip),
+            Some(solicitor_mac),
+            "NDP RX should learn the solicitor's MAC",
+        );
+        // ...and a Neighbor Advertisement for our address was emitted.
+        let sent = cap.sent_frames();
+        let na = sent
+            .iter()
+            .filter_map(|f| parse_ndp_packet(f))
+            .find(|p| p.icmp_type == ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT && p.target == local_ip);
+        assert!(
+            na.is_some(),
+            "expected a Neighbor Advertisement for {local_ip}, got {} frame(s)",
+            sent.len(),
+        );
+    }
+
+    /// IPv4 ARP-cache parity: inbound IPv6 UDP must learn the sender's MAC into
+    /// the NDP cache, so echo replies resolve from cache instead of broadcasting.
+    #[test]
+    fn ipv6_udp_rx_learns_sender_mac_into_ndp_cache() {
+        use crate::ipv6::build_udp6_frame;
+        let socket = UdpSocket::bind("[2001:db8::1]:0").unwrap();
+        let local_port = match socket.local_addr().unwrap() {
+            SocketAddr::V6(v6) => v6.port(),
+            _ => panic!("expected V6"),
+        };
+        let src_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let src_mac = [0xaa; 6];
+        let frame = build_udp6_frame(
+            &src_mac, &[0xbb; 6], src_ip, "2001:db8::1".parse().unwrap(),
+            8000, local_port, b"learn me", 64,
+        ).unwrap();
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, local_port, &mut buf, &mut result, None);
+        assert_eq!(
+            socket.ndp_cache().lookup(&src_ip),
+            Some(src_mac),
+            "inbound IPv6 UDP should learn the sender's MAC (IPv4 ARP parity)",
+        );
+    }
+
+    /// After learning a neighbor via inbound traffic, `send_to_v6` must use the
+    /// learned MAC — not the `[0xff; 6]` broadcast fallback (which AWS VPC drops).
+    #[test]
+    fn ipv6_reply_uses_learned_mac_not_broadcast() {
+        use crate::ipv6::build_udp6_frame;
+        let (socket, cap) = v6_socket_with_capture("2001:db8::1", 9000);
+        let peer_ip: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let peer_mac = [0xcc; 6];
+        let frame = build_udp6_frame(
+            &peer_mac, &[0x02, 0, 0, 0, 0, 0x11], peer_ip,
+            "2001:db8::1".parse().unwrap(), 7000, 9000, b"hi", 64,
+        ).unwrap();
+        let mut buf = [0u8; 1500];
+        let mut result = None;
+        socket.process_frame_zerocopy(&frame, 9000, &mut buf, &mut result, None);
+
+        socket
+            .send_to(b"reply", SocketAddr::V6(SocketAddrV6::new(peer_ip, 7000, 0, 0)))
+            .unwrap();
+        let sent = cap.sent_frames();
+        let reply = sent.last().expect("a reply frame should have been sent");
+        assert_eq!(&reply[0..6], &peer_mac, "reply dst MAC must be the learned peer MAC");
+        assert_ne!(&reply[0..6], &[0xff; 6], "reply must not broadcast");
+    }
+
+    /// `add_ndp_entry` seeds the cache so the very first send resolves correctly
+    /// (the IPv6 analogue of `add_arp_entry` / the `--gateway-mac` seed).
+    #[test]
+    fn add_ndp_entry_seeds_resolution() {
+        let (socket, cap) = v6_socket_with_capture("2001:db8::1", 9000);
+        let peer_ip: Ipv6Addr = "2001:db8::abc".parse().unwrap();
+        let gw_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
+        socket.add_ndp_entry(peer_ip, gw_mac);
+        assert_eq!(socket.ndp_cache().lookup(&peer_ip), Some(gw_mac));
+        socket
+            .send_to(b"x", SocketAddr::V6(SocketAddrV6::new(peer_ip, 7000, 0, 0)))
+            .unwrap();
+        let sent = cap.sent_frames();
+        assert_eq!(&sent.last().unwrap()[0..6], &gw_mac, "send must use the seeded MAC");
     }
 
     #[test]
