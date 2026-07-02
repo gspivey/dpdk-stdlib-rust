@@ -1056,18 +1056,23 @@ ${output_tail}
         return 1
     fi
 
-    # Download results.
-    local results_json
-    results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "echo '---JSON_START---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
-    if [[ "$results_json" == *"FILE_NOT_FOUND"* ]]; then
+    # Download results — gzip+base64 through SSM. The full TCP results JSON is
+    # larger than SSM's ~24KB StandardOutputContent cap, so a plain `cat` gets
+    # truncated mid-structure (invalid JSON, "--output truncated--"). gzip shrinks
+    # it ~15x — well under the cap — and base64 makes it safe to carry; we decode
+    # locally.
+    local results_b64
+    results_b64=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
+        "if [ -f /tmp/perf-results/${config_name}.json ]; then echo '---JSON_B64_START---'; gzip -c /tmp/perf-results/${config_name}.json | base64 -w0; echo; echo '---JSON_B64_END---'; else echo 'FILE_NOT_FOUND'; fi")
+    if [[ "$results_b64" == *"FILE_NOT_FOUND"* ]]; then
         log_error "TCP results file not found on TRex for $config_name"
         return 1
     fi
-    local json_content
-    json_content=$(echo "$results_json" | sed -n '/^---JSON_START---$/,$ p' | tail -n +2)
     mkdir -p "$RESULTS_DIR"
-    echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
+    echo "$results_b64" \
+        | sed -n '/---JSON_B64_START---/,/---JSON_B64_END---/p' \
+        | sed '1d;$d' | tr -d ' \t\r\n' \
+        | base64 -d 2>/dev/null | gunzip 2>/dev/null > "$RESULTS_DIR/${config_name}.json"
 
     local json_check
     json_check=$(python3 -c "
