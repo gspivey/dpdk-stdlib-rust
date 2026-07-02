@@ -169,20 +169,25 @@ impl PacketBackend for DpdkBackend {
         let mut mbuf = self.mempool.alloc()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc failed: {}", e)))?;
 
-        // Copy frame data into mbuf
-        let data = mbuf.data_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
-
-        if data.len() < frame.len() {
+        // A freshly-allocated mbuf has data_len == 0, so data_mut() would return
+        // a zero-length slice. Compute capacity from the buffer and set the data
+        // length BEFORE data_mut() so it returns a correctly-sized slice. Getting
+        // this order wrong makes the capacity check read 0 and silently drops
+        // EVERY frame — this matches the proven UDP TX path in dpdk-udp.
+        let capacity = mbuf.buf_len() as usize - mbuf.data_offset() as usize;
+        if capacity < frame.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Frame too large: {} bytes, mbuf capacity: {}", frame.len(), data.len()),
+                format!("Frame too large: {} bytes, mbuf capacity: {}", frame.len(), capacity),
             ));
         }
 
-        data[..frame.len()].copy_from_slice(frame);
         mbuf.set_data_len(frame.len() as u16);
         mbuf.set_packet_len(frame.len() as u32);
+
+        let data = mbuf.data_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get mbuf data"))?;
+        data[..frame.len()].copy_from_slice(frame);
 
         // Transmit
         let port = self.port.lock().unwrap();
@@ -298,10 +303,18 @@ mod tests {
         // EtherType (IPv4)
         frame[12..14].copy_from_slice(&[0x08, 0x00]);
 
-        // With stubs, tx_burst returns 0, so this will get WouldBlock
+        // The frame must pass the capacity check and reach tx_burst. With stubs
+        // tx_burst returns 0 → WouldBlock; on real hardware it returns Ok(len).
+        // It must NEVER fail the capacity check — that was the regression that
+        // silently dropped every TX frame (data_mut() before set_data_len()).
         let result = backend.send_frame(&frame);
-        // Stubs return 0 for tx_burst, so we expect WouldBlock
-        assert!(result.is_err() || result.unwrap() == 64);
+        if let Err(e) = &result {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "send_frame must reach tx_burst, not fail the capacity check: {e}"
+            );
+        }
     }
 
     #[test]

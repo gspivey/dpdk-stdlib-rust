@@ -121,6 +121,21 @@ pub fn init_dpdk_tcp_context(cfg: DpdkTcpRuntimeConfig) -> io::Result<()> {
 ///
 /// Split out from [`run_engine_driver`] so it can be unit-tested with a mock
 /// backend.
+/// Send a frame, warning ONCE if the backend rejects it for a non-transient
+/// reason. A persistent TX failure would otherwise be silent — silently
+/// dropping every SYN-ACK once cost a full EC2 perf run to diagnose. Transient
+/// WouldBlock (tx ring full) is normal backpressure and ignored.
+fn send_or_warn(backend: &Arc<dyn PacketBackend>, out: &[u8]) {
+    if let Err(e) = backend.send_frame(out) {
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            static TX_ERR_ONCE: std::sync::Once = std::sync::Once::new();
+            TX_ERR_ONCE.call_once(|| {
+                eprintln!("tcp-engine: backend.send_frame failed — frames are being dropped: {e}");
+            });
+        }
+    }
+}
+
 fn drive_once(
     backend: &Arc<dyn PacketBackend>,
     engine: &mut TcpEngine,
@@ -140,7 +155,7 @@ fn drive_once(
             src_mac.copy_from_slice(&frame[6..12]);
             if let Ok(seg) = parse_tcp_packet(frame) {
                 for out in engine.on_segment_with_macs(&seg, src_mac, dst_mac) {
-                    let _ = backend.send_frame(&out);
+                    send_or_warn(backend, &out);
                 }
             }
         }
@@ -149,14 +164,14 @@ fn drive_once(
     // Commands (Connect/Listen/Accept/Shutdown/SetOption/Close).
     while let Ok(cmd) = cmd_rx.try_recv() {
         for out in engine.on_command(cmd) {
-            let _ = backend.send_frame(&out);
+            send_or_warn(backend, &out);
         }
     }
 
     // Timers + tx-ring drain → segments.
     let now = engine.clock().now();
     for out in engine.on_tick(now) {
-        let _ = backend.send_frame(&out);
+        send_or_warn(backend, &out);
     }
 }
 
