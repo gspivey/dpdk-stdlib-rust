@@ -364,9 +364,19 @@ pub fn parse_tcp_packet(frame: &[u8]) -> Result<ParsedTcpSegment, TcpError> {
     // Parse TCP options
     let options = parse_options(&frame[tcp + TCP_HEADER_LEN..tcp + tcp_header_len]);
 
-    // Payload
+    // Payload — bound by the IPv4 Total Length, NOT the raw frame end. NICs pad
+    // sub-60-byte Ethernet frames up to the 60-byte minimum, so a bare 54-byte
+    // ACK arrives on the wire as 60 bytes. Without this bound those 6 padding
+    // bytes are parsed as TCP payload, which advances rcv_nxt past what the peer
+    // actually sent — the DUT then ACKs unsent data and the peer RSTs the flow.
     let payload_start = tcp + tcp_header_len;
-    let payload = frame[payload_start..].to_vec();
+    let ip_total_len = u16::from_be_bytes([frame[ip + 2], frame[ip + 3]]) as usize;
+    let ip_end = (ip + ip_total_len).min(frame.len());
+    let payload = if ip_end > payload_start {
+        frame[payload_start..ip_end].to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(ParsedTcpSegment {
         src: SocketAddr::V4(SocketAddrV4::new(src_ip, src_port)),
@@ -775,6 +785,45 @@ mod tests {
         assert!(parsed.options.window_scale.is_some());
         assert!(parsed.options.sack_permitted);
         assert!(parsed.options.timestamps.is_some());
+    }
+
+    #[test]
+    fn parse_ignores_ethernet_padding() {
+        // A bare ACK is 54 bytes (14 Eth + 20 IPv4 + 20 TCP, no payload). NICs
+        // hardware-pad sub-60-byte frames to the 60-byte Ethernet minimum, so it
+        // arrives with 6 trailing zero bytes. The parser must bound payload by
+        // the IPv4 Total Length and report an EMPTY payload — treating the
+        // padding as data advances rcv_nxt past what the peer sent, so the DUT
+        // ACKs unsent bytes and the peer RSTs the flow (the on-wire perf bug).
+        let params = TcpFrameParams {
+            src_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            dst_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+            src: SocketAddr::from(([10, 0, 0, 1], 12345)),
+            dst: SocketAddr::from(([10, 0, 0, 2], 80)),
+            seq: SeqNum(1000),
+            ack: SeqNum(2000),
+            flags: TcpFlags::ACK,
+            window: 32768,
+            options: TcpOptions::default(),
+            payload: vec![],
+            ttl: 64,
+        };
+
+        let mut frame = build_tcp_frame(&params).unwrap();
+        assert_eq!(frame.len(), MIN_FRAME_LEN, "bare ACK should build to 54 bytes");
+
+        // Simulate the NIC padding the 54-byte frame up to the 60-byte minimum.
+        frame.extend_from_slice(&[0u8; 6]);
+        assert_eq!(frame.len(), 60);
+
+        let parsed = parse_tcp_packet(&frame).unwrap();
+        assert!(
+            parsed.payload.is_empty(),
+            "Ethernet padding must not be parsed as TCP payload (got {} bytes)",
+            parsed.payload.len()
+        );
+        assert_eq!(parsed.flags, TcpFlags::ACK);
+        assert_eq!(parsed.seq, SeqNum(1000));
     }
 
     #[test]
