@@ -1163,6 +1163,24 @@ impl TcpEngine {
                     entry_end.gt(tcb.snd_una)
                 });
 
+                // Drain acknowledged bytes off the front of send_buf and rebase
+                // the surviving retransmit-entry offsets. Without this, acked
+                // bytes linger in send_buf: the next write pushes send_buf past
+                // one MSS while has_unacked_data is (wrongly) still set, so Nagle
+                // withholds every subsequent segment and the connection stalls
+                // after the first exchange (the sustained bidir_multi hang).
+                let drain_n = (bytes_acked as usize).min(tcb.send_buf.len());
+                if drain_n > 0 {
+                    tcb.send_buf.drain(..drain_n);
+                    for entry in tcb.retransmit_queue.iter_mut() {
+                        entry.offset = entry.offset.saturating_sub(drain_n);
+                    }
+                }
+                // Nothing left in flight → clear the Nagle "unacked data" latch.
+                if tcb.snd_una == tcb.snd_nxt {
+                    tcb.has_unacked_data = false;
+                }
+
                 // Update congestion control
                 let mss = tcb.effective_mss();
                 tcb.congestion.on_ack(bytes_acked, mss);
