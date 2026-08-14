@@ -302,7 +302,7 @@ Three binary crates: `apps/tcp-echo` (sync echo server, `--ip`/`--port`, gracefu
 `.github/workflows/perf-tests-tcp.yml`: `workflow_dispatch` trigger with configurable inputs (payload sizes, duration, rate steps, DUT configs: `plain-rust-tcp`/`rust-dpdk-tcp`/`tokio-dpdk-tcp`). Deploy infrastructure → run TRex TCP traffic → collect results → post to PR comment (throughput, latency percentiles, CPS) → upload artifacts (90-day retention). Concurrency group `perf-tests-tcp` with safety-net teardown.
 
 - Spec: `.kiro/specs/tcp-support/` · task `15.5`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #114
 
 ---
 
