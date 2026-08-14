@@ -4,6 +4,65 @@ Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
 
+## Run #51: dpdk-stdlib-tcp EC2 Tier-1 Integration Test Scripts — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-08-14 |
+| **Git Hash** | `78538e5` |
+| **Branch** | `agent/tcp-tier1-integration-scripts` |
+| **PR** | [#115](https://github.com/gspivey/dpdk-stdlib-rust/pull/115) |
+| **GH Actions Run** | [31820177275](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/31820177275) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #50
+
+1. **`78538e5` — EC2 tier-1 TCP integration test scripts.** Adds three shell scripts in `scripts/integration-tests/`: `tier1-tcp-handshake.sh` (three-way handshake), `tier1-tcp-echo.sh` (bidirectional data transfer), `tier1-tcp-shutdown.sh` (graceful FIN teardown). Zero changes to any data-path crate.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,997 | 1.4% | 68,981 | 1.5% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,976 | 0.7% | 138,931 | 0.8% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 344,559 | 1.6% | 348,839 | 0.3% | 309,598 | 11.5% | 349,988 | 0.0% |
+| 700,000 | 355,153 | 49.3% | 570,124 | 17.3% | 309,883 | 55.7% | 542,971 | 22.4% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,978 | 1.5% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,956 | 0.7% | 138,908 | 0.8% | 138,998 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 323,268 | 7.6% | 348,872 | 0.3% | 225,978 | 35.4% | 349,988 | 0.0% |
+| 700,000 | 338,633 | 51.6% | 510,848 | 24.8% | 223,664 | 68.0% | 554,636 | 20.3% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,988 | 1.4% | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,957 | 0.7% | 138,910 | 0.8% | 138,954 | 0.7% | 139,995 | 0.0% |
+| 350,000 | 319,845 | 8.6% | 348,932 | 0.3% | 143,763 | 58.9% | 349,985 | 0.0% |
+| 700,000 | 335,368 | 29.6% | 471,225 | 1.1% | 152,758 | 68.0% | 475,537 | 0.2% |
+
+#### 8500-byte packets (jumbo, capped at 30 Gbps)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 50,632 | 27.7% | 68,993 | 1.4% | 54,801 | 21.7% | 69,994 | 0.0% |
+| 140,000 | 76,489 | 2.4% | 77,710 | 0.8% | 57,480 | 26.6% | 77,705 | 0.8% |
+| 350,000 | 77,156 | 1.5% | 77,658 | 0.9% | 58,174 | 25.7% | 75,732 | 3.3% |
+
+### Analysis
+
+No performance regression compared to Run #50. This PR adds TCP EC2 tier-1 integration test scripts (shell scripts only) with zero changes to any data-path crate. The UDP benchmark results confirm no collateral impact.
+
+---
+
 ## Run #50: dpdk-stdlib-tcp TRex TCP Performance Profile and Benchmark Runner — No Regression
 
 | Field | Value |
