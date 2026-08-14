@@ -311,7 +311,7 @@ Three binary crates: `apps/tcp-echo` (sync echo server, `--ip`/`--port`, gracefu
 Three scripts in `scripts/integration-tests/`: `tier1-tcp-handshake.sh` (DPDK↔DPDK three-way handshake), `tier1-tcp-echo.sh` (bidirectional data transfer), `tier1-tcp-shutdown.sh` (graceful FIN teardown). Each produces JUnit XML via `harness-common.sh`, 60-second timeout, targets `target/release/tcp-echo`.
 
 - Spec: `.kiro/specs/tcp-support/` · task `15.1`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #115
 
 ---
 

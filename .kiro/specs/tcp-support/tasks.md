@@ -436,7 +436,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - _Requirements: 3.4_
 
 - [ ] 15. Create TCP integration test harness scripts
-  - [ ] 15.1 Create tier1 TCP integration test scripts
+  - [x] 15.1 Create tier1 TCP integration test scripts
     - Create `scripts/integration-tests/tier1-tcp-handshake.sh` (three-way handshake DPDK↔DPDK, targets `target/release/tcp-echo`)
     - Create `scripts/integration-tests/tier1-tcp-echo.sh` (bidirectional data transfer)
     - Create `scripts/integration-tests/tier1-tcp-shutdown.sh` (graceful FIN teardown)
