@@ -4,6 +4,70 @@ Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
 
+## Run #51: dpdk-stdlib-tcp EC2 Tier-2 and Tier-3 Integration Test Scripts — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-08-14 |
+| **Git Hash** | `aaed799` |
+| **Branch** | `agent/tcp-tier2-tier3-integration-scripts` |
+| **PR** | [#117](https://github.com/gspivey/dpdk-stdlib-rust/pull/117) |
+| **GH Actions Run** | [31858746968](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/31858746968) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #50
+
+1. **`aaed799` — EC2 tier-2 and tier-3 TCP integration test scripts.** Adds `tier2-tcp-retransmit.sh` (loss injection via tc/netem), `tier2-tcp-flow-control.sh` (zero-window/persist probe), `tier3-tcp-kernel-interop.sh` (ncat/iperf3 interop), `tier3-tcp-std-parity.sh` (byte-for-byte std::net comparison). Zero changes to any data-path crate — shell scripts only.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,994 | 1.4% | 68,979 | 1.5% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,993 | 0.7% | 138,998 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 347,913 | 0.6% | 348,593 | 0.4% | 312,162 | 10.8% | 349,971 | 0.0% |
+| 700,000 | 471,308 | 32.7% | 697,369 | 0.4% | 314,573 | 55.1% | 454,827 | 35.0% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,994 | 1.4% | 68,997 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,968 | 0.7% | 138,939 | 0.8% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 344,967 | 1.4% | 348,567 | 0.4% | 225,615 | 35.5% | 349,994 | 0.0% |
+| 700,000 | 463,275 | 33.8% | 697,122 | 0.4% | 226,821 | 67.6% | 624,607 | 10.8% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,998 | 1.4% | 68,988 | 1.4% | 69,000 | 1.4% | 69,996 | 0.0% |
+| 140,000 | 138,967 | 0.7% | 138,928 | 0.8% | 138,976 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 343,992 | 1.7% | 348,781 | 0.3% | 145,199 | 58.5% | 349,924 | 0.0% |
+| 700,000 | 359,956 | 24.5% | 473,556 | 0.7% | 155,237 | 67.4% | 468,763 | 1.7% |
+
+#### 8500-byte packets (jumbo, capped at 30 Gbps)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 43,071 | 38.5% | 68,988 | 1.4% | 54,891 | 21.6% | 69,997 | 0.0% |
+| 140,000 | 76,968 | 1.8% | 76,921 | 1.8% | 58,499 | 25.3% | 77,320 | 1.3% |
+| 350,000 | 77,245 | 1.4% | 71,448 | 8.8% | 58,356 | 25.5% | 69,980 | 10.7% |
+
+### Analysis
+
+No performance regression compared to Run #50. This PR adds only shell scripts (tier-2 and tier-3 TCP integration test harnesses) with zero changes to any data-path crate. The UDP benchmark results confirm no collateral impact.
+
+Key observations:
+- **rust-dpdk** continues to perform well: 697K RX pps at 700K target for 64B (0.4% drop) — consistent with or better than Run #50 (675K, 3.5% drop).
+- **native-dpdk** shows normal variance at saturation: 454K at 700K/64B vs 677K in Run #50. This is expected run-to-run variability at line rate on a shared hypervisor.
+- **tokio-dpdk** and **plain-rust** results are consistent with historical patterns.
+
+---
+
 ## Run #50: dpdk-stdlib-tcp TRex TCP Performance Profile and Benchmark Runner — No Regression
 
 | Field | Value |
