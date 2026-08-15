@@ -89,6 +89,14 @@ export class DpdkTestStack extends cdk.Stack {
       'ICMP traffic between instances'
     );
 
+    // Allow TCP between DPDK interfaces (tcp-echo smoke tiers on port 9000).
+    // Without this, Tier-1 DPDK<->DPDK TCP handshakes are silently dropped.
+    dpdkSecurityGroup.addIngressRule(
+      dpdkSecurityGroup,
+      ec2.Port.allTcp(),
+      'TCP between DPDK interfaces (tcp-echo smoke tiers)'
+    );
+
     // Allow UDP from management interfaces (test-client sends from primary ENI
     // which is in the mgmt security group, targeting the DPDK ENI)
     dpdkSecurityGroup.addIngressRule(

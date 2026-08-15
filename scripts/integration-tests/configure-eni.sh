@@ -358,10 +358,15 @@ do_assign_ip() {
         return 1
     }
 
-    # Add route via subnet gateway
-    local gw
-    gw=$(echo "$ASSIGN_IP" | sed 's/\.[0-9]*$/.1/')
-    ip route replace default via "$gw" dev "$iface" metric 200 2>/dev/null || true
+    # Do NOT add a default route via this (data) ENI. All integration traffic is
+    # same-subnet (sender <-> receiver), handled by the /24 subnet route added by
+    # `ip addr` above. The old `ip route replace default ... metric 200` outranked
+    # the primary ENI's default route (metric 512 on AL2023), so the SSM agent's
+    # control-plane traffic got pulled onto this data ENI and lost connectivity —
+    # the in-flight SSM command then hung InProgress and the CI job was cancelled
+    # (the integration-test flake). For off-subnet needs, use source-based policy
+    # routing instead of a competing global default.
+    sysctl -w "net.ipv4.conf.${iface}.rp_filter=2" >/dev/null 2>&1 || true
 
     # Verify the IP is actually configured
     if ip -4 addr show "$iface" 2>/dev/null | grep -q "$ASSIGN_IP"; then
