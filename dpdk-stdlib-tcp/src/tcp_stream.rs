@@ -69,26 +69,52 @@ impl TcpContext {
         wakeup: Arc<EngineWakeup>,
         local_ip: std::net::Ipv4Addr,
     ) -> Self {
+        // Seed the ephemeral port allocator with a time-based offset so that
+        // successive process runs start from different ports. Without this,
+        // every new process begins at 49152 and collides with the TIME_WAIT
+        // entry left by the previous connection on the same 4-tuple (same
+        // peer IP:port and same local IP; TIME_WAIT lasts 120 s). On real
+        // hardware this manifests as the second DPDK connect in a test
+        // sequence hanging for exactly TEST_TIMEOUT seconds (60 s) because
+        // the server drops the SYN while the 4-tuple is still in TIME_WAIT.
+        //
+        // The range is 49152..=65535 (16384 ports). We mix the low bits of
+        // SystemTime to spread starts across the full range without pulling
+        // in a PRNG crate. The modulo arithmetic stays within u16 without
+        // risk of panic: RANGE is 16384, well below u16::MAX.
+        const RANGE: u16 = 65535 - 49152 + 1; // 16384
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u16;
+        let start = 49152u16.saturating_add(seed % RANGE);
         Self {
             backend,
             resolver,
             cmd_tx,
             wakeup,
             local_ip,
-            next_port: std::sync::atomic::AtomicU16::new(49152),
+            next_port: std::sync::atomic::AtomicU16::new(start),
         }
     }
 
     /// Allocate an ephemeral port for a new outbound connection.
     pub fn allocate_port(&self) -> u16 {
-        // Simple incrementing ephemeral port allocator (49152..65535).
+        // Incrementing ephemeral port allocator (49152..=65535), wrapping
+        // within the range. The starting point is randomised per process in
+        // `TcpContext::new` to avoid TIME_WAIT 4-tuple collisions across runs.
+        const RANGE_END: u16 = 65535;
+        const RANGE_START: u16 = 49152;
         loop {
             let port = self.next_port.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if port >= 49152 {
-                return port;
+            if port >= RANGE_START {
+                if port <= RANGE_END {
+                    return port;
+                }
+                // Wrapped past the top of the ephemeral range; reset to start.
+                self.next_port.store(RANGE_START, std::sync::atomic::Ordering::Relaxed);
             }
-            // Wrapped; reset to start of ephemeral range.
-            self.next_port.store(49152, std::sync::atomic::Ordering::Relaxed);
+            // port < RANGE_START means we raced past a reset; retry.
         }
     }
 }

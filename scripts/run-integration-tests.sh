@@ -81,10 +81,13 @@ while [[ $# -gt 0 ]]; do
         --json-summary)  FLAG_JSON_SUMMARY=true;  shift ;;
         --tier)
             TIER_FILTER="$2"
-            if [[ "$TIER_FILTER" != "1" && "$TIER_FILTER" != "2" && "$TIER_FILTER" != "3" ]]; then
-                echo "ERROR: --tier must be 1, 2, or 3, got: $TIER_FILTER" >&2
-                exit 2
-            fi
+            case "$TIER_FILTER" in
+                1|2|3|4|tcp1|tcp1a|tcp2) ;;
+                *)
+                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2, got: $TIER_FILTER" >&2
+                    exit 2
+                    ;;
+            esac
             shift 2
             ;;
         -h|--help)
@@ -158,7 +161,7 @@ post_pr_comment() {
 
 # ── Process cleanup and ARP warming ──────────────────────────────────────────
 
-CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
 
 # Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
 # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
@@ -903,6 +906,109 @@ run_tier4() {
     log_info "Tier 4 execution complete"
 }
 
+# ── TCP smoke tiers ──────────────────────────────────────────────────────────
+
+# Shared driver for a DPDK<->DPDK TCP echo pair (both instances on DPDK).
+# $1 = server binary name (tcp-echo | tokio-tcp-echo), $2 = output XML basename,
+# $3 = suite name for synthetic failure XML.
+_tier1_tcp_impl() {
+    local server_binary="$1"
+    local out_xml="$2"
+    local suite="$3"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    log_info "Starting TCP listener on receiver (server=$server_binary)..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary $server_binary"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener ($server_binary)"
+        generate_failure_xml "$suite" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    log_info "Starting TCP sender on sender..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/$out_xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "TCP sender test execution failed ($server_binary)"
+        generate_failure_xml "$suite" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+}
+
+run_tier1_tcp() {
+    log_section "Tier 1 TCP (sync): DPDK <-> DPDK TCP echo test"
+    _tier1_tcp_impl "tcp-echo" "tier1-tcp-echo.xml" "tier1-tcp-echo"
+    log_info "Tier 1 TCP (sync) execution complete"
+}
+
+run_tier1_tcp_async() {
+    log_section "Tier 1 TCP (async): DPDK <-> DPDK tokio TCP echo test"
+    _tier1_tcp_impl "tokio-tcp-echo" "tier1-tcp-echo-async.xml" "tier1-tcp-echo-async"
+    log_info "Tier 1 TCP (async) execution complete"
+}
+
+run_tier2_tcp() {
+    log_section "Tier 2 TCP: kernel client -> DPDK TCP server test"
+
+    # Bind receiver ENI (DPDK), unbind sender ENI (kernel) — mirrors run_tier2.
+    log_info "Configuring ENIs for Tier 2 TCP..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier2-tcp-echo" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+
+    warm_arp_cache
+
+    log_info "Starting DPDK TCP listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener"
+        generate_failure_xml "tier2-tcp-echo" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    log_info "Starting kernel TCP client on sender (kernel networking)..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-tcp-echo.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Kernel client test execution failed"
+        generate_failure_xml "tier2-tcp-echo" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 2 TCP execution complete"
+}
+
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
@@ -1213,6 +1319,115 @@ print(f"JSON summary written to {output_path}")
 PYEOF
 
     log_info "JSON summary generated: $RESULTS_DIR/summary.json"
+}
+
+# Generate a self-contained, analyzable Markdown summary of all tiers: per-tier,
+# per-testcase pass/fail WITH the failure reason, classifying each failure as a
+# real test failure (JUnit type=AssertionError, from the tier scripts) vs an
+# infra/setup flake (type=ExecutionError, from generate_failure_xml — ENI bind /
+# SSM / listener-start timeouts). Written to summary.md so a reviewer can analyze
+# a run from the PR comment alone, without downloading artifacts or using gh.
+generate_markdown_summary() {
+    local commit_hash run_url label
+    commit_hash=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}/actions/runs/${GITHUB_RUN_ID:-0}"
+    label="${GITHUB_WORKFLOW:-Integration Tests}"
+    python3 - "$RESULTS_DIR" "$commit_hash" "$run_url" "$label" > "$RESULTS_DIR/summary.md" <<'PYEOF'
+import re, os, sys, html
+
+results_dir, commit, run_url, label = sys.argv[1:5]
+# Infra/setup failures use JUnit type=ExecutionError (generate_failure_xml); real
+# test failures use type=AssertionError (harness junit_add_failure). Fall back to
+# a keyword match if the type is missing.
+INFRA_RE = re.compile(r'ENI|SSM|Polling timeout|configure-eni|assign-ip|Failed to start|unbind|IP assignment|listener|readiness|instance', re.I)
+
+def classify(ftype, msg):
+    if (ftype or '') == 'ExecutionError':
+        return 'infra'
+    if (ftype or '') == 'AssertionError':
+        return 'real'
+    return 'infra' if INFRA_RE.search(msg or '') else 'real'
+
+def cell(s):
+    s = html.unescape(s or '').replace('\n', ' ').replace('|', r'\|').strip()
+    return (s[:90] + '…') if len(s) > 91 else s
+
+rows, reals, infras = [], [], []
+total = passed = n_real = n_infra = 0
+
+for xmlf in sorted(os.listdir(results_dir)):
+    if not xmlf.endswith('.xml'):
+        continue
+    with open(os.path.join(results_dir, xmlf)) as f:
+        content = f.read()
+    sm = re.search(r'<testsuite\s+([^>]+)>', content)
+    if not sm:
+        continue
+    m = re.search(r'name="([^"]*)"', sm.group(1))
+    suite = m.group(1) if m else xmlf
+    for tc in re.finditer(r'<testcase\s+([^>]*?)>(.*?)</testcase>', content, re.DOTALL):
+        attrs, body = tc.group(1), tc.group(2)
+        m = re.search(r'name="([^"]*)"', attrs)
+        name = m.group(1) if m else 'unknown'
+        m = re.search(r'time="([^"]*)"', attrs)
+        tsec = m.group(1) if m else '0'
+        fm = re.search(r'<failure\s+message="([^"]*)"(?:\s+type="([^"]*)")?[^>]*>(.*?)</failure>', body, re.DOTALL)
+        total += 1
+        if not fm:
+            passed += 1
+            rows.append((suite, name, '✅ pass', tsec, ''))
+            continue
+        msg = html.unescape(fm.group(1))
+        kind = classify(fm.group(2), msg)
+        details = html.unescape(fm.group(3)).strip()
+        if kind == 'infra':
+            n_infra += 1
+            rows.append((suite, name, '⚠️ infra', tsec, cell(msg)))
+            infras.append((suite, name, msg))
+        else:
+            n_real += 1
+            rows.append((suite, name, '❌ real', tsec, cell(msg)))
+            reals.append((suite, name, msg, details))
+
+def plural(n):
+    return '' if n == 1 else 's'
+
+if n_real:
+    verdict = f'❌ {n_real} real failure{plural(n_real)}'
+    if n_infra:
+        verdict += f' · ⚠️ {n_infra} infra flake{plural(n_infra)}'
+elif n_infra:
+    verdict = f'⚠️ {n_infra} infra flake{plural(n_infra)} · 0 real failures'
+else:
+    verdict = '✅ all passed'
+
+o = []
+o.append(f'## Integration Tests — {verdict}')
+o.append(f'`{commit}` · [run]({run_url}) · {label} · {total} tests: {passed} ✅ · {n_real} ❌ real · {n_infra} ⚠️ infra')
+o.append('')
+o.append('| Tier | Test | Result | Time | Reason |')
+o.append('|------|------|--------|-----:|--------|')
+for suite, name, result, tsec, reason in rows:
+    o.append(f'| {suite} | {name} | {result} | {tsec}s | {reason} |')
+o.append('')
+if reals:
+    o.append(f'### ❌ Real failures ({n_real}) — code/test issues')
+    for suite, name, msg, details in reals:
+        o.append(f'- **{suite} / {name}** — {html.unescape(msg)}')
+        if details:
+            o.append(f'  <details><summary>details</summary>\n\n```\n{details[:1500]}\n```\n</details>')
+    o.append('')
+if infras:
+    o.append(f'### ⚠️ Infra flakes ({n_infra}) — SSM/ENI setup, not code (task #10)')
+    for suite, name, msg in infras:
+        o.append(f'- {suite} / {name} — {html.unescape(msg)}')
+    o.append('')
+if not reals and not infras:
+    o.append(f'### ✅ All {total} tests passed')
+
+print('\n'.join(o))
+PYEOF
+    log_info "Markdown summary generated: $RESULTS_DIR/summary.md"
 }
 
 # ── Teardown ─────────────────────────────────────────────────────────────────
@@ -1608,6 +1823,31 @@ Infrastructure ready.
         run_tier4 || true
     fi
 
+    # Unbind ENIs between tier 4 and the TCP tiers
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1" ]]; then
+        run_tier1_tcp || true
+    fi
+
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1a" ]]; then
+        run_tier1_tcp_async || true
+    fi
+
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp2" ]]; then
+        run_tier2_tcp || true
+    fi
+
     # Step 6: Collect results
     collect_results
 
@@ -1619,24 +1859,13 @@ Infrastructure ready.
     collect_instance_logs || true
     write_step_summary || true
 
-    # Post final summary to PR
-    local summary_body="## [CI] Stage: Summary\n"
-    if [[ "$TEST_EXIT_CODE" -eq 0 ]]; then
-        summary_body+="All tests **PASSED**."
-    else
-        summary_body+="Some tests **FAILED** (exit code: $TEST_EXIT_CODE)."
+    # Post the final analyzable summary to the PR: per-tier, per-testcase pass/
+    # fail with the failure reason, classifying real test failures vs infra/setup
+    # flakes. Self-contained — a run can be analyzed from this comment alone.
+    generate_markdown_summary
+    if [[ -f "$RESULTS_DIR/summary.md" ]]; then
+        post_pr_comment "$(cat "$RESULTS_DIR/summary.md")"
     fi
-    summary_body+="\n\nARP seeding: kernel /proc/net/arp (automatic)"
-    # Include JUnit results summary
-    for xml_file in "$RESULTS_DIR"/*.xml; do
-        [[ -f "$xml_file" ]] || continue
-        local suite_name tests failures
-        suite_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        tests=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        failures=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        summary_body+="\n- **${suite_name:-unknown}**: ${tests:-0} tests, ${failures:-0} failures"
-    done
-    post_pr_comment "$(echo -e "$summary_body")"
 
     # Step 9: Teardown
     teardown_infrastructure
