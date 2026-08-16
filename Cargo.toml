@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+  "dpdk-sys",
+  "dpdk",
+  "dpdk-stdlib-net",
+  "dpdk-udp",
+  "dpdk-stdlib-tcp",
+  "dpdk-stdlib-quic",
+  "dpdk-tokio",
+  "apps/echo",
+  "apps/test-client",
+  "apps/tokio-echo",
+  "apps/plain-echo",
+  "apps/synthetic-bench",
+  "apps/tcp-echo",
+  "apps/tcp-test-client",
+  "apps/tokio-tcp-echo",
+  "apps/tcp-synthetic-bench",
+  "apps/plain-tcp-echo",
+  "apps/tcp-kernel-client",
+]
+
+[workspace.package]
+version = "0.2.0"
+authors = ["Gerard Spivey"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/gspivey/dpdk-stdlib-rust"
+keywords = ["dpdk", "networking", "udp", "kernel-bypass", "zero-copy"]
+categories = ["network-programming"]
+
+[workspace.dependencies]
+thiserror = "1"
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serial_test = "3"

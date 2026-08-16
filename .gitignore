@@ -1,0 +1,28 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+node_modules/
+design-doc.md
+yt.md
+
+# CDK artifacts
+deploy/cdk/cdk.out/
+deploy/cdk/cdk.context.json
+deploy/cdk/package-lock.json
+
+# Deployment test directories
+deploy/test-*/
+deploy/deploy.sh
+scripts/__pycache__/
+
+# Logs from an integration test run
+integ-logs
+instance-logs/
+test-results/

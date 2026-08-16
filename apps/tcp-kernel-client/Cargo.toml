@@ -1,0 +1,13 @@
+[package]
+name = "tcp-kernel-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tcp-kernel-client"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

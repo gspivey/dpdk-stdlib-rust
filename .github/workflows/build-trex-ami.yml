@@ -1,0 +1,150 @@
+name: Build TRex AMI
+
+on:
+  schedule:
+    - cron: '0 4 * * 1,4' # Monday and Thursday 4:00 AM UTC (twice weekly)
+  workflow_dispatch:
+    inputs:
+      trex_version:
+        description: 'TRex version to build'
+        required: false
+        default: 'v3.08'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  SSM_AMI_PARAMETER: /dpdk-stdlib-rust/ami/trex-latest
+  SSM_TREX_VERSION_PARAMETER: /dpdk-stdlib-rust/ami/trex-version
+
+jobs:
+  build-ami:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: 'latest'
+
+      - name: Initialize Packer
+        run: |
+          cd packer
+          packer init trex-ami.pkr.hcl
+
+      - name: Validate Packer template
+        run: |
+          cd packer
+          packer validate trex-ami.pkr.hcl
+
+      - name: Build AMI
+        id: build
+        run: |
+          cd packer
+          TREX_VERSION="${{ github.event.inputs.trex_version || 'v3.08' }}"
+
+          set +e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "trex_version=${TREX_VERSION}" \
+            -machine-readable \
+            trex-ami.pkr.hcl 2>&1 | tee packer-output.log
+          PACKER_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $PACKER_EXIT -ne 0 ]]; then
+            PACKER_ERRORS=$(grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -5 | tr '\n' ' ' || echo "unknown")
+            echo "::error::Packer build failed (exit ${PACKER_EXIT}). Errors: ${PACKER_ERRORS}"
+
+            {
+              echo "## TRex Packer Build Failed (exit code ${PACKER_EXIT})"
+              echo ""
+              echo "### Error Messages"
+              echo '```'
+              grep -E ',(ui,error|error),' packer-output.log | sed 's/.*,ui,error,//; s/.*,error,//' | tail -40 || echo "(none)"
+              echo '```'
+              echo ""
+              echo "### Last 80 UI Messages"
+              echo '```'
+              grep ',ui,' packer-output.log | sed 's/.*,ui,[^,]*,//' | tail -80 || echo "(none)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit $PACKER_EXIT
+          fi
+
+          AMI_ID=$(grep 'artifact,0,id' packer-output.log | awk -F, '{print $NF}' | awk -F: '{print $NF}')
+
+          if [[ -z "$AMI_ID" || ! "$AMI_ID" =~ ^ami- ]]; then
+            echo "::error::Failed to extract AMI ID from Packer output"
+            tail -80 packer-output.log
+            exit 1
+          fi
+
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          echo "trex_version=${TREX_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Built TRex AMI: ${AMI_ID}"
+
+      - name: Upload Packer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-output-log
+          path: packer/packer-output.log
+          retention-days: 7
+
+      - name: Store AMI ID in SSM Parameter Store
+        run: |
+          AMI_ID="${{ steps.build.outputs.ami_id }}"
+          TREX_VERSION="${{ steps.build.outputs.trex_version }}"
+
+          aws ssm put-parameter \
+            --name "${{ env.SSM_AMI_PARAMETER }}" \
+            --type String \
+            --value "${AMI_ID}" \
+            --overwrite \
+            --description "Latest TRex AMI for dpdk-stdlib-rust performance tests"
+
+          aws ssm put-parameter \
+            --name "${{ env.SSM_TREX_VERSION_PARAMETER }}" \
+            --type String \
+            --value "${TREX_VERSION}" \
+            --overwrite \
+            --description "TRex version in the latest pre-built AMI"
+
+          echo "Stored TRex AMI ID ${AMI_ID} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
+
+      - name: Deregister old AMIs (keep last 3)
+        run: |
+          OLD_AMIS=$(aws ec2 describe-images \
+            --owners self \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=*trex*" \
+            --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
+            --output text)
+
+          for ami_id in $OLD_AMIS; do
+            echo "Deregistering old TRex AMI: $ami_id"
+            SNAPSHOTS=$(aws ec2 describe-images \
+              --image-ids "$ami_id" \
+              --query "Images[0].BlockDeviceMappings[*].Ebs.SnapshotId" \
+              --output text)
+
+            aws ec2 deregister-image --image-id "$ami_id"
+
+            for snap_id in $SNAPSHOTS; do
+              echo "Deleting snapshot: $snap_id"
+              aws ec2 delete-snapshot --snapshot-id "$snap_id" || true
+            done
+          done

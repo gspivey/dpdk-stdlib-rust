@@ -1,0 +1,29 @@
+[package]
+name = "dpdk-stdlib-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Raw FFI bindings for DPDK with stub support for building without DPDK installed"
+readme = "README.md"
+links = "dpdk"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
+
+[features]
+default = []
+# Use real DPDK bindings (requires DPDK installed)
+# When disabled, uses stub implementations for development/testing
+bindgen = ["dep:bindgen"]
+
+[dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+bindgen = { version = "0.70", optional = true }
+cc = "1"
+pkg-config = "0.3"
+
+[lib]
+name = "dpdk_sys"

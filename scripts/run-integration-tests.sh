@@ -1,0 +1,2088 @@
+#!/usr/bin/env bash
+# run-integration-tests.sh - Orchestrator for EC2 integration tests
+#
+# Drives the full lifecycle: deploy, wait for readiness, configure ENIs,
+# run test tiers, collect JUnit XML results, optionally teardown.
+#
+# Usage:
+#   ./scripts/run-integration-tests.sh [AWS_PROFILE] [--teardown] [--skip-deploy] [--tier 1|3] [--json-summary]
+#
+# When AWS_PROFILE is omitted or set to "default", the script relies on
+# environment-variable credentials (AWS_ACCESS_KEY_ID, etc.) which is the
+# norm in GitHub Actions.  A named profile is only exported when explicitly
+# provided and not equal to "default".
+#
+# Exit codes:
+#   0 = all tests passed
+#   1 = one or more tests failed
+#   2 = infrastructure/setup failure
+
+set -euo pipefail
+
+# ── Repository root detection ────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CDK_DIR="$REPO_ROOT/deploy/cdk"
+
+# ── Configuration constants ──────────────────────────────────────────────────
+
+SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
+TEST_TIMEOUT=120             # 2 minutes per test scenario
+ENI_BIND_TIMEOUT=120         # 120 seconds for ENI bind/unbind (covers 30s vfio drain + 20s bind poll + SSM latency)
+RESULTS_DIR="$REPO_ROOT/test-results"
+RESULTS_REMOTE_DIR="/tmp/test-results"
+CDK_STACK_NAME="${CDK_STACK_NAME:-DpdkTestStack}"
+SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
+LOGS_DIR="$REPO_ROOT/instance-logs"
+FAILED_STEP=""               # Set by fail_with_logs; written to step summary / failure JSON
+
+# ── CLI argument parsing ─────────────────────────────────────────────────────
+
+AWS_PROFILE=""
+FLAG_TEARDOWN=false
+FLAG_SKIP_DEPLOY=false
+FLAG_JSON_SUMMARY=false
+TIER_FILTER=""  # empty = run all tiers
+
+usage() {
+    cat <<EOF
+Usage: $0 [AWS_PROFILE] [OPTIONS]
+
+Orchestrates EC2 integration tests for dpdk-stdlib-rust.
+
+Arguments:
+  AWS_PROFILE           AWS CLI profile name (optional; ignored when "default")
+
+Options:
+  --teardown            Destroy AWS infrastructure after tests complete
+  --skip-deploy         Skip CDK deployment (use existing infrastructure)
+  --tier <1|3>          Run only the specified test tier
+  --json-summary        Generate test-results/summary.json for agent consumption
+  -h, --help            Show this help message
+
+Exit codes:
+  0  All tests passed
+  1  One or more tests failed
+  2  Infrastructure/setup failure
+EOF
+}
+
+# First positional argument is AWS_PROFILE (optional — may be a flag instead)
+if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    AWS_PROFILE="$1"
+    shift
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --teardown)      FLAG_TEARDOWN=true;      shift ;;
+        --skip-deploy)   FLAG_SKIP_DEPLOY=true;   shift ;;
+        --json-summary)  FLAG_JSON_SUMMARY=true;  shift ;;
+        --tier)
+            TIER_FILTER="$2"
+            if [[ "$TIER_FILTER" != "1" && "$TIER_FILTER" != "2" && "$TIER_FILTER" != "3" && "$TIER_FILTER" != "4" && "$TIER_FILTER" != "tcp1" && "$TIER_FILTER" != "tcp2" && "$TIER_FILTER" != "tcp3" ]]; then
+                echo "ERROR: --tier must be 1, 2, 3, 4, tcp1, tcp2, or tcp3, got: $TIER_FILTER" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+# Only export AWS_PROFILE when it's a real named profile.
+# In GitHub Actions, credentials come from env vars (AWS_ACCESS_KEY_ID etc.)
+# and exporting AWS_PROFILE=default causes the CLI to look for a named profile
+# that doesn't exist, shadowing the env-var credentials.
+if [[ -n "$AWS_PROFILE" && "$AWS_PROFILE" != "default" ]]; then
+    export AWS_PROFILE
+else
+    # Ensure no stale AWS_PROFILE leaks into child processes
+    unset AWS_PROFILE 2>/dev/null || true
+    AWS_PROFILE=""
+fi
+
+# ── Logging helpers ──────────────────────────────────────────────────────────
+
+log_info() {
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] INFO: $*"
+}
+
+log_error() {
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: $*" >&2
+}
+
+log_section() {
+    echo ""
+    echo "================================================================"
+    echo "  $*"
+    echo "================================================================"
+    echo ""
+}
+
+# ── PR comment helper (for staged CI feedback to Claude Code web) ────────────
+# Posts a markdown comment to the PR associated with this CI run.
+# Requires GH_TOKEN and either PR_NUMBER or GITHUB_HEAD_REF to be set.
+# No-op if not running in CI or no PR is found.
+
+post_pr_comment() {
+    local body="$1"
+    local pr_number="${PR_NUMBER:-}"
+
+    # Skip if gh CLI is not available
+    command -v gh >/dev/null 2>&1 || return 0
+
+    # Skip if no GH_TOKEN
+    [[ -n "${GH_TOKEN:-}" ]] || return 0
+
+    # Find PR number if not set
+    if [[ -z "$pr_number" && -n "${GITHUB_HEAD_REF:-}" ]]; then
+        pr_number=$(gh pr list --head "$GITHUB_HEAD_REF" --json number --jq '.[0].number' \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$pr_number" ]]; then
+        gh pr comment "$pr_number" --body "$body" \
+            --repo "${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}" 2>/dev/null || true
+    fi
+}
+
+# ── Process cleanup and ARP warming ──────────────────────────────────────────
+
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+
+# Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
+# In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
+# dpdk-udp reads /proc/net/arp at bind() time, so we need the kernel to
+# have resolved the gateway and peer IPs before the DPDK binaries start.
+# Uses async SSM commands to warm both instances in parallel.
+warm_arp_cache() {
+    log_info "Warming kernel ARP cache on both instances..."
+    local subnet_prefix
+    subnet_prefix=$(echo "$SENDER_DPDK_ENI_IP" | sed 's/\.[0-9]*$/.1/')
+    local arp_warm_cmd="ping -c 1 -W 2 ${subnet_prefix} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${SENDER_DPDK_ENI_IP} >/dev/null 2>&1 || true; ping -c 1 -W 2 ${RECEIVER_DPDK_ENI_IP} >/dev/null 2>&1 || true"
+    ssm_run_command "$SENDER_INSTANCE_ID" 30 "$arp_warm_cmd" || true
+    sleep 2
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 30 "$arp_warm_cmd" || true
+}
+
+# ── Networking diagnostics ───────────────────────────────────────────────────
+
+run_diagnostics() {
+    local label="$1"  # "baseline" or "failure"
+    log_info "Running networking diagnostics ($label)..."
+
+    for entry in "sender:${SENDER_INSTANCE_ID}" "receiver:${RECEIVER_INSTANCE_ID}"; do
+        local role="${entry%%:*}"
+        local instance_id="${entry##*:}"
+        [[ -n "$instance_id" ]] || continue
+
+        local diag_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/diagnose-networking.sh 2>&1"
+        local diag_cmd_id
+        diag_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$diag_cmd")
+        if [[ -n "$diag_cmd_id" ]]; then
+            if ssm_wait_command "$instance_id" "$diag_cmd_id" 30; then
+                local output
+                output=$(ssm_get_stdout "$instance_id" "$diag_cmd_id" 2>/dev/null || echo "")
+                if [[ -n "$output" ]]; then
+                    mkdir -p "$LOGS_DIR"
+                    echo "$output" > "$LOGS_DIR/${role}-networking-diag-${label}.txt"
+                    log_info "Saved ${role} diagnostics to ${role}-networking-diag-${label}.txt"
+                fi
+            fi
+        fi
+    done
+}
+
+# ── Stack output variables (populated after deploy) ──────────────────────────
+
+SENDER_INSTANCE_ID=""
+RECEIVER_INSTANCE_ID=""
+SENDER_DPDK_ENI_ID=""
+RECEIVER_DPDK_ENI_ID=""
+SENDER_DPDK_ENI_IP=""
+RECEIVER_DPDK_ENI_IP=""
+
+# Track test results
+TEST_EXIT_CODE=0
+
+# ── Infrastructure deployment ────────────────────────────────────────────────
+
+# wait_for_stack_delete: poll until the stack is no longer in DELETE_IN_PROGRESS.
+# CDK deploy fails immediately if a previous run's teardown is still in flight.
+# Also handles DELETE_FAILED: retriggers stack deletion so CDK can deploy fresh.
+# Waits up to STACK_DELETE_WAIT_SECS (default 600 = 10 min), polling every 15s.
+wait_for_stack_delete() {
+    local stack_name="$1"
+    local max_wait="${STACK_DELETE_WAIT_SECS:-600}"
+    local poll_interval=15
+    local elapsed=0
+
+    local status
+    status=$(aws cloudformation describe-stacks \
+        --stack-name "$stack_name" \
+        --query "Stacks[0].StackStatus" \
+        --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+    case "$status" in
+        DOES_NOT_EXIST)
+            # Stack is gone, nothing to wait for.
+            return 0
+            ;;
+        DELETE_IN_PROGRESS)
+            # A prior teardown is still running.
+            log_info "Stack $stack_name is in DELETE_IN_PROGRESS -- waiting up to ${max_wait}s for deletion..."
+            ;;
+        DELETE_FAILED)
+            # Stack is stuck: re-trigger deletion so deploy can proceed.
+            log_info "Stack $stack_name is in DELETE_FAILED -- re-triggering deletion so deploy can proceed..."
+            aws cloudformation delete-stack --stack-name "$stack_name" 2>&1 || {
+                log_error "Failed to re-trigger deletion of DELETE_FAILED stack $stack_name"
+                return 1
+            }
+            sleep 5
+            ;;
+        *)
+            # Any other state is fine for deploy.
+            return 0
+            ;;
+    esac
+
+    log_info "Waiting for stack $stack_name deletion (up to ${max_wait}s)..."
+    while [[ $elapsed -lt $max_wait ]]; do
+        sleep $poll_interval
+        elapsed=$((elapsed + poll_interval))
+
+        status=$(aws cloudformation describe-stacks \
+            --stack-name "$stack_name" \
+            --query "Stacks[0].StackStatus" \
+            --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+        case "$status" in
+            DOES_NOT_EXIST)
+                log_info "Stack $stack_name fully deleted after ${elapsed}s"
+                return 0
+                ;;
+            DELETE_IN_PROGRESS)
+                log_info "Still waiting for stack deletion... (${elapsed}s elapsed, status: $status)"
+                ;;
+            DELETE_FAILED)
+                log_error "Stack $stack_name entered DELETE_FAILED — manual cleanup required before deploy can proceed"
+                return 1
+                ;;
+            *)
+                # Stack completed deletion and may have been re-created, or is in another state
+                log_info "Stack $stack_name is now in state: $status (after ${elapsed}s)"
+                return 0
+                ;;
+        esac
+    done
+
+    log_error "Timed out waiting for stack $stack_name to finish deleting (${max_wait}s elapsed, last status: $status)"
+    return 1
+}
+
+deploy_infrastructure() {
+    log_section "Deploying infrastructure"
+
+    cd "$CDK_DIR"
+
+    # If a previous run's teardown is still in flight, CDK deploy fails
+    # immediately with "Stack is in DELETE_IN_PROGRESS state".  Wait it out.
+    if ! wait_for_stack_delete "$CDK_STACK_NAME"; then
+        log_error "Pre-deploy stack state check failed — stack not ready for deploy"
+        return 1
+    fi
+
+    # Pass pre-built AMI ID to CDK if available
+    local cdk_context_args=""
+    if [[ -n "${DPDK_AMI_ID:-}" ]]; then
+        cdk_context_args="-c ${CDK_AMI_CONTEXT_KEY:-amiId}=${DPDK_AMI_ID}"
+        log_info "Using pre-built DPDK AMI: $DPDK_AMI_ID"
+    else
+        log_info "No pre-built AMI specified, using stock AL2023 with full bootstrap"
+    fi
+
+    # --no-rollback: on failure, leave instances running so we can collect
+    # user-data.log via SSM.  The safety-net teardown step destroys the stack.
+    log_info "Running cdk deploy (--no-rollback for debug)..."
+    if ! npx cdk deploy "$CDK_STACK_NAME" \
+        --require-approval never \
+        --no-rollback \
+        --outputs-file /tmp/cdk-outputs.json \
+        $cdk_context_args 2>&1; then
+        log_error "CDK deployment failed"
+
+        # Query CloudFormation for failure reasons — these contain the cfn-signal
+        # --reason string from the EXIT trap, showing the actual user-data error.
+        log_info "CloudFormation CREATE_FAILED events:"
+        aws cloudformation describe-stack-events \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+            --output table 2>/dev/null || true
+
+        return 1
+    fi
+
+    log_info "CDK deployment complete"
+    cd "$REPO_ROOT"
+}
+
+fetch_stack_outputs() {
+    log_info "Fetching stack outputs..."
+
+    # ── Attempt 1: CDK outputs file written by cdk deploy ────────────────────
+    # CDK writes this file when --outputs-file is passed. However, when CDK
+    # cannot assume the deploy role and "proceeds anyway", it may write an
+    # empty JSON object ({}) even though the stack has real outputs.
+    if [[ -f /tmp/cdk-outputs.json ]]; then
+        local cdk_outputs
+        cdk_outputs=$(cat /tmp/cdk-outputs.json)
+        log_info "CDK outputs file contents: $cdk_outputs"
+        SENDER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderInstanceId', ''))
+" 2>&1) || { log_error "Python parse failed for SenderInstanceId: $SENDER_INSTANCE_ID"; SENDER_INSTANCE_ID=""; }
+        RECEIVER_INSTANCE_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverInstanceId', ''))
+" 2>&1) || { log_error "Python parse failed for ReceiverInstanceId: $RECEIVER_INSTANCE_ID"; RECEIVER_INSTANCE_ID=""; }
+        SENDER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniId', ''))
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniId: $SENDER_DPDK_ENI_ID"; SENDER_DPDK_ENI_ID=""; }
+        RECEIVER_DPDK_ENI_ID=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniId', ''))
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniId: $RECEIVER_DPDK_ENI_ID"; RECEIVER_DPDK_ENI_ID=""; }
+        SENDER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('SenderDpdkEniPrivateIp', ''))
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniPrivateIp: $SENDER_DPDK_ENI_IP"; SENDER_DPDK_ENI_IP=""; }
+        RECEIVER_DPDK_ENI_IP=$(echo "$cdk_outputs" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('$CDK_STACK_NAME', {}).get('ReceiverDpdkEniPrivateIp', ''))
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniPrivateIp: $RECEIVER_DPDK_ENI_IP"; RECEIVER_DPDK_ENI_IP=""; }
+
+        if [[ -n "$SENDER_INSTANCE_ID" && -n "$RECEIVER_INSTANCE_ID" \
+              && -n "$SENDER_DPDK_ENI_IP" && -n "$RECEIVER_DPDK_ENI_IP" ]]; then
+            log_info "Stack outputs (from cdk-outputs.json):"
+            log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
+            log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
+            log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
+            log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
+            log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
+            log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
+            return 0
+        fi
+
+        log_info "CDK outputs file incomplete (CDK may not have had deploy-role access) — falling back to CloudFormation"
+    fi
+
+    # ── Attempt 2: CloudFormation describe-stacks ────────────────────────────
+    # Authoritative source of truth. Used when the CDK outputs file is absent
+    # or incomplete (e.g., CDK ran without the deploy role and wrote {}).
+    local cf_outputs
+    local cf_error
+    cf_error=$(mktemp)
+    cf_outputs=$(aws cloudformation describe-stacks \
+        --stack-name "$CDK_STACK_NAME" \
+        --query "Stacks[0].Outputs" \
+        --output json 2>"$cf_error") || {
+        log_error "CloudFormation describe-stacks failed:"
+        log_error "  $(cat "$cf_error")"
+        rm -f "$cf_error"
+        return 1
+    }
+    rm -f "$cf_error"
+
+    if [[ -z "$cf_outputs" || "$cf_outputs" == "null" ]]; then
+        log_error "CloudFormation describe-stacks returned no outputs for $CDK_STACK_NAME"
+        log_error "  Stack may not exist or may be in a failed state."
+        return 1
+    fi
+
+    log_info "CloudFormation outputs JSON: $cf_outputs"
+
+    SENDER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'SenderInstanceId': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for SenderInstanceId: $SENDER_INSTANCE_ID"; SENDER_INSTANCE_ID=""; }
+    RECEIVER_INSTANCE_ID=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'ReceiverInstanceId': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for ReceiverInstanceId: $RECEIVER_INSTANCE_ID"; RECEIVER_INSTANCE_ID=""; }
+    SENDER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'SenderDpdkEniId': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniId: $SENDER_DPDK_ENI_ID"; SENDER_DPDK_ENI_ID=""; }
+    RECEIVER_DPDK_ENI_ID=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'ReceiverDpdkEniId': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniId: $RECEIVER_DPDK_ENI_ID"; RECEIVER_DPDK_ENI_ID=""; }
+    SENDER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'SenderDpdkEniPrivateIp': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for SenderDpdkEniPrivateIp: $SENDER_DPDK_ENI_IP"; SENDER_DPDK_ENI_IP=""; }
+    RECEIVER_DPDK_ENI_IP=$(echo "$cf_outputs" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == 'ReceiverDpdkEniPrivateIp': print(o['OutputValue'])
+" 2>&1) || { log_error "Python parse failed for ReceiverDpdkEniPrivateIp: $RECEIVER_DPDK_ENI_IP"; RECEIVER_DPDK_ENI_IP=""; }
+
+    log_info "Stack outputs (from CloudFormation describe-stacks):"
+    log_info "  Sender Instance:    $SENDER_INSTANCE_ID"
+    log_info "  Receiver Instance:  $RECEIVER_INSTANCE_ID"
+    log_info "  Sender ENI:         $SENDER_DPDK_ENI_ID"
+    log_info "  Receiver ENI:       $RECEIVER_DPDK_ENI_ID"
+    log_info "  Sender ENI IP:      $SENDER_DPDK_ENI_IP"
+    log_info "  Receiver ENI IP:    $RECEIVER_DPDK_ENI_IP"
+
+    # ── Final validation ─────────────────────────────────────────────────────
+    if [[ -z "$SENDER_INSTANCE_ID" || -z "$RECEIVER_INSTANCE_ID" ]]; then
+        log_error "Missing required stack outputs (instance IDs)"
+        return 1
+    fi
+    if [[ -z "$SENDER_DPDK_ENI_IP" || -z "$RECEIVER_DPDK_ENI_IP" ]]; then
+        log_error "Missing required stack outputs (ENI private IPs)"
+        return 1
+    fi
+}
+
+# ── SSM readiness ────────────────────────────────────────────────────────────
+
+wait_for_ssm_readiness() {
+    log_section "Waiting for SSM readiness"
+
+    local elapsed=0
+    while [[ $elapsed -lt $SSM_READINESS_TIMEOUT ]]; do
+        local ready_count=0
+
+        # Check if both instances are registered with SSM.
+        local ssm_info
+        ssm_info=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${SENDER_INSTANCE_ID},${RECEIVER_INSTANCE_ID}" \
+            --query "InstanceInformationList[].InstanceId" \
+            --output text 2>/dev/null || true)
+
+        for id in $SENDER_INSTANCE_ID $RECEIVER_INSTANCE_ID; do
+            if echo "$ssm_info" | grep -q "$id"; then
+                ready_count=$((ready_count + 1))
+            fi
+        done
+
+        if [[ $ready_count -ge 2 ]]; then
+            log_info "Both instances are SSM-ready"
+            return 0
+        fi
+
+        log_info "Waiting for SSM readiness... ($ready_count/2 ready, ${elapsed}s elapsed)"
+        sleep "$SSM_POLL_INTERVAL"
+        elapsed=$((elapsed + SSM_POLL_INTERVAL))
+    done
+
+    log_error "SSM readiness timeout after ${SSM_READINESS_TIMEOUT}s"
+    return 1
+}
+
+verify_build() {
+    log_info "Verifying project build on instances (parallel)..."
+
+    local sender_cmd_id receiver_cmd_id
+    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 \
+        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+
+    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
+        local label="${entry%%:*}"
+        local rest="${entry#*:}"
+        local instance_id="${rest%%:*}"
+        local cmd_id="${rest##*:}"
+
+        if [[ -z "$cmd_id" ]]; then
+            log_error "Failed to send build verification command to $label ($instance_id)"
+            return 1
+        fi
+
+        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
+            log_error "Build verification command timed out on $label ($instance_id)"
+            return 1
+        fi
+
+        local result
+        result=$(ssm_get_stdout "$instance_id" "$cmd_id")
+
+        if echo "$result" | grep -q "BUILD_OK"; then
+            log_info "Build verified on $label ($instance_id)"
+        else
+            log_error "Build not found on $label ($instance_id) (output: $result)"
+            return 1
+        fi
+    done
+}
+
+# ── SSM command execution helpers ────────────────────────────────────────────
+
+# Run a command on an instance via SSM and wait for completion.
+# Usage: ssm_run_command <instance_id> <timeout_seconds> <command_string>
+# Returns: exit code of the remote command
+ssm_run_command() {
+    local instance_id="$1"
+    local timeout_secs="$2"
+    local command_str="$3"
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$command_str\"]" \
+        --timeout-seconds "$timeout_secs" \
+        --query "Command.CommandId" \
+        --output text 2>/dev/null)
+
+    if [[ -z "$cmd_id" ]]; then
+        log_error "Failed to send SSM command to $instance_id"
+        return 1
+    fi
+
+    # Poll for completion — poll longer than the SSM timeout to avoid a race
+    # where the command finishes just as we stop polling.
+    local poll_limit=$((timeout_secs + 30))
+    local elapsed=0
+    local status=""
+    while [[ $elapsed -lt $poll_limit ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+
+        status=$(aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" \
+            --output text 2>/dev/null || echo "Pending")
+
+        case "$status" in
+            Success)
+                return 0
+                ;;
+            Failed|TimedOut|Cancelled)
+                log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status (command: $command_str)"
+                return 1
+                ;;
+        esac
+    done
+
+    log_error "SSM command polling timed out on $instance_id after ${poll_limit}s (SSM timeout: ${timeout_secs}s, last status: $status)"
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout ${poll_limit}s (SSM timeout: ${timeout_secs}s, command: $command_str)"
+    return 1
+}
+
+# Run a command on an instance via SSM in the background (non-blocking).
+# Usage: ssm_run_command_async <instance_id> <timeout_seconds> <command_string>
+# Prints the command ID to stdout. Retries on failure with backoff.
+ssm_run_command_async() {
+    local instance_id="$1"
+    local timeout_secs="$2"
+    local command_str="$3"
+
+    local cmd_id=""
+    local attempt=0
+    local max_attempts=3
+    local backoff=2
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        cmd_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"$command_str\"]" \
+            --timeout-seconds "$timeout_secs" \
+            --query "Command.CommandId" \
+            --output text 2>/dev/null || true)
+
+        if [[ -n "$cmd_id" && "$cmd_id" != "None" ]]; then
+            echo "$cmd_id"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            # IMPORTANT: log to stderr, not stdout — stdout is used for the command ID
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] INFO: SSM send-command failed on $instance_id (attempt $attempt/$max_attempts), retrying in ${backoff}s..." >&2
+            sleep "$backoff"
+            backoff=$((backoff * 2))
+        fi
+    done
+
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: SSM send-command failed on $instance_id after $max_attempts attempts" >&2
+    echo ""
+}
+
+# Wait for an async SSM command to complete.
+# Usage: ssm_wait_command <instance_id> <command_id> <timeout_seconds>
+ssm_wait_command() {
+    local instance_id="$1"
+    local cmd_id="$2"
+    local timeout_secs="$3"
+
+    local elapsed=0
+    local status=""
+    while [[ $elapsed -lt $timeout_secs ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+
+        status=$(aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" \
+            --output text 2>/dev/null || echo "Pending")
+
+        case "$status" in
+            Success)  return 0 ;;
+            Failed|TimedOut|Cancelled)
+                log_error "SSM command $status on $instance_id (cmd: $cmd_id)"
+                ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "SSM Command $status"
+                return 1
+                ;;
+        esac
+    done
+
+    log_error "SSM command polling timed out on $instance_id after ${timeout_secs}s (last status: $status, cmd: $cmd_id)"
+    ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout after ${timeout_secs}s"
+    return 1
+}
+
+# Save SSM failure diagnostics to instance-logs for PR visibility
+ssm_save_failure_log() {
+    local instance_id="$1"
+    local cmd_id="$2"
+    local status="$3"
+    local reason="$4"
+
+    local ssm_log_dir="${REPO_ROOT}/instance-logs"
+    mkdir -p "$ssm_log_dir"
+    local role_prefix="unknown"
+    if [[ "$instance_id" == "$SENDER_INSTANCE_ID" ]]; then
+        role_prefix="sender"
+    elif [[ "$instance_id" == "$RECEIVER_INSTANCE_ID" ]]; then
+        role_prefix="receiver"
+    fi
+    local ssm_fail_log="$ssm_log_dir/${role_prefix}-ssm-failure.log"
+    {
+        echo "=== $reason ==="
+        echo "Status: $status"
+        echo "Instance: $instance_id ($role_prefix)"
+        echo "Command ID: ${cmd_id:-(empty)}"
+        echo ""
+        if [[ -n "$cmd_id" ]]; then
+            echo "=== STDOUT ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardOutputContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+            echo ""
+            echo "=== STDERR ==="
+            aws ssm get-command-invocation \
+                --command-id "$cmd_id" \
+                --instance-id "$instance_id" \
+                --query "StandardErrorContent" \
+                --output text 2>/dev/null || echo "(unavailable)"
+        else
+            echo "(no command ID — SSM send-command failed)"
+        fi
+        echo ""
+    } >> "$ssm_fail_log"
+    cat "$ssm_fail_log" >&2 || true
+}
+
+# Retrieve stdout from a completed SSM command.
+ssm_get_stdout() {
+    local instance_id="$1"
+    local cmd_id="$2"
+
+    aws ssm get-command-invocation \
+        --command-id "$cmd_id" \
+        --instance-id "$instance_id" \
+        --query "StandardOutputContent" \
+        --output text 2>/dev/null
+}
+
+# Cancel an in-flight SSM command (e.g., a listener that's still running).
+# Usage: ssm_cancel_command <instance_id> <command_id>
+ssm_cancel_command() {
+    local instance_id="$1"
+    local cmd_id="$2"
+
+    log_info "Cancelling SSM command $cmd_id on $instance_id..."
+    aws ssm cancel-command --command-id "$cmd_id" --instance-ids "$instance_id" 2>/dev/null || true
+    # Give SSM agent a moment to process the cancellation
+    sleep 2
+}
+
+# ── ENI configuration ───────────────────────────────────────────────────────
+
+configure_eni() {
+    local instance_id="$1"
+    local action="$2"  # bind or unbind
+    local expected_ip="${3:-}"  # optional: IP to assign after unbind
+
+    log_info "ENI $action on $instance_id"
+
+    # Build a single consolidated command to minimize SSM agent load.
+    # For unbind with IP assignment, chain both actions in one SSM call.
+    local cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action $action"
+    if [[ "$action" == "unbind" && -n "$expected_ip" ]]; then
+        cmd+=" && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"
+    fi
+
+    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
+        log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
+        ssm_run_command "$instance_id" 30 \
+            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
+        return 1
+    fi
+}
+
+# ── Tier execution ───────────────────────────────────────────────────────────
+
+run_tier1() {
+    log_section "Tier 1: DPDK <-> DPDK echo test"
+
+    # Bind ENIs on both instances
+    log_info "Binding ENIs for Tier 1..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "tier1-dpdk-echo" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier1-dpdk-echo" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    # Run baseline diagnostics
+    run_diagnostics "baseline" || true
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
+
+    # Start listener on receiver (Instance B) in background
+    log_info "Starting listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start listener"
+        generate_failure_xml "tier1-dpdk-echo" "Failed to start listener on receiver"
+        return 1
+    fi
+
+    # Give listener time to start
+    sleep 10
+
+    # Run sender on sender (Instance A) - this produces the JUnit XML
+    log_info "Starting sender on sender..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-dpdk-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-dpdk-echo.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Sender test execution failed"
+        generate_failure_xml "tier1-dpdk-echo" "Sender test execution failed or timed out"
+    fi
+
+    # Wait for listener to finish (or time out), then cancel if still running
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 1 execution complete"
+}
+
+run_tier2() {
+    log_section "Tier 2: Kernel -> DPDK interoperability test"
+
+    # Bind receiver ENI (DPDK), unbind sender ENI (kernel) — sequential to avoid SSM throttling
+    log_info "Configuring ENIs for Tier 2..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
+
+    # Start listener on receiver (DPDK) in background
+    log_info "Starting listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-kernel-interop.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start listener"
+        generate_failure_xml "tier2-kernel-interop" "Failed to start listener on receiver"
+        return 1
+    fi
+
+    # Give listener time to start
+    sleep 10
+
+    # Run sender on sender (kernel networking — no --bind-ip)
+    log_info "Starting sender on sender (kernel networking)..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-kernel-interop.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-kernel-interop.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Sender test execution failed"
+        generate_failure_xml "tier2-kernel-interop" "Sender test execution failed or timed out"
+    fi
+
+    # Wait for listener to finish (or time out), then cancel if still running
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 2 execution complete"
+}
+
+run_tier3() {
+    log_section "Tier 3: DPDK <-> iperf3 interoperability test"
+
+    # Bind sender ENI (DPDK), unbind receiver ENI (kernel) — sequential to avoid SSM throttling
+    log_info "Configuring ENIs for Tier 3..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender for Tier 3"
+        generate_failure_xml "tier3-iperf-interop" "ENI bind failed on sender instance"
+        return 1
+    fi
+    sleep 3
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
+        log_error "Failed to unbind/configure receiver ENI for Tier 3"
+        generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind or IP assignment failed"
+        generate_failure_xml "tier3-iperf-sends" "Receiver ENI unbind or IP assignment failed"
+        return 1
+    fi
+
+    # Warm ARP cache so DPDK can seed gateway MAC from /proc/net/arp
+    warm_arp_cache
+
+    # ── Direction 1: our-app-sends ───────────────────────────────────────
+    log_info "Direction 1: our-app-sends (dpdk-stdlib -> iperf3)"
+
+    # Start iperf3 server on Instance B
+    local iperf_server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role server --direction our-app-sends --local-ip $RECEIVER_DPDK_ENI_IP --peer-ip $SENDER_DPDK_ENI_IP --port 9000"
+    local iperf_server_cmd_id
+    iperf_server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$iperf_server_cmd")
+
+    sleep 10
+
+    # Run dpdk-stdlib sender on Instance A
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction our-app-sends --local-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-our-app-sends.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "our-app-sends test execution failed (tier3 is non-blocking)"
+        generate_failure_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out"
+    fi
+
+    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$iperf_server_cmd_id" 30 || true
+
+    # ── Direction 2: iperf-sends ─────────────────────────────────────────
+    log_info "Direction 2: iperf-sends (iperf3 -> dpdk-stdlib)"
+
+    # Start dpdk-stdlib listener on Instance A
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role server --direction iperf-sends --local-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    sleep 10
+
+    # Run iperf3 client on Instance B
+    local iperf_client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier3-iperf-interop.sh --role client --direction iperf-sends --local-ip $RECEIVER_DPDK_ENI_IP --peer-ip $SENDER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier3-iperf-sends.xml"
+    if ! ssm_run_command "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$iperf_client_cmd"; then
+        log_error "iperf-sends test execution failed (tier3 is non-blocking)"
+        generate_failure_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out"
+    fi
+
+    ssm_wait_command "$SENDER_INSTANCE_ID" "$listener_cmd_id" 30 || true
+
+    log_info "Tier 3 execution complete"
+}
+
+run_tier4() {
+    log_section "Tier 4: Jumbo frame echo test"
+
+    # Bind ENIs on both instances (same as tier 1 — both DPDK)
+    log_info "Binding ENIs for Tier 4..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "tier4-jumbo-echo" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier4-jumbo-echo" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    # Warm ARP cache
+    warm_arp_cache
+
+    # Start listener on receiver in background
+    log_info "Starting jumbo echo listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier4-jumbo-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start listener"
+        generate_failure_xml "tier4-jumbo-echo" "Failed to start listener on receiver"
+        return 1
+    fi
+
+    # Give listener time to start
+    sleep 10
+
+    # Run sender on sender instance
+    log_info "Starting jumbo echo sender on sender..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier4-jumbo-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier4-jumbo-echo.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Sender test execution failed"
+        generate_failure_xml "tier4-jumbo-echo" "Sender test execution failed or timed out"
+    fi
+
+    # Wait for listener to finish
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 4 execution complete"
+}
+
+# ── TCP Integration Test Tiers ───────────────────────────────────────────────
+# These mirror the UDP tiers but exercise dpdk-stdlib-tcp.
+# TCP tier scripts use --role server/client with --gateway-mac for auto-seed.
+
+run_tcp_tier1() {
+    log_section "TCP Tier 1: DPDK TCP handshake, echo, and shutdown"
+
+    # Kill any stale DPDK processes from prior UDP tiers before binding.
+    # SSM cancel-command kills the wrapper shell but child DPDK processes may
+    # survive, keeping /dev/vfio/noiommu-0 busy.
+    tcp_cleanup_processes "pre-tier1"
+
+    # Bind ENIs on both instances (both DPDK)
+    log_info "Binding ENIs for TCP Tier 1..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "tier1-tcp-handshake" "ENI bind failed on sender instance"
+        generate_failure_xml "tier1-tcp-echo" "ENI bind failed on sender instance"
+        generate_failure_xml "tier1-tcp-shutdown" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier1-tcp-handshake" "ENI bind failed on receiver instance"
+        generate_failure_xml "tier1-tcp-echo" "ENI bind failed on receiver instance"
+        generate_failure_xml "tier1-tcp-shutdown" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    # TCP Tier 1 runs 3 test scripts in sequence, each with its own server/client.
+    local tcp_scripts=("tier1-tcp-handshake" "tier1-tcp-echo" "tier1-tcp-shutdown")
+    local tcp_port=9100  # Use different port range than UDP to avoid conflicts
+
+    for script_name in "${tcp_scripts[@]}"; do
+        log_info "Running $script_name..."
+        local port=$tcp_port
+        tcp_port=$((tcp_port + 1))
+
+        # Start server on receiver
+        local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port $port"
+        local server_cmd_id
+        server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$server_cmd")
+
+        if [[ -z "$server_cmd_id" ]]; then
+            log_error "Failed to start $script_name server"
+            generate_failure_xml "$script_name" "Failed to start server on receiver"
+            continue
+        fi
+
+        # Give server time to start (DPDK EAL init + port probe takes several seconds)
+        sleep 12
+
+        # Run client on sender
+        local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port $port --output $RESULTS_REMOTE_DIR/${script_name}.xml"
+        if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+            log_error "$script_name client execution failed"
+            generate_failure_xml "$script_name" "Client test execution failed or timed out"
+        fi
+
+        # Wait for server to finish, then kill any lingering DPDK processes so
+        # the next test can open /dev/vfio/noiommu-0 cleanly.
+        if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+            ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+        fi
+        tcp_cleanup_processes "$script_name"
+    done
+
+    log_info "TCP Tier 1 execution complete"
+}
+
+run_tcp_tier2() {
+    log_section "TCP Tier 2: Retransmission and flow control"
+
+    # ENIs should already be bound from TCP Tier 1 (both DPDK↔DPDK).
+    # Just warm the ARP cache for gateway MAC discovery.
+    warm_arp_cache
+
+    # TCP Tier 2 scripts: retransmit and flow-control
+    local tcp_scripts=("tier2-tcp-retransmit" "tier2-tcp-flow-control")
+    local tcp_port=9200
+
+    for script_name in "${tcp_scripts[@]}"; do
+        log_info "Running $script_name..."
+        local port=$tcp_port
+        tcp_port=$((tcp_port + 1))
+
+        # Start server on receiver
+        local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port $port"
+        local server_cmd_id
+        server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 180 "$server_cmd")
+
+        if [[ -z "$server_cmd_id" ]]; then
+            log_error "Failed to start $script_name server"
+            generate_failure_xml "$script_name" "Failed to start server on receiver"
+            continue
+        fi
+
+        # Give server time to start (DPDK EAL init + port probe takes several seconds)
+        sleep 12
+
+        # Run client on sender (longer timeout for loss/flow-control tests)
+        local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port $port --output $RESULTS_REMOTE_DIR/${script_name}.xml"
+        if ! ssm_run_command "$SENDER_INSTANCE_ID" 180 "$client_cmd"; then
+            log_error "$script_name client execution failed"
+            generate_failure_xml "$script_name" "Client test execution failed or timed out"
+        fi
+
+        # Wait for server to finish, then kill any lingering DPDK processes.
+        if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+            ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+        fi
+        tcp_cleanup_processes "$script_name"
+    done
+
+    log_info "TCP Tier 2 execution complete"
+}
+
+run_tcp_tier3() {
+    log_section "TCP Tier 3: Kernel interop and std-parity"
+
+    # ENIs should already be bound from TCP Tier 1 (both DPDK↔DPDK).
+    # Just warm the ARP cache for gateway MAC discovery.
+    warm_arp_cache
+
+    # TCP Tier 3 scripts: kernel-interop and std-parity
+    local tcp_scripts=("tier3-tcp-kernel-interop" "tier3-tcp-std-parity")
+    local tcp_port=9300
+
+    for script_name in "${tcp_scripts[@]}"; do
+        log_info "Running $script_name..."
+        local port=$tcp_port
+        tcp_port=$((tcp_port + 1))
+
+        # Start server on receiver
+        local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port $port"
+        local server_cmd_id
+        server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 180 "$server_cmd")
+
+        if [[ -z "$server_cmd_id" ]]; then
+            log_error "Failed to start $script_name server"
+            generate_failure_xml "$script_name" "Failed to start server on receiver"
+            continue
+        fi
+
+        # Give server time to start (DPDK EAL init + port probe takes several seconds)
+        sleep 12
+
+        # Run client on sender
+        local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name}.sh --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port $port --output $RESULTS_REMOTE_DIR/${script_name}.xml"
+        if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+            log_error "$script_name client execution failed"
+            generate_failure_xml "$script_name" "Client test execution failed or timed out"
+        fi
+
+        # Wait for server to finish, then kill any lingering DPDK processes.
+        if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+            ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+        fi
+        tcp_cleanup_processes "$script_name"
+    done
+
+    log_info "TCP Tier 3 execution complete"
+}
+
+# ── Unbind ENIs between tiers ────────────────────────────────────────────────
+
+unbind_all_enis() {
+    log_info "Unbinding all ENIs (consolidated, sequential)..."
+
+    # Consolidate cleanup + unbind + IP assignment into ONE command per instance.
+    # Run sequentially with a pause between to avoid SSM API throttling.
+    local sender_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $SENDER_DPDK_ENI_IP"
+    local receiver_cmd="${CLEANUP_CMD}; cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action unbind && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $RECEIVER_DPDK_ENI_IP"
+
+    ssm_run_command "$SENDER_INSTANCE_ID" 90 "$sender_cmd" || \
+        log_error "Failed to unbind ENI on sender ($SENDER_INSTANCE_ID)"
+
+    # Pause between instances to avoid SSM API throttling
+    sleep 3
+
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 90 "$receiver_cmd" || \
+        log_error "Failed to unbind ENI on receiver ($RECEIVER_INSTANCE_ID)"
+
+    # Give SSM agent a longer cooldown period before next tier's commands
+    log_info "SSM cooldown (15s)..."
+    sleep 15
+}
+
+# Kill all DPDK processes and remove the /var/run/dpdk lock on both instances.
+# Run before starting TCP tiers (in case UDP tiers left stale processes) and
+# between individual TCP tests (SSM cancel kills the shell wrapper but may
+# leave DPDK child processes alive, which keeps /dev/vfio/noiommu-0 busy).
+tcp_cleanup_processes() {
+    local label="${1:-between-tests}"
+    log_info "TCP process cleanup ($label): killing stale DPDK processes on both instances..."
+    ssm_run_command "$SENDER_INSTANCE_ID"   60 "$CLEANUP_CMD" || \
+        log_info "  Sender cleanup returned non-zero (expected if no processes running)"
+    ssm_run_command "$RECEIVER_INSTANCE_ID" 60 "$CLEANUP_CMD" || \
+        log_info "  Receiver cleanup returned non-zero (expected if no processes running)"
+    # Poll until /dev/vfio/noiommu-0 is no longer held open on both instances.
+    # pkill is fire-and-forget: the vfio fd may linger for several seconds after
+    # signal delivery, especially under SSM latency.  Without this gate the next
+    # tcp-echo/tcp-test-client gets EBUSY on open("/dev/vfio/noiommu-0") → EAL
+    # reports "Requested device 0000:00:06.0 cannot be used" → Port init failed.
+    # configure-eni.sh --action bind is idempotent: on the already-bound-to-vfio
+    # path it calls kill_dpdk_processes + wait_vfio_free (polls up to 10 s with
+    # fuser), which is exactly the drain gate we need here.
+    local bind_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action bind"
+    ssm_run_command "$SENDER_INSTANCE_ID"   "$ENI_BIND_TIMEOUT" "$bind_cmd" || \
+        log_info "  Sender vfio drain/bind returned non-zero (tolerated)"
+    ssm_run_command "$RECEIVER_INSTANCE_ID" "$ENI_BIND_TIMEOUT" "$bind_cmd" || \
+        log_info "  Receiver vfio drain/bind returned non-zero (tolerated)"
+}
+
+# ── Result collection ────────────────────────────────────────────────────────
+
+generate_failure_xml() {
+    local suite_name="$1"
+    local message="$2"
+    local output_path="$RESULTS_DIR/${suite_name}.xml"
+
+    mkdir -p "$RESULTS_DIR"
+    cat > "$output_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="${suite_name}" tests="1" failures="1" errors="0" time="0.000">
+    <testcase name="execution" classname="${suite_name}" time="0.000">
+        <failure message="${message}" type="ExecutionError">${message}</failure>
+    </testcase>
+</testsuite>
+EOF
+    log_info "Generated synthetic failure XML: $output_path"
+}
+
+generate_skip_xml() {
+    local suite_name="$1"
+    local message="$2"
+    local output_path="$RESULTS_DIR/${suite_name}.xml"
+
+    mkdir -p "$RESULTS_DIR"
+    cat > "$output_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="${suite_name}" tests="1" failures="0" errors="0" skipped="1" time="0.000">
+    <testcase name="execution" classname="${suite_name}" time="0.000">
+        <skipped message="${message}">${message}</skipped>
+    </testcase>
+</testsuite>
+EOF
+    log_info "Generated synthetic skip XML: $output_path"
+}
+
+collect_results() {
+    log_section "Collecting test results"
+
+    mkdir -p "$RESULTS_DIR"
+
+    for entry in "sender:${SENDER_INSTANCE_ID}" "receiver:${RECEIVER_INSTANCE_ID}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
+        log_info "Collecting results from $label ($instance_id)..."
+
+        local list_cmd_id
+        list_cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+            "ls -1 $RESULTS_REMOTE_DIR/*.xml 2>/dev/null || echo NO_FILES")
+        [[ -z "$list_cmd_id" ]] && continue
+
+        if ! ssm_wait_command "$instance_id" "$list_cmd_id" 60; then
+            log_error "Failed to list results on $label"
+            continue
+        fi
+
+        local file_list
+        file_list=$(ssm_get_stdout "$instance_id" "$list_cmd_id")
+
+        if [[ "$file_list" == "NO_FILES" || -z "$file_list" ]]; then
+            log_info "No result files on $label"
+            continue
+        fi
+
+        # Cat all XML files in a single command with delimiters
+        sleep 2
+        local cat_script="cd $RESULTS_REMOTE_DIR && for f in *.xml; do echo ===FILE:\$f===; cat \$f; done"
+        local cat_cmd_id
+        cat_cmd_id=$(ssm_run_command_async "$instance_id" 30 "$cat_script")
+        [[ -z "$cat_cmd_id" ]] && continue
+
+        if ! ssm_wait_command "$instance_id" "$cat_cmd_id" 60; then
+            log_error "Failed to cat results from $label"
+            continue
+        fi
+
+        local output
+        output=$(ssm_get_stdout "$instance_id" "$cat_cmd_id")
+
+        if [[ -z "$output" ]]; then
+            log_error "Empty results from $label"
+            continue
+        fi
+
+        # Parse: split on ===FILE:name=== delimiters
+        local current_file=""
+        local current_content=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                    echo "$current_content" > "$RESULTS_DIR/$current_file"
+                    log_info "Saved $current_file from $label"
+                fi
+                current_file="${BASH_REMATCH[1]}"
+                current_content=""
+            else
+                if [[ -n "$current_content" ]]; then
+                    current_content+=$'\n'"$line"
+                else
+                    current_content="$line"
+                fi
+            fi
+        done <<< "$output"
+        if [[ -n "$current_file" && -n "$current_content" ]]; then
+            echo "$current_content" > "$RESULTS_DIR/$current_file"
+            log_info "Saved $current_file from $label"
+        fi
+
+        sleep 2
+    done
+}
+
+# ── Summary reporting ────────────────────────────────────────────────────────
+
+print_summary() {
+    log_section "Test Results Summary"
+
+    local total_tests=0
+    local total_failures=0
+    local total_time="0"
+
+    printf "%-40s %6s %8s %10s\n" "Suite" "Tests" "Failures" "Time (s)"
+    printf "%-40s %6s %8s %10s\n" "----------------------------------------" "------" "--------" "----------"
+
+    for xml_file in "$RESULTS_DIR"/*.xml; do
+        [[ -f "$xml_file" ]] || continue
+
+        local suite_name tests failures time_val
+        suite_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        suite_name="${suite_name:-unknown}"
+        tests=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        tests="${tests:-0}"
+        failures=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        failures="${failures:-0}"
+        time_val=$(sed -n 's/.*time="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        time_val="${time_val:-0}"
+
+        printf "%-40s %6s %8s %10s\n" "$suite_name" "$tests" "$failures" "$time_val"
+
+        total_tests=$((total_tests + tests))
+        total_failures=$((total_failures + failures))
+        total_time=$(awk "BEGIN {printf \"%.3f\", $total_time + $time_val}")
+    done
+
+    printf "%-40s %6s %8s %10s\n" "----------------------------------------" "------" "--------" "----------"
+    printf "%-40s %6d %8d %10s\n" "TOTAL" "$total_tests" "$total_failures" "$total_time"
+    echo ""
+
+    # TCP test failures are non-blocking — exclude from exit code
+    local tcp_failures=0
+    local tcp_tests=0
+    for xml_file in "$RESULTS_DIR"/*tcp*.xml; do
+        [[ -f "$xml_file" ]] || continue
+        local tf=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        local tt=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
+        tcp_failures=$((tcp_failures + ${tf:-0}))
+        tcp_tests=$((tcp_tests + ${tt:-0}))
+    done
+
+    local blocking_failures=$((total_failures - tcp_failures))
+    local blocking_tests=$((total_tests - tcp_tests))
+    local passed=$((blocking_tests - blocking_failures))
+    if [[ $blocking_failures -eq 0 ]]; then
+        log_info "ALL BLOCKING TESTS PASSED ($passed/$blocking_tests)"
+        if [[ $tcp_failures -gt 0 ]]; then
+            log_info "TCP tests (non-blocking): $tcp_failures failures (does not affect exit code)"
+        fi
+        TEST_EXIT_CODE=0
+    else
+        log_error "FAILURES DETECTED: $blocking_failures/$blocking_tests blocking tests failed"
+        TEST_EXIT_CODE=1
+    fi
+}
+
+# ── JSON summary generation ──────────────────────────────────────────────────
+
+generate_json_summary() {
+    if [[ "$FLAG_JSON_SUMMARY" != "true" ]]; then
+        return 0
+    fi
+
+    log_info "Generating JSON summary..."
+
+    local commit_hash
+    commit_hash=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local run_id
+    if command -v md5sum >/dev/null 2>&1; then
+        run_id=$(echo "$commit_hash$timestamp" | md5sum | cut -c1-8)
+    elif command -v md5 >/dev/null 2>&1; then
+        run_id=$(echo "$commit_hash$timestamp" | md5 -q | cut -c1-8)
+    else
+        run_id="unknown"
+    fi
+
+    # Build JSON using python3 for reliable JSON generation
+    python3 - "$RESULTS_DIR" "$run_id" "$commit_hash" "$timestamp" <<'PYEOF'
+import json
+import sys
+import os
+import re
+
+results_dir = sys.argv[1]
+run_id = sys.argv[2]
+commit_hash = sys.argv[3]
+timestamp = sys.argv[4]
+
+tiers = []
+total_tests = 0
+total_failures = 0
+total_time = 0.0
+
+for xml_file in sorted(os.listdir(results_dir)):
+    if not xml_file.endswith('.xml'):
+        continue
+    filepath = os.path.join(results_dir, xml_file)
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    # Parse testsuite attributes
+    suite_match = re.search(r'<testsuite\s+([^>]+)>', content)
+    if not suite_match:
+        continue
+
+    attrs = suite_match.group(1)
+    suite_name = re.search(r'name="([^"]*)"', attrs)
+    suite_tests = re.search(r'tests="([^"]*)"', attrs)
+    suite_failures = re.search(r'failures="([^"]*)"', attrs)
+    suite_time = re.search(r'time="([^"]*)"', attrs)
+
+    suite_name = suite_name.group(1) if suite_name else xml_file
+    num_tests = int(suite_tests.group(1)) if suite_tests else 0
+    num_failures = int(suite_failures.group(1)) if suite_failures else 0
+    suite_time_val = float(suite_time.group(1)) if suite_time else 0.0
+
+    total_tests += num_tests
+    total_failures += num_failures
+    total_time += suite_time_val
+
+    # Parse individual testcases
+    tests = []
+    for tc_match in re.finditer(r'<testcase\s+([^>]*)>(.*?)</testcase>', content, re.DOTALL):
+        tc_attrs = tc_match.group(1)
+        tc_body = tc_match.group(2)
+
+        tc_name = re.search(r'name="([^"]*)"', tc_attrs)
+        tc_class = re.search(r'classname="([^"]*)"', tc_attrs)
+        tc_time = re.search(r'time="([^"]*)"', tc_attrs)
+
+        failure_match = re.search(r'<failure\s+message="([^"]*)"[^>]*>(.*?)</failure>', tc_body, re.DOTALL)
+
+        test_entry = {
+            "name": tc_name.group(1) if tc_name else "unknown",
+            "classname": tc_class.group(1) if tc_class else "unknown",
+            "status": "fail" if failure_match else "pass",
+            "duration_seconds": float(tc_time.group(1)) if tc_time else 0.0,
+            "error": None
+        }
+
+        if failure_match:
+            test_entry["error"] = {
+                "message": failure_match.group(1),
+                "details": failure_match.group(2).strip()
+            }
+
+        tests.append(test_entry)
+
+    tier_status = "pass" if num_failures == 0 else "fail"
+    tiers.append({
+        "name": suite_name,
+        "status": tier_status,
+        "tests": tests
+    })
+
+summary = {
+    "run_id": run_id,
+    "commit": commit_hash,
+    "timestamp": timestamp,
+    "infrastructure": {
+        "instance_type": "c5n.large",
+        "dpdk_version": "22.11.6",
+        "region": "us-east-1"
+    },
+    "tiers": tiers,
+    "summary": {
+        "total": total_tests,
+        "passed": total_tests - total_failures,
+        "failed": total_failures,
+        "total_time_seconds": round(total_time, 3)
+    }
+}
+
+output_path = os.path.join(results_dir, "summary.json")
+with open(output_path, 'w') as f:
+    json.dump(summary, f, indent=2)
+
+print(f"JSON summary written to {output_path}")
+PYEOF
+
+    log_info "JSON summary generated: $RESULTS_DIR/summary.json"
+}
+
+# Generate a self-contained, analyzable Markdown summary of all tiers: per-tier,
+# per-testcase pass/fail WITH the failure reason, classifying each failure as a
+# real test failure (JUnit type=AssertionError, from the tier scripts) vs an
+# infra/setup flake (type=ExecutionError, from generate_failure_xml — ENI bind /
+# SSM / listener-start timeouts). Written to summary.md so a reviewer can analyze
+# a run from the PR comment alone, without downloading artifacts or using gh.
+generate_markdown_summary() {
+    local commit_hash run_url label
+    commit_hash=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}/actions/runs/${GITHUB_RUN_ID:-0}"
+    label="${GITHUB_WORKFLOW:-Integration Tests}"
+    python3 - "$RESULTS_DIR" "$commit_hash" "$run_url" "$label" > "$RESULTS_DIR/summary.md" <<'PYEOF'
+import re, os, sys, html
+
+results_dir, commit, run_url, label = sys.argv[1:5]
+# Infra/setup failures use JUnit type=ExecutionError (generate_failure_xml); real
+# test failures use type=AssertionError (harness junit_add_failure). Fall back to
+# a keyword match if the type is missing.
+INFRA_RE = re.compile(r'ENI|SSM|Polling timeout|configure-eni|assign-ip|Failed to start|unbind|IP assignment|listener|readiness|instance', re.I)
+
+def classify(ftype, msg):
+    if (ftype or '') == 'ExecutionError':
+        return 'infra'
+    if (ftype or '') == 'AssertionError':
+        return 'real'
+    return 'infra' if INFRA_RE.search(msg or '') else 'real'
+
+def cell(s):
+    s = html.unescape(s or '').replace('\n', ' ').replace('|', r'\|').strip()
+    return (s[:90] + '…') if len(s) > 91 else s
+
+rows, reals, infras = [], [], []
+total = passed = n_real = n_infra = 0
+
+for xmlf in sorted(os.listdir(results_dir)):
+    if not xmlf.endswith('.xml'):
+        continue
+    with open(os.path.join(results_dir, xmlf)) as f:
+        content = f.read()
+    sm = re.search(r'<testsuite\s+([^>]+)>', content)
+    if not sm:
+        continue
+    m = re.search(r'name="([^"]*)"', sm.group(1))
+    suite = m.group(1) if m else xmlf
+    for tc in re.finditer(r'<testcase\s+([^>]*?)>(.*?)</testcase>', content, re.DOTALL):
+        attrs, body = tc.group(1), tc.group(2)
+        m = re.search(r'name="([^"]*)"', attrs)
+        name = m.group(1) if m else 'unknown'
+        m = re.search(r'time="([^"]*)"', attrs)
+        tsec = m.group(1) if m else '0'
+        fm = re.search(r'<failure\s+message="([^"]*)"(?:\s+type="([^"]*)")?[^>]*>(.*?)</failure>', body, re.DOTALL)
+        total += 1
+        if not fm:
+            passed += 1
+            rows.append((suite, name, '✅ pass', tsec, ''))
+            continue
+        msg = html.unescape(fm.group(1))
+        kind = classify(fm.group(2), msg)
+        details = html.unescape(fm.group(3)).strip()
+        if kind == 'infra':
+            n_infra += 1
+            rows.append((suite, name, '⚠️ infra', tsec, cell(msg)))
+            infras.append((suite, name, msg))
+        else:
+            n_real += 1
+            rows.append((suite, name, '❌ real', tsec, cell(msg)))
+            reals.append((suite, name, msg, details))
+
+def plural(n):
+    return '' if n == 1 else 's'
+
+if n_real:
+    verdict = f'❌ {n_real} real failure{plural(n_real)}'
+    if n_infra:
+        verdict += f' · ⚠️ {n_infra} infra flake{plural(n_infra)}'
+elif n_infra:
+    verdict = f'⚠️ {n_infra} infra flake{plural(n_infra)} · 0 real failures'
+else:
+    verdict = '✅ all passed'
+
+o = []
+o.append(f'## Integration Tests — {verdict}')
+o.append(f'`{commit}` · [run]({run_url}) · {label} · {total} tests: {passed} ✅ · {n_real} ❌ real · {n_infra} ⚠️ infra')
+o.append('')
+o.append('| Tier | Test | Result | Time | Reason |')
+o.append('|------|------|--------|-----:|--------|')
+for suite, name, result, tsec, reason in rows:
+    o.append(f'| {suite} | {name} | {result} | {tsec}s | {reason} |')
+o.append('')
+if reals:
+    o.append(f'### ❌ Real failures ({n_real}) — code/test issues')
+    for suite, name, msg, details in reals:
+        o.append(f'- **{suite} / {name}** — {html.unescape(msg)}')
+        if details:
+            o.append(f'  <details><summary>details</summary>\n\n```\n{details[:1500]}\n```\n</details>')
+    o.append('')
+if infras:
+    o.append(f'### ⚠️ Infra flakes ({n_infra}) — SSM/ENI setup, not code (task #10)')
+    for suite, name, msg in infras:
+        o.append(f'- {suite} / {name} — {html.unescape(msg)}')
+    o.append('')
+if not reals and not infras:
+    o.append(f'### ✅ All {total} tests passed')
+
+print('\n'.join(o))
+PYEOF
+    log_info "Markdown summary generated: $RESULTS_DIR/summary.md"
+}
+
+# ── Teardown ─────────────────────────────────────────────────────────────────
+
+teardown_infrastructure() {
+    if [[ "$FLAG_TEARDOWN" != "true" ]]; then
+        log_info "Teardown not requested. To destroy infrastructure manually:"
+        log_info "  cd $CDK_DIR && npx cdk destroy $CDK_STACK_NAME"
+        return 0
+    fi
+
+    log_section "Tearing down infrastructure"
+
+    # Release DPDK ENIs from vfio-pci before CDK destroy.  If ENIs are still
+    # bound when CloudFormation deletes NetworkInterfaceAttachment resources it
+    # hits "Exceeded attempts to wait" leaving the stack in DELETE_FAILED,
+    # which then blocks the next run.  Best-effort SSM unbind avoids this.
+    if [[ -n "${SENDER_INSTANCE_ID:-}" || -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+        log_info "Pre-teardown: releasing DPDK ENIs from vfio-pci via SSM..."
+        for _td_pair in "sender:${SENDER_INSTANCE_ID:-}" "receiver:${RECEIVER_INSTANCE_ID:-}"; do
+            local _td_lbl="${_td_pair%%:*}"
+            local _td_iid="${_td_pair##*:}"
+            [[ -z "$_td_iid" ]] && continue
+            local _td_ssm
+            _td_ssm=$(aws ssm describe-instance-information \
+                --filters "Key=InstanceIds,Values=${_td_iid}" \
+                --query "InstanceInformationList[0].InstanceId" \
+                --output text 2>/dev/null || echo "")
+            if [[ -n "$_td_ssm" && "$_td_ssm" != "None" ]]; then
+                log_info "  Unbinding ENI on ${_td_lbl} (${_td_iid})..."
+                local _ucmd="cd /opt/dpdk-stdlib"
+                _ucmd+=" && bash scripts/integration-tests/configure-eni.sh --action unbind 2>&1 || true"
+                aws ssm send-command \
+                    --instance-ids "$_td_iid" \
+                    --document-name "AWS-RunShellScript" \
+                    --parameters "commands=[$_ucmd]" \
+                    --timeout-seconds 60 \
+                    --output text 2>/dev/null | head -1 || true
+            else
+                log_info "  SSM unavailable on ${_td_lbl} -- skipping"
+            fi
+        done
+        log_info "Waiting 15s for ENI unbinds before destroy..."
+        sleep 15
+    fi
+
+    cd "$CDK_DIR"
+    if ! npx cdk destroy "$CDK_STACK_NAME" --force 2>&1; then
+        log_error "CDK teardown failed (test results are preserved)"
+        # Don't change TEST_EXIT_CODE - preserve test result
+    else
+        log_info "Infrastructure destroyed"
+    fi
+    cd "$REPO_ROOT"
+}
+
+# ── Instance log collection ──────────────────────────────────────────────────
+#
+# Collects logs from EC2 instances using two methods:
+#   1. EC2 console output  - works even without SSM, survives instance termination
+#   2. SSM file retrieval  - richer logs when SSM is reachable
+#
+# Logs are written to $LOGS_DIR/ with <role>-<filename> naming.
+
+collect_instance_logs() {
+    log_section "Collecting instance logs"
+    mkdir -p "$LOGS_DIR"
+
+    # Build the list of (label, instance_id) pairs to collect from
+    local -a instances=()
+    if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+        instances+=("sender:${SENDER_INSTANCE_ID}")
+    fi
+    if [[ -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+        instances+=("receiver:${RECEIVER_INSTANCE_ID}")
+    fi
+
+    # Fallback: when CDK deploy failed and we have no stack outputs, look for
+    # instances in CloudFormation events (they appear even after rollback).
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No known instance IDs, scanning CloudFormation events..."
+        local event_ids
+        event_ids=$(aws cloudformation describe-stack-events \
+            --stack-name "$CDK_STACK_NAME" \
+            --query "StackEvents[?ResourceType=='AWS::EC2::Instance' && PhysicalResourceId!=''].PhysicalResourceId" \
+            --output text 2>/dev/null | tr '\t' '\n' | grep -E '^i-' | sort -u || true)
+
+        local idx=0
+        for inst_id in $event_ids; do
+            instances+=("instance-${idx}:${inst_id}")
+            idx=$((idx + 1))
+        done
+    fi
+
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_info "No instances found - skipping log collection"
+        return 0
+    fi
+
+    # Collect EC2 console output first (no SSM needed, survives termination)
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
+        log_info "Collecting console output from ${label} (${instance_id})..."
+        local console_output
+        console_output=$(aws ec2 get-console-output \
+            --instance-id "$instance_id" \
+            --latest \
+            --query "Output" \
+            --output text 2>/dev/null || echo "(console output unavailable)")
+        echo "$console_output" > "$LOGS_DIR/${label}-console-output.log"
+        log_info "  Saved: ${label}-console-output.log ($(echo "$console_output" | wc -l) lines)"
+    done
+
+    # Collect key logs via SSM — use individual commands with delays to avoid throttling
+    for entry in "${instances[@]}"; do
+        local label="${entry%%:*}"
+        local instance_id="${entry##*:}"
+
+        local ssm_ready
+        ssm_ready=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${instance_id}" \
+            --query "InstanceInformationList[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+        if [[ -n "$ssm_ready" && "$ssm_ready" != "None" ]]; then
+            log_info "  SSM available - collecting log files from ${label}..."
+
+            # Batch 1: user-data log (most important) + app logs
+            local batch1_cmd="echo '===FILE:user-data.log==='; tail -200 /var/log/user-data.log 2>/dev/null || echo '(not found)'; echo '===FILE:echo-server.log==='; cat /tmp/echo-server.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client.log==='; cat /tmp/test-client.log 2>/dev/null || echo '(not found)'; echo '===FILE:test-client-iperf.log==='; cat /tmp/test-client-iperf.log 2>/dev/null || echo '(not found)'"
+            local batch1_id
+            batch1_id=$(ssm_run_command_async "$instance_id" 30 "$batch1_cmd")
+            if [[ -n "$batch1_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch1_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch1_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        # Parse ===FILE:name=== delimited output
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" && "$current_content" != "(not found)" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
+            fi
+
+            sleep 3
+
+            # Batch 2: network state + crash diagnostics
+            local batch2_cmd="echo '===FILE:network-interfaces.log==='; ip addr show 2>/dev/null || echo unavailable; echo '===FILE:dmesg-crashes.log==='; dmesg | grep -iE 'segfault|trap|fault|oom|killed|echo|test-client' | tail -50 2>/dev/null || echo 'no crash entries'; echo '===FILE:build-listing.log==='; ls -la /opt/dpdk-stdlib/target/release/ 2>/dev/null || echo 'no build dir'"
+            local batch2_id
+            batch2_id=$(ssm_run_command_async "$instance_id" 30 "$batch2_cmd")
+            if [[ -n "$batch2_id" ]]; then
+                if ssm_wait_command "$instance_id" "$batch2_id" 60 2>/dev/null; then
+                    local output
+                    output=$(ssm_get_stdout "$instance_id" "$batch2_id" 2>/dev/null || true)
+                    if [[ -n "$output" ]]; then
+                        local current_file="" current_content=""
+                        while IFS= read -r line; do
+                            if [[ "$line" =~ ^===FILE:(.+)=== ]]; then
+                                if [[ -n "$current_file" && -n "$current_content" ]]; then
+                                    echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                                    log_info "  Saved: ${label}-${current_file}"
+                                fi
+                                current_file="${BASH_REMATCH[1]}"
+                                current_content=""
+                            else
+                                [[ -n "$current_content" ]] && current_content+=$'\n'"$line" || current_content="$line"
+                            fi
+                        done <<< "$output"
+                        if [[ -n "$current_file" && -n "$current_content" ]]; then
+                            echo "$current_content" > "$LOGS_DIR/${label}-${current_file}"
+                            log_info "  Saved: ${label}-${current_file}"
+                        fi
+                    fi
+                fi
+            fi
+
+            sleep 3
+        else
+            log_info "  SSM not available for ${label} - relying on console output only"
+        fi
+    done
+
+    log_info "Instance logs written to: $LOGS_DIR"
+}
+
+# ── GitHub Actions step summary ──────────────────────────────────────────────
+#
+# write_step_summary: writes a markdown digest to $GITHUB_STEP_SUMMARY so the
+# failure reason and key log excerpts are visible directly in the Actions UI
+# without downloading any artifacts.  No-op when not running in GitHub Actions.
+#
+# The goal: an agent or human reviewing a failed run should be able to see
+# the root cause and last lines of user-data.log without leaving the page.
+
+write_step_summary() {
+    [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] && return 0
+
+    local result_icon status_text
+    if [[ "${TEST_EXIT_CODE:-0}" -eq 0 ]]; then
+        result_icon="✅"
+        status_text="PASSED"
+    else
+        result_icon="❌"
+        status_text="FAILED (exit ${TEST_EXIT_CODE:-2})"
+    fi
+
+    {
+        echo "## ${result_icon} Integration Tests: ${status_text}"
+        echo ""
+
+        if [[ -n "${FAILED_STEP:-}" ]]; then
+            echo "**Failed at step:** \`${FAILED_STEP}\`"
+            echo ""
+        fi
+
+        if [[ -n "${SENDER_INSTANCE_ID:-}" ]]; then
+            echo "**Sender:** \`${SENDER_INSTANCE_ID}\` | **Receiver:** \`${RECEIVER_INSTANCE_ID:-unknown}\`"
+            echo ""
+        fi
+
+        # Per-instance log excerpts (collapsed by default — readable without downloading)
+        for label in sender receiver; do
+            local userdata_log="$LOGS_DIR/${label}-user-data.log"
+            local console_log="$LOGS_DIR/${label}-console-output.log"
+            local build_file="$LOGS_DIR/${label}-build-listing.txt"
+
+            echo "### ${label^} instance logs"
+            echo ""
+
+            # Prefer user-data.log (richer); fall back to console output
+            if [[ -f "$userdata_log" && -s "$userdata_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$userdata_log")
+                echo "<details><summary>user-data.log — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$userdata_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            elif [[ -f "$console_log" && -s "$console_log" ]]; then
+                local line_count
+                line_count=$(wc -l < "$console_log")
+                echo "<details><summary>EC2 console output — last 80 of ${line_count} lines</summary>"
+                echo ""
+                echo '```'
+                tail -80 "$console_log"
+                echo '```'
+                echo "</details>"
+                echo ""
+            else
+                echo "_No logs collected for ${label} instance._"
+                echo ""
+            fi
+
+            if [[ -f "$build_file" ]]; then
+                echo "**Build directory (\`/opt/dpdk-stdlib/target/release/\`):**"
+                echo '```'
+                cat "$build_file"
+                echo '```'
+                echo ""
+            fi
+        done
+
+        # Test result counts if JUnit XML was generated
+        if compgen -G "$RESULTS_DIR/*.xml" > /dev/null 2>&1; then
+            local total=0 failures=0
+            for xml in "$RESULTS_DIR"/*.xml; do
+                local t f
+                t=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('tests','0'))" 2>/dev/null || echo 0)
+                f=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(t.get('failures','0'))" 2>/dev/null || echo 0)
+                total=$(( total + t ))
+                failures=$(( failures + f ))
+            done
+            echo "### Test counts"
+            echo "Tests run: **${total}** | Failures: **${failures}**"
+            echo ""
+        fi
+
+        echo "---"
+        echo "_Artifacts: \`instance-logs\` (raw logs) · \`integration-test-results\` (JUnit XML)_"
+    } >> "$GITHUB_STEP_SUMMARY"
+}
+
+# write_failure_json: writes structured failure info to instance-logs/failure-summary.json.
+# An agent reading the artifact can parse this directly instead of grepping raw logs.
+
+write_failure_json() {
+    local step="$1"
+    local message="$2"
+    mkdir -p "$LOGS_DIR"
+
+    python3 - <<PYEOF
+import json, datetime
+data = {
+    "failed_step": """$step""",
+    "error": """$message""",
+    "exit_code": 2,
+    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "sender_instance_id": """${SENDER_INSTANCE_ID:-}""",
+    "receiver_instance_id": """${RECEIVER_INSTANCE_ID:-}""",
+    "commit": """${GITHUB_SHA:-unknown}""",
+    "run_url": "${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}",
+}
+with open("$LOGS_DIR/failure-summary.json", "w") as f:
+    json.dump(data, f, indent=2)
+print(f"Failure summary: $LOGS_DIR/failure-summary.json")
+PYEOF
+}
+
+# fail_with_logs: collect logs + write step summary + write failure JSON, then return.
+# Call this before exit 2 on any infrastructure failure path.
+
+fail_with_logs() {
+    local step="$1"
+    local message="$2"
+    FAILED_STEP="$step"
+    log_error "$message"
+    collect_instance_logs || true
+    write_failure_json "$step" "$message" || true
+    write_step_summary || true
+}
+
+# ── Main execution ───────────────────────────────────────────────────────────
+
+main() {
+    log_section "EC2 Integration Tests for dpdk-stdlib-rust"
+
+    log_info "Profile:      ${AWS_PROFILE:-<env-var credentials>}"
+    log_info "Teardown:     $FLAG_TEARDOWN"
+    log_info "Skip deploy:  $FLAG_SKIP_DEPLOY"
+    log_info "Tier filter:  ${TIER_FILTER:-all}"
+    log_info "JSON summary: $FLAG_JSON_SUMMARY"
+
+    # Step 1: Deploy (or skip)
+    if [[ "$FLAG_SKIP_DEPLOY" != "true" ]]; then
+        if ! deploy_infrastructure; then
+            # With --no-rollback, instances may still be running.
+            # Try to fetch outputs and collect logs before giving up.
+            log_info "Deploy failed — attempting to collect logs from surviving instances..."
+            fetch_stack_outputs 2>/dev/null || true
+            if [[ -n "${SENDER_INSTANCE_ID:-}" || -n "${RECEIVER_INSTANCE_ID:-}" ]]; then
+                # Wait briefly for SSM to become available
+                wait_for_ssm_readiness 2>/dev/null || true
+            fi
+            fail_with_logs "deploy_infrastructure" "Infrastructure deployment failed"
+            teardown_infrastructure
+            exit 2
+        fi
+    fi
+
+    # Step 2: Fetch stack outputs
+    if ! fetch_stack_outputs; then
+        fail_with_logs "fetch_stack_outputs" "Failed to fetch stack outputs"
+        exit 2
+    fi
+
+    # Step 3: Wait for SSM readiness
+    if ! wait_for_ssm_readiness; then
+        fail_with_logs "wait_for_ssm_readiness" "Instances not ready within SSM timeout"
+        teardown_infrastructure
+        exit 2
+    fi
+
+    # Post deploy status to PR
+    post_pr_comment "## [CI] Stage: Deploy
+Infrastructure ready.
+- Sender: \`$SENDER_INSTANCE_ID\` (DPDK ENI: $SENDER_DPDK_ENI_IP)
+- Receiver: \`$RECEIVER_INSTANCE_ID\` (DPDK ENI: $RECEIVER_DPDK_ENI_IP)
+- Both instances SSM-ready."
+
+    # Step 4: Verify build
+    if ! verify_build; then
+        fail_with_logs "verify_build" "Build verification failed — echo binary missing on instance"
+        teardown_infrastructure
+        exit 2
+    fi
+
+    # Step 5: Run tiers
+    mkdir -p "$RESULTS_DIR"
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "1" ]]; then
+        run_tier1 || true
+    fi
+
+    # Unbind ENIs between tier 1 and tier 2
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "2" ]]; then
+        run_tier2 || true
+    fi
+
+    # Unbind ENIs between tier 2 and tier 3
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "3" ]]; then
+        run_tier3 || true
+    fi
+
+    # Unbind ENIs between tier 3 and tier 4
+    if [[ -z "$TIER_FILTER" ]]; then
+        unbind_all_enis
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "4" ]]; then
+        run_tier4 || true
+    fi
+
+    # Unbind ENIs between UDP tier 4 and TCP tiers
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == tcp* ]]; then
+        unbind_all_enis
+    fi
+
+    # TCP integration tiers (non-blocking — failures don't affect exit code)
+    # All TCP tiers use DPDK↔DPDK (both ENIs bound), so we bind once at the
+    # start of tcp_tier1 and don't unbind between TCP tiers.
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1" ]]; then
+        run_tcp_tier1 || true
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp2" ]]; then
+        run_tcp_tier2 || true
+    fi
+
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp3" ]]; then
+        run_tcp_tier3 || true
+    fi
+
+    # Step 6: Collect results
+    collect_results
+
+    # Step 7: Summary
+    print_summary
+    generate_json_summary
+
+    # Step 8: Collect instance logs + write step summary (always, before teardown)
+    collect_instance_logs || true
+    write_step_summary || true
+
+    # Post the final analyzable summary to the PR: per-tier, per-testcase pass/
+    # fail with the failure reason, classifying real test failures vs infra/setup
+    # flakes. Self-contained — a run can be analyzed from this comment alone.
+    generate_markdown_summary
+    if [[ -f "$RESULTS_DIR/summary.md" ]]; then
+        post_pr_comment "$(cat "$RESULTS_DIR/summary.md")"
+    fi
+
+    # Step 9: Teardown
+    teardown_infrastructure
+
+    log_info "Exiting with code: $TEST_EXIT_CODE"
+    exit "$TEST_EXIT_CODE"
+}
+
+main "$@"

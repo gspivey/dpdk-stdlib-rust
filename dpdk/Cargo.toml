@@ -1,0 +1,19 @@
+[package]
+name = "dpdk-stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Safe Rust wrappers for DPDK EAL, Port, Mbuf, Mempool, and RX/TX queues"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
+
+[dependencies]
+dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+serial_test = { workspace = true }

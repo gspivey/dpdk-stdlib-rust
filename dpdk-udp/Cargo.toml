@@ -1,0 +1,25 @@
+[package]
+name = "dpdk-stdlib-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Drop-in DPDK-accelerated replacement for std::net::UdpSocket"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
+
+[features]
+default = ["perf-counters"]
+## Enable hot-path performance counters (atomic increments on every packet).
+## Disable with `--no-default-features` to eliminate all instrumentation overhead
+## from the TX/RX fast paths — useful for latency-critical production deployments.
+perf-counters = []
+
+[dependencies]
+thiserror = { workspace = true }
+dpdk = { version = "0.2.0", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-sys = { version = "0.2.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
+dpdk-stdlib-net = { version = "0.2.0", path = "../dpdk-stdlib-net" }
+libc = { workspace = true }

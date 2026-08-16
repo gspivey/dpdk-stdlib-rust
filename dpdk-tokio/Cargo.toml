@@ -1,0 +1,29 @@
+[package]
+name = "dpdk-stdlib-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async DPDK-accelerated replacement for tokio::net::UdpSocket"
+readme = "README.md"
+exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
+
+[features]
+default = []
+dpdk = ["dep:dpdk-udp", "dep:dpdk-stdlib-tcp"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+thiserror.workspace = true
+async-trait = "0.1"
+
+# Optional DPDK support
+dpdk-udp = { version = "0.2.0", path = "../dpdk-udp", optional = true, package = "dpdk-stdlib-udp" }
+dpdk-stdlib-tcp = { version = "0.2.0", path = "../dpdk-stdlib-tcp", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+dpdk-stdlib-tcp = { version = "0.2.0", path = "../dpdk-stdlib-tcp" }
+proptest = "1.4"
