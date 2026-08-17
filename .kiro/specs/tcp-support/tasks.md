@@ -443,12 +443,12 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - All scripts produce JUnit XML using harness-common.sh, 60-second timeout per test
     - _Requirements: 2.1, 2.2, 2.3, 16.4_
 
-  - [ ] 15.2 Create tier2 TCP integration test scripts
+  - [x] 15.2 Create tier2 TCP integration test scripts
     - Create `scripts/integration-tests/tier2-tcp-retransmit.sh` (loss-injection, verify retransmission + bounded recovery)
     - Create `scripts/integration-tests/tier2-tcp-flow-control.sh` (zero-window, persist probe, resume)
     - _Requirements: 2.5, 2.6_
 
-  - [ ] 15.3 Create tier3 TCP integration test scripts
+  - [x] 15.3 Create tier3 TCP integration test scripts
     - Create `scripts/integration-tests/tier3-tcp-kernel-interop.sh` (ncat/iperf3 interop)
     - Create `scripts/integration-tests/tier3-tcp-std-parity.sh` (byte-for-byte + ErrorKind comparison using tcp-test-client --mode std-parity)
     - _Requirements: 2.4, 2.7, 2.9_

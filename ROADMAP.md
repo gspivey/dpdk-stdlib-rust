@@ -320,7 +320,7 @@ Three scripts in `scripts/integration-tests/`: `tier1-tcp-handshake.sh` (DPDK↔
 Tier-2: `tier2-tcp-retransmit.sh` (loss injection, verify retransmission + bounded recovery), `tier2-tcp-flow-control.sh` (zero-window probe, resume). Tier-3: `tier3-tcp-kernel-interop.sh` (ncat/iperf3 interop), `tier3-tcp-std-parity.sh` (byte-for-byte + ErrorKind comparison via `--mode std-parity`). All produce JUnit XML.
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `15.2`, `15.3`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #117
 
 ---
 
