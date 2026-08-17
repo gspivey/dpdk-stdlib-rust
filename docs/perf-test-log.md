@@ -4,6 +4,72 @@ Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
 
+## Run #51: docs: mark ROADMAP #35 complete — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-08-17 |
+| **Git Hash** | `08fa798` |
+| **Branch** | `agent/mark-roadmap-35-complete` |
+| **PR** | [#119](https://github.com/gspivey/dpdk-stdlib-rust/pull/119) |
+| **GH Actions Run** | [32038128064](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/32038128064) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #50
+
+1. **`08fa798` — docs: mark ROADMAP #35 complete (PR #117).** Marks ROADMAP item #35 as complete and checks off tasks 15.2/15.3 in tasks.md. Zero changes to any data-path crate — docs-only.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 68,994 | 1.4% | 68,990 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,979 | 0.7% | 138,920 | 0.8% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 230,975 | 34.0% | 348,773 | 0.4% | 309,910 | 11.5% | 349,990 | 0.0% |
+| 700,000 | 482,833 | 31.0% | 698,392 | 0.2% | 312,228 | 55.4% | 699,386 | 0.1% |
+
+#### 512-byte packets
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,994 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,966 | 0.7% | 138,958 | 0.7% | 138,994 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 224,633 | 35.8% | 348,882 | 0.3% | 228,794 | 34.6% | 350,000 | 0.0% |
+| 700,000 | 476,528 | 31.9% | 696,842 | 0.5% | 228,496 | 67.4% | 699,110 | 0.1% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 68,990 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 138,922 | 0.8% | 138,946 | 0.8% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 216,650 | 38.1% | 348,853 | 0.3% | 146,305 | 58.2% | 349,981 | 0.0% |
+| 700,000 | 467,580 | 33.2% | 561,216 | 19.8% | 146,608 | 79.1% | 654,549 | 6.5% |
+
+#### 8500-byte packets (jumbo, capped at 30 Gbps)
+
+| Target PPS | plain-rust RX | Drop | rust-dpdk RX | Drop | tokio-dpdk RX | Drop | native-dpdk RX | Drop |
+|-----------|--------------|------|-------------|------|--------------|------|---------------|------|
+| 70,000 | 37,033 | 47.1% | 69,000 | 1.4% | 55,671 | 20.5% | 69,996 | 0.0% |
+| 140,000 | 124,261 | 0.8% | 124,151 | 0.9% | 59,415 | 52.6% | 125,193 | 0.1% |
+| 350,000 | 124,092 | 1.0% | 121,785 | 2.8% | 59,158 | 52.8% | 123,317 | 1.6% |
+
+### Analysis
+
+Docs-only change (ROADMAP.md + tasks.md updates). No regression expected or observed.
+
+- **rust-dpdk** at 64B/700K: 698,392 RX (0.2% drop) — improved vs Run #50's 675,214 (3.5% drop)
+- **rust-dpdk** at 512B/700K: 696,842 RX (0.5% drop) — improved vs Run #50's 624,461 (10.8% drop)
+- **native-dpdk** at 64B/700K: 699,386 RX (0.1% drop) — stable vs Run #50's 677,629 (3.2% drop)
+- **tokio-dpdk** consistent with historical high-rate scaling limitations
+
+No performance regression. Run-to-run variance at high PPS is normal for shared c6in instances.
+
+---
+
 ## Run #50: dpdk-stdlib-tcp TRex TCP Performance Profile and Benchmark Runner — No Regression
 
 | Field | Value |
