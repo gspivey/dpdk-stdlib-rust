@@ -82,9 +82,9 @@ while [[ $# -gt 0 ]]; do
         --tier)
             TIER_FILTER="$2"
             case "$TIER_FILTER" in
-                1|2|3|4|tcp1|tcp1a|tcp2) ;;
+                1|2|3|4|tcp1|tcp1a|tcp2|tcp-full) ;;
                 *)
-                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2, got: $TIER_FILTER" >&2
+                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2 tcp-full, got: $TIER_FILTER" >&2
                     exit 2
                     ;;
             esac
@@ -1009,6 +1009,188 @@ run_tier2_tcp() {
     log_info "Tier 2 TCP execution complete"
 }
 
+# ── TCP full test suite ──────────────────────────────────────────────────────
+#
+# Runs all TCP integration test scripts (tier1, tier2, tier3) in sequence.
+# Used by the tcp-integration-tests CI job which has continue-on-error: true.
+
+# Shared driver for DPDK<->DPDK TCP tests (both instances on DPDK).
+# $1 = test script basename, $2 = suite name for failure XML
+_run_tcp_dpdk_pair() {
+    local script_name="$1"
+    local suite="$2"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    # Start server on receiver
+    log_info "Starting TCP server on receiver for $suite..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$server_cmd")
+
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start TCP server ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP server on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # Run client on sender
+    log_info "Starting TCP client on sender for $suite..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+        log_error "TCP client execution failed ($suite)"
+        generate_failure_xml "$suite" "Client test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+}
+
+# Variant for scripts that use listener/sender role names (e.g., tier1-tcp-echo.sh)
+# $1 = test script basename, $2 = suite name for failure XML
+_run_tcp_dpdk_pair_lr() {
+    local script_name="$1"
+    local suite="$2"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    # Start listener on receiver
+    log_info "Starting TCP listener on receiver for $suite..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # Run sender on sender instance
+    log_info "Starting TCP sender on sender for $suite..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "TCP sender execution failed ($suite)"
+        generate_failure_xml "$suite" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+}
+
+# Shared driver for kernel-interop TCP tests (receiver DPDK, sender kernel).
+# $1 = test script basename, $2 = suite name for failure XML
+_run_tcp_kernel_interop() {
+    local script_name="$1"
+    local suite="$2"
+
+    log_info "Configuring ENIs for $suite (receiver DPDK, sender kernel)..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+
+    warm_arp_cache
+
+    # Start DPDK server on receiver
+    log_info "Starting DPDK TCP server on receiver for $suite..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$server_cmd")
+
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start TCP server ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP server on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # Run kernel client on sender (no --bind-ip, uses kernel networking)
+    log_info "Starting kernel TCP client on sender for $suite..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+        log_error "Kernel TCP client execution failed ($suite)"
+        generate_failure_xml "$suite" "Client test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+}
+
+run_tcp_full() {
+    log_section "TCP Full Test Suite"
+
+    # ── Tier 1: DPDK <-> DPDK tests ─────────────────────────────────────────
+
+    log_section "TCP Tier 1: Handshake (DPDK <-> DPDK)"
+    _run_tcp_dpdk_pair "tier1-tcp-handshake.sh" "tier1-tcp-handshake" || true
+    unbind_all_enis
+
+    log_section "TCP Tier 1: Echo (DPDK <-> DPDK, sync)"
+    _run_tcp_dpdk_pair_lr "tier1-tcp-echo.sh" "tier1-tcp-echo-full" || true
+    unbind_all_enis
+
+    log_section "TCP Tier 1: Shutdown (DPDK <-> DPDK)"
+    _run_tcp_dpdk_pair "tier1-tcp-shutdown.sh" "tier1-tcp-shutdown" || true
+    unbind_all_enis
+
+    # ── Tier 2: Reliability tests ────────────────────────────────────────────
+
+    log_section "TCP Tier 2: Retransmit (DPDK <-> DPDK)"
+    _run_tcp_dpdk_pair "tier2-tcp-retransmit.sh" "tier2-tcp-retransmit" || true
+    unbind_all_enis
+
+    log_section "TCP Tier 2: Flow Control (DPDK <-> DPDK)"
+    _run_tcp_dpdk_pair "tier2-tcp-flow-control.sh" "tier2-tcp-flow-control" || true
+    unbind_all_enis
+
+    # ── Tier 3: Kernel interoperability ──────────────────────────────────────
+
+    log_section "TCP Tier 3: Kernel Interop (ncat/iperf3 <-> DPDK)"
+    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop" || true
+    unbind_all_enis
+
+    log_section "TCP Tier 3: std-parity (DPDK <-> DPDK)"
+    _run_tcp_dpdk_pair "tier3-tcp-std-parity.sh" "tier3-tcp-std-parity" || true
+
+    log_info "TCP Full Test Suite execution complete"
+}
+
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
@@ -1846,6 +2028,11 @@ Infrastructure ready.
 
     if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp2" ]]; then
         run_tier2_tcp || true
+    fi
+
+    # TCP full test suite — runs all TCP tiers in a dedicated job
+    if [[ "$TIER_FILTER" == "tcp-full" ]]; then
+        run_tcp_full || true
     fi
 
     # Step 6: Collect results
