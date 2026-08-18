@@ -124,6 +124,71 @@ jobs:
           chmod +x scripts/validate-cdk.sh
           ./scripts/validate-cdk.sh
 
+  # ── TCP Synthetic performance test (no AWS credentials needed) ───────────────
+  # Measures framework overhead of TCP engine, connection establishment latency,
+  # single-stream throughput, and tick processing time with a mock PacketBackend.
+  # Runs in ~30 seconds. Posts results as a PR comment.
+  tcp-synthetic-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tcp-synth-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tcp-synth-
+
+      - name: Run TCP synthetic benchmark
+        id: bench
+        run: |
+          cargo build --release -p tcp-synthetic-bench
+          cargo run --release -p tcp-synthetic-bench > /tmp/tcp-bench-results.md 2>/tmp/tcp-bench-stderr.log
+          cat /tmp/tcp-bench-stderr.log >&2
+          cat /tmp/tcp-bench-results.md
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number, skipping comment"
+            exit 0
+          fi
+
+          REPORT="/tmp/tcp-synth-perf-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "## TCP Synthetic Performance Results ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          cat /tmp/tcp-bench-results.md >> "$REPORT"
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post TCP synthetic perf PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-synthetic-bench-results
+          path: /tmp/tcp-bench-results.md
+          retention-days: 30
+          if-no-files-found: ignore
+
   # ── Full integration test suite (requires AWS) ──────────────────────────────
   integration-tests:
     runs-on: ubuntu-latest
@@ -439,6 +504,209 @@ jobs:
 
       - name: Safety net teardown
         if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          cd deploy/cdk
+          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+
+  # ── TCP integration tests (non-blocking while TCP matures) ──────────────────
+  # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
+  # retransmit/flow-control, tier3 kernel-interop/std-parity) on EC2 with real
+  # DPDK hardware. Uses continue-on-error: true so TCP failures do not block CI
+  # while the TCP stack matures. Once ≥10/10 recent runs pass, the gate is
+  # removed (ROADMAP item 36, task 16.1).
+  tcp-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    needs: validate-cdk
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch DPDK AMI ID from SSM
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$AMI_ID" ]]; then
+            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ami_id=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run TCP integration tests
+        id: tcp-tests
+        run: |
+          chmod +x scripts/run-integration-tests.sh
+          chmod +x scripts/integration-tests/*.sh
+          ./scripts/run-integration-tests.sh --teardown --json-summary --tier tcp-full
+        env:
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+
+      - name: Post TCP test results to PR
+        if: always() && steps.tcp-tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping TCP result posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/tcp-integration-report.md"
+          OUTCOME="${{ steps.tcp-tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ TCP Integration Tests Passed ([run](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ⚠️ TCP Integration Tests (non-blocking) ([run](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "> TCP tests run with \`continue-on-error: true\` — failures do not block CI." >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          TOTAL_TESTS=0
+          TOTAL_FAILURES=0
+          TOTAL_SKIPPED=0
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+            TOTAL_TESTS=$((TOTAL_TESTS + TESTS))
+            TOTAL_FAILURES=$((TOTAL_FAILURES + FAILURES))
+            TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -5 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+          echo "**Summary**: ${TOTAL_TESTS} tests, ${TOTAL_FAILURES} failures, ${TOTAL_SKIPPED} skipped" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Application logs (last 20 lines inline)
+          echo "<details><summary>Application Logs (last 20 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-tcp-echo*.log instance-logs/*-tcp-test-client*.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Network state
+          echo "<details><summary>Network State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-networking-diag-*.txt instance-logs/*-network-interfaces.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Truncate if too long
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-tcp-report.md
+            echo "" >> /tmp/truncated-tcp-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-tcp-report.md
+            mv /tmp/truncated-tcp-report.md "$REPORT"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post TCP integration test PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload TCP test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-integration-test-results
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload TCP instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Publish TCP test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: TCP Integration Tests
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
+
+      - name: Safety net teardown
+        if: failure() && steps.tcp-tests.outcome == 'failure'
         run: |
           cd deploy/cdk
           npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
