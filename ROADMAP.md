@@ -329,7 +329,7 @@ Tier-2: `tier2-tcp-retransmit.sh` (loss injection, verify retransmission + bound
 Add TCP integration test jobs to `integration-tests.yml` with `continue-on-error: true`. Post pass/fail/skip counts + log excerpts as PR comment. Upload JUnit XML artifacts (30-day retention). Use `dorny/test-reporter` for PR checks UI. Once ≥10/10 recent runs pass all MVP requirements, remove `continue-on-error: true` to make TCP test failures blocking CI.
 
 - Spec: `.kiro/specs/tcp-support/` · tasks `15.4`, `16.1`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #120
 
 ---
 

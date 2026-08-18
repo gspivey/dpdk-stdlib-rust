@@ -453,7 +453,7 @@ Build production-credible TCP support for dpdk-stdlib-rust, providing drop-in re
     - Create `scripts/integration-tests/tier3-tcp-std-parity.sh` (byte-for-byte + ErrorKind comparison using tcp-test-client --mode std-parity)
     - _Requirements: 2.4, 2.7, 2.9_
 
-  - [ ] 15.4 Add TCP integration test jobs to CI workflow
+  - [x] 15.4 Add TCP integration test jobs to CI workflow
     - Add TCP integration test jobs to `integration-tests.yml` with `continue-on-error: true`
     - Post test results and logs to PR comment (pass/fail/skip counts, app logs, network state)
     - Upload JUnit XML results as artifacts with 30-day retention
