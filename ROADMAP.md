@@ -333,6 +333,27 @@ Add TCP integration test jobs to `integration-tests.yml` with `continue-on-error
 
 ---
 
+### 37. Wire QUIC Tier 1 into the integration test orchestrator
+
+Read `.kiro/specs/quic-tcp-ec2-integration/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement tasks `1`, `2`, `2a`, `3`, `4`, `5`, `6`.
+
+- Spec: `.kiro/specs/quic-tcp-ec2-integration/` · tasks `1`, `2`, `2a`, `3`, `4`, `5`, `6`
+- [ ] Complete · PR: —
+
+---
+
+### 38. QUIC integration and performance CI workflows + TCP/QUIC gate evaluation
+
+Read `.kiro/specs/quic-tcp-ec2-integration/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement tasks `7`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `15`, `16`,
+`16a`, `17`, `17a`, `18`, `19`. [Depends on item 37 — orchestrator `--tier quic` must be merged first.]
+
+- Spec: `.kiro/specs/quic-tcp-ec2-integration/` · tasks `7`–`19`
+- [ ] Complete · PR: —
+
+---
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
