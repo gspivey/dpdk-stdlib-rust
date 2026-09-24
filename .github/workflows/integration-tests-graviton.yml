@@ -164,6 +164,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Pre-deploy stack cleanup
+        run: |
+          # Destroy any stuck stack (DELETE_FAILED / CREATE_FAILED) before
+          # deploying. A stuck stack causes every subsequent deploy to fail with
+          # "stack is in X state and cannot be updated".
+          cd deploy/cdk
+          npx cdk destroy DpdkTestStackGraviton --force 2>&1 \
+            | grep -v "^$\|NodeVersionSupportWarning\|addDependency is deprecated\|Use .addResourceDependency" \
+            || echo "Pre-deploy destroy returned non-zero (stack may not exist — proceeding)"
+
       - name: Run integration tests
         id: tests
         run: |

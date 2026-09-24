@@ -253,6 +253,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Pre-deploy stack cleanup
+        run: |
+          # Destroy any stuck stack (DELETE_FAILED / CREATE_FAILED) before
+          # deploying. A stuck stack causes every subsequent deploy to fail with
+          # "stack is in X state and cannot be updated". --force is safe here:
+          # the stack is ephemeral test infra recreated fresh each run.
+          cd deploy/cdk
+          npx cdk destroy DpdkTestStack --force 2>&1 \
+            | grep -v "^$\|NodeVersionSupportWarning\|addDependency is deprecated\|Use .addResourceDependency" \
+            || echo "Pre-deploy destroy returned non-zero (stack may not exist — proceeding)"
+
       - name: Run integration tests
         id: tests
         run: |
@@ -573,6 +584,13 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Pre-deploy stack cleanup
+        run: |
+          cd deploy/cdk
+          npx cdk destroy DpdkTestStack --force 2>&1 \
+            | grep -v "^$\|NodeVersionSupportWarning\|addDependency is deprecated\|Use .addResourceDependency" \
+            || echo "Pre-deploy destroy returned non-zero (stack may not exist — proceeding)"
 
       - name: Run TCP integration tests
         id: tcp-tests
