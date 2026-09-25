@@ -164,6 +164,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackGraviton
+
       - name: Run integration tests
         id: tests
         run: |
