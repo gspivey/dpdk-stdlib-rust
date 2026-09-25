@@ -254,19 +254,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Pre-deploy stack cleanup
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
-          # Destroy any stuck stack (DELETE_FAILED / CREATE_FAILED) before
-          # deploying. A stuck stack causes every subsequent deploy to fail with
-          # "stack is in X state and cannot be updated". --force is safe here:
-          # the stack is ephemeral test infra recreated fresh each run.
-          # set -o pipefail preserves cdk exit code through the grep filter so
-          # a real destroy failure surfaces as a step failure.
-          set -o pipefail
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force 2>&1 \
-            | grep -v "^$\|NodeVersionSupportWarning\|addDependency is deprecated\|Use .addResourceDependency" \
-            || echo "Pre-deploy destroy returned non-zero (stack may not exist — proceeding)"
+          # Clear any leftover stack in DELETE_FAILED or CREATE_FAILED state
+          # (caused by --no-rollback on deploy or an early exit without teardown).
+          # Uses aws cloudformation directly — no CDK synth overhead.
+          # Fails the step if the stack can't be removed, and prints the blocking
+          # resource so the cause can be recorded in docs/debugging-log.md.
+          STACK=DpdkTestStack
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "Existing $STACK status: $STATUS"
+          [ "$STATUS" = NONE ] && exit 0
+          aws cloudformation delete-stack --stack-name "$STACK"
+          if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+            aws cloudformation describe-stack-events --stack-name "$STACK" \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+              --output table
+            echo "::error::Could not delete stuck stack $STACK"
+            exit 1
+          fi
 
       - name: Run integration tests
         id: tests
@@ -590,19 +597,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Pre-deploy stack cleanup
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
-          # Destroy any stuck stack (DELETE_FAILED / CREATE_FAILED) before
-          # deploying. A stuck stack causes every subsequent deploy to fail with
-          # "stack is in X state and cannot be updated". --force is safe here:
-          # the stack is ephemeral test infra recreated fresh each run.
-          # set -o pipefail preserves cdk exit code through the grep filter so
-          # a real destroy failure surfaces as a step failure.
-          set -o pipefail
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force 2>&1 \
-            | grep -v "^$\|NodeVersionSupportWarning\|addDependency is deprecated\|Use .addResourceDependency" \
-            || echo "Pre-deploy destroy returned non-zero (stack may not exist — proceeding)"
+          # Clear any leftover stack in DELETE_FAILED or CREATE_FAILED state.
+          # Uses aws cloudformation directly — no CDK synth overhead.
+          # Fails the step if the stack can't be removed.
+          STACK=DpdkTestStack
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "Existing $STACK status: $STATUS"
+          [ "$STATUS" = NONE ] && exit 0
+          aws cloudformation delete-stack --stack-name "$STACK"
+          if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+            aws cloudformation describe-stack-events --stack-name "$STACK" \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+              --output table
+            echo "::error::Could not delete stuck stack $STACK"
+            exit 1
+          fi
 
       - name: Run TCP integration tests
         id: tcp-tests
