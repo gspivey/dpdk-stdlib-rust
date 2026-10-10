@@ -179,6 +179,14 @@ run_sender() {
     # Clean up DPDK shared memory so the next process can reinitialize EAL.
     rm -rf /var/run/dpdk/ 2>/dev/null || true
 
+    # Allow the server-side TCP engine to complete TIME_WAIT processing and
+    # drain its TX ring before the second client starts.  Without this pause
+    # the second SYN can arrive while the engine still has queued TX frames
+    # from the FIN exchange; send_or_warn suppresses TX ring-full errors
+    # silently, so the SYN-ACK is dropped and bidir_multi times out at 60s.
+    # 3 seconds is conservative but cheap — the test already runs ~90s total.
+    sleep 3
+
     # ── Test 2: bidir multi round-trip (20) ──────────────────────────────
     log_info "Test: bidir_multi"
     start=$(_timer_now)
