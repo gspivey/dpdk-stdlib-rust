@@ -511,8 +511,8 @@ jobs:
       - name: Safety net teardown
         if: failure() && steps.tests.outcome == 'failure'
         run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"
 
   # ── TCP integration tests (non-blocking while TCP matures) ──────────────────
   # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
@@ -721,5 +721,5 @@ jobs:
       - name: Safety net teardown
         if: failure() && steps.tcp-tests.outcome == 'failure'
         run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"

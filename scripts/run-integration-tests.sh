@@ -1617,20 +1617,35 @@ PYEOF
 teardown_infrastructure() {
     if [[ "$FLAG_TEARDOWN" != "true" ]]; then
         log_info "Teardown not requested. To destroy infrastructure manually:"
-        log_info "  cd $CDK_DIR && npx cdk destroy $CDK_STACK_NAME"
+        log_info "  scripts/ci/cleanup-cfn-stack.sh $CDK_STACK_NAME"
         return 0
     fi
 
     log_section "Tearing down infrastructure"
 
-    cd "$CDK_DIR"
-    if ! npx cdk destroy "$CDK_STACK_NAME" --force 2>&1; then
-        log_error "CDK teardown failed (test results are preserved)"
-        # Don't change TEST_EXIT_CODE - preserve test result
+    # Use the same force-delete script as the pre-deploy cleanup so a stuck
+    # DPDK ENI attachment (ReceiverDpdkAttachment) doesn't leave the stack in
+    # DELETE_FAILED between runs.  Plain 'cdk destroy' fails the same way a
+    # plain 'aws cloudformation delete-stack' does -- without
+    # --deletion-mode FORCE_DELETE_STACK the ENI attachment blocks every time.
+    if [[ -x "$REPO_ROOT/scripts/ci/cleanup-cfn-stack.sh" ]]; then
+        if ! bash "$REPO_ROOT/scripts/ci/cleanup-cfn-stack.sh" "$CDK_STACK_NAME"; then
+            log_error "CDK teardown failed (test results are preserved)"
+            # Don't change TEST_EXIT_CODE - preserve test result
+        else
+            log_info "Infrastructure destroyed"
+        fi
     else
-        log_info "Infrastructure destroyed"
+        # Fallback: script not found, try plain cdk destroy
+        log_info "cleanup-cfn-stack.sh not found, falling back to cdk destroy"
+        cd "$CDK_DIR"
+        if ! npx cdk destroy "$CDK_STACK_NAME" --force 2>&1; then
+            log_error "CDK teardown failed (test results are preserved)"
+        else
+            log_info "Infrastructure destroyed"
+        fi
+        cd "$REPO_ROOT"
     fi
-    cd "$REPO_ROOT"
 }
 
 # ── Instance log collection ──────────────────────────────────────────────────
