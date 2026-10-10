@@ -27,6 +27,19 @@ case "$STATUS" in
   DELETE_IN_PROGRESS)
     # Already being deleted -- fall through to wait.
     ;;
+  REVIEW_IN_PROGRESS)
+    # CDK created a change set but the deploy crashed before any resources were
+    # created. The stack has no resources; a plain delete succeeds immediately.
+    echo "$STACK is REVIEW_IN_PROGRESS (empty change-set stack) -- deleting directly"
+    aws cloudformation delete-stack --stack-name "$STACK"
+    sleep 5
+    if ! timeout 5m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+      echo "::error::Could not delete REVIEW_IN_PROGRESS stack $STACK"
+      exit 1
+    fi
+    echo "$STACK successfully removed"
+    exit 0
+    ;;
   *_IN_PROGRESS)
     echo "::error::$STACK is $STATUS -- concurrent run? Refusing to delete."
     exit 1
@@ -57,8 +70,24 @@ fi
 # aws cloudformation wait default is 60 min, exceeding the 20-min step budget.
 # Wrap in timeout so the diagnostic branch runs before GitHub kills the step.
 if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
-  print_failed_events
-  echo "::error::Could not delete stuck stack $STACK"
-  exit 1
+  # Check if we landed in DELETE_FAILED after a plain delete (stuck ENI, etc).
+  # Retry once with force-delete so teardown clears debris in the same run
+  # rather than leaving the stack stuck for the next run's pre-deploy step.
+  NOW=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+          --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)
+  if [ "$NOW" = DELETE_FAILED ] && [ ${#DEL_ARGS[@]} -eq 0 ]; then
+    echo "::warning::$STACK entered DELETE_FAILED -- retrying with force-delete"
+    print_failed_events
+    aws cloudformation delete-stack --stack-name "$STACK" --deletion-mode FORCE_DELETE_STACK
+    if ! timeout 10m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+      print_failed_events
+      echo "::error::Force-delete of $STACK failed -- orphaned resources need manual cleanup"
+      exit 1
+    fi
+  else
+    print_failed_events
+    echo "::error::Could not delete stuck stack $STACK (status: $NOW)"
+    exit 1
+  fi
 fi
 echo "$STACK successfully removed"
