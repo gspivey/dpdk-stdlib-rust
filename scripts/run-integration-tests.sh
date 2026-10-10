@@ -434,37 +434,51 @@ wait_for_ssm_readiness() {
 }
 
 verify_build() {
-    log_info "Verifying project build on instances (parallel)..."
+    log_info "Verifying project build on instances (with retry for cloud-init build time)..."
 
-    local sender_cmd_id receiver_cmd_id
-    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 \
-        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
-    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 \
-        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    # The build runs inside cloud-init user-data and takes ~4-7 min on Graviton.
+    # SSM becomes responsive before the build completes, so we poll until the
+    # binary appears rather than checking once and failing immediately.
+    local BUILD_POLL_INTERVAL=20   # seconds between polls
+    local BUILD_TIMEOUT=600        # 10 minutes max (build is ~4-7 min)
 
-    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
-        local label="${entry%%:*}"
-        local rest="${entry#*:}"
-        local instance_id="${rest%%:*}"
-        local cmd_id="${rest##*:}"
+    for role_entry in "sender:$SENDER_INSTANCE_ID" "receiver:$RECEIVER_INSTANCE_ID"; do
+        local label="${role_entry%%:*}"
+        local instance_id="${role_entry##*:}"
 
-        if [[ -z "$cmd_id" ]]; then
-            log_error "Failed to send build verification command to $label ($instance_id)"
-            return 1
-        fi
+        log_info "Waiting for build on $label ($instance_id)..."
+        local elapsed=0
+        local found=false
 
-        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
-            log_error "Build verification command timed out on $label ($instance_id)"
-            return 1
-        fi
+        while [[ $elapsed -lt $BUILD_TIMEOUT ]]; do
+            local cmd_id
+            cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+                "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
 
-        local result
-        result=$(ssm_get_stdout "$instance_id" "$cmd_id")
+            if [[ -z "$cmd_id" ]]; then
+                log_error "Failed to send build check to $label — retrying in ${BUILD_POLL_INTERVAL}s"
+                sleep "$BUILD_POLL_INTERVAL"
+                elapsed=$((elapsed + BUILD_POLL_INTERVAL))
+                continue
+            fi
 
-        if echo "$result" | grep -q "BUILD_OK"; then
-            log_info "Build verified on $label ($instance_id)"
-        else
-            log_error "Build not found on $label ($instance_id) (output: $result)"
+            if ssm_wait_command "$instance_id" "$cmd_id" 60 2>/dev/null; then
+                local result
+                result=$(ssm_get_stdout "$instance_id" "$cmd_id")
+                if echo "$result" | grep -q "BUILD_OK"; then
+                    log_info "Build verified on $label ($instance_id) after ${elapsed}s"
+                    found=true
+                    break
+                fi
+            fi
+
+            log_info "Build not ready on $label (${elapsed}s elapsed) — cloud-init still running, waiting ${BUILD_POLL_INTERVAL}s..."
+            sleep "$BUILD_POLL_INTERVAL"
+            elapsed=$((elapsed + BUILD_POLL_INTERVAL))
+        done
+
+        if [[ "$found" != "true" ]]; then
+            log_error "Build verification timed out on $label ($instance_id) after ${BUILD_TIMEOUT}s — echo binary never appeared"
             return 1
         fi
     done
