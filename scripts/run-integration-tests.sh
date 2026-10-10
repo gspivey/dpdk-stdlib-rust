@@ -2010,18 +2010,71 @@ Infrastructure ready.
         unbind_all_enis
     fi
 
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1" ]]; then
-        run_tier1_tcp || true
+    # ── TCP tiers: bind ENIs ONCE for all DPDK<->DPDK tests, then reconfigure
+    # once for the kernel-interop test.  Repeated bind/unbind cycles between
+    # tcp1 and tcp1a hammered the receiver VFIO device into a reset loop,
+    # causing SSM to become unresponsive for the tcp2 bind.
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1" || "$TIER_FILTER" == "tcp1a" || "$TIER_FILTER" == "tcp2" ]]; then
+        # Bind both ENIs once for all DPDK<->DPDK TCP tests
+        log_info "Binding ENIs once for TCP DPDK-pair tests (tcp1, tcp1a)..."
+        if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+            log_error "Failed to bind ENI on sender for TCP tests"
+            generate_failure_xml "tier1-tcp-echo" "ENI bind failed on sender instance"
+            generate_failure_xml "tier1-tcp-echo-async" "ENI bind failed on sender instance"
+        else
+            if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+                log_error "Failed to bind ENI on receiver for TCP tests"
+                generate_failure_xml "tier1-tcp-echo" "ENI bind failed on receiver instance"
+                generate_failure_xml "tier1-tcp-echo-async" "ENI bind failed on receiver instance"
+            else
+                warm_arp_cache
+
+                # tcp1: run without rebinding
+                if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1" ]]; then
+                    log_section "Tier 1 TCP (sync): DPDK <-> DPDK TCP echo test"
+                    local listener_cmd_id
+                    log_info "Starting TCP listener on receiver (server=tcp-echo)..."
+                    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tcp-echo"
+                    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+                    if [[ -z "$listener_cmd_id" ]]; then
+                        generate_failure_xml "tier1-tcp-echo" "Failed to start TCP listener on receiver"
+                    else
+                        sleep 10
+                        local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo.xml"
+                        if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+                            generate_failure_xml "tier1-tcp-echo" "Sender test execution failed or timed out"
+                        fi
+                        ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+                    fi
+                    log_info "Tier 1 TCP (sync) execution complete"
+                fi
+
+                # tcp1a: reuse existing DPDK bind — no unbind/rebind
+                if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1a" ]]; then
+                    log_section "Tier 1 TCP (async): DPDK <-> DPDK tokio TCP echo test"
+                    log_info "Reusing existing DPDK ENI bind (no rebind between tcp1 and tcp1a)..."
+                    warm_arp_cache
+                    local listener_cmd_id
+                    log_info "Starting TCP listener on receiver (server=tokio-tcp-echo)..."
+                    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tokio-tcp-echo"
+                    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+                    if [[ -z "$listener_cmd_id" ]]; then
+                        generate_failure_xml "tier1-tcp-echo-async" "Failed to start TCP listener on receiver"
+                    else
+                        sleep 10
+                        local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo-async.xml"
+                        if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+                            generate_failure_xml "tier1-tcp-echo-async" "Sender test execution failed or timed out"
+                        fi
+                        ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+                    fi
+                    log_info "Tier 1 TCP (async) execution complete"
+                fi
+            fi
+        fi
     fi
 
-    if [[ -z "$TIER_FILTER" ]]; then
-        unbind_all_enis
-    fi
-
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp1a" ]]; then
-        run_tier1_tcp_async || true
-    fi
-
+    # Unbind all ENIs once after all DPDK<->DPDK TCP tests
     if [[ -z "$TIER_FILTER" ]]; then
         unbind_all_enis
     fi
