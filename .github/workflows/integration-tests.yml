@@ -253,6 +253,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack
+
       - name: Run integration tests
         id: tests
         run: |
@@ -505,8 +511,8 @@ jobs:
       - name: Safety net teardown
         if: failure() && steps.tests.outcome == 'failure'
         run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"
 
   # ── TCP integration tests (non-blocking while TCP matures) ──────────────────
   # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
@@ -573,6 +579,12 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack
 
       - name: Run TCP integration tests
         id: tcp-tests
@@ -709,5 +721,5 @@ jobs:
       - name: Safety net teardown
         if: failure() && steps.tcp-tests.outcome == 'failure'
         run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"

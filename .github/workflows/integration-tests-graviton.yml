@@ -164,6 +164,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackGraviton
+
       - name: Run integration tests
         id: tests
         run: |
@@ -300,5 +306,5 @@ jobs:
       - name: Safety net teardown
         if: failure() && steps.tests.outcome == 'failure'
         run: |
-          cd deploy/cdk
-          npx cdk destroy DpdkTestStackGraviton --force || echo "Teardown failed (may already be destroyed)"
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackGraviton || echo "Safety net teardown failed (stack may already be gone)"
