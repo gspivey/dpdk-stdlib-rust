@@ -16,6 +16,6 @@ default = ["dpdk"]
 dpdk = ["dpdk-tokio/dpdk"]
 
 [dependencies]
-dpdk-tokio = { path = "../../dpdk-tokio", package = "dpdk-stdlib-tokio" }
+dpdk-tokio = { path = "../../dpdk-stdlib-tokio", package = "dpdk-stdlib-tokio" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
