@@ -6,5 +6,5 @@ publish = false
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
-dpdk-udp = { path = "../../dpdk-udp", package = "dpdk-stdlib-udp" }
+dpdk-udp = { path = "../../dpdk-stdlib-udp", package = "dpdk-stdlib-udp" }
 libc = "0.2"
