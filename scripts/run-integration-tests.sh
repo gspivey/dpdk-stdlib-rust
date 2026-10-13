@@ -57,7 +57,8 @@ Arguments:
 Options:
   --teardown            Destroy AWS infrastructure after tests complete
   --skip-deploy         Skip CDK deployment (use existing infrastructure)
-  --tier <1|3>          Run only the specified test tier
+  --tier <value>        Run only the specified test tier
+                        (1|2|3|4|tcp1|tcp1a|tcp2|tcp-full|quic)
   --json-summary        Generate test-results/summary.json for agent consumption
   -h, --help            Show this help message
 
@@ -82,9 +83,9 @@ while [[ $# -gt 0 ]]; do
         --tier)
             TIER_FILTER="$2"
             case "$TIER_FILTER" in
-                1|2|3|4|tcp1|tcp1a|tcp2|tcp-full) ;;
+                1|2|3|4|tcp1|tcp1a|tcp2|tcp-full|quic) ;;
                 *)
-                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2 tcp-full, got: $TIER_FILTER" >&2
+                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2 tcp-full quic, got: $TIER_FILTER" >&2
                     exit 2
                     ;;
             esac
@@ -670,6 +671,74 @@ ssm_get_stdout() {
         --output text 2>/dev/null
 }
 
+# Run a command on an instance via SSM, wait for completion, and print its
+# StandardOutputContent to stdout. Used by the QUIC cert-transfer and
+# build-verification steps.
+#
+# NOTE on argument order: this uses (instance_id, timeout, command) to match the
+# orchestrator's own ssm_run_command / ssm_run_command_async convention. The
+# reference implementation at run-quic-perf.sh:175 uses the OPPOSITE order
+# (instance_id, command, timeout); the reordering here is deliberate — only the
+# send+wait+get-stdout logic is ported, not the signature.
+#
+# Remote commands passed to this helper SHOULD always exit 0 (e.g. append
+# `|| true`) so a not-yet-present file does not generate false SSM failure logs
+# while polling.
+#
+# Usage: ssm_run_get_output <instance_id> <timeout_seconds> <command_string>
+# Prints: remote StandardOutputContent on success; returns 1 on SSM failure.
+ssm_run_get_output() {
+    local instance_id="$1"
+    local timeout_secs="$2"
+    local command_str="$3"
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$command_str\"]" \
+        --timeout-seconds "$timeout_secs" \
+        --query "Command.CommandId" \
+        --output text 2>/dev/null || true)
+
+    if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then
+        log_error "ssm_run_get_output: send-command failed on $instance_id" >&2
+        return 1
+    fi
+
+    local poll_limit=$((timeout_secs + 30))
+    local elapsed=0
+    local status=""
+    while [[ $elapsed -lt $poll_limit ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+
+        status=$(aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" \
+            --output text 2>/dev/null || echo "Pending")
+
+        case "$status" in
+            Success)
+                aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardOutputContent" \
+                    --output text 2>/dev/null
+                return 0
+                ;;
+            Failed|TimedOut|Cancelled)
+                log_error "ssm_run_get_output: command $status on $instance_id (cmd: $cmd_id)" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    log_error "ssm_run_get_output: polling timed out on $instance_id after ${poll_limit}s (last status: $status)" >&2
+    return 1
+}
+
 # Cancel an in-flight SSM command (e.g., a listener that's still running).
 # Usage: ssm_cancel_command <instance_id> <command_id>
 ssm_cancel_command() {
@@ -1203,6 +1272,151 @@ run_tcp_full() {
     _run_tcp_dpdk_pair "tier3-tcp-std-parity.sh" "tier3-tcp-std-parity" || true
 
     log_info "TCP Full Test Suite execution complete"
+}
+
+# ── QUIC Tier 1 (DPDK <-> DPDK) ──────────────────────────────────────────────
+#
+# Additive QUIC wiring: these functions run only when `--tier quic` is selected
+# (see main()). They reuse the shared SSM/ENI/ARP helpers and do NOT alter any
+# existing tier function or the UDP `verify_build` step. The existing QUIC
+# harness (scripts/integration-tests/tier1-quic-handshake.sh) is treated as
+# correct and is invoked unmodified.
+
+# Verify the QUIC binaries exist on both instances before running the tier.
+# Emits a synthetic failure XML and returns 1 if either binary is missing.
+# Separate from the UDP verify_build; runs only for the QUIC tier (Req 2.7).
+# quic-echo-server runs on the receiver (server role); quic-test-client runs on
+# the sender (client role). Each remote check always exits 0 to suppress false
+# SSM failure logs.
+quic_verify_build() {
+    local suite="$1"
+    local bindir="/opt/dpdk-stdlib/target/release"
+
+    local recv_out
+    recv_out=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 60 \
+        "test -x $bindir/quic-echo-server && echo OK || echo MISSING") || recv_out=""
+    local send_out
+    send_out=$(ssm_run_get_output "$SENDER_INSTANCE_ID" 60 \
+        "test -x $bindir/quic-test-client && echo OK || echo MISSING") || send_out=""
+
+    if [[ "$recv_out" != *OK* || "$send_out" != *OK* ]]; then
+        log_error "QUIC build verification failed (receiver: '${recv_out:-<none>}', sender: '${send_out:-<none>}')"
+        generate_failure_xml "$suite" "QUIC build verification failed: quic-echo-server / quic-test-client missing at $bindir"
+        return 1
+    fi
+    log_info "QUIC binaries present: quic-echo-server (receiver), quic-test-client (sender)"
+}
+
+# Transfer the QUIC server's self-signed cert from the receiver (server) to the
+# sender (client). The server writes /tmp/quic-server-cert.pem only AFTER it logs
+# QUIC_SERVER_READY, so a non-empty cert observed on the server IS the readiness
+# check — there is no separate readiness signal to wait on.
+#
+# The cert is read base64-encoded (base64 -w 0, single line) and decoded on the
+# client. Base64 guarantees byte-exact PEM transfer and avoids shell-quoting /
+# newline / `%` corruption that a sed/printf-escaping approach would suffer.
+# Returns 0 on success; on failure emits a synthetic failure XML and returns 1.
+quic_transfer_cert() {
+    local suite="$1"
+    local cert_path="/tmp/quic-server-cert.pem"
+
+    # Bounded wait (up to ~60s) for a non-empty cert on the server. The
+    # `|| true` keeps the remote command exit 0 so a not-yet-written cert does
+    # not log a false SSM failure.
+    local waited=0 b64=""
+    while [[ $waited -lt 60 ]]; do
+        sleep 5
+        waited=$((waited + 5))
+        b64=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 60 \
+            "base64 -w 0 $cert_path 2>/dev/null || true") || b64=""
+        b64=$(echo "$b64" | tr -d '[:space:]')
+        [[ -n "$b64" ]] && break
+    done
+
+    if [[ -z "$b64" ]]; then
+        log_error "QUIC server cert not available after ${waited}s"
+        generate_failure_xml "$suite" "QUIC certificate transfer failed: server cert unavailable"
+        return 1
+    fi
+
+    # Write the cert to the client, decoding base64 back to exact PEM bytes.
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" 60 \
+        "printf '%s' '$b64' | base64 -d > $cert_path"; then
+        log_error "Failed to write QUIC cert to client"
+        generate_failure_xml "$suite" "QUIC certificate transfer failed: could not write to client"
+        return 1
+    fi
+
+    log_info "QUIC server cert transferred to client at $cert_path"
+}
+
+# Run the QUIC Tier 1 test (DPDK <-> DPDK handshake + bidir echo). Modeled on
+# _run_tcp_dpdk_pair with the QUIC-specific cert handoff inserted between the
+# server start and the client run. Reuses configure_eni, warm_arp_cache,
+# ssm_run_command_async, ssm_run_command, ssm_wait_command, ssm_cancel_command.
+run_quic_tier1() {
+    log_section "QUIC Tier 1: Handshake + bidir echo (DPDK <-> DPDK)"
+
+    local suite="tier1-quic-handshake"
+    local port=4433
+
+    # Measurable SSM command timeouts (Requirement 1.9).
+    local QUIC_SERVER_TIMEOUT=300   # async server SSM command
+    local QUIC_CLIENT_TIMEOUT=240   # synchronous client SSM command
+
+    # 0. Verify QUIC binaries exist before anything else (Req 2.7). Does NOT
+    #    touch the UDP verify_build path.
+    if ! quic_verify_build "$suite"; then
+        return 1
+    fi
+
+    # 1. Bind ENIs on both instances (same as the TCP DPDK pair).
+    log_info "Binding ENIs for QUIC Tier 1..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    # 2. Warm the kernel ARP cache so the QUIC binaries can seed the gateway MAC.
+    warm_arp_cache
+
+    # 3. Start the QUIC server (receiver) as an async SSM command.
+    log_info "Starting QUIC server on receiver..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-quic-handshake.sh --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port $port"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$QUIC_SERVER_TIMEOUT" "$server_cmd")
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start QUIC server on receiver"
+        generate_failure_xml "$suite" "Failed to start QUIC server on receiver"
+        return 1
+    fi
+
+    # 4. Cert poll IS the readiness check: transfer the cert to the client.
+    if ! quic_transfer_cert "$suite"; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+        return 1
+    fi
+
+    # 5. Run the QUIC client (sender). This writes the JUnit XML.
+    log_info "Starting QUIC client on sender..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-quic-handshake.sh --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port $port --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$QUIC_CLIENT_TIMEOUT" "$client_cmd"; then
+        log_error "QUIC client execution failed or timed out"
+        generate_failure_xml "$suite" "QUIC client execution failed or timed out"
+    fi
+
+    # 6. Wait for / cancel the server (same as the TCP pair).
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+
+    log_info "QUIC Tier 1 execution complete"
 }
 
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
@@ -2155,6 +2369,13 @@ Infrastructure ready.
     # TCP full test suite — dedicated CI job, has its own ENI lifecycle
     if [[ "$TIER_FILTER" == "tcp-full" ]]; then
         run_tcp_full || true
+    fi
+
+    # QUIC Tier 1 — dedicated CI job, quic-only (NOT part of run-all mode so the
+    # primary integration-tests job behavior is unchanged, Req 3.3). Runs its
+    # own ENI bind + cert transfer inside run_quic_tier1.
+    if [[ "$TIER_FILTER" == "quic" ]]; then
+        run_quic_tier1 || true
     fi
 
     # Step 6: Collect results
