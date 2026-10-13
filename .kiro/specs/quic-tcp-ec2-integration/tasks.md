@@ -18,7 +18,7 @@ Validation commands (from AGENTS.md):
 
 ## Tasks
 
-- [ ] 1. Add QUIC cert-transfer SSM helpers to the orchestrator
+- [x] 1. Add QUIC cert-transfer SSM helpers to the orchestrator
   - Add `ssm_run_get_output <instance_id> <timeout> <cmd>` to `scripts/run-integration-tests.sh`
     alongside existing SSM helpers, using argument order `(instance_id, timeout, command)` to
     match the orchestrator's own `ssm_run_command` / `ssm_run_command_async` convention.
@@ -33,7 +33,7 @@ Validation commands (from AGENTS.md):
     `scripts/run-integration-tests.sh`; do not alter existing helper behavior
   - _Requirements: 2.2, 2.3, 2.5, 10.4_
 
-- [ ] 2. Implement `quic_transfer_cert` in the orchestrator
+- [x] 2. Implement `quic_transfer_cert` in the orchestrator
   - Add `quic_transfer_cert <suite>` that bounded-polls the Server_Instance (receiver)
     via a separate SSM `base64 -w 0 /tmp/quic-server-cert.pem` command until it returns a
     non-empty string (up to ~60s). Readiness IS this cert poll — do NOT add a separate
@@ -46,7 +46,7 @@ Validation commands (from AGENTS.md):
     is invoked
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6_
 
-- [ ] 2a. Implement `quic_verify_build` in the orchestrator
+- [x] 2a. Implement `quic_verify_build` in the orchestrator
   - Add `quic_verify_build <suite>` that verifies the QUIC binaries via two separate
     SSM calls: check `quic-echo-server` on the RECEIVER_INSTANCE (receiver runs the server)
     and `quic-test-client` on the SENDER_INSTANCE (sender runs the client). Each call uses
@@ -57,7 +57,7 @@ Validation commands (from AGENTS.md):
     that runs only when `TIER_FILTER=quic`
   - _Requirements: 2.7, 10.5_
 
-- [ ] 3. Implement `run_quic_tier1` in the orchestrator
+- [x] 3. Implement `run_quic_tier1` in the orchestrator
   - Define the SSM timeout constants `QUIC_SERVER_TIMEOUT=300` (async server command) and
     `QUIC_CLIENT_TIMEOUT=240` (synchronous client command)
   - Add `run_quic_tier1` modeled on `_run_tcp_dpdk_pair`: first call
@@ -77,7 +77,7 @@ Validation commands (from AGENTS.md):
   - Do not modify any existing tier function
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.7, 10.1, 10.5_
 
-- [ ] 4. Add the `--tier quic` filter and dispatch
+- [x] 4. Add the `--tier quic` filter and dispatch
   - Add `quic` to the `--tier` validation `case` list in the argument parser
   - Update the invalid-tier error message to list `quic` among valid values
   - In `main()`, add a dispatch block `if [[ "$TIER_FILTER" == "quic" ]]; then
@@ -85,7 +85,7 @@ Validation commands (from AGENTS.md):
   - Verify QUIC does not run in run-all mode (no `-z "$TIER_FILTER"` branch)
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 10.3_
 
-- [ ] 5. Validate the orchestrator changes locally
+- [x] 5. Validate the orchestrator changes locally
   - Run `bash -n scripts/run-integration-tests.sh` for syntax
   - Dry-run/trace `run_quic_tier1` with SSM/ENI helpers stubbed to confirm the sequence:
     bind → warm → server(async) → cert transfer → client(sync) → wait/cancel
@@ -93,7 +93,7 @@ Validation commands (from AGENTS.md):
   - Confirm existing tier functions are byte-unchanged
   - _Requirements: 1.8, 3.2, 3.3, 10.1, 10.3_
 
-- [ ] 6. Checkpoint — Orchestrator wiring complete
+- [x] 6. Checkpoint — Orchestrator wiring complete
   - Ensure orchestrator syntax passes and QUIC dispatch is correct. Ask the user if
     questions arise.
 
