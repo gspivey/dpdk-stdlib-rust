@@ -339,7 +339,7 @@ Read `.kiro/specs/quic-tcp-ec2-integration/requirements.md`, `design.md`, and `t
 in full, then implement tasks `1`, `2`, `2a`, `3`, `4`, `5`, `6`.
 
 - Spec: `.kiro/specs/quic-tcp-ec2-integration/` · tasks `1`, `2`, `2a`, `3`, `4`, `5`, `6`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #126
 
 ---
 
