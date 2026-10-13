@@ -354,6 +354,54 @@ in full, then implement tasks `7`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `15`,
 
 ---
 
+### 39. TCP CI reliability — known-failures gate
+
+Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement **Task 0**.
+
+This is the prerequisite for items 40–42. It adds `ci/known-failures.txt` with the
+three expected-failure entries and a CI check that enforces the strict xfail rules
+(listed+fail=ok, listed+pass=CI-fail, listed+not-run=CI-fail, ratchet: no new entries).
+
+**SOP exception:** Once this item is merged, the agent picking up items 40–42 MUST
+treat CI as green when: its own target test passes AND all remaining listed tests fail
+as expected. Do NOT require all TCP tests to be green before merging a single-bug fix.
+
+- Spec: `.kiro/specs/tcp-ci-reliability/` · Task 0
+- [ ] Complete · PR: --
+
+---
+
+### 40. TCP CI reliability — RFC 6191 TIME_WAIT SYN handling
+
+Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement **Task 1**. Requires item 39.
+
+- Spec: `.kiro/specs/tcp-ci-reliability/` · Task 1
+- [ ] Complete · PR: --
+
+---
+
+### 41. TCP CI reliability — kernel client bind-ip
+
+Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement **Task 2**. Requires item 39.
+
+- Spec: `.kiro/specs/tcp-ci-reliability/` · Task 2
+- [ ] Complete · PR: --
+
+---
+
+### 42. TCP CI reliability — vfio-pci bind wait
+
+Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
+in full, then implement **Task 3**. Requires item 39.
+
+- Spec: `.kiro/specs/tcp-ci-reliability/` · Task 3
+- [ ] Complete · PR: --
+
+---
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
