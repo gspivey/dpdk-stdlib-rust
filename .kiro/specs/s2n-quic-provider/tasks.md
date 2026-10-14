@@ -244,7 +244,7 @@ All tasks must pass `cargo build && cargo test` from the workspace root without 
     - _Requirements: 1.4, 11.1_
 
 - [ ] 15. Add CI workflow for QUIC integration and performance tests
-  - [ ] 15.1 Extend `.github/workflows/quic-integration-tests.yml` (created in 1.5)
+  - [x] 15.1 Extend `.github/workflows/quic-integration-tests.yml` (created in 1.5)
     - Add two EC2 instances (server + client) with DPDK
     - Run full handshake + bidirectional throughput test
     - Produce JUnit XML artifacts and PR-comment summary
