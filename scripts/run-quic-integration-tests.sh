@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # run-quic-integration-tests.sh - Orchestrator for QUIC EC2 integration tests
 #
+# SUPERSEDED by `./run-integration-tests.sh --tier quic`; retained for local
+# developer convenience. The shared orchestrator (run-integration-tests.sh) now
+# runs QUIC Tier 1 end-to-end via `run_quic_tier1` using the same two-instance
+# infrastructure as UDP and TCP, and is what CI invokes. This standalone script
+# is kept because its cert-transfer logic remains valid as a reference
+# implementation; it is not the CI entry point.
+#
 # Deploys two EC2 instances via CDK (DpdkTestStack), builds the QUIC binaries,
 # runs a QUIC handshake + bidirectional throughput test between them,
 # collects JUnit XML results, and optionally tears down.

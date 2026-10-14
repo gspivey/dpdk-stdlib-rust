@@ -1,0 +1,258 @@
+name: QUIC Performance Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Seconds per run (QUIC_PERF_DURATION)'
+        required: false
+        default: '30'
+      streams:
+        description: 'Concurrent stream count (QUIC_PERF_STREAMS)'
+        required: false
+        default: '8'
+      payload:
+        description: 'Payload size in bytes (QUIC_PERF_PAYLOAD)'
+        required: false
+        default: '65536'
+      port:
+        description: 'QUIC port (QUIC_PERF_PORT)'
+        required: false
+        default: '4433'
+      teardown:
+        description: 'Destroy stack after tests'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+# The quic-native-dpdk-nic perf path deploys DpdkTestStack (app-to-app QUIC;
+# TRex cannot speak QUIC), NOT PerfTestStack. It therefore shares the SAME
+# concurrency group as the UDP/TCP/QUIC *integration* workflows so no two runs
+# ever hold DpdkTestStack at once. cancel-in-progress: false lets an in-flight
+# run finish (including teardown) rather than being killed mid-deploy.
+concurrency:
+  group: integration-tests
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ── CDK pre-flight validation ───────────────────────────────────────────────
+  # Synthesizes DpdkTestStack (the stack the quic-native-dpdk-nic perf path uses),
+  # NOT PerfTestStack.
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Synthesize DpdkTestStack
+        run: |
+          cd deploy/cdk
+          npx cdk synth DpdkTestStack --quiet
+
+  # ── QUIC performance test suite ─────────────────────────────────────────────
+  perf-tests-quic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: validate-cdk
+
+    env:
+      QUIC_PERF_DURATION: ${{ inputs.duration }}
+      QUIC_PERF_STREAMS: ${{ inputs.streams }}
+      QUIC_PERF_PAYLOAD: ${{ inputs.payload }}
+      QUIC_PERF_PORT: ${{ inputs.port }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch DPDK AMI ID from SSM
+        id: ami
+        run: |
+          DPDK_AMI=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          echo "dpdk_ami=${DPDK_AMI}" >> "$GITHUB_OUTPUT"
+          echo "DPDK AMI: ${DPDK_AMI:-none}"
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          echo "PR number: ${PR:-none}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run QUIC performance tests
+        id: tests
+        run: |
+          chmod +x scripts/run-perf-tests.sh
+
+          TEARDOWN_FLAG=$([[ "${{ inputs.teardown }}" == 'true' ]] && echo '--teardown' || echo '--no-teardown')
+
+          ./scripts/run-perf-tests.sh \
+            "$TEARDOWN_FLAG" \
+            --configs quic-native-dpdk-nic \
+            --json-summary
+        env:
+          DPDK_AMI_ID: ${{ steps.ami.outputs.dpdk_ami }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.ref_name }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== QUIC Performance Test Failure Diagnostics ==="
+
+          REPORT="/tmp/quic-perf-failure-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "## QUIC Performance Test Failure (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "### failure-summary.json" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Application logs — last 20 lines inline, full log in collapsible section.
+          echo "### Application Logs (last 20 lines)" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*quic-perf-server*.log instance-logs/*quic-perf-client*.log instance-logs/*quic-echo*.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log" 2>/dev/null || echo 0)
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "**$(basename "$log")**" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "" >> "$REPORT"
+
+          echo "<details><summary>Full Application Logs (last 200 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*quic-perf-server*.log instance-logs/*quic-perf-client*.log instance-logs/*quic-echo*.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log" 2>/dev/null || echo 0)
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -200 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Network & PCI state
+          echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-network-interfaces.log instance-logs/*-networking-diag-*.txt; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          cat "$REPORT"
+
+          # Truncate if too long
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/quic-truncated.md
+            echo "" >> /tmp/quic-truncated.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/quic-truncated.md
+            mv /tmp/quic-truncated.md "$REPORT"
+          fi
+
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post failure report to PR"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload QUIC performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-perf-results
+          path: perf-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-perf-instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Safety net teardown
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          if [[ "${{ inputs.teardown }}" != "false" ]]; then
+            cd deploy/cdk
+            npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
+          fi
