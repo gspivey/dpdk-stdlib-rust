@@ -402,6 +402,11 @@ in full, then implement **Task 3**. Requires item 39.
 
 ---
 
+### 43. CI cost reduction: AMI build schedule weekly + path-triggered push
+- [ ] Complete · PR: --
+### 44. CI cost reduction: integration tests gate on main only
+- [ ] Complete · PR: --
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
