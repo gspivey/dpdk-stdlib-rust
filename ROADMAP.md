@@ -368,7 +368,7 @@ treat CI as green when: its own target test passes AND all remaining listed test
 as expected. Do NOT require all TCP tests to be green before merging a single-bug fix.
 
 - Spec: `.kiro/specs/tcp-ci-reliability/` · Task 0
-- [ ] Complete · PR: --
+- [x] Complete · PR: #129
 
 ---
 

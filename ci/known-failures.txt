@@ -1,0 +1,40 @@
+# Known-failures gate (tcp-ci-reliability Requirement 1)
+#
+# Each non-comment, non-blank line names a TCP integration test that is a KNOWN
+# expected failure. The known-failures gate (scripts/ci/check-known-failures.sh)
+# treats a listed test as an expected failure and does NOT count it against the
+# CI pass/fail result, so a PR that fixes exactly one of these bugs can reach
+# green while the other listed bugs still fail.
+#
+# Strict xfail rules enforced by the gate:
+#   listed + FAIL              -> expected (ok)
+#   listed + PASS              -> CI fails ("unexpected pass: remove <test> ...")
+#   listed + NOT RUN           -> CI fails ("known failure did not run: <test>")
+#   PR adds a line             -> CI fails (ratchet: no new xfail entries)
+#
+# The gate runs in both the dedicated TCP suite (--tier tcp-full, non-blocking
+# tcp-integration-tests job) AND the all-tiers runs used by the BLOCKING
+# integration-tests jobs (incl. Graviton), where the TCP tests run under
+# Phase A/B.
+#
+# Name format: either a bare JUnit testcase name (e.g. `bidir_multi`, matching
+# that testcase in ANY suite) or a suite-qualified name `<suite>/<testcase>`
+# (e.g. `tier1-tcp-handshake/execution`) when the bare name is ambiguous across
+# suites. A suite-qualified entry whose SUITE does not run in a given CI mode is
+# treated as NOT APPLICABLE (skipped) rather than NOT RUN — e.g. the
+# tcp-full-only `tier1-tcp-handshake` suite is absent from all-tiers runs. If the
+# suite runs but the testcase is missing, that is still NOT RUN (Req 1.3).
+# An inline `#` comment MUST name the ROADMAP task that removes the entry (Req 1.5).
+#
+# A fixed bug MUST delete its own line(s) in the same PR (Req 1.2).
+#
+# On a GREEN verdict the gate also rewrites each expected (listed) failure in
+# test-results/*.xml from <failure> to <skipped> and decrements the suite's
+# failures count, so JUnit reporters that read the XMLs directly
+# (dorny/test-reporter, fail-on-error:true) do not fail the CI job on known
+# bugs. Unlisted failures are left intact so a genuine regression still fails.
+
+bidir_echo                       # Task 1 — RFC 6191 TIME_WAIT SYN handling (async echo, sequential same 4-tuple)
+bidir_multi                      # Task 1 — RFC 6191 TIME_WAIT SYN handling
+kernel_to_dpdk_echo              # Task 2 — kernel client bind-ip
+tier1-tcp-handshake/execution    # Task 3 — vfio-pci bind wait (port init race, tcp-full suite only)
