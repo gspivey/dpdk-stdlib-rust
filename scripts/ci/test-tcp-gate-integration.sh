@@ -50,6 +50,7 @@ EOF
 
 KF="$TMP/known.txt"
 cat > "$KF" <<EOF
+bidir_echo                     # Task 1
 bidir_multi                    # Task 1
 kernel_to_dpdk_echo            # Task 2
 tier1-tcp-handshake/execution  # Task 3
@@ -59,22 +60,24 @@ EOF
 # reads $REPO_ROOT/ci/known-failures.txt, $RESULTS_DIR and $SCRIPT_DIR/ci/...
 # We set REPO_ROOT to a temp root holding ci/known-failures.txt, and keep
 # SCRIPT_DIR pointing at the real scripts dir so the gate script is found.
-run_eval() {   # run_eval <results_dir>
+# tier arg lets a case choose tcp-full vs all-tiers (empty) mode.
+run_eval() {   # run_eval <results_dir> [tier]
     local rd="$1"
+    local tier="${2:-tcp-full}"
     local root="$TMP/root"
     mkdir -p "$root/ci"
     cp "$KF" "$root/ci/known-failures.txt"
     REPO_ROOT="$root"
     RESULTS_DIR="$rd"
     SCRIPT_DIR="$(cd "$ORCH" >/dev/null 2>&1; cd "$(dirname "$ORCH")" && pwd)"
-    TIER_FILTER="tcp-full"
+    TIER_FILTER="$tier"
     TEST_EXIT_CODE=99
     evaluate_known_failures_gate >/dev/null 2>&1
 }
 
-# ── Case A: Task 0 verification — all three known tests fail, rest pass -> GREEN
+# ── Case A: Task 0 verification (tcp-full) — all known tests fail, rest pass ──
 DA="$TMP/a"
-make_suite "$DA" "echo.xml"   "tier1-tcp-echo-full"    bidir_echo pass bidir_multi fail
+make_suite "$DA" "echo.xml"   "tier1-tcp-echo-full"    bidir_echo fail bidir_multi fail
 make_suite "$DA" "hs.xml"     "tier1-tcp-handshake"    execution fail
 make_suite "$DA" "shut.xml"   "tier1-tcp-shutdown"     bidir_shutdown pass
 make_suite "$DA" "retx.xml"   "tier2-tcp-retransmit"   retransmit pass
@@ -82,18 +85,30 @@ make_suite "$DA" "fc.xml"     "tier2-tcp-flow-control" flow_control pass
 make_suite "$DA" "k2d.xml"    "tier2-tcp-echo"         kernel_to_dpdk_echo fail
 make_suite "$DA" "interop.xml" "tier3-tcp-kernel-interop" kernel_interop pass
 make_suite "$DA" "parity.xml" "tier3-tcp-std-parity"   std_parity pass
-run_eval "$DA"
-[[ "$TEST_EXIT_CODE" -eq 0 ]] && ok "Task 0: 3 known fail + rest pass -> GREEN" \
-    || nok "Task 0: 3 known fail + rest pass -> GREEN (got $TEST_EXIT_CODE)"
+run_eval "$DA" tcp-full
+[[ "$TEST_EXIT_CODE" -eq 0 ]] && ok "Task 0 (tcp-full): all known fail + rest pass -> GREEN" \
+    || nok "Task 0 (tcp-full): all known fail + rest pass -> GREEN (got $TEST_EXIT_CODE)"
+
+# ── Case A2: all-tiers mode (the BLOCKING Graviton job) ──────────────────────
+# sync tier1-tcp-echo passes; async tier1-tcp-echo-async fails both; k2d fails;
+# handshake suite is NOT present (tcp-full-only) -> inapplicable. -> GREEN
+DA2="$TMP/a2"
+make_suite "$DA2" "echo-sync.xml"  "tier1-tcp-echo"       bidir_echo pass bidir_multi pass
+make_suite "$DA2" "echo-async.xml" "tier1-tcp-echo-async" bidir_echo fail bidir_multi fail
+make_suite "$DA2" "k2d.xml"        "tier2-tcp-echo"       kernel_to_dpdk_echo fail
+make_suite "$DA2" "udp.xml"        "tier1-dpdk-echo"      udp_send_receive pass
+make_suite "$DA2" "iperf.xml"      "tier3-iperf-interop"  iperf_sends pass
+run_eval "$DA2" ""
+[[ "$TEST_EXIT_CODE" -eq 0 ]] && ok "all-tiers: async-fail xfail + handshake inapplicable -> GREEN" \
+    || nok "all-tiers: async-fail xfail + handshake inapplicable -> GREEN (got $TEST_EXIT_CODE)"
 
 # ── Case B: an unlisted test also fails -> RED ───────────────────────────────
 DB="$TMP/b"
-cp "$DA"/*.xml "$DB/" 2>/dev/null || mkdir -p "$DB"
-make_suite "$DB" "echo.xml" "tier1-tcp-echo-full" bidir_echo pass bidir_multi fail
+make_suite "$DB" "echo.xml" "tier1-tcp-echo-full" bidir_echo fail bidir_multi fail
 make_suite "$DB" "hs.xml"   "tier1-tcp-handshake" execution fail
 make_suite "$DB" "k2d.xml"  "tier2-tcp-echo"      kernel_to_dpdk_echo fail
 make_suite "$DB" "shut.xml" "tier1-tcp-shutdown"  bidir_shutdown fail   # UNLISTED failure
-run_eval "$DB"
+run_eval "$DB" tcp-full
 [[ "$TEST_EXIT_CODE" -eq 1 ]] && ok "unlisted failure -> RED" \
     || nok "unlisted failure -> RED (got $TEST_EXIT_CODE)"
 
@@ -102,7 +117,7 @@ DC="$TMP/c"
 make_suite "$DC" "echo.xml" "tier1-tcp-echo-full" bidir_echo pass bidir_multi pass  # fixed, still listed
 make_suite "$DC" "hs.xml"   "tier1-tcp-handshake" execution fail
 make_suite "$DC" "k2d.xml"  "tier2-tcp-echo"      kernel_to_dpdk_echo fail
-run_eval "$DC"
+run_eval "$DC" tcp-full
 [[ "$TEST_EXIT_CODE" -eq 1 ]] && ok "fixed-but-listed test -> RED (forces line removal)" \
     || nok "fixed-but-listed test -> RED (got $TEST_EXIT_CODE)"
 

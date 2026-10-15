@@ -134,6 +134,7 @@ known = [l.strip() for l in os.environ["KNOWN_NAMES"].splitlines() if l.strip()]
 
 # status[(suite, name)] = 'pass' | 'fail'
 observed = {}
+suites_seen = set()
 if os.path.isdir(results_dir):
     for fn in sorted(os.listdir(results_dir)):
         if not fn.endswith(".xml"):
@@ -146,6 +147,7 @@ if os.path.isdir(results_dir):
             m = re.search(r'name="([^"]*)"', sm.group(1))
             if m:
                 suite = html.unescape(m.group(1))
+        suites_seen.add(suite)
         for tc in re.finditer(r'<testcase\s+([^>]*?)(/>|>(.*?)</testcase>)', content, re.DOTALL):
             attrs = tc.group(1)
             body = tc.group(3) or ""
@@ -158,9 +160,19 @@ if os.path.isdir(results_dir):
             observed[key] = "fail" if (failed or prev == "fail") else "pass"
 
 def resolve(entry):
-    """Return 'pass' | 'fail' | 'notrun' for a known-failures entry."""
+    """Return 'pass' | 'fail' | 'notrun' | 'inapplicable' for an entry.
+
+    A suite-qualified entry (suite/name) whose SUITE did not run at all in this
+    results set is 'inapplicable' — the suite isn't part of this CI mode (e.g.
+    the tcp-full-only `tier1-tcp-handshake` suite under an all-tiers run). If the
+    suite DID run but the testcase is absent, that is 'notrun' (Req 1.3 — a
+    listed xfail must not be silently skipped within a suite that executed).
+    Bare entries must appear in some suite or they are 'notrun'.
+    """
     if "/" in entry:
         suite, name = entry.split("/", 1)
+        if suite not in suites_seen:
+            return "inapplicable"
         matches = [v for (s, n), v in observed.items() if s == suite and n == name]
     else:
         matches = [v for (s, n), v in observed.items() if n == entry]
@@ -171,7 +183,9 @@ def resolve(entry):
 fail = 0
 for entry in known:
     status = resolve(entry)
-    if status == "fail":
+    if status == "inapplicable":
+        print(f"known-failures gate: '{entry}' suite not in this run — not applicable (skipped)")
+    elif status == "fail":
         print(f"known-failures gate: '{entry}' failed as expected (xfail ok)")
     elif status == "pass":
         print(f"::error::unexpected pass: remove '{entry}' from ci/known-failures.txt")

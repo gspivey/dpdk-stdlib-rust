@@ -2385,6 +2385,13 @@ Infrastructure ready.
 
     mkdir -p "$RESULTS_DIR"
 
+    # Known-failures ratchet (Req 1.4): run before any TCP-bearing suite so a PR
+    # that adds xfail entries fails fast. Applies to all-tiers mode and the
+    # dedicated tcp-full suite; skipped for numeric single-tier and quic runs.
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp-full" ]]; then
+        run_known_failures_ratchet || true
+    fi
+
     if [[ -z "$TIER_FILTER" ]]; then
         # ── Phase A: Sender kernel, Receiver DPDK ───────────────────────────
         log_section "Phase A: Receiver DPDK, Sender kernel"
@@ -2495,7 +2502,6 @@ Infrastructure ready.
 
     # TCP full test suite — dedicated CI job, has its own ENI lifecycle
     if [[ "$TIER_FILTER" == "tcp-full" ]]; then
-        run_known_failures_ratchet || true
         run_tcp_full || true
     fi
 
@@ -2514,14 +2520,19 @@ Infrastructure ready.
     generate_json_summary
 
     # Step 7b: Known-failures gate (tcp-ci-reliability Req 1).
-    # For the dedicated TCP suite, the overall pass/fail is decided by the xfail
-    # gate rather than the raw count: a run is GREEN when every test listed in
-    # ci/known-failures.txt failed as expected, no listed test passed
-    # unexpectedly, no listed test was skipped, and no UNLISTED test failed.
-    # This lets a single-bug fix PR reach green while the other known bugs still
-    # fail. Scoped to --tier tcp-full so other tiers keep their existing
-    # semantics.
-    if [[ "$TIER_FILTER" == "tcp-full" ]]; then
+    # The overall pass/fail is decided by the xfail gate rather than the raw
+    # count: a run is GREEN when every test listed in ci/known-failures.txt
+    # failed as expected, no listed test passed unexpectedly, no listed test was
+    # skipped, and no UNLISTED test failed. This lets a single-bug fix PR reach
+    # green while the other known bugs still fail.
+    #
+    # Applies to the paths that run the TCP suite and gate merge:
+    #   - all-tiers mode (TIER_FILTER empty) — the BLOCKING integration-tests
+    #     jobs (incl. Graviton) run the TCP tests here via Phase A/B.
+    #   - --tier tcp-full — the dedicated (non-blocking) TCP job.
+    # Numeric single-tier runs and --tier quic keep their existing raw-count
+    # semantics (the gate is a no-op there).
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp-full" ]]; then
         evaluate_known_failures_gate
     fi
 

@@ -133,6 +133,36 @@ run_gate "$KF_EMPTY" "$D1"
 assert_exit 0 "comment/blank-only list -> green"
 assert_contains "nothing to enforce" "empty-list message"
 
+# ── Fixture 6b: suite-qualified entry whose SUITE is absent -> inapplicable ──
+# Mirrors an all-tiers run where the tcp-full-only `tier1-tcp-handshake` suite
+# never runs. bidir_echo (async-fail) + bidir_multi (async-fail) +
+# kernel_to_dpdk_echo (fail) are expected; the handshake entry is skipped.
+D6B="$TMP/inapplicable"
+# sync suite passes both; async suite fails both (bare names resolve to fail)
+make_suite "$D6B" "echo-sync.xml"  "tier1-tcp-echo"       bidir_echo pass bidir_multi pass
+make_suite "$D6B" "echo-async.xml" "tier1-tcp-echo-async" bidir_echo fail bidir_multi fail
+make_suite "$D6B" "k2d.xml"        "tier2-tcp-echo"       kernel_to_dpdk_echo fail
+KF_REAL="$TMP/kf-real.txt"
+cat > "$KF_REAL" <<EOF
+bidir_echo                     # Task 1
+bidir_multi                    # Task 1
+kernel_to_dpdk_echo            # Task 2
+tier1-tcp-handshake/execution  # Task 3 (tcp-full only)
+EOF
+run_gate "$KF_REAL" "$D6B"
+assert_exit 0 "all-tiers: bare bidir fail + k2d fail, handshake inapplicable -> GREEN"
+assert_contains "not applicable" "inapplicable message for absent suite"
+assert_contains "'bidir_echo' failed as expected" "bare name resolves fail across suites"
+
+# ── Fixture 6c: suite ran but the listed testcase is absent -> notrun -> fail ─
+D6C="$TMP/suite-ran-tc-absent"
+make_suite "$D6C" "hs.xml" "tier1-tcp-handshake" some_other_case fail
+KF_HS="$TMP/kf-hs.txt"
+printf 'tier1-tcp-handshake/execution  # Task 3\n' > "$KF_HS"
+run_gate "$KF_HS" "$D6C"
+assert_exit 1 "suite ran but listed testcase absent -> did-not-run fail"
+assert_contains "known failure did not run: tier1-tcp-handshake/execution" "notrun within present suite"
+
 # ── Fixture 7: ratchet in a throwaway git repo ───────────────────────────────
 GITREPO="$TMP/repo"
 mkdir -p "$GITREPO/ci"

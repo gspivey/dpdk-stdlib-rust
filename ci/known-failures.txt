@@ -7,18 +7,28 @@
 # green while the other listed bugs still fail.
 #
 # Strict xfail rules enforced by the gate:
-#   listed + FAIL     -> expected (ok)
-#   listed + PASS     -> CI fails ("unexpected pass: remove <test> ...")
-#   listed + NOT RUN  -> CI fails ("known failure did not run: <test>")
-#   PR adds a line    -> CI fails (ratchet: no new xfail entries)
+#   listed + FAIL              -> expected (ok)
+#   listed + PASS              -> CI fails ("unexpected pass: remove <test> ...")
+#   listed + NOT RUN           -> CI fails ("known failure did not run: <test>")
+#   PR adds a line             -> CI fails (ratchet: no new xfail entries)
 #
-# Name format: either a bare JUnit testcase name (e.g. `bidir_multi`) or a
-# suite-qualified name `<suite>/<testcase>` (e.g. `tier1-tcp-handshake/execution`)
-# when the bare testcase name is ambiguous across suites. An inline `#` comment
-# MUST name the ROADMAP task that removes the entry (Req 1.5).
+# The gate runs in both the dedicated TCP suite (--tier tcp-full, non-blocking
+# tcp-integration-tests job) AND the all-tiers runs used by the BLOCKING
+# integration-tests jobs (incl. Graviton), where the TCP tests run under
+# Phase A/B.
 #
-# A fixed bug MUST delete its own line in the same PR (Req 1.2).
+# Name format: either a bare JUnit testcase name (e.g. `bidir_multi`, matching
+# that testcase in ANY suite) or a suite-qualified name `<suite>/<testcase>`
+# (e.g. `tier1-tcp-handshake/execution`) when the bare name is ambiguous across
+# suites. A suite-qualified entry whose SUITE does not run in a given CI mode is
+# treated as NOT APPLICABLE (skipped) rather than NOT RUN — e.g. the
+# tcp-full-only `tier1-tcp-handshake` suite is absent from all-tiers runs. If the
+# suite runs but the testcase is missing, that is still NOT RUN (Req 1.3).
+# An inline `#` comment MUST name the ROADMAP task that removes the entry (Req 1.5).
+#
+# A fixed bug MUST delete its own line(s) in the same PR (Req 1.2).
 
+bidir_echo                       # Task 1 — RFC 6191 TIME_WAIT SYN handling (async echo, sequential same 4-tuple)
 bidir_multi                      # Task 1 — RFC 6191 TIME_WAIT SYN handling
 kernel_to_dpdk_echo              # Task 2 — kernel client bind-ip
-tier1-tcp-handshake/execution    # Task 3 — vfio-pci bind wait (port init race)
+tier1-tcp-handshake/execution    # Task 3 — vfio-pci bind wait (port init race, tcp-full suite only)
