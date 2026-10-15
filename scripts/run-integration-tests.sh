@@ -1723,6 +1723,11 @@ PYEOF
     if [[ "$xfail_ok" -eq 1 && "$unlisted_fail" -eq 0 ]]; then
         log_info "known-failures gate: GREEN (only expected failures remain)"
         TEST_EXIT_CODE=0
+        # Rewrite the expected (listed) failures as <skipped> in the JUnit XMLs
+        # so downstream reporters (dorny/test-reporter, fail-on-error:true) do
+        # not fail the job on known bugs. Only done on a GREEN verdict, so an
+        # unlisted regression still leaves a <failure> for the reporter to catch.
+        "$gate" --rewrite-xfails --known-file "$known_file" --results-dir "$RESULTS_DIR" || true
     else
         log_error "known-failures gate: RED (xfail_ok=$xfail_ok unlisted_failures=$unlisted_fail)"
         TEST_EXIT_CODE=1

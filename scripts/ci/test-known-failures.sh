@@ -163,6 +163,37 @@ run_gate "$KF_HS" "$D6C"
 assert_exit 1 "suite ran but listed testcase absent -> did-not-run fail"
 assert_contains "known failure did not run: tier1-tcp-handshake/execution" "notrun within present suite"
 
+# ── Fixture 6d: --rewrite-xfails marks listed failures skipped, keeps others ─
+D6D="$TMP/rewrite"
+make_suite "$D6D" "async.xml" "tier1-tcp-echo-async" bidir_echo fail bidir_multi fail
+make_suite "$D6D" "shut.xml"  "tier1-tcp-shutdown"    bidir_shutdown fail   # UNLISTED
+KF_RW="$TMP/kf-rw.txt"
+printf 'bidir_echo  # Task 1\nbidir_multi  # Task 1\n' > "$KF_RW"
+ACTUAL_OUT="$("$GATE" --rewrite-xfails --known-file "$KF_RW" --results-dir "$D6D" 2>&1)"
+ACTUAL_CODE=$?
+assert_exit 0 "rewrite mode exits 0"
+# listed failures become <skipped>, suite failures=0
+if grep -q '<skipped' "$D6D/async.xml" && grep -q 'failures="0"' "$D6D/async.xml" \
+   && ! grep -q '<failure' "$D6D/async.xml"; then
+    ok "rewrite: listed failures -> skipped, failures=0"
+else
+    nok "rewrite: listed failures -> skipped"; cat "$D6D/async.xml"
+fi
+# unlisted failure untouched
+if grep -q '<failure' "$D6D/shut.xml" && grep -q 'failures="1"' "$D6D/shut.xml"; then
+    ok "rewrite: unlisted failure left intact (reporter still fails on regressions)"
+else
+    nok "rewrite: unlisted failure should be intact"; cat "$D6D/shut.xml"
+fi
+# idempotent: second run changes nothing
+cp "$D6D/async.xml" "$D6D/async.before"
+"$GATE" --rewrite-xfails --known-file "$KF_RW" --results-dir "$D6D" >/dev/null 2>&1
+if diff -q "$D6D/async.before" "$D6D/async.xml" >/dev/null; then
+    ok "rewrite: idempotent (second run is a no-op)"
+else
+    nok "rewrite: not idempotent"
+fi
+
 # ── Fixture 7: ratchet in a throwaway git repo ───────────────────────────────
 GITREPO="$TMP/repo"
 mkdir -p "$GITREPO/ci"

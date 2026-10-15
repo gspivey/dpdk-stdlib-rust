@@ -101,6 +101,14 @@ make_suite "$DA2" "iperf.xml"      "tier3-iperf-interop"  iperf_sends pass
 run_eval "$DA2" ""
 [[ "$TEST_EXIT_CODE" -eq 0 ]] && ok "all-tiers: async-fail xfail + handshake inapplicable -> GREEN" \
     || nok "all-tiers: async-fail xfail + handshake inapplicable -> GREEN (got $TEST_EXIT_CODE)"
+# On GREEN, the gate must have rewritten the known failures to <skipped> so
+# dorny/test-reporter stays green; k2d + async bidir failures -> skipped.
+if ! grep -q '<failure' "$DA2/echo-async.xml" && ! grep -q '<failure' "$DA2/k2d.xml" \
+   && grep -q '<skipped' "$DA2/echo-async.xml"; then
+    ok "all-tiers GREEN: known failures rewritten to <skipped> in JUnit XML"
+else
+    nok "all-tiers GREEN: expected known failures rewritten to skipped"
+fi
 
 # ── Case B: an unlisted test also fails -> RED ───────────────────────────────
 DB="$TMP/b"

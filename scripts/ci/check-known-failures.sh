@@ -24,6 +24,11 @@
 #   --known-file FILE   Path to known-failures list (default: ci/known-failures.txt)
 #   --results-dir DIR   Directory of JUnit *.xml results (default: test-results)
 #   --ratchet           Run ONLY the ratchet check (no xfail evaluation)
+#   --rewrite-xfails    Rewrite listed+failed testcases to <skipped> in the JUnit
+#                       XMLs (decrementing suite failures) so reporters that read
+#                       the XMLs (dorny/test-reporter, fail-on-error) stay green
+#                       on known bugs. Unlisted failures are left intact. The
+#                       orchestrator calls this only on a GREEN gate verdict.
 #   --base REF          Base git ref for the ratchet diff (default: $BASE_REF
 #                       or origin/development)
 #
@@ -53,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --known-file)  KNOWN_FILE="$2"; shift 2 ;;
         --results-dir) RESULTS_DIR="$2"; shift 2 ;;
         --ratchet)     MODE="ratchet"; shift ;;
+        --rewrite-xfails) MODE="rewrite"; shift ;;
         --base)        BASE_REF="$2"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -198,7 +204,107 @@ sys.exit(1 if fail else 0)
 PYEOF
 }
 
+# ── Rewrite expected failures as skipped (so JUnit reporters stay green) ─────
+# dorny/test-reporter (fail-on-error: true) reads test-results/*.xml directly
+# and fails the CI job on any <failure> element — it does not know about the
+# known-failures gate. To keep the job green when only expected bugs fail, this
+# mode rewrites each LISTED testcase that FAILED into a <skipped> testcase and
+# decrements its suite's `failures` count. UNLISTED failures are left intact so
+# the reporter still fails the job for a genuine regression. Idempotent.
+run_rewrite() {
+    local known_list
+    known_list="$(parse_known_list "$KNOWN_FILE")"
+    [[ -z "$known_list" ]] && { echo "known-failures rewrite: list empty — nothing to rewrite"; return 0; }
+
+    KNOWN_NAMES="$known_list" RESULTS_DIR="$RESULTS_DIR" python3 - <<'PYEOF'
+import os, re, html, sys
+
+results_dir = os.environ["RESULTS_DIR"]
+known = [l.strip() for l in os.environ["KNOWN_NAMES"].splitlines() if l.strip()]
+
+def listed(suite, name):
+    for e in known:
+        if "/" in e:
+            s, n = e.split("/", 1)
+            if s == suite and n == name:
+                return True
+        elif e == name:
+            return True
+    return False
+
+if not os.path.isdir(results_dir):
+    print(f"known-failures rewrite: no results dir {results_dir}")
+    sys.exit(0)
+
+rewritten_total = 0
+for fn in sorted(os.listdir(results_dir)):
+    if not fn.endswith(".xml"):
+        continue
+    path = os.path.join(results_dir, fn)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    sm = re.search(r'<testsuite\s+([^>]*)>', content)
+    if not sm:
+        continue
+    m = re.search(r'name="([^"]*)"', sm.group(1))
+    suite = html.unescape(m.group(1)) if m else fn
+    file_rewrites = 0
+
+    def repl(tc):
+        nonlocal_body = tc.group(0)
+        attrs = tc.group(1)
+        nm = re.search(r'name="([^"]*)"', attrs)
+        name = html.unescape(nm.group(1)) if nm else "unknown"
+        has_fail = ("<failure" in nonlocal_body) or ("<error" in nonlocal_body)
+        if not has_fail or not listed(suite, name):
+            return nonlocal_body
+        # Replace the <failure.../> or <failure>...</failure> (and <error>) with
+        # a <skipped> element marking it an expected (known) failure.
+        new = re.sub(
+            r'<(failure|error)\b[^>]*?(/>|>.*?</\1>)',
+            '<skipped message="known-failure (tcp-ci-reliability xfail); '
+            'tracked in ci/known-failures.txt"/>',
+            nonlocal_body, flags=re.DOTALL)
+        return new
+
+    # Count how many we will rewrite (listed + failed) for the failures= fixup.
+    to_rewrite = 0
+    for tc in re.finditer(r'<testcase\s+([^>]*?)(?:/>|>.*?</testcase>)', content, re.DOTALL):
+        body = tc.group(0)
+        a = tc.group(1)
+        nm = re.search(r'name="([^"]*)"', a)
+        name = html.unescape(nm.group(1)) if nm else "unknown"
+        if (("<failure" in body) or ("<error" in body)) and listed(suite, name):
+            to_rewrite += 1
+
+    if to_rewrite == 0:
+        continue
+
+    new_content = re.sub(r'<testcase\s+([^>]*?)(?:/>|>.*?</testcase>)', repl, content, flags=re.DOTALL)
+
+    # Decrement the suite failures="N" by the number rewritten (floor 0).
+    def fix_failures(mm):
+        attrs = mm.group(1)
+        def dec(a):
+            n = int(a.group(1))
+            return 'failures="%d"' % max(0, n - to_rewrite)
+        attrs2 = re.sub(r'failures="(\d+)"', dec, attrs)
+        return "<testsuite " + attrs2 + ">"
+    new_content = re.sub(r'<testsuite\s+([^>]*)>', fix_failures, new_content, count=1)
+
+    if new_content != content:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        rewritten_total += to_rewrite
+        print(f"known-failures rewrite: {suite} — {to_rewrite} expected failure(s) marked skipped")
+
+print(f"known-failures rewrite: {rewritten_total} testcase(s) rewritten as skipped")
+PYEOF
+}
+
 case "$MODE" in
     ratchet) run_ratchet ;;
     xfail)   run_xfail ;;
+    rewrite) run_rewrite ;;
 esac
