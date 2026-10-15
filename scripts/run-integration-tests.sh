@@ -1602,6 +1602,133 @@ print_summary() {
     fi
 }
 
+# ── Known-failures ratchet (tcp-ci-reliability Req 1.4) ──────────────────────
+# A PR MUST NOT add new xfail entries to ci/known-failures.txt. Runs before the
+# TCP suite. Delegates to the standalone gate script in --ratchet mode. If the
+# base ref is not available in the CI checkout (shallow clone), the ratchet is
+# skipped with a warning rather than failing the run — the standalone CI step
+# (if wired) fetches the base ref explicitly. A detected addition sets
+# TEST_EXIT_CODE=1 so the suite goes RED.
+run_known_failures_ratchet() {
+    local known_file="$REPO_ROOT/ci/known-failures.txt"
+    local gate="$SCRIPT_DIR/ci/check-known-failures.sh"
+    local base="${BASE_REF:-${GITHUB_BASE_REF:+origin/$GITHUB_BASE_REF}}"
+    base="${base:-origin/development}"
+
+    [[ -f "$known_file" ]] || return 0
+    [[ -x "$gate" ]] || { log_error "ratchet: $gate missing"; TEST_EXIT_CODE=1; return 0; }
+
+    if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+        log_info "ratchet: base ref '$base' not present in checkout — skipping ratchet"
+        return 0
+    fi
+
+    log_section "Known-failures ratchet"
+    if "$gate" --ratchet --base "$base" --known-file "$known_file"; then
+        log_info "ratchet: ok"
+    else
+        log_error "ratchet: PR adds xfail entries — suite is RED"
+        TEST_EXIT_CODE=1
+    fi
+}
+
+# ── Known-failures gate (tcp-ci-reliability Req 1) ───────────────────────────
+# Reconciles the raw pass/fail count with ci/known-failures.txt. The TCP suite
+# is GREEN (TEST_EXIT_CODE=0) only when:
+#   - every listed test failed as EXPECTED (Req 1.1),
+#   - no listed test passed unexpectedly (Req 1.2),
+#   - no listed test was skipped / did not run (Req 1.3),
+#   - no UNLISTED test failed.
+# Otherwise TEST_EXIT_CODE=1. If ci/known-failures.txt is absent the gate is a
+# no-op and the raw count stands (back-compat).
+evaluate_known_failures_gate() {
+    local known_file="$REPO_ROOT/ci/known-failures.txt"
+    local gate="$SCRIPT_DIR/ci/check-known-failures.sh"
+
+    if [[ ! -f "$known_file" ]]; then
+        log_info "known-failures gate: no ci/known-failures.txt — raw result stands"
+        return 0
+    fi
+    if [[ ! -x "$gate" ]]; then
+        log_error "known-failures gate: $gate missing or not executable"
+        TEST_EXIT_CODE=1
+        return 0
+    fi
+
+    log_section "Known-failures gate"
+
+    # 1. xfail evaluation of the listed tests.
+    local xfail_ok=0
+    if "$gate" --known-file "$known_file" --results-dir "$RESULTS_DIR"; then
+        xfail_ok=1
+    else
+        xfail_ok=0
+    fi
+
+    # 2. Any UNLISTED test that failed must still fail the suite. Compute the set
+    #    of failed (suite,name) pairs from the JUnit XMLs and subtract the listed
+    #    entries (bare name or suite/name).
+    local unlisted_fail
+    unlisted_fail=$(KNOWN_FILE="$known_file" RESULTS_DIR="$RESULTS_DIR" python3 - <<'PYEOF'
+import os, re, html
+results_dir = os.environ["RESULTS_DIR"]
+known_file  = os.environ["KNOWN_FILE"]
+
+listed = []
+with open(known_file, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if line:
+            listed.append(line)
+
+def is_listed(suite, name):
+    for e in listed:
+        if "/" in e:
+            s, n = e.split("/", 1)
+            if s == suite and n == name:
+                return True
+        elif e == name:
+            return True
+    return False
+
+unlisted = 0
+if os.path.isdir(results_dir):
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".xml"):
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        sm = re.search(r'<testsuite\s+([^>]*)>', content)
+        suite = "unknown"
+        if sm:
+            m = re.search(r'name="([^"]*)"', sm.group(1))
+            if m:
+                suite = html.unescape(m.group(1))
+        for tc in re.finditer(r'<testcase\s+([^>]*?)(/>|>(.*?)</testcase>)', content, re.DOTALL):
+            attrs = tc.group(1); body = tc.group(3) or ""
+            m = re.search(r'name="([^"]*)"', attrs)
+            name = html.unescape(m.group(1)) if m else "unknown"
+            failed = ("<failure" in body) or ("<error" in body)
+            if failed and not is_listed(suite, name):
+                unlisted += 1
+print(unlisted)
+PYEOF
+)
+    unlisted_fail="${unlisted_fail:-0}"
+
+    if [[ "$unlisted_fail" -gt 0 ]]; then
+        log_error "known-failures gate: $unlisted_fail unlisted test failure(s) — suite is RED"
+    fi
+
+    if [[ "$xfail_ok" -eq 1 && "$unlisted_fail" -eq 0 ]]; then
+        log_info "known-failures gate: GREEN (only expected failures remain)"
+        TEST_EXIT_CODE=0
+    else
+        log_error "known-failures gate: RED (xfail_ok=$xfail_ok unlisted_failures=$unlisted_fail)"
+        TEST_EXIT_CODE=1
+    fi
+}
+
 # ── JSON summary generation ──────────────────────────────────────────────────
 
 generate_json_summary() {
@@ -2368,6 +2495,7 @@ Infrastructure ready.
 
     # TCP full test suite — dedicated CI job, has its own ENI lifecycle
     if [[ "$TIER_FILTER" == "tcp-full" ]]; then
+        run_known_failures_ratchet || true
         run_tcp_full || true
     fi
 
@@ -2384,6 +2512,18 @@ Infrastructure ready.
     # Step 7: Summary
     print_summary
     generate_json_summary
+
+    # Step 7b: Known-failures gate (tcp-ci-reliability Req 1).
+    # For the dedicated TCP suite, the overall pass/fail is decided by the xfail
+    # gate rather than the raw count: a run is GREEN when every test listed in
+    # ci/known-failures.txt failed as expected, no listed test passed
+    # unexpectedly, no listed test was skipped, and no UNLISTED test failed.
+    # This lets a single-bug fix PR reach green while the other known bugs still
+    # fail. Scoped to --tier tcp-full so other tiers keep their existing
+    # semantics.
+    if [[ "$TIER_FILTER" == "tcp-full" ]]; then
+        evaluate_known_failures_gate
+    fi
 
     # Step 8: Collect instance logs + write step summary (always, before teardown)
     collect_instance_logs || true
@@ -2404,4 +2544,8 @@ Infrastructure ready.
     exit "$TEST_EXIT_CODE"
 }
 
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by unit tests
+# that exercise individual functions such as evaluate_known_failures_gate).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

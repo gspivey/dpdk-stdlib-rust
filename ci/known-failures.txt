@@ -1,0 +1,24 @@
+# Known-failures gate (tcp-ci-reliability Requirement 1)
+#
+# Each non-comment, non-blank line names a TCP integration test that is a KNOWN
+# expected failure. The known-failures gate (scripts/ci/check-known-failures.sh)
+# treats a listed test as an expected failure and does NOT count it against the
+# CI pass/fail result, so a PR that fixes exactly one of these bugs can reach
+# green while the other listed bugs still fail.
+#
+# Strict xfail rules enforced by the gate:
+#   listed + FAIL     -> expected (ok)
+#   listed + PASS     -> CI fails ("unexpected pass: remove <test> ...")
+#   listed + NOT RUN  -> CI fails ("known failure did not run: <test>")
+#   PR adds a line    -> CI fails (ratchet: no new xfail entries)
+#
+# Name format: either a bare JUnit testcase name (e.g. `bidir_multi`) or a
+# suite-qualified name `<suite>/<testcase>` (e.g. `tier1-tcp-handshake/execution`)
+# when the bare testcase name is ambiguous across suites. An inline `#` comment
+# MUST name the ROADMAP task that removes the entry (Req 1.5).
+#
+# A fixed bug MUST delete its own line in the same PR (Req 1.2).
+
+bidir_multi                      # Task 1 — RFC 6191 TIME_WAIT SYN handling
+kernel_to_dpdk_echo              # Task 2 — kernel client bind-ip
+tier1-tcp-handshake/execution    # Task 3 — vfio-pci bind wait (port init race)
