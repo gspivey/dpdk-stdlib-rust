@@ -5,14 +5,15 @@ on:
     branches: [main, development]
   workflow_dispatch: {}
 
-# Only one integration test run at a time — concurrent runs race to create
-# and destroy the same CloudFormation stack (DpdkTestStack). This QUIC workflow
-# shares the SAME concurrency group as the UDP/TCP integration workflow so a
-# QUIC run and a UDP/TCP run queue behind one another instead of colliding on
-# DpdkTestStack. cancel-in-progress: false lets the in-flight run finish cleanly
-# (including teardown) rather than being killed mid-deploy.
+# Only one QUIC integration test run at a time — concurrent QUIC runs race to
+# create and destroy the same CloudFormation stack (DpdkTestStackQuic). The
+# QUIC workflow has its own dedicated stack (DpdkTestStackQuic) so it does NOT
+# collide with integration-tests.yml (which uses DpdkTestStack). The QUIC
+# concurrency group is therefore separate.
+# cancel-in-progress: false lets the in-flight run finish cleanly (including
+# teardown) rather than being killed mid-deploy.
 concurrency:
-  group: integration-tests
+  group: quic-integration-tests
   cancel-in-progress: false
 
 permissions:
@@ -126,7 +127,7 @@ jobs:
         timeout-minutes: 20
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic
 
       - name: Run QUIC integration tests
         id: quic-tests
@@ -135,6 +136,7 @@ jobs:
           chmod +x scripts/integration-tests/*.sh
           ./scripts/run-integration-tests.sh --teardown --json-summary --tier quic
         env:
+          CDK_STACK_NAME: DpdkTestStackQuic
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -264,4 +266,4 @@ jobs:
         if: failure() && steps.quic-tests.outcome == 'failure'
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic || echo "Safety net teardown failed (stack may already be gone)"
