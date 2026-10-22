@@ -29,7 +29,7 @@ CDK_DIR="$REPO_ROOT/deploy/cdk"
 
 SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
 TEST_TIMEOUT=120             # 2 minutes per test scenario
-ENI_BIND_TIMEOUT=90          # 90 seconds for ENI bind/unbind (generous for SSM agent recovery)
+ENI_BIND_TIMEOUT=180         # ENI bind/unbind; CI binds regularly run 90-130s (see configure_eni)
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
 CDK_STACK_NAME="${CDK_STACK_NAME:-DpdkTestStack}"
@@ -792,12 +792,41 @@ configure_eni() {
         cmd+=" && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"
     fi
 
-    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
-        log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
-        ssm_run_command "$instance_id" 30 \
-            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
-        return 1
+    if ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
+        return 0
     fi
+
+    # The SSM agent can go silent for minutes right after a driver change while
+    # it reconnects, although the change itself already happened (PR #131: the
+    # sender's vfio-pci bind is in dmesg, its SSM command still InProgress at
+    # 120s, and the phase was skipped as "bind failed"). Ask for the actual
+    # driver state, retrying while the agent recovers, before failing the step.
+    local want="STATUS: bound_to_vfio" attempt status_id status_out=""
+    [[ "$action" == "unbind" ]] && want="STATUS: bound_to_ena"
+    log_error "ENI $action on $instance_id did not report success — checking the actual driver state..."
+    for attempt in 1 2 3 4; do
+        status_id=$(ssm_run_command_async "$instance_id" 60 \
+            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status")
+        status_out=""
+        if [[ -n "$status_id" ]] && ssm_wait_command "$instance_id" "$status_id" 60; then
+            status_out=$(ssm_get_stdout "$instance_id" "$status_id" || true)
+        fi
+        [[ -n "$status_out" ]] && echo "$status_out"
+        if grep -qF "$want" <<< "$status_out"; then
+            # unbind also assigns the kernel IP; that step may not have run
+            # before the agent stalled, and do_assign_ip is idempotent.
+            if [[ "$action" == "unbind" && -n "$expected_ip" ]] && ! ssm_run_command "$instance_id" 60 \
+                "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"; then
+                log_error "ENI unbind on $instance_id: driver is ena but assign-ip $expected_ip failed"
+                return 1
+            fi
+            log_info "ENI $action on $instance_id confirmed by status (${want#STATUS: }) on check $attempt"
+            return 0
+        fi
+        [[ -n "$status_out" ]] && break   # agent answered with the wrong state: a real failure
+    done
+    log_error "ENI $action failed on $instance_id (want ${want#STATUS: })"
+    return 1
 }
 
 # ── Tier execution ───────────────────────────────────────────────────────────
