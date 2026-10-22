@@ -106,7 +106,7 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 65
     needs: validate-cdk
 
     steps:
@@ -172,6 +172,7 @@ jobs:
 
       - name: Run integration tests
         id: tests
+        timeout-minutes: 45
         run: |
           chmod +x scripts/run-integration-tests.sh
           chmod +x scripts/integration-tests/*.sh
@@ -303,8 +304,20 @@ jobs:
           fail-on-error: true
           fail-on-empty: false
 
+      # Re-assume the role first: the OIDC session from the first configure
+      # step lasts 1h, which a long run can outlive before teardown starts.
+      - name: Refresh AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own --teardown, and failure() is false on cancellation. The
+      # cleanup script is a no-op (plus orphaned-VPC purge) when nothing exists.
       - name: Safety net teardown
-        if: failure() && steps.tests.outcome == 'failure'
+        if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
           scripts/ci/cleanup-cfn-stack.sh DpdkTestStackGraviton || echo "Safety net teardown failed (stack may already be gone)"
