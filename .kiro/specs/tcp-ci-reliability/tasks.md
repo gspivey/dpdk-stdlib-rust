@@ -17,12 +17,12 @@ there, CI is allowed to fail for the OTHER listed tests. A PR is green when:
 
 *Lands as ROADMAP item 39a or as a prerequisite commit in the item 39 PR.*
 
-- [ ] Add `ci/known-failures.txt` with the three initial entries (see design §Group 0)
-- [ ] Add the known-failures check step to `.github/workflows/tcp-integration-tests.yml`
+- [x] Add `ci/known-failures.txt` with the three initial entries (see design §Group 0)
+- [x] Add the known-failures check step to `.github/workflows/tcp-integration-tests.yml`
   (or the summary script it calls): listed+FAIL → ok; listed+PASS → CI fail;
   listed+NOT-RUN → CI fail
-- [ ] Add the ratchet step: PR adds lines → CI fail
-- [ ] Verify CI goes green on a branch where all three tests are failing
+- [x] Add the ratchet step: PR adds lines → CI fail
+- [x] Verify CI goes green on a branch where all three tests are failing
   (the xfail list covers all three)
 - *Requirements: 1.1, 1.2, 1.3, 1.4, 1.5*
 
