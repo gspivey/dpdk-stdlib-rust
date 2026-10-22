@@ -34,4 +34,3 @@
 # (dorny/test-reporter, fail-on-error:true) do not fail the CI job on known
 # bugs. Unlisted failures are left intact so a genuine regression still fails.
 
-tier1-tcp-handshake/execution    # Task 3 — vfio-pci bind wait (port init race, tcp-full suite only)
