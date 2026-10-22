@@ -1,8 +1,25 @@
 name: Integration Tests
 
 on:
+  # EC2 runs only when something the hardware tests exercise changed; docs,
+  # specs and ROADMAP-only PRs skip them (the Rust workflow still runs).
   pull_request:
     branches: [main, development]
+    paths:
+      - 'apps/**'
+      - 'dpdk/**'
+      - 'dpdk-sys/**'
+      - 'dpdk-stdlib-*/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - 'deploy/**'
+      - 'ci/**'
+      - '.github/workflows/integration-tests.yml'
+  # The full run on development, without paths. nightly-gate skips it when
+  # this commit already passed a scheduled run, so quiet days cost nothing.
+  schedule:
+    - cron: '0 6 * * *' # daily 06:00 UTC
   workflow_dispatch: {}
 
 # Only one integration test run at a time — concurrent runs race to create
@@ -25,6 +42,33 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  # Gate for the scheduled run: skip every EC2 job when development has not moved
+  # since the last successful scheduled run. PR and manual runs always proceed.
+  nightly-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: Skip a scheduled run whose commit already passed
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/integration-tests.yml/runs?event=schedule&status=success&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""' || echo "")
+          if [ "$last" = "${{ github.sha }}" ]; then
+            echo "Commit ${{ github.sha }} already passed a scheduled run; skipping EC2 jobs."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Synthetic performance test (no AWS credentials needed) ─────────────────
   # Measures framework overhead of the Tokio async wrapper vs sync dpdk_udp.
   # Uses a mock PacketBackend so no real NIC is needed — runs in ~20 seconds.
@@ -100,6 +144,8 @@ jobs:
   # catches that class of problem at synth time (scripts/validate-cdk.sh).
   validate-cdk:
     runs-on: ubuntu-latest
+    needs: nightly-gate
+    if: needs.nightly-gate.outputs.run == 'true'
     timeout-minutes: 10
 
     steps:

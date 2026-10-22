@@ -114,6 +114,20 @@ pub const TOTAL_HEADER_LEN: usize = 42;     // ETH + IPv4 + UDP
 
 ## Steering Rules for Agents
 
+### Red CI comes first
+
+Before starting any ROADMAP item or feature, check the latest runs on `development`:
+
+```bash
+gh run list --repo gspivey/dpdk-stdlib-rust --branch development --workflow rust.yml --limit 1 --json conclusion
+gh run list --repo gspivey/dpdk-stdlib-rust --workflow integration-tests.yml --event schedule --limit 1 --json conclusion,headSha
+gh run list --repo gspivey/dpdk-stdlib-rust --workflow integration-tests-graviton.yml --event schedule --limit 1 --json conclusion,headSha
+```
+
+If any of them is `failure`, fixing it is the ONLY work for this cycle: open a fix PR for that failure and nothing else.
+No new ROADMAP items or features land on a red `development`. A red that comes from infrastructure (AWS limits,
+stuck stacks) still blocks feature work; fix or escalate it, do not work around it.
+
 ### DO:
 - **Run `cargo build` and `cargo test` from the workspace root** after any changes
 - **Read files before modifying them** - understand existing patterns first

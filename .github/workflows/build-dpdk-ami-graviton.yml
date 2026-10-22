@@ -2,7 +2,7 @@ name: Build DPDK AMI (Graviton)
 
 on:
   schedule:
-    - cron: '0 4 * * 0,3' # Sunday and Wednesday 4:00 AM UTC (twice weekly)
+    - cron: '0 4 * * 0' # Sunday 4:00 AM UTC (weekly); input changes rebuild via push below
   workflow_dispatch:
     inputs:
       dpdk_version:
@@ -10,10 +10,11 @@ on:
         required: false
         default: '22.11.6'
   push:
-    branches: [main]
+    branches: [main, development]
     paths:
-      - 'packer/dpdk-ami-graviton.pkr.hcl'
+      - 'packer/**'
       - 'scripts/install_dpdk_amazon_linux.sh'
+      - '.github/workflows/build-dpdk-ami-graviton.yml'
 
 permissions:
   id-token: write
