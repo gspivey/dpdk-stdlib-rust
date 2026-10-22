@@ -1247,9 +1247,11 @@ _run_tcp_kernel_interop() {
 
     sleep 10
 
-    # Run kernel client on sender (no --bind-ip, uses kernel networking)
+    # Run kernel client on sender. The sender's kernel interface holds
+    # SENDER_DPDK_ENI_IP after the unbind above; the script requires --bind-ip
+    # for every role and exits "Missing required arguments" without it.
     log_info "Starting kernel TCP client on sender for $suite..."
-    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
         log_error "Kernel TCP client execution failed ($suite)"
         generate_failure_xml "$suite" "Client test execution failed or timed out"
@@ -1263,38 +1265,43 @@ _run_tcp_kernel_interop() {
 run_tcp_full() {
     log_section "TCP Full Test Suite"
 
-    # ── Tier 1: DPDK <-> DPDK tests ─────────────────────────────────────────
+    # Grouped by ENI topology so each host moves between the kernel driver and
+    # vfio-pci at most once per run, as in the all-tiers Phase A/B/C flow.
+    # The suite used to unbind both ENIs after every sub-suite and rebind them
+    # for the next (6+ real cycles per host); repeated vfio bind/unbind cycles
+    # wedge the device (">120s unbind", "ENI bind failed on receiver").
+    #
+    #   Phase A — receiver DPDK, sender kernel: tier3 kernel interop
+    #   Phase B — both DPDK: every DPDK <-> DPDK sub-suite
+    #
+    # The per-suite helpers still call configure_eni; configure-eni.sh is a
+    # no-op when the ENI is already in the requested state, so within a phase
+    # those calls do not cycle the device. ensure_dpdk_free kills the previous
+    # sub-suite's server before the next starts (see ensure_dpdk_free).
 
-    log_section "TCP Tier 1: Handshake (DPDK <-> DPDK)"
-    _run_tcp_dpdk_pair "tier1-tcp-handshake.sh" "tier1-tcp-handshake" || true
-    unbind_all_enis
-
-    log_section "TCP Tier 1: Echo (DPDK <-> DPDK, sync)"
-    _run_tcp_dpdk_pair_lr "tier1-tcp-echo.sh" "tier1-tcp-echo-full" || true
-    unbind_all_enis
-
-    log_section "TCP Tier 1: Shutdown (DPDK <-> DPDK)"
-    _run_tcp_dpdk_pair "tier1-tcp-shutdown.sh" "tier1-tcp-shutdown" || true
-    unbind_all_enis
-
-    # ── Tier 2: Reliability tests ────────────────────────────────────────────
-
-    log_section "TCP Tier 2: Retransmit (DPDK <-> DPDK)"
-    _run_tcp_dpdk_pair "tier2-tcp-retransmit.sh" "tier2-tcp-retransmit" || true
-    unbind_all_enis
-
-    log_section "TCP Tier 2: Flow Control (DPDK <-> DPDK)"
-    _run_tcp_dpdk_pair "tier2-tcp-flow-control.sh" "tier2-tcp-flow-control" || true
-    unbind_all_enis
-
-    # ── Tier 3: Kernel interoperability ──────────────────────────────────────
-
+    # ── Phase A: receiver DPDK, sender kernel ───────────────────────────────
     log_section "TCP Tier 3: Kernel Interop (ncat/iperf3 <-> DPDK)"
+    ensure_dpdk_free "tcp-full: before tier3-tcp-kernel-interop" || true
     _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop" || true
-    unbind_all_enis
 
-    log_section "TCP Tier 3: std-parity (DPDK <-> DPDK)"
-    _run_tcp_dpdk_pair "tier3-tcp-std-parity.sh" "tier3-tcp-std-parity" || true
+    # ── Phase B: both instances on DPDK (sender binds once, here) ───────────
+    local entry script suite
+    for entry in \
+        "pair:tier1-tcp-handshake.sh:tier1-tcp-handshake" \
+        "pair_lr:tier1-tcp-echo.sh:tier1-tcp-echo-full" \
+        "pair:tier1-tcp-shutdown.sh:tier1-tcp-shutdown" \
+        "pair:tier2-tcp-retransmit.sh:tier2-tcp-retransmit" \
+        "pair:tier2-tcp-flow-control.sh:tier2-tcp-flow-control" \
+        "pair:tier3-tcp-std-parity.sh:tier3-tcp-std-parity"; do
+        IFS=: read -r kind script suite <<< "$entry"
+        log_section "TCP: ${suite} (DPDK <-> DPDK)"
+        ensure_dpdk_free "tcp-full: before ${suite}" || true
+        if [[ "$kind" == "pair_lr" ]]; then
+            _run_tcp_dpdk_pair_lr "$script" "$suite" || true
+        else
+            _run_tcp_dpdk_pair "$script" "$suite" || true
+        fi
+    done
 
     log_info "TCP Full Test Suite execution complete"
 }
