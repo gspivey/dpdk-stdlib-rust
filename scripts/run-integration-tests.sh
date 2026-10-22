@@ -164,6 +164,31 @@ post_pr_comment() {
 
 CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
 
+# Runs on the instance after CLEANUP_CMD: wait until no process holds /dev/vfio
+# (escalating to SIGKILL at 5s), then print `dpdk_free: ok`, or list the holders and
+# exit 1. Single-quoted so it expands on the instance; it must contain no double
+# quotes or ${...}, because ssm_run_command embeds it in commands=["..."].
+# shellcheck disable=SC2016
+DPDK_FREE_CHECK='for i in $(seq 1 10); do h=$(for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q /dev/vfio/ && echo $(basename $p):$(cat $p/comm 2>/dev/null); done | paste -sd, -); if [ x$h = x ]; then echo dpdk_free: ok; exit 0; fi; if [ $i -eq 5 ]; then pkill -9 -f target/release/ 2>/dev/null; fi; sleep 1; done; echo dpdk_free: FAIL holders=$h; exit 1'
+
+# Kill leftover test binaries on both instances and confirm nothing still holds
+# the DPDK NIC before the next tier starts. A tier's listener script keeps its
+# server alive for up to max_wait (120s), and cancelling its SSM command does not
+# kill that child, so without this the previous tier's server still owns
+# /dev/vfio/noiommu-0 and the next DPDK server dies at EAL init with
+# "Device or resource busy" / "Port init failed: Invalid port ID: 0".
+ensure_dpdk_free() {
+    local label="$1" inst rc=0
+    for inst in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
+        if ! ssm_run_command "$inst" 60 "${CLEANUP_CMD}; ${DPDK_FREE_CHECK}"; then
+            log_error "dpdk_free ($label): a process still holds /dev/vfio on $inst"
+            rc=1
+        fi
+    done
+    [[ $rc -eq 0 ]] && log_info "dpdk_free ($label): ok on both instances"
+    return $rc
+}
+
 # Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
 # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
 # dpdk-udp reads /proc/net/arp at bind() time, so we need the kernel to
@@ -2410,10 +2435,12 @@ Infrastructure ready.
             warm_arp_cache
 
             # tier2 UDP kernel-interop (sender=kernel, receiver=DPDK)
+            ensure_dpdk_free "before tier2 UDP" || true
             run_tier2 || true
 
             # tier2-tcp-echo: same topology — no rebind
             log_section "Tier 2 TCP: kernel client -> DPDK TCP server"
+            ensure_dpdk_free "before tier2-tcp-echo" || true
             local t2tcp_listener_id
             t2tcp_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000")
             if [[ -z "$t2tcp_listener_id" ]]; then
@@ -2441,10 +2468,12 @@ Infrastructure ready.
             warm_arp_cache
 
             # tier1 UDP DPDK echo (sender=DPDK, receiver=DPDK)
+            ensure_dpdk_free "before tier1 UDP" || true
             run_tier1 || true
 
             # tier1-tcp-echo (sync) — no rebind
             log_section "Tier 1 TCP (sync): DPDK <-> DPDK TCP echo"
+            ensure_dpdk_free "before tier1-tcp-echo sync" || true
             warm_arp_cache
             local t1tcp_listener_id
             t1tcp_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tcp-echo")
@@ -2460,6 +2489,7 @@ Infrastructure ready.
 
             # tier1-tcp-echo (async) — still on DPDK, no rebind
             log_section "Tier 1 TCP (async): DPDK <-> DPDK tokio TCP echo"
+            ensure_dpdk_free "before tier1-tcp-echo async" || true
             warm_arp_cache
             local t1tcpa_listener_id
             t1tcpa_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tokio-tcp-echo")
@@ -2474,6 +2504,7 @@ Infrastructure ready.
             fi
 
             # tier4 jumbo (sender=DPDK, receiver=DPDK)
+            ensure_dpdk_free "before tier4 jumbo" || true
             run_tier4 || true
             log_info "Phase B complete"
         fi
@@ -2488,6 +2519,7 @@ Infrastructure ready.
         else
             warm_arp_cache
             # tier3 UDP iperf-interop (sender=DPDK, receiver=kernel)
+            ensure_dpdk_free "before tier3 UDP" || true
             run_tier3 || true
             log_info "Phase C complete"
         fi
