@@ -5,14 +5,15 @@ on:
     branches: [main, development]
   workflow_dispatch: {}
 
-# Only one integration test run at a time — concurrent runs race to create
-# and destroy the same CloudFormation stack (DpdkTestStack). This QUIC workflow
-# shares the SAME concurrency group as the UDP/TCP integration workflow so a
-# QUIC run and a UDP/TCP run queue behind one another instead of colliding on
-# DpdkTestStack. cancel-in-progress: false lets the in-flight run finish cleanly
-# (including teardown) rather than being killed mid-deploy.
+# Only one QUIC integration test run at a time — concurrent QUIC runs race to
+# create and destroy the same CloudFormation stack (DpdkTestStackQuic). The
+# QUIC workflow has its own dedicated stack (DpdkTestStackQuic) so it does NOT
+# collide with integration-tests.yml (which uses DpdkTestStack). The QUIC
+# concurrency group is therefore separate.
+# cancel-in-progress: false lets the in-flight run finish cleanly (including
+# teardown) rather than being killed mid-deploy.
 concurrency:
-  group: integration-tests
+  group: quic-integration-tests
   cancel-in-progress: false
 
 permissions:
@@ -64,7 +65,7 @@ jobs:
   # the gate is removed (spec: quic-tcp-ec2-integration, Requirement 7, task 16).
   quic-integration-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 65
     needs: validate-cdk
     if: needs.validate-cdk.result == 'success'
     continue-on-error: true
@@ -126,15 +127,17 @@ jobs:
         timeout-minutes: 20
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic
 
       - name: Run QUIC integration tests
         id: quic-tests
+        timeout-minutes: 45
         run: |
           chmod +x scripts/run-integration-tests.sh
           chmod +x scripts/integration-tests/*.sh
           ./scripts/run-integration-tests.sh --teardown --json-summary --tier quic
         env:
+          CDK_STACK_NAME: DpdkTestStackQuic
           DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -260,8 +263,20 @@ jobs:
           fail-on-error: false
           fail-on-empty: false
 
+      # Re-assume the role first: the OIDC session from the first configure
+      # step lasts 1h, which a long run can outlive before teardown starts.
+      - name: Refresh AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own --teardown, and failure() is false on cancellation. The
+      # cleanup script is a no-op (plus orphaned-VPC purge) when nothing exists.
       - name: Safety net teardown
-        if: failure() && steps.quic-tests.outcome == 'failure'
+        if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic || echo "Safety net teardown failed (stack may already be gone)"

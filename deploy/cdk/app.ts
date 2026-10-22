@@ -16,6 +16,11 @@ const env = {
 new DpdkTestStack(app, 'DpdkTestStack', { env });
 new PerfTestStack(app, 'PerfTestStack', { env });
 
+// ── QUIC integration tests stack (x86_64) ────────────────────────────────────
+// Dedicated stack for quic-integration-tests.yml so the QUIC workflow does not
+// collide with the concurrent DpdkTestStack used by integration-tests.yml.
+new DpdkTestStack(app, 'DpdkTestStackQuic', { env });
+
 // ── Graviton (arm64) stacks ──────────────────────────────────────────────────
 // TRex stays on x86_64 in PerfTestStackGraviton — TRex does not support ARM.
 new DpdkTestStack(app, 'DpdkTestStackGraviton', {
