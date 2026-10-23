@@ -112,6 +112,21 @@ export class DpdkTestStack extends cdk.Stack {
       'iperf3 control connections from management interfaces'
     );
 
+    // tier3-tcp-kernel-interop: the receiver's kernel listeners (ncat, iperf3)
+    // answer only on its primary ENI while its secondary ENI is on DPDK, so the
+    // primary ENI must accept TCP from the peer's DPDK ENI (DPDK client -> ncat)
+    // and from its kernel interfaces (iperf3 path check).
+    mgmtSecurityGroup.addIngressRule(
+      dpdkSecurityGroup,
+      ec2.Port.allTcp(),
+      'Kernel interop: DPDK client to kernel listeners on the primary ENI'
+    );
+    mgmtSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allTcp(),
+      'Kernel interop: kernel-to-kernel path check (iperf3)'
+    );
+
     // Bundle our project as an asset
     const projectAsset = new s3assets.Asset(this, 'DpdkStdlibProject', {
       path: '../../',  // Points to dpdk-stdlib root directory
@@ -178,7 +193,8 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Updating system packages ==="',
         'dnf update -y',
         'dnf groupinstall -y "Development Tools"',
-        'dnf install -y git pciutils iperf3 clang-devel unzip --allowerasing',
+        // iproute-tc (tc/netem: tier2-tcp-retransmit), nmap-ncat + iperf3 (tier3-tcp-kernel-interop)
+        'dnf install -y git pciutils iperf3 iproute-tc nmap-ncat clang-devel unzip --allowerasing',
 
         // Install Rust
         'echo "=== Installing Rust ==="',
@@ -227,8 +243,9 @@ export class DpdkTestStack extends cdk.Stack {
         'systemctl enable amazon-ssm-agent 2>/dev/null || true',
         'systemctl start amazon-ssm-agent 2>/dev/null || true',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo not-running)"',
-        '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
-        'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
+        '# Ensure clang-devel and unzip are available (may not be in older AMIs), plus the TCP test',
+        '# tools the AMI lacks: tc (tier2-tcp-retransmit), ncat + iperf3 (tier3-tcp-kernel-interop)',
+        'dnf install -y clang-devel unzip iproute-tc nmap-ncat iperf3 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
         'echo "which unzip: $(which unzip 2>/dev/null || echo MISSING)"',
         'echo "which cargo: $(which cargo 2>/dev/null || echo MISSING)"',
