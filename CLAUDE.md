@@ -56,6 +56,7 @@
 - Never assume CI will catch what local tests missed
 - On failure, read the actual logs — do not guess
 - Loop back to step 1 on any failure, do not try to patch forward
+- Red CI on `development` (Rust, or the nightly integration runs) comes first: fix it before any ROADMAP or feature work (see "Red CI comes first" in AGENTS.md)
 
 ## Claude Code (Hooks & Skills)
 

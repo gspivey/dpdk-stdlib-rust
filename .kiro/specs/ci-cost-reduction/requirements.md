@@ -63,6 +63,13 @@ on any active branch, not just on the weekly schedule.
 
 ### REQ-3: Integration tests — remove `development` branch trigger
 
+> **Revised 2026-10-22 (Gerard, implemented in the CI cost reduction PR):** main-only gating would leave the
+> agent-router PRs against `development` with no hardware signal. Instead, the three EC2 integration workflows keep
+> PRs to `main` and `development` but are **path-filtered** to code, harness, deploy and workflow paths (docs,
+> specs and ROADMAP-only PRs skip EC2), and gain a **scheduled full run on `development`** (x86 and Graviton
+> daily, QUIC weekly) behind a `nightly-gate` job that skips the run when the commit already passed a scheduled
+> run. The TRex AMI schedule also drops to weekly. The original text below is kept for history.
+
 `integration-tests.yml` and `integration-tests-graviton.yml` currently trigger on
 PRs to both `main` and `development`.
 

@@ -3,6 +3,10 @@
 [![crates.io dpdk-stdlib-udp](https://img.shields.io/crates/v/dpdk-stdlib-udp.svg)](https://crates.io/crates/dpdk-stdlib-udp)
 [![crates.io dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg)](https://crates.io/crates/dpdk-stdlib-tokio)
 [![crates.io dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg)](https://crates.io/crates/dpdk-stdlib)
+[![Rust](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml/badge.svg?branch=development)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml?query=branch%3Adevelopment)
+[![Integration Tests (x86, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml?query=event%3Aschedule)
+[![Integration Tests (Graviton, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=event%3Aschedule)
+[![QUIC Integration (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml?query=event%3Aschedule)
 
 Drop-in DPDK-accelerated replacements for `std::net::UdpSocket` and `tokio::net::UdpSocket`. Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
 
