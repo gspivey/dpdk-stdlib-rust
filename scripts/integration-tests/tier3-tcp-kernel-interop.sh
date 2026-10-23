@@ -38,6 +38,13 @@ OUTPUT=""
 GATEWAY_MAC=""
 TEST_TIMEOUT=60
 CLASSNAME="tier3.tcp_kernel_interop"
+# Which client tests to run (comma-separated). The orchestrator runs them in two
+# ENI topologies: ncat_to_dpdk_echo + iperf3_throughput with the sender on the
+# kernel, dpdk_to_ncat_echo with the sender on DPDK.
+TESTS="ncat_to_dpdk_echo,dpdk_to_ncat_echo,iperf3_throughput"
+# The server's kernel listeners (ncat, iperf3) bind 0.0.0.0 while the server's
+# secondary ENI is on DPDK, so they answer only on its primary (kernel) IP.
+PEER_KERNEL_IP=""
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -49,9 +56,11 @@ while [[ $# -gt 0 ]]; do
         --port)        PORT="$2";        shift 2 ;;
         --output)      OUTPUT="$2";      shift 2 ;;
         --gateway-mac) GATEWAY_MAC="$2"; shift 2 ;;
+        --tests)       TESTS="$2";       shift 2 ;;
+        --peer-kernel-ip) PEER_KERNEL_IP="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 --role <server|client> --bind-ip <IP> [--peer-ip <IP>] --port <PORT> [--output <PATH>] [--gateway-mac <MAC>]" >&2
+            echo "Usage: $0 --role <server|client> --bind-ip <IP> [--peer-ip <IP>] [--peer-kernel-ip <IP>] [--tests <a,b>] --port <PORT> [--output <PATH>] [--gateway-mac <MAC>]" >&2
             exit 1
             ;;
     esac
@@ -70,6 +79,9 @@ fi
 if [[ -z "$OUTPUT" ]]; then
     OUTPUT=$(result_path "tier3" "tcp-kernel-interop")
 fi
+PEER_KERNEL_IP="${PEER_KERNEL_IP:-$PEER_IP}"
+
+wants_test() { [[ ",$TESTS," == *",$1,"* ]]; }
 
 # ── Discover gateway MAC if not provided ─────────────────────────────────────
 
@@ -196,11 +208,16 @@ run_client() {
     local iperf_port=$((PORT + 2))
 
     mkdir -p "$(dirname "$OUTPUT")"
-    junit_start_suite "tier3-tcp-kernel-interop" 3
+    local selected=0 t
+    for t in ncat_to_dpdk_echo dpdk_to_ncat_echo iperf3_throughput; do
+        wants_test "$t" && selected=$((selected + 1))
+    done
+    junit_start_suite "tier3-tcp-kernel-interop" "$selected"
 
     # Give the servers time to start
     sleep 5
 
+    if wants_test ncat_to_dpdk_echo; then
     # ── Test 1: ncat client → DPDK tcp-echo server ───────────────────────
     #
     # Use ncat (kernel TCP) to connect to the DPDK tcp-echo server.
@@ -251,17 +268,21 @@ run_client() {
             "Kernel ncat could not communicate with DPDK tcp-echo server" "$ncat_out"
     fi
 
+    fi
+
+    if wants_test dpdk_to_ncat_echo; then
     # ── Test 2: DPDK tcp-test-client → ncat echo server ──────────────────
     #
     # Use the DPDK tcp-test-client to connect to a kernel ncat echo server.
     # This tests the reverse direction: DPDK initiating against kernel TCP.
+    # Needs DPDK on THIS (client) host and targets the server's kernel IP.
     log_info "Test 2: dpdk_to_ncat_echo"
     test_start=$(_timer_now)
     local dpdk_out=""
     local dpdk_ok=true
 
     dpdk_out=$(run_with_timeout "$TEST_TIMEOUT" \
-        "$TCP_CLIENT_BINARY" --target "$PEER_IP" --port "$ncat_port" \
+        "$TCP_CLIENT_BINARY" --target "$PEER_KERNEL_IP" --port "$ncat_port" \
         --local-ip "$BIND_IP" --gateway-mac "$GATEWAY_MAC" \
         --mode bidir --count 5 --payload-size 64 2>&1) || {
         dpdk_ok=false
@@ -283,6 +304,9 @@ run_client() {
             "$failure_msg" "$dpdk_out"
     fi
 
+    fi
+
+    if wants_test iperf3_throughput; then
     # ── Test 3: iperf3 throughput (kernel TCP) → DPDK ────────────────────
     #
     # Run iperf3 client against the iperf3 server on the peer instance.
@@ -298,7 +322,7 @@ run_client() {
 
     if command -v iperf3 >/dev/null 2>&1; then
         iperf_out=$(run_with_timeout "$TEST_TIMEOUT" \
-            iperf3 -c "$PEER_IP" -p "$iperf_port" -t 5 -J 2>&1) || {
+            iperf3 -c "$PEER_KERNEL_IP" -p "$iperf_port" -t 5 -J 2>&1) || {
             iperf_ok=false
         }
     else
@@ -328,6 +352,8 @@ run_client() {
         fi
         junit_add_failure "iperf3_throughput" "$CLASSNAME" "$elapsed" \
             "$failure_msg" "${iperf_out:0:500}"
+    fi
+
     fi
 
     # ── Finalize ─────────────────────────────────────────────────────────

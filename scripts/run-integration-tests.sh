@@ -162,7 +162,7 @@ post_pr_comment() {
 
 # ── Process cleanup and ARP warming ──────────────────────────────────────────
 
-CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; pkill -f 'ncat -l -k' 2>/dev/null || true; pkill -f 'iperf3 -s' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
 
 # Runs on the instance after CLEANUP_CMD: wait until no process holds /dev/vfio
 # (escalating to SIGKILL at 5s), then print `dpdk_free: ok`, or list the holders and
@@ -1247,18 +1247,41 @@ _run_tcp_dpdk_pair_lr() {
 
 # Shared driver for kernel-interop TCP tests (receiver DPDK, sender kernel).
 # $1 = test script basename, $2 = suite name for failure XML
+# Usage: _run_tcp_kernel_interop <script> <suite> <tests> <kernel-sender|dpdk-sender>
+#   kernel-sender: receiver DPDK, sender kernel (ncat -> DPDK echo, iperf3 path check)
+#   dpdk-sender:   both DPDK; the DPDK client targets the receiver's PRIMARY
+#                  (kernel) IP, where its ncat/iperf3 listeners actually answer
 _run_tcp_kernel_interop() {
     local script_name="$1"
     local suite="$2"
+    local tests="$3"
+    local mode="$4"
 
-    log_info "Configuring ENIs for $suite (receiver DPDK, sender kernel)..."
+    log_info "Configuring ENIs for $suite ($mode)..."
     if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
         log_error "Failed to bind ENI on receiver"
         generate_failure_xml "$suite" "ENI bind failed on receiver instance"
         return 1
     fi
     sleep 3
-    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+    if [[ "$mode" == "dpdk-sender" ]]; then
+        if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+            log_error "Failed to bind ENI on sender"
+            generate_failure_xml "$suite" "ENI bind failed on sender instance"
+            return 1
+        fi
+    else
+        configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+    fi
+
+    local receiver_kernel_ip
+    receiver_kernel_ip=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 30 "hostname -I | cut -d' ' -f1" | tr -d '[:space:]')
+    if [[ -z "$receiver_kernel_ip" ]]; then
+        log_error "Could not read the receiver's primary IP ($suite)"
+        generate_failure_xml "$suite" "Receiver primary IP lookup failed"
+        return 1
+    fi
+    log_info "Receiver primary (kernel) IP: $receiver_kernel_ip"
 
     warm_arp_cache
 
@@ -1276,11 +1299,10 @@ _run_tcp_kernel_interop() {
 
     sleep 10
 
-    # Run kernel client on sender. The sender's kernel interface holds
-    # SENDER_DPDK_ENI_IP after the unbind above; the script requires --bind-ip
-    # for every role and exits "Missing required arguments" without it.
-    log_info "Starting kernel TCP client on sender for $suite..."
-    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    # The client binds SENDER_DPDK_ENI_IP: the kernel holds it after an unbind
+    # (kernel-sender), DPDK owns it after a bind (dpdk-sender).
+    log_info "Starting TCP client on sender for $suite ($tests)..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --peer-kernel-ip $receiver_kernel_ip --tests $tests --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
     if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
         log_error "Kernel TCP client execution failed ($suite)"
         generate_failure_xml "$suite" "Client test execution failed or timed out"
@@ -1311,7 +1333,8 @@ run_tcp_full() {
     # ── Phase A: receiver DPDK, sender kernel ───────────────────────────────
     log_section "TCP Tier 3: Kernel Interop (ncat/iperf3 <-> DPDK)"
     ensure_dpdk_free "tcp-full: before tier3-tcp-kernel-interop" || true
-    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop" || true
+    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop" \
+        "ncat_to_dpdk_echo,iperf3_throughput" kernel-sender || true
 
     # ── Phase B: both instances on DPDK (sender binds once, here) ───────────
     local entry script suite
@@ -1331,6 +1354,12 @@ run_tcp_full() {
             _run_tcp_dpdk_pair "$script" "$suite" || true
         fi
     done
+
+    # DPDK client -> kernel ncat needs DPDK on the sender, so it runs here.
+    log_section "TCP Tier 3: Kernel Interop, DPDK client (DPDK -> ncat)"
+    ensure_dpdk_free "tcp-full: before tier3-tcp-kernel-interop-dpdk" || true
+    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop-dpdk" \
+        "dpdk_to_ncat_echo" dpdk-sender || true
 
     log_info "TCP Full Test Suite execution complete"
 }
