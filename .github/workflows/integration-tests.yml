@@ -573,18 +573,15 @@ jobs:
           chmod +x scripts/ci/cleanup-cfn-stack.sh
           scripts/ci/cleanup-cfn-stack.sh DpdkTestStack || echo "Safety net teardown failed (stack may already be gone)"
 
-  # ── TCP integration tests (non-blocking while TCP matures) ──────────────────
+  # ── TCP integration tests (blocking) ────────────────────────────────────────
   # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
   # retransmit/flow-control, tier3 kernel-interop/std-parity) on EC2 with real
-  # DPDK hardware. Uses continue-on-error: true so TCP failures do not block CI
-  # while the TCP stack matures. Once ≥10/10 recent runs pass, the gate is
-  # removed (ROADMAP item 36, task 16.1).
+  # DPDK hardware. A TCP failure fails CI.
   tcp-integration-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     needs: [validate-cdk, integration-tests]
     if: always() && needs.validate-cdk.result == 'success'
-    continue-on-error: true
 
     steps:
       - name: Checkout
@@ -675,12 +672,10 @@ jobs:
           if [ "$OUTCOME" = "success" ]; then
             echo "## ✅ TCP Integration Tests Passed ([run](${RUN_URL}))" > "$REPORT"
           else
-            echo "## ⚠️ TCP Integration Tests (non-blocking) ([run](${RUN_URL}))" > "$REPORT"
+            echo "## ❌ TCP Integration Tests Failed ([run](${RUN_URL}))" > "$REPORT"
           fi
           echo "" >> "$REPORT"
           echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "> TCP tests run with \`continue-on-error: true\` — failures do not block CI." >> "$REPORT"
           echo "" >> "$REPORT"
 
           # Include JUnit test result summaries

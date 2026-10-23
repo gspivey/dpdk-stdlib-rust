@@ -19,7 +19,7 @@ on:
   # The full run on development, without paths. nightly-gate skips it when
   # this commit already passed a scheduled run, so quiet days cost nothing.
   schedule:
-    - cron: '30 6 * * 0' # weekly, Sunday 06:30 UTC (QUIC is non-blocking)
+    - cron: '30 6 * * 0' # weekly, Sunday 06:30 UTC
   workflow_dispatch: {}
 
 # Only one QUIC integration test run at a time — concurrent QUIC runs race to
@@ -103,18 +103,15 @@ jobs:
           chmod +x scripts/validate-cdk.sh
           ./scripts/validate-cdk.sh
 
-  # ── QUIC integration tests (non-blocking while QUIC matures) ────────────────
+  # ── QUIC integration tests (blocking) ───────────────────────────────────────
   # Runs QUIC Tier 1 (DPDK <-> DPDK handshake + bidirectional echo) on EC2 with
-  # real DPDK hardware via the shared orchestrator (`--tier quic`). Uses
-  # continue-on-error: true so QUIC failures do not block CI while the QUIC stack
-  # is validated end-to-end for the first time. Once >=10/10 recent runs pass,
-  # the gate is removed (spec: quic-tcp-ec2-integration, Requirement 7, task 16).
+  # real DPDK hardware via the shared orchestrator (`--tier quic`). A QUIC
+  # failure fails CI.
   quic-integration-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 65
     needs: validate-cdk
     if: needs.validate-cdk.result == 'success'
-    continue-on-error: true
 
     steps:
       - name: Checkout
@@ -206,12 +203,10 @@ jobs:
           if [ "$OUTCOME" = "success" ]; then
             echo "## ✅ QUIC Integration Tests Passed ([run](${RUN_URL}))" > "$REPORT"
           else
-            echo "## ⚠️ QUIC Integration Tests (non-blocking) ([run](${RUN_URL}))" > "$REPORT"
+            echo "## ❌ QUIC Integration Tests Failed ([run](${RUN_URL}))" > "$REPORT"
           fi
           echo "" >> "$REPORT"
           echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "> QUIC tests run with \`continue-on-error: true\` — failures do not block CI." >> "$REPORT"
           echo "" >> "$REPORT"
 
           # Include JUnit test result summaries

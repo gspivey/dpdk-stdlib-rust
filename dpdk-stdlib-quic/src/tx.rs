@@ -79,19 +79,24 @@ impl tx::Queue for DpdkTxQueue {
         let (dst_ip, dst_port) = socket_address_to_v4(&remote)
             .expect("IPv6 should be rejected at path handle construction");
 
+        let bound_ip = match self.local_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => Ipv4Addr::UNSPECIFIED,
+        };
         let local = path.local_address();
         let (src_ip, src_port) = match socket_address_to_v4(&local) {
             Some(v) => v,
-            None => {
-                // Fall back to bound local address
-                let ip = match self.local_addr.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => Ipv4Addr::UNSPECIFIED,
-                };
-                (ip, self.local_addr.port())
-            }
+            // Fall back to bound local address
+            None => (bound_ip, self.local_addr.port()),
         };
-        // Use local_addr port if the path handle's local port is 0
+        // A client-initiated path starts with LocalAddress::default()
+        // (0.0.0.0:0) until a reply is received: use the bound address, or
+        // the packet leaves with source IP 0.0.0.0 and is dropped.
+        let src_ip = if src_ip.is_unspecified() {
+            bound_ip
+        } else {
+            src_ip
+        };
         let src_port = if src_port == 0 {
             self.local_addr.port()
         } else {
@@ -439,5 +444,29 @@ mod tests {
         };
         let result = queue.push(msg);
         assert!(matches!(result, Err(tx::Error::AtCapacity)));
+    }
+
+    #[test]
+    fn unspecified_local_address_uses_bound_address() {
+        let mut queue = DpdkTxQueue::new(
+            "10.0.0.1:50000".parse().unwrap(),
+            32,
+            [0x11; 6],
+            [0x22; 6],
+        );
+
+        // A client-initiated path: local address is still 0.0.0.0:0
+        let remote = path::RemoteAddress::from(IpV4Address::from([10, 0, 0, 2]).with_port(4433));
+        let msg = SingleSegmentMessage {
+            handle: DpdkPathHandle::from_remote_address(remote),
+            ecn: ExplicitCongestionNotification::NotEct,
+            payload: b"initial".to_vec(),
+        };
+        queue.push(msg).unwrap();
+
+        let frames: Vec<_> = queue.drain().collect();
+        let ip = &frames[0].frame[ETH_HEADER_LEN..];
+        assert_eq!(&ip[12..16], &[10, 0, 0, 1], "source IP");
+        assert_eq!(u16::from_be_bytes([ip[20], ip[21]]), 50000, "source port");
     }
 }

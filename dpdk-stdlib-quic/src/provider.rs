@@ -8,7 +8,7 @@ use dpdk_udp::{BackendConfig, BackendType, DpdkBackend, IcmpHandler, PacketBacke
 use s2n_quic_core::endpoint::Endpoint;
 use s2n_quic_core::inet::{IpV4Address, SocketAddress};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::DpdkQuicError;
@@ -148,6 +148,21 @@ impl DpdkProvider {
 }
 
 /// Resolve gateway MAC: use explicit value if set, otherwise read kernel ARP cache.
+/// Next ephemeral port (IANA dynamic range 49152-65535). Seeded per process
+/// from the PID so two short-lived clients started back to back do not reuse
+/// the same 4-tuple; the server may still hold state for the previous one.
+static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
+
+const EPHEMERAL_FIRST: u16 = 49152;
+const EPHEMERAL_COUNT: u16 = 16384; // 49152..=65535
+
+fn ephemeral_port() -> u16 {
+    let seed = (std::process::id() % EPHEMERAL_COUNT as u32) as u16;
+    let _ = NEXT_EPHEMERAL_PORT.compare_exchange(0, seed + 1, Ordering::Relaxed, Ordering::Relaxed);
+    let n = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+    EPHEMERAL_FIRST + (n.wrapping_sub(1) % EPHEMERAL_COUNT)
+}
+
 fn resolve_gateway_mac(explicit: Option<[u8; 6]>, _local_ip: Ipv4Addr) -> [u8; 6] {
     if let Some(mac) = explicit {
         return mac;
@@ -244,8 +259,16 @@ impl s2n_quic::provider::io::Provider for DpdkProvider {
         // 3. Resolve gateway MAC
         let gateway_mac = resolve_gateway_mac(self.config.gateway_mac, local_ip);
 
-        // 4. Determine bound address
-        let bind_addr = self.config.bind_addr;
+        // 4. Determine bound address. Port 0 means "any port", as with
+        // std::net::UdpSocket::bind: pick an ephemeral one here. The TX queue
+        // stamps this port as the UDP source port and the RX filter accepts only
+        // datagrams addressed to it, so leaving it 0 sends from port 0 and drops
+        // every reply (the QUIC handshake then times out).
+        let bind_addr = if self.config.bind_addr.port() == 0 {
+            SocketAddr::new(self.config.bind_addr.ip(), ephemeral_port())
+        } else {
+            self.config.bind_addr
+        };
         let src_mac = backend.mac_address();
 
         // 5. Create IcmpHandler
@@ -293,6 +316,18 @@ mod tests {
     use super::*;
     use s2n_quic::provider::io::Provider;
     use serial_test::serial;
+
+    #[test]
+    fn ephemeral_port_is_in_dynamic_range_and_advances() {
+        let ports: Vec<u16> = (0..(EPHEMERAL_COUNT as usize + 2)).map(|_| ephemeral_port()).collect();
+        for p in &ports {
+            assert!(*p >= EPHEMERAL_FIRST, "port {p} below the dynamic range");
+        }
+        // Consecutive calls hand out different ports, and the allocator wraps
+        // back inside the range instead of overflowing to 0.
+        assert_ne!(ports[0], ports[1]);
+        assert_eq!(ports[0], ports[EPHEMERAL_COUNT as usize]);
+    }
 
     #[test]
     fn builder_defaults() {
