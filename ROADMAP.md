@@ -377,8 +377,13 @@ as expected. Do NOT require all TCP tests to be green before merging a single-bu
 Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
 in full, then implement **Task 1**. Requires item 39.
 
+**Superseded by #131.** Hardware A/B showed this test failed because the previous tier's DPDK
+server still held the NIC (`Device or resource busy` at EAL init), not because of TIME_WAIT (the 120s failure time was 2 x 60s TEST_TIMEOUT). #131 frees
+the NIC between tiers and removed the entry from `ci/known-failures.txt`; the test passes. Do not implement
+the spec task. The engine gaps found while reading `engine.rs` are listed under Future Specs.
+
 - Spec: `.kiro/specs/tcp-ci-reliability/` · Task 1
-- [ ] Complete · PR: --
+- [x] Superseded · PR: #131
 
 ---
 
@@ -387,8 +392,13 @@ in full, then implement **Task 1**. Requires item 39.
 Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
 in full, then implement **Task 2**. Requires item 39.
 
+**Superseded by #131.** Hardware A/B showed this test failed because the previous tier's DPDK
+server still held the NIC (`Device or resource busy` at EAL init), not because of asymmetric routing (`kernel_to_dpdk_echo` passes without `--bind-ip`). #131 frees
+the NIC between tiers and removed the entry from `ci/known-failures.txt`; the test passes. Do not implement
+the spec task. 
+
 - Spec: `.kiro/specs/tcp-ci-reliability/` · Task 2
-- [ ] Complete · PR: --
+- [x] Superseded · PR: #131
 
 ---
 
@@ -397,15 +407,23 @@ in full, then implement **Task 2**. Requires item 39.
 Read `.kiro/specs/tcp-ci-reliability/requirements.md`, `design.md`, and `tasks.md`
 in full, then implement **Task 3**. Requires item 39.
 
+**Superseded by #131.** Hardware A/B showed this test failed because the previous tier's DPDK
+server still held the NIC (`Device or resource busy` at EAL init), not because of vfio-pci bind timing (the `/dev/vfio` node existed; it was busy). #131 frees
+the NIC between tiers and removed the entry from `ci/known-failures.txt`; the test passes. Do not implement
+the spec task. #131 also binds each host once in `tcp-full` and confirms ENI driver state when the SSM agent stalls.
+
 - Spec: `.kiro/specs/tcp-ci-reliability/` · Task 3
-- [ ] Complete · PR: --
+- [x] Superseded · PR: #131
 
 ---
 
 ### 43. CI cost reduction: AMI build schedule weekly + path-triggered push
-- [ ] Complete · PR: --
+- Spec: `.kiro/specs/ci-cost-reduction/` · Tasks 1-2
+- [x] Complete · PR: #132
 ### 44. CI cost reduction: integration tests gate on main only
-- [ ] Complete · PR: --
+Implemented as path filters + a gated nightly run on `development` instead of main-only (spec REQ-3 revision note).
+- Spec: `.kiro/specs/ci-cost-reduction/` · Tasks 3-4
+- [x] Complete · PR: #132
 
 ## Future Specs (Not Yet Written)
 
@@ -413,6 +431,9 @@ These require new kiro spec files before agents can pick them up.
 
 - **TCP IPv6** — IPv6 address support in `dpdk-stdlib-tcp` (additive over IPv4 TCP; `SocketAddr` everywhere, v4/v6 codec pairs, NDP seam, MSS accounts for IPv6 header).
 - **QUIC IPv6** — IPv6 address support in `dpdk-stdlib-quic` (additive over IPv4 QUIC).
+- **TCP retransmit loss injection** — `tier2-tcp-retransmit` applies `tc netem` to the kernel interface from `ip route get`, but its client is the DPDK `tcp-test-client` on the vfio-bound ENI, so "transfer under loss" runs with no loss. Needs in-path loss: a test-only drop rate in the DPDK backend/test client, or netem on a kernel peer in a kernel<->DPDK topology.
+- **tier3 TCP kernel-interop redesign** — in `tcp-full` Phase A the sender is on the kernel, yet `dpdk_to_ncat_echo` runs a DPDK client there (`Invalid port ID: 0`), and `ncat`/`iperf3` aim kernel servers at the receiver's DPDK-owned IP. Split the DPDK-client direction into a both-DPDK test and point kernel tools at reachable addresses.
+- **TCP engine hardening (RFC 6191 / RFC 793)** — `handle_time_wait` drops a reopening SYN for the same 4-tuple; the SYN_SENT branch drops an unacceptable ACK instead of replying RST(seq=SEG.ACK); a reopened passive TCB must reuse the TIME_WAIT TCB's MACs (`handle_syn` would set zero MACs). Real gaps, not what failed CI.
 
 ---
 
