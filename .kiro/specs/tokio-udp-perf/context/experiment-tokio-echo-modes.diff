@@ -1,0 +1,91 @@
+diff --git a/apps/tokio-echo/src/main.rs b/apps/tokio-echo/src/main.rs
+index 4d297d1..f88832e 100644
+--- a/apps/tokio-echo/src/main.rs
++++ b/apps/tokio-echo/src/main.rs
+@@ -67,6 +67,21 @@ struct Args {
+     /// log lines with rx/tx pps, drop counters, and latency percentiles.
+     #[arg(long, default_value_t = 0)]
+     perf_interval: u64,
++
++    /// EXPERIMENT (kiro/tokio-perf-exp): per-packet work.
++    /// `legacy` = current behaviour (to_vec, spawn, semaphore, timeout, format!).
++    /// `spawn`  = legacy minus from_utf8_lossy/format! (echo the same bytes).
++    /// `fair`   = recv_from then send_to of the same bytes in one task, like apps/echo.
++    #[arg(long, default_value = "legacy")]
++    mode: String,
++
++    /// EXPERIMENT: tokio runtime flavour, `mt` (multi_thread) or `ct` (current_thread).
++    #[arg(long, default_value = "mt")]
++    runtime: String,
++
++    /// EXPERIMENT: worker threads for `--runtime mt` (0 = tokio default, one per CPU).
++    #[arg(long, default_value_t = 0)]
++    worker_threads: usize,
+ }
+ 
+ /// Statistics tracker
+@@ -125,9 +140,27 @@ fn join_addr(ip: &str, port: u16) -> String {
+     }
+ }
+ 
+-#[tokio::main]
+-async fn main() -> Result<(), Box<dyn std::error::Error>> {
++fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let args = Args::parse();
++    let rt = match args.runtime.as_str() {
++        "ct" => tokio::runtime::Builder::new_current_thread().enable_all().build()?,
++        "mt" => {
++            let mut b = tokio::runtime::Builder::new_multi_thread();
++            if args.worker_threads > 0 {
++                b.worker_threads(args.worker_threads);
++            }
++            b.enable_all().build()?
++        }
++        other => return Err(format!("unknown --runtime {other} (mt|ct)").into()),
++    };
++    if !matches!(args.mode.as_str(), "legacy" | "spawn" | "fair") {
++        return Err(format!("unknown --mode {} (legacy|spawn|fair)", args.mode).into());
++    }
++    println!("Experiment: mode={} runtime={} worker_threads={}", args.mode, args.runtime, args.worker_threads);
++    rt.block_on(async_main(args))
++}
++
++async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+ 
+     // Create socket with automatic backend selection.
+     // join_addr brackets IPv6 literals ([2001:db8::1]:9000) so ToSocketAddrs
+@@ -238,6 +271,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+ 
+         stats.record_recv(len);
+ 
++        if args.mode == "fair" {
++            match socket.send_to(&buf[..len], from_addr).await {
++                Ok(n) => stats.record_send(n),
++                Err(_) => stats.record_error(),
++            }
++            continue;
++        }
++        let plain = args.mode == "spawn";
++
+         // Get the data for this packet
+         let data = buf[..len].to_vec();
+ 
+@@ -260,12 +302,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             let _permit = permit; // Hold permit until done
+ 
+             // Create echo response
+-            let response = format!("echo: {}", String::from_utf8_lossy(&data));
++            let response = if plain {
++                data
++            } else {
++                format!("echo: {}", String::from_utf8_lossy(&data)).into_bytes()
++            };
+ 
+             // Send with timeout
+             let send_result = tokio::time::timeout(
+                 Duration::from_millis(timeout_ms),
+-                socket_clone.send_to(response.as_bytes(), from_addr),
++                socket_clone.send_to(&response, from_addr),
+             )
+             .await;
+ 
