@@ -21,7 +21,7 @@ This crate is a dependency of [`dpdk-stdlib-udp`](https://crates.io/crates/dpdk-
 
 ```toml
 [dependencies]
-dpdk-stdlib = "0.1"
+dpdk = { version = "0.3", package = "dpdk-stdlib" }
 ```
 
 ```rust

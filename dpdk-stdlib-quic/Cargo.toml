@@ -7,6 +7,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Native DPDK I/O provider for s2n-quic (kernel-bypass QUIC transport)"
+readme = "README.md"
 
 [dependencies]
 s2n-quic = "=1.81.0"

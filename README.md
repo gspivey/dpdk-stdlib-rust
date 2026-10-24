@@ -10,7 +10,7 @@
 [![Integration Tests (Graviton, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=event%3Aschedule)
 [![QUIC Integration (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml?query=event%3Aschedule)
 
-Drop-in DPDK-accelerated replacements for `std::net::UdpSocket` and `tokio::net::UdpSocket`. Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
+Drop-in DPDK-accelerated replacements for Rust's UDP and TCP sockets (`std::net` and `tokio::net`), plus a native DPDK I/O provider for [s2n-quic](https://github.com/aws/s2n-quic). Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
 
 ## Why
 
@@ -26,12 +26,14 @@ DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace d
 
 ## Features
 
-- **100% API-compatible** with `std::net::UdpSocket` and `tokio::net::UdpSocket`
+- **UDP**: 100% API-compatible with `std::net::UdpSocket` and `tokio::net::UdpSocket`, IPv4 and IPv6
+- **TCP** (IPv4): userspace TCP stack with drop-in `TcpStream`/`TcpListener` for `std::net` and `tokio::net`
+- **QUIC** (IPv4): `s2n_quic::provider::io::Provider` over DPDK, no Tokio in the I/O path
 - **Multiple backends**: DPDK (kernel bypass), AF_PACKET (raw sockets), AF_PACKET+MMAP (zero-copy)
 - **Automatic fallback**: Works without DPDK installed (development, testing, CI)
-- **Hardware offload**: IPv4/UDP checksum offloading on supported NICs
-- **Protocol support**: ARP resolution, ICMP echo reply, GUE/VXLAN/GENEVE tunnel endpoints
-- **Async runtime**: Full Tokio integration with poll-based API
+- **Hardware offload**: IPv4/IPv6 UDP checksum and VLAN offload on supported NICs
+- **Protocol support**: ARP, NDP, ICMP/ICMPv6, 802.1Q VLAN, GUE/VXLAN/GENEVE tunnel endpoints
+- **Tested on real hardware**: every PR runs on AWS EC2 x86 (c5n) and Graviton (c7g) with DPDK
 
 ## Quick Start
 
@@ -41,14 +43,30 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# Sync (std::net::UdpSocket drop-in)
-dpdk-udp = { version = "0.2", package = "dpdk-stdlib-udp" }
+# Sync UDP (std::net::UdpSocket drop-in)
+dpdk-udp = { version = "0.3", package = "dpdk-stdlib-udp" }
 
-# Async (tokio::net::UdpSocket drop-in)
-dpdk-tokio = { version = "0.2", package = "dpdk-stdlib-tokio" }
+# Async UDP and TCP (tokio::net drop-ins)
+dpdk-tokio = { version = "0.3", package = "dpdk-stdlib-tokio", features = ["dpdk"] }
+
+# Sync TCP (std::net::TcpStream / TcpListener drop-in)
+dpdk-stdlib-tcp = "0.3"
+
+# QUIC (s2n-quic I/O provider)
+dpdk-stdlib-quic = "0.3"
 ```
 
-The `package` rename means your `use` statements stay identical to what you have today — `use dpdk_udp::UdpSocket` and `use dpdk_tokio::compat::tokio::UdpSocket`.
+The `package` rename keeps your `use` statements short: `use dpdk_udp::UdpSocket` and `use dpdk_tokio::compat::tokio::UdpSocket`.
+
+| Crate | What it is |
+|-------|------------|
+| [`dpdk-stdlib-udp`](https://crates.io/crates/dpdk-stdlib-udp) | `UdpSocket` drop-in, backends, ARP/NDP/ICMP, tunnels |
+| [`dpdk-stdlib-tcp`](https://crates.io/crates/dpdk-stdlib-tcp) | Userspace TCP stack: `TcpStream`, `TcpListener` |
+| [`dpdk-stdlib-quic`](https://crates.io/crates/dpdk-stdlib-quic) | DPDK I/O provider for s2n-quic |
+| [`dpdk-stdlib-tokio`](https://crates.io/crates/dpdk-stdlib-tokio) | Async UDP and TCP drop-ins for `tokio::net` |
+| [`dpdk-stdlib-net`](https://crates.io/crates/dpdk-stdlib-net) | Shared `PacketBackend` trait and backends |
+| [`dpdk-stdlib`](https://crates.io/crates/dpdk-stdlib) | Safe DPDK wrappers (EAL, Port, Mbuf, Mempool) |
+| [`dpdk-stdlib-sys`](https://crates.io/crates/dpdk-stdlib-sys) | Raw DPDK FFI bindings, with stubs when DPDK is absent |
 
 ### As a Library
 
@@ -81,6 +99,56 @@ socket.send_to(b"hello", "192.168.1.100:9000").await?;
 ```
 
 Backend selection is automatic: DPDK if available, otherwise AF_PACKET raw sockets.
+
+#### TCP
+
+Start the DPDK TCP runtime once, then use `TcpListener`/`TcpStream` like `std::net`:
+
+```rust
+use dpdk_stdlib_tcp::{init_dpdk_tcp_context, DpdkTcpRuntimeConfig, TcpListener};
+use std::io::{Read, Write};
+
+init_dpdk_tcp_context(DpdkTcpRuntimeConfig {
+    local_ip: "10.0.1.50".parse().unwrap(),
+    gateway_mac: Some([0x02, 0xff, 0xec, 0x01, 0x65, 0x2d]), // AWS VPC: always the gateway MAC
+    ..Default::default()
+})?;
+
+let listener = TcpListener::bind("10.0.1.50:8080")?;
+for stream in listener.incoming() {
+    let mut stream = stream?;
+    let mut buf = [0u8; 1460];
+    let n = stream.read(&mut buf)?;
+    stream.write_all(&buf[..n])?;
+}
+```
+
+Async TCP uses `dpdk_tokio::compat::{TcpStream, TcpListener}` (same API as `tokio::net`). IPv4 goes through DPDK; IPv6 falls back to Tokio.
+
+#### QUIC
+
+`dpdk-stdlib-quic` plugs into s2n-quic as its I/O provider:
+
+```rust
+use dpdk_stdlib_quic::DpdkProvider;
+use s2n_quic::Server;
+
+let (provider, _handle) = DpdkProvider::builder()
+    .with_addr("10.0.1.50:4433".parse()?)
+    .with_gateway_mac([0x02, 0xff, 0xec, 0x01, 0x65, 0x2d])
+    .build();
+
+let mut server = Server::builder()
+    .with_tls((cert_pem, key_pem))?
+    .with_io(provider)?
+    .start()?;
+
+while let Some(conn) = server.accept().await {
+    // handle the connection
+}
+```
+
+The crate pins `s2n-quic = "=1.81.0"`, because the provider implements s2n-quic's lower-level I/O traits.
 
 ### Running Examples
 
@@ -186,17 +254,21 @@ socket.set_vlan(Some(VlanConfig::new(200).trunk(vec![100, 200], None)));
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│              Applications (echo, tokio-echo, test-client)        │
+│     Applications (echo, tokio-echo, tcp-echo, quic-echo-server)  │
 ├──────────────────────────────────────────────────────────────────┤
-│  dpdk-tokio   Async runtime, compat layer (std/tokio drop-ins)  │
-├──────────────────────────────────────────────────────────────────┤
-│  dpdk-udp     UdpSocket API, ARP, ICMP, packet parsing          │
+│  dpdk-stdlib-tokio  Async compat: UDP + TCP tokio::net drop-ins  │
+├─────────────────────┬────────────────────┬───────────────────────┤
+│  dpdk-stdlib-quic   │  dpdk-stdlib-udp   │  dpdk-stdlib-tcp      │
+│  s2n-quic provider  │  UdpSocket, ARP,   │  TCP engine, sockets  │
+│                     │  NDP, ICMP, tunnels│                       │
+├─────────────────────┴────────────────────┴───────────────────────┤
+│  dpdk-stdlib-net    PacketBackend trait                          │
 │               ┌──────────────┬────────────────┬────────────────┐ │
 │               │ DpdkBackend  │ RawSocket      │ RawSocket+MMAP │ │
-├───────────────┴──────────────┴────────────────┴────────────────┤
-│  dpdk         Safe wrapper (Port, Mbuf, Mempool, Queue)         │
+├───────────────┴──────────────┴────────────────┴────────────────┴─┤
+│  dpdk-stdlib        Safe wrapper (Port, Mbuf, Mempool, Queue)    │
 ├──────────────────────────────────────────────────────────────────┤
-│  dpdk-sys     Raw FFI bindings + stubs (no DPDK required)       │
+│  dpdk-stdlib-sys    Raw FFI bindings + stubs (no DPDK required)  │
 └──────────────────────────────────────────────────────────────────┘
                             │
                     ┌───────┴────────┐
@@ -206,19 +278,24 @@ socket.set_vlan(Some(VlanConfig::new(200).trunk(vec![100, 200], None)));
 
 ### Crate Breakdown
 
-**dpdk-sys** — Raw FFI bindings generated by bindgen when DPDK is installed. Ships with full stub implementations so everything compiles and tests pass without DPDK. Build script auto-detects DPDK via `pkg-config`.
+**dpdk-stdlib-sys** — Raw FFI bindings generated by bindgen when DPDK is installed. Ships with full stub implementations so everything compiles and tests pass without DPDK. Build script auto-detects DPDK via `pkg-config`.
 
-**dpdk** — Safe Rust wrappers around EAL initialization, Port configuration, Mbuf/Mempool management, and RX/TX queues. Handles hardware offload capability detection and NUMA-aware resource allocation.
+**dpdk-stdlib** — Safe Rust wrappers around EAL initialization, Port configuration, Mbuf/Mempool management, and RX/TX queues. Handles hardware offload capability detection and NUMA-aware resource allocation.
 
-**dpdk-udp** — The core networking crate. Contains:
-- `UdpSocket` with the full `std::net::UdpSocket` API (19/19 methods)
-- `PacketBackend` trait abstracting raw packet I/O across backends
+**dpdk-stdlib-net** — The `PacketBackend` trait and its implementations, shared by UDP, TCP and QUIC:
 - `DpdkBackend` — userspace DPDK with kernel bypass and direct mbuf writes
 - `RawSocketBackend` — Linux AF_PACKET with optional PACKET_MMAP ring buffers
-- ARP resolution (cache + handler) and ICMP echo reply, both backend-agnostic
-- Topology detection and NUMA-aware resource allocation
 
-**dpdk-tokio** — Async layer providing `tokio::net::UdpSocket`-compatible API with poll-based I/O. Includes a compat module (`dpdk_tokio::compat::tokio`) for zero-change migration from Tokio sockets.
+**dpdk-stdlib-udp** — The UDP crate. Contains:
+- `UdpSocket` with the full `std::net::UdpSocket` API (19/19 methods), IPv4 and IPv6
+- ARP/NDP resolution and ICMP/ICMPv6, all backend-agnostic
+- VLAN, subnet-aware routing, and GUE/VXLAN/GENEVE tunnel endpoints
+
+**dpdk-stdlib-tcp** — A userspace TCP stack (IPv4). A dedicated engine thread runs the TCP state machine (handshake, reordering, Nagle/delayed ACK, RTO, persist, keepalive, TIME_WAIT, Reno congestion control) and talks to `TcpStream`/`TcpListener` over SPSC rings.
+
+**dpdk-stdlib-quic** — Implements `s2n_quic::provider::io::Provider` (IPv4). A busy-poll event loop thread drives the s2n-quic endpoint straight from `rx_burst`/`tx_burst`, with ECN and GSO.
+
+**dpdk-stdlib-tokio** — Async layer: `tokio::net::UdpSocket`, `TcpStream` and `TcpListener` drop-ins under `dpdk_tokio::compat`, for zero-change migration from Tokio sockets.
 
 ### Packet Path
 
@@ -316,11 +393,11 @@ For async backends, note that the `tokio-dpdk` compat layer adds a `spawn_blocki
 # Build everything (works without DPDK - uses stubs)
 cargo build
 
-# Run 360+ unit tests (no DPDK required)
+# Run 1,000+ unit and property tests (no DPDK required)
 cargo test
 
 # Run specific crate tests
-cargo test -p dpdk-udp
+cargo test -p dpdk-stdlib-udp
 ```
 
 ### Local Development Setup
@@ -329,20 +406,19 @@ No DPDK installation needed. The stub system provides mock implementations so al
 
 ### Integration Testing
 
-For changes touching networking or backends:
+Integration tests run on real DPDK hardware: a pair of AWS EC2 instances per run, x86 (c5n.large) and Graviton (c7g.large).
+
+| Workflow | Runs | Covers |
+|----------|------|--------|
+| Integration Tests (x86, Graviton) | PRs touching code, CI or deploy files; nightly on `development` | UDP tiers 1-3 (x86 also TCP: handshake, echo, shutdown, flow control, retransmit, kernel interop, std parity) |
+| QUIC Integration Tests | PRs touching code; weekly on `development` | QUIC handshake + bidirectional echo |
+
+TCP and QUIC are blocking: a failure fails CI. Nightlies skip a commit that has already passed. To run the suite by hand:
 
 ```bash
 # Validate locally + trigger EC2 integration tests
 ./scripts/ci-validate.sh
 ```
-
-This runs:
-1. `cargo build && cargo test` locally
-2. Pushes your branch
-3. Triggers GitHub Actions workflow on real EC2 DPDK hardware
-4. Waits for results (exits non-zero on failure)
-
-**Do not create a PR until this passes.**
 
 ### Contributing
 
@@ -392,11 +468,11 @@ See `docs/perf-test-log.md` for detailed benchmark history across optimization p
 
 ### What This Is
 
-A **high-performance UDP endpoint library** that replaces `std::net::UdpSocket` with DPDK kernel bypass. Designed for applications that are the **source or destination** of UDP traffic and need maximum packet throughput with minimum latency. Think: DNS servers, game servers, telemetry collectors, financial feed handlers, echo/relay services.
+A **high-performance endpoint library** that replaces Rust's UDP and TCP sockets, and s2n-quic's I/O, with DPDK kernel bypass. Designed for applications that are the **source or destination** of traffic and need maximum packet throughput with minimum latency. Think: DNS servers, game servers, telemetry collectors, financial feed handlers, echo/relay services, QUIC endpoints.
 
 ### What This Is Not
 
-This is **not a general-purpose network stack**. It does not replace the Linux kernel's networking subsystem. It is not a router, firewall, load balancer, or network function. Applications that need full TCP/IP semantics, connection tracking, netfilter integration, or namespace isolation should use the kernel.
+This is **not a general-purpose network stack**. It does not replace the Linux kernel's networking subsystem. It is not a router, firewall, load balancer, or network function. Applications that need connection tracking, netfilter integration, or namespace isolation should use the kernel.
 
 ### What's Implemented
 
@@ -449,18 +525,35 @@ This is **not a general-purpose network stack**. It does not replace the Linux k
 | GENEVE endpoint | Complete | RFC 8926, 24-bit VNI, TLV options, inner Ethernet · [#51](https://github.com/gspivey/dpdk-stdlib-rust/pull/51) |
 | IPv6 outer for all encap protocols | Complete | VXLAN/GENEVE/GUE with IPv6 outer headers, mandatory UDP6 checksum · [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60) |
 
-### What's Not Implemented
-
-The following features are absent or incomplete. TCP and QUIC are the primary planned additions; the rest are intentional scope exclusions.
+**TCP** (`dpdk-stdlib-tcp`, IPv4)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **TCP** | Planned | Full `TcpStream`/`TcpListener` — see [ROADMAP.md](ROADMAP.md) |
-| **QUIC** | Planned | Native DPDK via s2n-quic `io::Provider` — see [ROADMAP.md](ROADMAP.md) |
-| **IPv6 performance benchmarks** | Pending | Protocol complete; TRex PPS run not yet recorded |
+| `std::net::TcpStream` / `TcpListener` | Complete | Connect, accept, read/write, shutdown, timeouts, options, `split` |
+| `tokio::net::TcpStream` / `TcpListener` | Complete | `AsyncRead`/`AsyncWrite` in `dpdk-stdlib-tokio`; IPv6 falls back to Tokio |
+| Engine | Complete | Handshake, out-of-order reassembly, FIN/RST, Nagle, delayed ACK, SWS avoidance, RTO, persist, keepalive, TIME_WAIT |
+| Congestion control | Complete | Reno with fast retransmit |
+| EC2 integration | Complete, blocking | Handshake, echo, shutdown, flow control, retransmit, interop with kernel `ncat`/`iperf3`, `std` parity |
+
+**QUIC** (`dpdk-stdlib-quic`, IPv4)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| s2n-quic `io::Provider` | Complete | Busy-poll event loop, no Tokio in the I/O path |
+| ECN and GSO | Complete | TOS/ECN marking on TX and RX, GSO segmentation |
+| EC2 integration | Complete, blocking | Handshake + bidirectional echo, DPDK ↔ DPDK |
+
+### What's Not Implemented
+
+The following features are absent or incomplete. TCP and QUIC over IPv6 are the next planned additions; the rest are intentional scope exclusions.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **TCP over IPv6** | Planned | IPv4 only today — see [ROADMAP.md](ROADMAP.md) |
+| **QUIC over IPv6** | Planned | IPv4 only today — see [ROADMAP.md](ROADMAP.md) |
 | **IP fragmentation/reassembly** | Not planned | Modern networks use PMTUD; DF always set |
 | **SO_REUSEPORT** | Not planned | Use RSS queues for multi-socket steering |
-| **GSO/GRO** | Not planned | `rx_burst`/`tx_burst` amortizes per-packet costs |
+| **GSO/GRO for UDP sockets** | Not planned | `rx_burst`/`tx_burst` amortizes per-packet costs |
 | **Netfilter / iptables** | Not planned | DPDK bypasses kernel; use Security Groups / upstream ACLs |
 | **Network namespaces** | Not planned | Container isolation is a kernel concern |
 | **BPF/XDP** | Not planned | Not applicable to userspace DPDK |
@@ -484,15 +577,15 @@ All completed work is captured in the [What's Implemented](#whats-implemented) t
 
 ### Next Major Features
 
-**TCP** (IPv4 first) — Full drop-in replacements for `std::net::TcpStream`, `std::net::TcpListener`, `tokio::net::TcpStream`, and `tokio::net::TcpListener`. Driven by a dedicated engine thread with SPSC rings, standard congestion control (Reno + fast retransmit), and EC2 integration tests vs. the kernel TCP stack. Published as `dpdk-stdlib-tcp`.
+TCP and QUIC (IPv4) shipped in v0.3.0. Next:
 
-**QUIC** (IPv4 first) — Native DPDK QUIC via an s2n-quic `io::Provider` (`dpdk-stdlib-quic` crate). The provider owns an s2n-quic endpoint and drives it from a busy-poll event loop thread with no Tokio runtime dependency in the I/O path. ECN and GSO supported.
+**TCP engine hardening** — RFC 6191 SYN-in-TIME_WAIT reuse, RFC 793 RST for an unacceptable ACK in SYN_SENT, and keeping MACs on a reopened connection.
 
-**TCP IPv6** — IPv6 address support in the TCP stack (follow-on spec, additive over IPv4 TCP).
+**Test depth** — real in-path loss for the TCP retransmit tests, and TCP integration tests on Graviton.
 
-**QUIC IPv6** — IPv6 address support in the QUIC provider (follow-on spec, additive over IPv4 QUIC).
+**TCP IPv6** — IPv6 address support in the TCP stack (additive over IPv4 TCP).
 
-IPv6 protocol tasks 1–8 are complete (PRs [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49)–[#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62)). Synthetic CPU benchmarks merged in [#63](https://github.com/gspivey/dpdk-stdlib-rust/pull/63). The remaining item — a TRex PPS run at 64/512/1400 B compared against the IPv4 baseline — is tracked in [ROADMAP.md](ROADMAP.md) as item 13.
+**QUIC IPv6** — IPv6 address support in the QUIC provider (additive over IPv4 QUIC).
 
 ## DPDK Installation (Optional)
 
@@ -532,7 +625,7 @@ cdk deploy --profile your-aws-profile
 ```
 
 This creates:
-- 2x c6gn.large instances (sender/receiver)
+- 2x c5n.large instances (sender/receiver); the Graviton stack uses c7g.large
 - Dual ENIs (management + DPDK)
 - SSM access (no SSH keys needed)
 

@@ -7,6 +7,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "DPDK-accelerated TCP stack for dpdk-stdlib-rust"
+readme = "README.md"
 
 [dependencies]
 dpdk-stdlib-net = { version = "0.3.0", path = "../dpdk-stdlib-net" }

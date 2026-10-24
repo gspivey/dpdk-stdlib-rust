@@ -7,6 +7,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Shared networking traits and backends for dpdk-stdlib crates"
+readme = "README.md"
 
 [dependencies]
 dpdk = { version = "0.3.0", path = "../dpdk", package = "dpdk-stdlib" }

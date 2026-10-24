@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Async DPDK-accelerated replacement for tokio::net::UdpSocket"
+description = "Async DPDK-accelerated replacements for tokio::net::UdpSocket, TcpStream and TcpListener"
 readme = "README.md"
 exclude = ["deploy/", "packer/", "scripts/", "notes/", "docs/", ".github/"]
 
