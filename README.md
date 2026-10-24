@@ -1,8 +1,10 @@
 # dpdk-stdlib-rust
 
-[![crates.io dpdk-stdlib-udp](https://img.shields.io/crates/v/dpdk-stdlib-udp.svg)](https://crates.io/crates/dpdk-stdlib-udp)
-[![crates.io dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg)](https://crates.io/crates/dpdk-stdlib-tokio)
-[![crates.io dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg)](https://crates.io/crates/dpdk-stdlib)
+[![dpdk-stdlib-udp](https://img.shields.io/crates/v/dpdk-stdlib-udp.svg?label=dpdk-stdlib-udp)](https://crates.io/crates/dpdk-stdlib-udp)
+[![dpdk-stdlib-tcp](https://img.shields.io/crates/v/dpdk-stdlib-tcp.svg?label=dpdk-stdlib-tcp)](https://crates.io/crates/dpdk-stdlib-tcp)
+[![dpdk-stdlib-quic](https://img.shields.io/crates/v/dpdk-stdlib-quic.svg?label=dpdk-stdlib-quic)](https://crates.io/crates/dpdk-stdlib-quic)
+[![dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg?label=dpdk-stdlib-tokio)](https://crates.io/crates/dpdk-stdlib-tokio)
+[![dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg?label=dpdk-stdlib)](https://crates.io/crates/dpdk-stdlib)
 [![Rust](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml/badge.svg?branch=development)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml?query=branch%3Adevelopment)
 [![Integration Tests (x86, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml?query=event%3Aschedule)
 [![Integration Tests (Graviton, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=event%3Aschedule)
