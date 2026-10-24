@@ -31,7 +31,7 @@ This crate is a dependency of [`dpdk-stdlib`](https://crates.io/crates/dpdk-stdl
 
 ```toml
 [dependencies]
-dpdk-stdlib-sys = "0.1"
+dpdk-stdlib-sys = "0.3"
 ```
 
 ## Covered DPDK APIs

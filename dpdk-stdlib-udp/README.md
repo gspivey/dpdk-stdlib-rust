@@ -10,7 +10,7 @@ This crate provides a `UdpSocket` that is 100% API-compatible with `std::net::Ud
 
 ```toml
 [dependencies]
-dpdk-stdlib-udp = "0.1"
+dpdk-udp = { version = "0.3", package = "dpdk-stdlib-udp" }
 ```
 
 ```rust

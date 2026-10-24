@@ -3,6 +3,7 @@ name = "synthetic-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "synthetic-bench"

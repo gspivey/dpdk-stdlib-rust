@@ -1,6 +1,6 @@
 # dpdk-stdlib-tokio
 
-Async DPDK-accelerated replacement for `tokio::net::UdpSocket`.
+Async DPDK-accelerated replacements for `tokio::net::UdpSocket`, `TcpStream` and `TcpListener`.
 
 ## Overview
 
@@ -10,7 +10,7 @@ This crate provides async Tokio integration for DPDK networking. The compat laye
 
 ```toml
 [dependencies]
-dpdk-stdlib-tokio = { version = "0.1", features = ["dpdk"] }
+dpdk-tokio = { version = "0.3", package = "dpdk-stdlib-tokio", features = ["dpdk"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -35,6 +35,7 @@ The `compat` module provides drop-in replacements:
 
 - **`dpdk_tokio::compat::tokio::UdpSocket`** — Replaces `tokio::net::UdpSocket`. Tries DPDK first, falls back to Tokio.
 - **`dpdk_tokio::compat::net::UdpSocket`** — Replaces `std::net::UdpSocket`. Tries DPDK first, falls back to std.
+- **`dpdk_tokio::compat::TcpStream`** / **`TcpListener`** — Replace `tokio::net::TcpStream` / `TcpListener` (`AsyncRead` + `AsyncWrite`, `into_split`). IPv4 runs on the DPDK TCP stack from [`dpdk-stdlib-tcp`](https://crates.io/crates/dpdk-stdlib-tcp); IPv6 falls back to Tokio. Call `dpdk_stdlib_tcp::init_dpdk_tcp_context` once at startup.
 
 ## Async Trait
 
