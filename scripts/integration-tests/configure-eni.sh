@@ -145,6 +145,15 @@ do_bind() {
     echo "  Current driver: $(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null || echo 'none')"
     echo "  driver_override: $(cat /sys/bus/pci/devices/$pci_addr/driver_override 2>/dev/null || echo 'empty')"
 
+    # Tell NetworkManager to stop managing this interface so it doesn't hold
+    # the ena driver open or restart DHCP while we're trying to unbind.
+    local iface
+    iface=$(ls "/sys/bus/pci/devices/$pci_addr/net/" 2>/dev/null | head -1)
+    if [[ -n "$iface" ]]; then
+        nmcli device set "$iface" managed no 2>/dev/null || true
+        echo "Set $iface as unmanaged by NetworkManager"
+    fi
+
     # Kill any DPDK processes that might hold the vfio-pci device open
     kill_dpdk_processes
 
@@ -253,6 +262,13 @@ do_unbind() {
     # A running DPDK app keeps /dev/vfio/* open, preventing driver unbind.
     kill_dpdk_processes
 
+    # Clean up any source-based policy routing rules that were added by
+    # do_assign_ip.  Rules reference the old ASSIGN_IP via ip rule; they
+    # persist even after the interface is brought down and would accumulate
+    # across runs with different IPs.  Remove all rules pointing to table 200.
+    while ip rule del table 200 2>/dev/null; do :; done
+    ip route flush table 200 2>/dev/null || true
+
     # Unbind from current driver (vfio-pci or whatever is loaded)
     if [[ -e "/sys/bus/pci/devices/$pci_addr/driver" ]]; then
         echo "$pci_addr" > "/sys/bus/pci/devices/$pci_addr/driver/unbind" 2>/dev/null || true
@@ -349,15 +365,66 @@ do_assign_ip() {
         return 1
     }
 
-    # Add route via subnet gateway
-    local gw
-    gw=$(echo "$ASSIGN_IP" | sed 's/\.[0-9]*$/.1/')
-    ip route replace default via "$gw" dev "$iface" metric 200 2>/dev/null || true
+    # Do NOT add a default route via this (data) ENI (would hijack SSM traffic).
+    # For off-subnet needs, use source-based policy routing in table 200 below.
+    sysctl -w "net.ipv4.conf.${iface}.rp_filter=2" >/dev/null 2>&1 || true
 
     # Verify the IP is actually configured
     if ip -4 addr show "$iface" 2>/dev/null | grep -q "$ASSIGN_IP"; then
         echo "SUCCESS: $iface has IP $ASSIGN_IP"
         ip -4 addr show "$iface"
+
+        # ── Source-based policy routing (table 200) ──────────────────────────
+        # In a dual-ENI setup both ENIs share the same /24 subnet.  The kernel
+        # has two equal connected routes; without guidance it may route a SYN
+        # from ASSIGN_IP via the primary ENI.  The DPDK server replies to
+        # ASSIGN_IP; the VPC delivers the reply to the ENI that owns ASSIGN_IP
+        # (this secondary ENI), which is correct.  But if the rp_filter lookup
+        # uses the wrong table, it may still fail.  Source policy routing
+        # eliminates the ambiguity: any frame sourced FROM ASSIGN_IP exits and
+        # returns via this secondary ENI exclusively.
+        local table_id=200
+
+        # Derive the subnet CIDR from the interface (handles any prefix length,
+        # not just /24) and compute the VPC gateway (.1 of the network).
+        local cidr
+        cidr=$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4; exit}')
+        local subnet_prefix
+        subnet_prefix=$(python3 -c "
+import ipaddress, sys
+net = ipaddress.ip_network('$cidr', strict=False)
+print(str(net))
+" 2>/dev/null || echo "")
+        local gw
+        gw=$(python3 -c "
+import ipaddress, sys
+net = ipaddress.ip_network('$cidr', strict=False)
+print(str(list(net.hosts())[0]))
+" 2>/dev/null || echo "")
+
+        if [[ -z "$cidr" || -z "$gw" ]]; then
+            echo "WARNING: could not derive subnet/gateway for policy routing ($iface cidr=$cidr)" >&2
+        else
+            # Idempotent: remove stale rules for this IP, then add a fresh one
+            while ip rule del from "${ASSIGN_IP}" table ${table_id} 2>/dev/null; do :; done
+            ip rule add from "${ASSIGN_IP}" table ${table_id} priority 100
+
+            # On-link subnet route (same-subnet traffic goes direct, not via gw)
+            ip route replace "${subnet_prefix}" dev "${iface}" src "${ASSIGN_IP}" table ${table_id}
+
+            # Default route for off-subnet traffic
+            ip route replace default via "${gw}" dev "${iface}" table ${table_id}
+
+            # Verify the route resolves correctly
+            local resolved_dev
+            resolved_dev=$(ip route get "${ASSIGN_IP%.*}.255" from "${ASSIGN_IP}" 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+            if [[ "$resolved_dev" == "$iface" ]]; then
+                echo "Source policy routing OK: traffic from ${ASSIGN_IP} exits ${iface} (table ${table_id}, gw ${gw})"
+            else
+                echo "WARNING: policy routing may not be effective (expected dev=${iface}, got dev=${resolved_dev:-unknown})" >&2
+            fi
+        fi
+
         return 0
     else
         echo "ERROR: IP $ASSIGN_IP not found on $iface after assignment" >&2

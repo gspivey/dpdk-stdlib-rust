@@ -115,15 +115,27 @@ impl Stats {
     }
 }
 
+/// Build a `host:port` string valid for both IPv4 and IPv6 literals.
+/// IPv6 literals must be wrapped in brackets: `[2001:db8::1]:9000`.
+fn join_addr(ip: &str, port: u16) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{}]:{}", ip, port)
+    } else {
+        format!("{}:{}", ip, port)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("=== Async UDP Echo Server ===");
-    println!("Binding to {}:{}", args.ip, args.port);
+    // Create socket with automatic backend selection.
+    // join_addr brackets IPv6 literals ([2001:db8::1]:9000) so ToSocketAddrs
+    // can parse them — a bare "{}:{}" produces an unparsable v6 string.
+    let bind_addr = join_addr(&args.ip, args.port);
 
-    // Create socket with automatic backend selection
-    let bind_addr = format!("{}:{}", args.ip, args.port);
+    println!("=== Async UDP Echo Server ===");
+    println!("Binding to {}", bind_addr);
 
     let socket: Arc<dyn AsyncUdpSocket> = if args.force_tokio {
         println!("Backend: Tokio (forced)");

@@ -4,12 +4,31 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { Construct } from 'constructs';
 
+export interface DpdkTestStackProps extends cdk.StackProps {
+  /** EC2 instance class for sender and receiver. Default: C5N */
+  instanceClass?: ec2.InstanceClass;
+  /** EC2 instance size for sender and receiver. Default: LARGE */
+  instanceSize?: ec2.InstanceSize;
+  /** CPU architecture for stock AL2023 AMI fallback. Default: X86_64 */
+  cpuType?: ec2.AmazonLinuxCpuType;
+  /** CDK context key used to pass a pre-built AMI ID. Default: 'amiId' */
+  amiContextKey?: string;
+  /** Architecture suffix for the SSM agent RPM fallback URL. Default: 'linux_amd64' */
+  ssmAgentRpmArch?: string;
+}
+
 export class DpdkTestStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: DpdkTestStackProps) {
     super(scope, id, props);
 
+    const instanceClass = props?.instanceClass ?? ec2.InstanceClass.C5N;
+    const instanceSize  = props?.instanceSize  ?? ec2.InstanceSize.LARGE;
+    const cpuType       = props?.cpuType       ?? ec2.AmazonLinuxCpuType.X86_64;
+    const amiContextKey = props?.amiContextKey ?? 'amiId';
+    const ssmAgentRpmArch = props?.ssmAgentRpmArch ?? 'linux_amd64';
+
     // Check for pre-built AMI via CDK context
-    const amiId = this.node.tryGetContext('amiId');
+    const amiId = this.node.tryGetContext(amiContextKey);
     const usePrebuiltAmi = !!amiId;
 
     // VPC for our test instances
@@ -70,6 +89,14 @@ export class DpdkTestStack extends cdk.Stack {
       'ICMP traffic between instances'
     );
 
+    // Allow TCP between DPDK interfaces (tcp-echo smoke tiers on port 9000).
+    // Without this, Tier-1 DPDK<->DPDK TCP handshakes are silently dropped.
+    dpdkSecurityGroup.addIngressRule(
+      dpdkSecurityGroup,
+      ec2.Port.allTcp(),
+      'TCP between DPDK interfaces (tcp-echo smoke tiers)'
+    );
+
     // Allow UDP from management interfaces (test-client sends from primary ENI
     // which is in the mgmt security group, targeting the DPDK ENI)
     dpdkSecurityGroup.addIngressRule(
@@ -83,6 +110,21 @@ export class DpdkTestStack extends cdk.Stack {
       mgmtSecurityGroup,
       ec2.Port.allTcp(),
       'iperf3 control connections from management interfaces'
+    );
+
+    // tier3-tcp-kernel-interop: the receiver's kernel listeners (ncat, iperf3)
+    // answer only on its primary ENI while its secondary ENI is on DPDK, so the
+    // primary ENI must accept TCP from the peer's DPDK ENI (DPDK client -> ncat)
+    // and from its kernel interfaces (iperf3 path check).
+    mgmtSecurityGroup.addIngressRule(
+      dpdkSecurityGroup,
+      ec2.Port.allTcp(),
+      'Kernel interop: DPDK client to kernel listeners on the primary ENI'
+    );
+    mgmtSecurityGroup.addIngressRule(
+      mgmtSecurityGroup,
+      ec2.Port.allTcp(),
+      'Kernel interop: kernel-to-kernel path check (iperf3)'
     );
 
     // Bundle our project as an asset
@@ -115,9 +157,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Select machine image: pre-built DPDK AMI or stock AL2023
     const machineImage = usePrebuiltAmi
       ? ec2.MachineImage.genericLinux({ [this.region]: amiId })
-      : ec2.MachineImage.latestAmazonLinux2023({
-          cpuType: ec2.AmazonLinuxCpuType.X86_64,
-        });
+      : ec2.MachineImage.latestAmazonLinux2023({ cpuType });
 
     // Timeout: 20 min with pre-built AMI (cargo build takes 8-12 min on c5n.large), 35 min for full bootstrap
     const creationTimeout = usePrebuiltAmi ? 'PT20M' : 'PT35M';
@@ -153,7 +193,8 @@ export class DpdkTestStack extends cdk.Stack {
         'echo "=== Updating system packages ==="',
         'dnf update -y',
         'dnf groupinstall -y "Development Tools"',
-        'dnf install -y git pciutils iperf3 clang-devel unzip --allowerasing',
+        // iproute-tc (tc/netem: tier2-tcp-retransmit), nmap-ncat + iperf3 (tier3-tcp-kernel-interop)
+        'dnf install -y git pciutils iperf3 iproute-tc nmap-ncat clang-devel unzip --allowerasing',
 
         // Install Rust
         'echo "=== Installing Rust ==="',
@@ -195,15 +236,16 @@ export class DpdkTestStack extends cdk.Stack {
         // The pre-built AMI may lack SSM agent (base AL2023 variants differ),
         // and Packer builds bake in stale registration data.
         'echo "=== Ensuring SSM agent is installed and running ==="',
-        'if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi',
+        `if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then echo "SSM agent not installed — installing..."; dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/${ssmAgentRpmArch}/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi`,
         '# Clear stale registration from AMI build and restart fresh',
         'systemctl stop amazon-ssm-agent 2>/dev/null || true',
         'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
         'systemctl enable amazon-ssm-agent 2>/dev/null || true',
         'systemctl start amazon-ssm-agent 2>/dev/null || true',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo not-running)"',
-        '# Ensure clang-devel and unzip are available (may not be in older AMIs)',
-        'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed or unavailable"',
+        '# Ensure clang-devel and unzip are available (may not be in older AMIs), plus the TCP test',
+        '# tools the AMI lacks: tc (tier2-tcp-retransmit), ncat + iperf3 (tier3-tcp-kernel-interop)',
+        'dnf install -y clang-devel unzip iproute-tc nmap-ncat iperf3 2>/dev/null || echo "packages already installed or unavailable"',
         '# Diagnostic: verify key tools are present',
         'echo "which unzip: $(which unzip 2>/dev/null || echo MISSING)"',
         'echo "which cargo: $(which cargo 2>/dev/null || echo MISSING)"',
@@ -226,6 +268,27 @@ export class DpdkTestStack extends cdk.Stack {
         'mkdir -p /tmp/coredumps',
         'echo "/tmp/coredumps/core.%e.%p.%t" > /proc/sys/kernel/core_pattern',
         'echo "SSM agent status: $(systemctl is-active amazon-ssm-agent 2>/dev/null || echo unknown)"',
+        '# Pin management routing to ens5 BEFORE handing ens6 to DPDK.',
+        '# At boot, Linux adds a default route via ens6 (device-number 1) which',
+        '# breaks SSM connectivity the moment ens6 is unbound from the kernel.',
+        '# Fix: (1) swap the kernel default to ens5, (2) add a policy-routing',
+        '# table (100) so ens5-sourced traffic stays on ens5 even after ens6 is',
+        '# handed to vfio-pci.',
+        'echo "=== Pinning management route to ens5 (before DPDK bind) ==="',
+        'ENS5_IP=$(ip -4 addr show ens5 | awk \'/inet /{split($2,a,"/"); print a[1]}\' | head -1)',
+        'ENS5_GW=$(ip route show dev ens5 | awk \'/default/{print $3}\' | head -1)',
+        '# Fallback: derive GW from subnet (.1 of the /24)',
+        'if [ -z "$ENS5_GW" ]; then ENS5_GW=$(echo "$ENS5_IP" | sed \'s/\\.[0-9]*$/.1/\'); fi',
+        'echo "ens5 IP=$ENS5_IP GW=$ENS5_GW"',
+        '# Make ens5 the kernel default route (metric 50 < default metric 100)',
+        'ip route replace default via "$ENS5_GW" dev ens5 metric 50 2>/dev/null || true',
+        '# Remove the ens6 default route so it cannot take over again',
+        'ip route del default dev ens6 2>/dev/null || true',
+        '# Policy routing table 100: all traffic from ens5 IP exits via ens5',
+        'ip route add default via "$ENS5_GW" dev ens5 table 100 2>/dev/null || true',
+        'ip rule add from "$ENS5_IP" lookup 100 priority 100 2>/dev/null || true',
+        'echo "Route after fix: $(ip route show)"',
+        'echo "SSM reachability check: $(curl -s --max-time 5 -o /dev/null -w \"%{http_code}\" https://ssm.us-east-1.amazonaws.com/ 2>/dev/null || echo timeout)"',
         '# Wait for secondary ENI via IMDSv2, then bind to vfio-pci',
         'echo "=== Binding secondary ENI to DPDK ==="',
         'for i in {1..60}; do',
@@ -309,7 +372,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Create sender instance
     const senderInstance = new ec2.Instance(this, 'DpdkSender', {
       vpc,
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5N, ec2.InstanceSize.LARGE),
+      instanceType: ec2.InstanceType.of(instanceClass, instanceSize),
       machineImage,
       securityGroup: mgmtSecurityGroup,
       userData: senderUserData,
@@ -333,7 +396,7 @@ export class DpdkTestStack extends cdk.Stack {
     // Create receiver instance
     const receiverInstance = new ec2.Instance(this, 'DpdkReceiver', {
       vpc,
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5N, ec2.InstanceSize.LARGE),
+      instanceType: ec2.InstanceType.of(instanceClass, instanceSize),
       machineImage,
       securityGroup: mgmtSecurityGroup,
       userData: receiverUserData,

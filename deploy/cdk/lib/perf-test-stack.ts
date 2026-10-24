@@ -4,24 +4,43 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { Construct } from 'constructs';
 
+export interface PerfTestStackProps extends cdk.StackProps {
+  /** EC2 instance class for the DUT. Default: C6IN */
+  dutInstanceClass?: ec2.InstanceClass;
+  /** EC2 instance size for the DUT. Default: XLARGE */
+  dutInstanceSize?: ec2.InstanceSize;
+  /** CPU architecture for the DUT stock AL2023 AMI fallback. Default: X86_64 */
+  dutCpuType?: ec2.AmazonLinuxCpuType;
+  /** CDK context key used to pass a pre-built DUT AMI ID. Default: 'dpdkAmiId' */
+  dutAmiContextKey?: string;
+  /** Architecture suffix for the DUT SSM agent RPM fallback URL. Default: 'linux_amd64' */
+  dutSsmAgentRpmArch?: string;
+}
+
 /**
  * PerfTestStack deploys a TRex traffic generator and a DUT (Device Under Test)
  * instance for performance benchmarking of the dpdk-stdlib-rust UDP stack.
  *
  * Architecture:
- *   TRex (c6in.xlarge)  <--UDP-->  DUT (c6in.xlarge)
- *   ENI-0: mgmt/SSM              ENI-0: mgmt/SSM
- *   ENI-1: DPDK traffic           ENI-1: DPDK/kernel traffic
+ *   TRex (c6in.xlarge, x86_64)  <--UDP-->  DUT (configurable, default c6in.xlarge x86_64)
+ *   ENI-0: mgmt/SSM                        ENI-0: mgmt/SSM
+ *   ENI-1: DPDK traffic                    ENI-1: DPDK/kernel traffic
  *
- * The DUT runs 4 configs sequentially: rust-dpdk, native-dpdk, rust-stdlib, plain-rust.
- * TRex sends UDP streams and measures throughput, latency, and packet loss.
+ * TRex always runs on x86_64 (it does not support ARM).
+ * Pass dutInstanceClass/dutCpuType to benchmark a Graviton DUT against an x86 TRex generator.
  */
 export class PerfTestStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: PerfTestStackProps) {
     super(scope, id, props);
 
+    const dutInstanceClass    = props?.dutInstanceClass    ?? ec2.InstanceClass.C6IN;
+    const dutInstanceSize     = props?.dutInstanceSize     ?? ec2.InstanceSize.XLARGE;
+    const dutCpuType          = props?.dutCpuType          ?? ec2.AmazonLinuxCpuType.X86_64;
+    const dutAmiContextKey    = props?.dutAmiContextKey    ?? 'dpdkAmiId';
+    const dutSsmAgentRpmArch  = props?.dutSsmAgentRpmArch  ?? 'linux_amd64';
+
     // AMI IDs via CDK context
-    const dpdkAmiId = this.node.tryGetContext('dpdkAmiId');
+    const dpdkAmiId = this.node.tryGetContext(dutAmiContextKey);
     const trexAmiId = this.node.tryGetContext('trexAmiId');
     const usePrebuiltDpdkAmi = !!dpdkAmiId;
     const usePrebuiltTrexAmi = !!trexAmiId;
@@ -43,6 +62,23 @@ export class PerfTestStack extends cdk.Stack {
         },
       ],
     });
+
+    // Enable IPv6 on VPC for IPv6 perf tests
+    const cfnVpc = vpc.node.defaultChild as ec2.CfnVPC;
+    const ipv6Cidr = new ec2.CfnVPCCidrBlock(this, 'Ipv6Cidr', {
+      vpcId: vpc.vpcId,
+      amazonProvidedIpv6CidrBlock: true,
+    });
+
+    // Assign IPv6 CIDR to private subnet (used by data-plane ENIs)
+    const privateSubnet = vpc.privateSubnets[0];
+    const cfnPrivateSubnet = privateSubnet.node.defaultChild as ec2.CfnSubnet;
+    cfnPrivateSubnet.ipv6CidrBlock = cdk.Fn.select(0, cdk.Fn.cidr(
+      cdk.Fn.select(0, vpc.vpcIpv6CidrBlocks),
+      2, // 2 subnets
+      '64', // /64 subnets
+    ));
+    cfnPrivateSubnet.addDependency(ipv6Cidr);
 
     // VPC Interface Endpoints for SSM
     vpc.addInterfaceEndpoint('SsmEndpoint', {
@@ -84,6 +120,12 @@ export class PerfTestStack extends cdk.Stack {
       ec2.Port.allIcmp(),
       'ICMP traffic between TRex and DUT'
     );
+    // IPv6 ICMP (NDP, etc.)
+    dataSecurityGroup.addIngressRule(
+      dataSecurityGroup,
+      ec2.Port.allTraffic(),
+      'All IPv6 traffic between TRex and DUT (NDP + data)'
+    );
     // Allow traffic from mgmt to data plane (for kernel-mode tests)
     dataSecurityGroup.addIngressRule(
       mgmtSecurityGroup,
@@ -116,9 +158,10 @@ export class PerfTestStack extends cdk.Stack {
     });
     projectAsset.grantRead(instanceRole);
 
-    const instanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE);
+    const trexInstanceType = ec2.InstanceType.of(ec2.InstanceClass.C6IN, ec2.InstanceSize.XLARGE);
+    const dutInstanceType  = ec2.InstanceType.of(dutInstanceClass, dutInstanceSize);
 
-    // ── TRex Instance ────────────────────────────────────────────────────────
+    // ── TRex Instance (always x86_64 — TRex does not support ARM) ───────────
 
     const trexMachineImage = usePrebuiltTrexAmi
       ? ec2.MachineImage.genericLinux({ [this.region]: trexAmiId })
@@ -207,7 +250,7 @@ export class PerfTestStack extends cdk.Stack {
 
     const trexInstance = new ec2.Instance(this, 'TrexInstance', {
       vpc,
-      instanceType,
+      instanceType: trexInstanceType,
       machineImage: trexMachineImage,
       securityGroup: mgmtSecurityGroup,
       userData: trexUserData,
@@ -225,9 +268,7 @@ export class PerfTestStack extends cdk.Stack {
 
     const dutMachineImage = usePrebuiltDpdkAmi
       ? ec2.MachineImage.genericLinux({ [this.region]: dpdkAmiId })
-      : ec2.MachineImage.latestAmazonLinux2023({
-          cpuType: ec2.AmazonLinuxCpuType.X86_64,
-        });
+      : ec2.MachineImage.latestAmazonLinux2023({ cpuType: dutCpuType });
 
     const dutCreationTimeout = usePrebuiltDpdkAmi ? 'PT20M' : 'PT35M';
 
@@ -242,7 +283,7 @@ export class PerfTestStack extends cdk.Stack {
 
     const dutPrebuiltPreamble = [
       'echo "=== Using pre-built DPDK AMI for DUT ==="',
-      'if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then dnf install -y amazon-ssm-agent; fi',
+      `if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then dnf install -y amazon-ssm-agent 2>/dev/null || (curl -s https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/${dutSsmAgentRpmArch}/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && rpm -ivh /tmp/amazon-ssm-agent.rpm); fi`,
       'systemctl stop amazon-ssm-agent 2>/dev/null || true',
       'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
       'systemctl enable amazon-ssm-agent 2>/dev/null || true',
@@ -356,7 +397,7 @@ export class PerfTestStack extends cdk.Stack {
 
     const dutInstance = new ec2.Instance(this, 'DutInstance', {
       vpc,
-      instanceType,
+      instanceType: dutInstanceType,
       machineImage: dutMachineImage,
       securityGroup: mgmtSecurityGroup,
       userData: dutUserData,
@@ -378,18 +419,21 @@ export class PerfTestStack extends cdk.Stack {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane TX interface',
+      ipv6AddressCount: 1,
     });
 
     const trexDataEniRx = new ec2.CfnNetworkInterface(this, 'TrexDataEniRx', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'TRex data plane RX interface',
+      ipv6AddressCount: 1,
     });
 
     const dutDataEni = new ec2.CfnNetworkInterface(this, 'DutDataEni', {
       subnetId: vpc.privateSubnets[0].subnetId,
       groupSet: [dataSecurityGroup.securityGroupId],
       description: 'DUT data plane interface',
+      ipv6AddressCount: 1,
     });
 
     // NOTE: ENA Express (SRD) requires MTU ≤ 8900 and c6in.8xlarge+.

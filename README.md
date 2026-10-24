@@ -1,6 +1,16 @@
 # dpdk-stdlib-rust
 
-Drop-in DPDK-accelerated replacements for `std::net::UdpSocket` and `tokio::net::UdpSocket`. Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
+[![dpdk-stdlib-udp](https://img.shields.io/crates/v/dpdk-stdlib-udp.svg?label=dpdk-stdlib-udp)](https://crates.io/crates/dpdk-stdlib-udp)
+[![dpdk-stdlib-tcp](https://img.shields.io/crates/v/dpdk-stdlib-tcp.svg?label=dpdk-stdlib-tcp)](https://crates.io/crates/dpdk-stdlib-tcp)
+[![dpdk-stdlib-quic](https://img.shields.io/crates/v/dpdk-stdlib-quic.svg?label=dpdk-stdlib-quic)](https://crates.io/crates/dpdk-stdlib-quic)
+[![dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg?label=dpdk-stdlib-tokio)](https://crates.io/crates/dpdk-stdlib-tokio)
+[![dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg?label=dpdk-stdlib)](https://crates.io/crates/dpdk-stdlib)
+[![Rust](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml/badge.svg?branch=development)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml?query=branch%3Adevelopment)
+[![Integration Tests (x86, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml?query=event%3Aschedule)
+[![Integration Tests (Graviton, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=event%3Aschedule)
+[![QUIC Integration (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml?query=event%3Aschedule)
+
+Drop-in DPDK-accelerated replacements for Rust's UDP and TCP sockets (`std::net` and `tokio::net`), plus a native DPDK I/O provider for [s2n-quic](https://github.com/aws/s2n-quic). Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
 
 ## Why
 
@@ -16,14 +26,47 @@ DPDK (Data Plane Development Kit) bypasses the kernel entirely using userspace d
 
 ## Features
 
-- **100% API-compatible** with `std::net::UdpSocket` and `tokio::net::UdpSocket`
+- **UDP**: 100% API-compatible with `std::net::UdpSocket` and `tokio::net::UdpSocket`, IPv4 and IPv6
+- **TCP** (IPv4): userspace TCP stack with drop-in `TcpStream`/`TcpListener` for `std::net` and `tokio::net`
+- **QUIC** (IPv4): `s2n_quic::provider::io::Provider` over DPDK, no Tokio in the I/O path
 - **Multiple backends**: DPDK (kernel bypass), AF_PACKET (raw sockets), AF_PACKET+MMAP (zero-copy)
 - **Automatic fallback**: Works without DPDK installed (development, testing, CI)
-- **Hardware offload**: IPv4/UDP checksum offloading on supported NICs
-- **Protocol support**: ARP resolution, ICMP echo reply
-- **Async runtime**: Full Tokio integration with poll-based API
+- **Hardware offload**: IPv4/IPv6 UDP checksum and VLAN offload on supported NICs
+- **Protocol support**: ARP, NDP, ICMP/ICMPv6, 802.1Q VLAN, GUE/VXLAN/GENEVE tunnel endpoints
+- **Tested on real hardware**: every PR runs on AWS EC2 x86 (c5n) and Graviton (c7g) with DPDK
 
 ## Quick Start
+
+### Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+# Sync UDP (std::net::UdpSocket drop-in)
+dpdk-udp = { version = "0.3", package = "dpdk-stdlib-udp" }
+
+# Async UDP and TCP (tokio::net drop-ins)
+dpdk-tokio = { version = "0.3", package = "dpdk-stdlib-tokio", features = ["dpdk"] }
+
+# Sync TCP (std::net::TcpStream / TcpListener drop-in)
+dpdk-stdlib-tcp = "0.3"
+
+# QUIC (s2n-quic I/O provider)
+dpdk-stdlib-quic = "0.3"
+```
+
+The `package` rename keeps your `use` statements short: `use dpdk_udp::UdpSocket` and `use dpdk_tokio::compat::tokio::UdpSocket`.
+
+| Crate | What it is |
+|-------|------------|
+| [`dpdk-stdlib-udp`](https://crates.io/crates/dpdk-stdlib-udp) | `UdpSocket` drop-in, backends, ARP/NDP/ICMP, tunnels |
+| [`dpdk-stdlib-tcp`](https://crates.io/crates/dpdk-stdlib-tcp) | Userspace TCP stack: `TcpStream`, `TcpListener` |
+| [`dpdk-stdlib-quic`](https://crates.io/crates/dpdk-stdlib-quic) | DPDK I/O provider for s2n-quic |
+| [`dpdk-stdlib-tokio`](https://crates.io/crates/dpdk-stdlib-tokio) | Async UDP and TCP drop-ins for `tokio::net` |
+| [`dpdk-stdlib-net`](https://crates.io/crates/dpdk-stdlib-net) | Shared `PacketBackend` trait and backends |
+| [`dpdk-stdlib`](https://crates.io/crates/dpdk-stdlib) | Safe DPDK wrappers (EAL, Port, Mbuf, Mempool) |
+| [`dpdk-stdlib-sys`](https://crates.io/crates/dpdk-stdlib-sys) | Raw DPDK FFI bindings, with stubs when DPDK is absent |
 
 ### As a Library
 
@@ -56,6 +99,56 @@ socket.send_to(b"hello", "192.168.1.100:9000").await?;
 ```
 
 Backend selection is automatic: DPDK if available, otherwise AF_PACKET raw sockets.
+
+#### TCP
+
+Start the DPDK TCP runtime once, then use `TcpListener`/`TcpStream` like `std::net`:
+
+```rust
+use dpdk_stdlib_tcp::{init_dpdk_tcp_context, DpdkTcpRuntimeConfig, TcpListener};
+use std::io::{Read, Write};
+
+init_dpdk_tcp_context(DpdkTcpRuntimeConfig {
+    local_ip: "10.0.1.50".parse().unwrap(),
+    gateway_mac: Some([0x02, 0xff, 0xec, 0x01, 0x65, 0x2d]), // AWS VPC: always the gateway MAC
+    ..Default::default()
+})?;
+
+let listener = TcpListener::bind("10.0.1.50:8080")?;
+for stream in listener.incoming() {
+    let mut stream = stream?;
+    let mut buf = [0u8; 1460];
+    let n = stream.read(&mut buf)?;
+    stream.write_all(&buf[..n])?;
+}
+```
+
+Async TCP uses `dpdk_tokio::compat::{TcpStream, TcpListener}` (same API as `tokio::net`). IPv4 goes through DPDK; IPv6 falls back to Tokio.
+
+#### QUIC
+
+`dpdk-stdlib-quic` plugs into s2n-quic as its I/O provider:
+
+```rust
+use dpdk_stdlib_quic::DpdkProvider;
+use s2n_quic::Server;
+
+let (provider, _handle) = DpdkProvider::builder()
+    .with_addr("10.0.1.50:4433".parse()?)
+    .with_gateway_mac([0x02, 0xff, 0xec, 0x01, 0x65, 0x2d])
+    .build();
+
+let mut server = Server::builder()
+    .with_tls((cert_pem, key_pem))?
+    .with_io(provider)?
+    .start()?;
+
+while let Some(conn) = server.accept().await {
+    // handle the connection
+}
+```
+
+The crate pins `s2n-quic = "=1.81.0"`, because the provider implements s2n-quic's lower-level I/O traits.
 
 ### Running Examples
 
@@ -161,17 +254,21 @@ socket.set_vlan(Some(VlanConfig::new(200).trunk(vec![100, 200], None)));
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│              Applications (echo, tokio-echo, test-client)        │
+│     Applications (echo, tokio-echo, tcp-echo, quic-echo-server)  │
 ├──────────────────────────────────────────────────────────────────┤
-│  dpdk-tokio   Async runtime, compat layer (std/tokio drop-ins)  │
-├──────────────────────────────────────────────────────────────────┤
-│  dpdk-udp     UdpSocket API, ARP, ICMP, packet parsing          │
+│  dpdk-stdlib-tokio  Async compat: UDP + TCP tokio::net drop-ins  │
+├─────────────────────┬────────────────────┬───────────────────────┤
+│  dpdk-stdlib-quic   │  dpdk-stdlib-udp   │  dpdk-stdlib-tcp      │
+│  s2n-quic provider  │  UdpSocket, ARP,   │  TCP engine, sockets  │
+│                     │  NDP, ICMP, tunnels│                       │
+├─────────────────────┴────────────────────┴───────────────────────┤
+│  dpdk-stdlib-net    PacketBackend trait                          │
 │               ┌──────────────┬────────────────┬────────────────┐ │
 │               │ DpdkBackend  │ RawSocket      │ RawSocket+MMAP │ │
-├───────────────┴──────────────┴────────────────┴────────────────┤
-│  dpdk         Safe wrapper (Port, Mbuf, Mempool, Queue)         │
+├───────────────┴──────────────┴────────────────┴────────────────┴─┤
+│  dpdk-stdlib        Safe wrapper (Port, Mbuf, Mempool, Queue)    │
 ├──────────────────────────────────────────────────────────────────┤
-│  dpdk-sys     Raw FFI bindings + stubs (no DPDK required)       │
+│  dpdk-stdlib-sys    Raw FFI bindings + stubs (no DPDK required)  │
 └──────────────────────────────────────────────────────────────────┘
                             │
                     ┌───────┴────────┐
@@ -181,19 +278,24 @@ socket.set_vlan(Some(VlanConfig::new(200).trunk(vec![100, 200], None)));
 
 ### Crate Breakdown
 
-**dpdk-sys** — Raw FFI bindings generated by bindgen when DPDK is installed. Ships with full stub implementations so everything compiles and tests pass without DPDK. Build script auto-detects DPDK via `pkg-config`.
+**dpdk-stdlib-sys** — Raw FFI bindings generated by bindgen when DPDK is installed. Ships with full stub implementations so everything compiles and tests pass without DPDK. Build script auto-detects DPDK via `pkg-config`.
 
-**dpdk** — Safe Rust wrappers around EAL initialization, Port configuration, Mbuf/Mempool management, and RX/TX queues. Handles hardware offload capability detection and NUMA-aware resource allocation.
+**dpdk-stdlib** — Safe Rust wrappers around EAL initialization, Port configuration, Mbuf/Mempool management, and RX/TX queues. Handles hardware offload capability detection and NUMA-aware resource allocation.
 
-**dpdk-udp** — The core networking crate. Contains:
-- `UdpSocket` with the full `std::net::UdpSocket` API (19/19 methods)
-- `PacketBackend` trait abstracting raw packet I/O across backends
+**dpdk-stdlib-net** — The `PacketBackend` trait and its implementations, shared by UDP, TCP and QUIC:
 - `DpdkBackend` — userspace DPDK with kernel bypass and direct mbuf writes
 - `RawSocketBackend` — Linux AF_PACKET with optional PACKET_MMAP ring buffers
-- ARP resolution (cache + handler) and ICMP echo reply, both backend-agnostic
-- Topology detection and NUMA-aware resource allocation
 
-**dpdk-tokio** — Async layer providing `tokio::net::UdpSocket`-compatible API with poll-based I/O. Includes a compat module (`dpdk_tokio::compat::tokio`) for zero-change migration from Tokio sockets.
+**dpdk-stdlib-udp** — The UDP crate. Contains:
+- `UdpSocket` with the full `std::net::UdpSocket` API (19/19 methods), IPv4 and IPv6
+- ARP/NDP resolution and ICMP/ICMPv6, all backend-agnostic
+- VLAN, subnet-aware routing, and GUE/VXLAN/GENEVE tunnel endpoints
+
+**dpdk-stdlib-tcp** — A userspace TCP stack (IPv4). A dedicated engine thread runs the TCP state machine (handshake, reordering, Nagle/delayed ACK, RTO, persist, keepalive, TIME_WAIT, Reno congestion control) and talks to `TcpStream`/`TcpListener` over SPSC rings.
+
+**dpdk-stdlib-quic** — Implements `s2n_quic::provider::io::Provider` (IPv4). A busy-poll event loop thread drives the s2n-quic endpoint straight from `rx_burst`/`tx_burst`, with ECN and GSO.
+
+**dpdk-stdlib-tokio** — Async layer: `tokio::net::UdpSocket`, `TcpStream` and `TcpListener` drop-ins under `dpdk_tokio::compat`, for zero-change migration from Tokio sockets.
 
 ### Packet Path
 
@@ -291,11 +393,11 @@ For async backends, note that the `tokio-dpdk` compat layer adds a `spawn_blocki
 # Build everything (works without DPDK - uses stubs)
 cargo build
 
-# Run 360+ unit tests (no DPDK required)
+# Run 1,000+ unit and property tests (no DPDK required)
 cargo test
 
 # Run specific crate tests
-cargo test -p dpdk-udp
+cargo test -p dpdk-stdlib-udp
 ```
 
 ### Local Development Setup
@@ -304,20 +406,19 @@ No DPDK installation needed. The stub system provides mock implementations so al
 
 ### Integration Testing
 
-For changes touching networking or backends:
+Integration tests run on real DPDK hardware: a pair of AWS EC2 instances per run, x86 (c5n.large) and Graviton (c7g.large).
+
+| Workflow | Runs | Covers |
+|----------|------|--------|
+| Integration Tests (x86, Graviton) | PRs touching code, CI or deploy files; nightly on `development` | UDP tiers 1-3 (x86 also TCP: handshake, echo, shutdown, flow control, retransmit, kernel interop, std parity) |
+| QUIC Integration Tests | PRs touching code; weekly on `development` | QUIC handshake + bidirectional echo |
+
+TCP and QUIC are blocking: a failure fails CI. Nightlies skip a commit that has already passed. To run the suite by hand:
 
 ```bash
 # Validate locally + trigger EC2 integration tests
 ./scripts/ci-validate.sh
 ```
-
-This runs:
-1. `cargo build && cargo test` locally
-2. Pushes your branch
-3. Triggers GitHub Actions workflow on real EC2 DPDK hardware
-4. Waits for results (exits non-zero on failure)
-
-**Do not create a PR until this passes.**
 
 ### Contributing
 
@@ -367,47 +468,97 @@ See `docs/perf-test-log.md` for detailed benchmark history across optimization p
 
 ### What This Is
 
-A **high-performance UDP endpoint library** that replaces `std::net::UdpSocket` with DPDK kernel bypass. Designed for applications that are the **source or destination** of UDP traffic and need maximum packet throughput with minimum latency. Think: DNS servers, game servers, telemetry collectors, financial feed handlers, echo/relay services.
+A **high-performance endpoint library** that replaces Rust's UDP and TCP sockets, and s2n-quic's I/O, with DPDK kernel bypass. Designed for applications that are the **source or destination** of traffic and need maximum packet throughput with minimum latency. Think: DNS servers, game servers, telemetry collectors, financial feed handlers, echo/relay services, QUIC endpoints.
 
 ### What This Is Not
 
-This is **not a general-purpose network stack**. It does not replace the Linux kernel's networking subsystem. It is not a router, firewall, load balancer, or network function. Applications that need full TCP/IP semantics, connection tracking, netfilter integration, or namespace isolation should use the kernel.
+This is **not a general-purpose network stack**. It does not replace the Linux kernel's networking subsystem. It is not a router, firewall, load balancer, or network function. Applications that need connection tracking, netfilter integration, or namespace isolation should use the kernel.
 
 ### What's Implemented
+
+**Core API & Backends**
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `std::net::UdpSocket` API | 19/19 methods | Full API compatibility |
 | `tokio::net::UdpSocket` API | Complete | All async + poll methods |
-| IPv4 UDP send/receive | Complete | Build and parse Ethernet/IPv4/UDP frames |
-| ARP resolution | Complete | Cache with atomic fast-path, auto-request, kernel ARP seeding, gratuitous ARP on bind |
-| ICMP echo reply | Complete | Auto-responds to ping |
-| ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. queued via `take_error()` |
-| Hardware checksum offload | Complete | TX offload on capable NICs, RX validation on all packets |
-| Hardware VLAN offload | Complete | NIC inserts/strips 802.1Q tags, software fallback, force-software option |
 | Multiple backends | 3 backends | DPDK, AF_PACKET, AF_PACKET+MMAP |
-| Ephemeral port allocation | Complete | Linux-compatible range (32768-60999) |
-| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default |
-| Multicast join/leave | Basic | IPv4 only, simplified group tracking |
-| Connected socket filtering | Complete | Buffers non-matching packets |
+| Hardware checksum offload | Complete | TX NIC offload (`IP_CKSUM`, `UDP_CKSUM`), RX software validation · [#32](https://github.com/gspivey/dpdk-stdlib-rust/pull/32) |
+| Hardware VLAN offload | Complete | NIC tag insert/strip, software fallback, force-software option · [#37](https://github.com/gspivey/dpdk-stdlib-rust/pull/37) |
+| Ephemeral port allocation | Complete | Linux-compatible range (32768–60999) |
 | Socket timeouts | Complete | Read and write deadlines |
+| RX backpressure + drop counters | Complete | `SO_RCVBUF`-style byte limit, atomic `recv_drops()`, 256 KiB default · [#33](https://github.com/gspivey/dpdk-stdlib-rust/pull/33) |
+| Connected socket filtering | Complete | Buffers non-matching packets |
+| Multicast join/leave | Basic | IPv4 only, simplified group tracking |
+
+**IPv4**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| IPv4 UDP send/receive | Complete | Ethernet/IPv4/UDP frame build and parse |
+| ARP resolution | Complete | Cache, auto-request, kernel ARP seeding, gratuitous ARP on bind · [#34](https://github.com/gspivey/dpdk-stdlib-rust/pull/34) |
+| ICMP echo reply | Complete | Auto-responds to ping |
+| ICMP error handling | Complete | Dest Unreachable, Time Exceeded, etc. via `take_error()` · [#35](https://github.com/gspivey/dpdk-stdlib-rust/pull/35) |
+| 802.1Q VLAN | Complete | Access/Trunk/PortTagging modes, all protocol handlers covered · [#36](https://github.com/gspivey/dpdk-stdlib-rust/pull/36) |
+| Subnet-aware routing | Complete | LPM routes, OS auto-detect from `/proc/net/route`, configurable gateway/MTU · [#29](https://github.com/gspivey/dpdk-stdlib-rust/pull/29) [#30](https://github.com/gspivey/dpdk-stdlib-rust/pull/30) |
+| Jumbo frames | Complete | Configurable MTU up to 9001 bytes · [#32](https://github.com/gspivey/dpdk-stdlib-rust/pull/32) |
+
+**IPv6**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| IPv6 header build/parse | Complete | 40-byte fixed header, extension-header chain walk · [#49](https://github.com/gspivey/dpdk-stdlib-rust/pull/49) |
+| IPv6 UDP send/receive | Complete | `SocketAddrV6` through all socket methods, `only_v6` option · [#62](https://github.com/gspivey/dpdk-stdlib-rust/pull/62) |
+| IPv6 UDP checksum | Complete | Mandatory pseudo-header checksum, zero-checksum rejection per RFC 8200 · [#61](https://github.com/gspivey/dpdk-stdlib-rust/pull/61) |
+| IPv6 hardware offload | Complete | `RTE_MBUF_F_TX_IPV6` + `UDP_CKSUM`, RX `PKT_RX_L4_CKSUM_GOOD` · [#55](https://github.com/gspivey/dpdk-stdlib-rust/pull/55) |
+| IPv6 link-local / scope IDs | Complete | `fe80::/10` handling, `%ifindex` scope, solicited-node multicast MAC · [#54](https://github.com/gspivey/dpdk-stdlib-rust/pull/54) |
+| NDP | Complete | Neighbor Solicitation/Advertisement, atomic cache, gratuitous NA on bind, kernel seeding · [#59](https://github.com/gspivey/dpdk-stdlib-rust/pull/59) |
+| ICMPv6 echo reply | Complete | Auto-responds to `ping6` · [#56](https://github.com/gspivey/dpdk-stdlib-rust/pull/56) |
+| ICMPv6 error handling | Complete | Dest Unreachable, Packet Too Big (with MTU), Time Exceeded · [#58](https://github.com/gspivey/dpdk-stdlib-rust/pull/58) |
+
+**Tunneling**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| GUE endpoint | Complete | RFC 8470 L3-over-UDP, IPv4/IPv6 outer · [#42](https://github.com/gspivey/dpdk-stdlib-rust/pull/42) |
+| VXLAN endpoint | Complete | RFC 7348, 24-bit VNI, inner Ethernet, per-VNI filtering · [#50](https://github.com/gspivey/dpdk-stdlib-rust/pull/50) |
+| GENEVE endpoint | Complete | RFC 8926, 24-bit VNI, TLV options, inner Ethernet · [#51](https://github.com/gspivey/dpdk-stdlib-rust/pull/51) |
+| IPv6 outer for all encap protocols | Complete | VXLAN/GENEVE/GUE with IPv6 outer headers, mandatory UDP6 checksum · [#60](https://github.com/gspivey/dpdk-stdlib-rust/pull/60) |
+
+**TCP** (`dpdk-stdlib-tcp`, IPv4)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `std::net::TcpStream` / `TcpListener` | Complete | Connect, accept, read/write, shutdown, timeouts, options, `split` |
+| `tokio::net::TcpStream` / `TcpListener` | Complete | `AsyncRead`/`AsyncWrite` in `dpdk-stdlib-tokio`; IPv6 falls back to Tokio |
+| Engine | Complete | Handshake, out-of-order reassembly, FIN/RST, Nagle, delayed ACK, SWS avoidance, RTO, persist, keepalive, TIME_WAIT |
+| Congestion control | Complete | Reno with fast retransmit |
+| EC2 integration | Complete, blocking | Handshake, echo, shutdown, flow control, retransmit, interop with kernel `ncat`/`iperf3`, `std` parity |
+
+**QUIC** (`dpdk-stdlib-quic`, IPv4)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| s2n-quic `io::Provider` | Complete | Busy-poll event loop, no Tokio in the I/O path |
+| ECN and GSO | Complete | TOS/ECN marking on TX and RX, GSO segmentation |
+| EC2 integration | Complete, blocking | Handshake + bidirectional echo, DPDK ↔ DPDK |
 
 ### What's Not Implemented
 
-The Linux kernel's UDP path (`net/ipv4/udp.c` and surrounding infrastructure) handles significantly more than raw packet I/O. The following kernel features have **no equivalent** in this library. Planned items are listed first, matching the Roadmap order below.
+The following features are absent or incomplete. TCP and QUIC over IPv6 are the next planned additions; the rest are intentional scope exclusions.
 
-| Feature | Kernel | Us | Impact |
-|---------|--------|-----|--------|
-| **IPv6** | Full dual-stack | IPv4 only | Planned |
-| **UDP encapsulation (VXLAN/GUE/GENEVE)** | Tunnel endpoint support | None | Planned |
-| **IP fragmentation/reassembly** | Full fragment/reassembly | DF always set, packets > 1472 bytes rejected | Not planned |
-| **SO_REUSEPORT** | Multiple sockets share a port with BPF-programmable steering | One socket per port | Not planned |
-| **GSO/GRO** | Batch segmentation/coalescing for bulk transfers | Single-packet TX/RX | Not planned |
-| **Netfilter / iptables** | Full hook chain (PREROUTING through POSTROUTING) | None — DPDK bypasses kernel entirely | Not planned |
-| **Network namespaces** | Per-namespace socket/routing isolation | None | Not planned |
-| **BPF/XDP** | Programmable packet processing at NIC driver level | None | Not planned |
-| **TOS/DSCP** | `IP_TOS` socket option | Always 0x00 | Not planned |
-| **Cork / MSG_MORE** | Accumulate multiple writes into one datagram | None | Not planned |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **TCP over IPv6** | Planned | IPv4 only today — see [ROADMAP.md](ROADMAP.md) |
+| **QUIC over IPv6** | Planned | IPv4 only today — see [ROADMAP.md](ROADMAP.md) |
+| **IP fragmentation/reassembly** | Not planned | Modern networks use PMTUD; DF always set |
+| **SO_REUSEPORT** | Not planned | Use RSS queues for multi-socket steering |
+| **GSO/GRO for UDP sockets** | Not planned | `rx_burst`/`tx_burst` amortizes per-packet costs |
+| **Netfilter / iptables** | Not planned | DPDK bypasses kernel; use Security Groups / upstream ACLs |
+| **Network namespaces** | Not planned | Container isolation is a kernel concern |
+| **BPF/XDP** | Not planned | Not applicable to userspace DPDK |
+| **TOS/DSCP** | Not planned | Trivial to add; most DPDK deployments use dedicated NICs |
+| **Cork / MSG_MORE** | Not planned | `tx_burst` already batches at NIC level |
 
 ### Current Environment Assumptions
 
@@ -422,46 +573,19 @@ Integration testing runs on **AWS EC2 with VPC networking**, which has specific 
 
 ## Roadmap
 
-### Done
+All completed work is captured in the [What's Implemented](#whats-implemented) tables above. The detailed, agent-shippable task list lives in **[ROADMAP.md](ROADMAP.md)**.
 
-**Subnet-aware routing** — Subnet mask awareness with longest-prefix-match static routes, configurable default gateway, and MTU. Auto-detects subnet/gateway from `/proc/net/route` and seeds ARP cache from `/proc/net/arp` on Linux. Falls back to passthrough when detection fails. The library now runs correctly on bare-metal servers and on-premises environments. See `docs/routing.md`.
+### Next Major Features
 
-**Jumbo frames** — Configurable MTU via `NetworkConfig` (up to 9001 bytes). `send_to()` rejects payloads exceeding the MTU-derived limit. TxBuffer is always sized for jumbo frames to avoid reallocation.
+TCP and QUIC (IPv4) shipped in v0.3.0. Next:
 
-**RX checksum validation** — IPv4 header and UDP checksums are verified in software on every received packet. Packets with corrupted headers or payloads are silently dropped before reaching the application. Handles UDP checksum-disabled (0) per RFC 768.
+**TCP engine hardening** — RFC 6191 SYN-in-TIME_WAIT reuse, RFC 793 RST for an unacceptable ACK in SYN_SENT, and keeping MACs on a reopened connection.
 
-**TX hardware checksum offload** — When the NIC supports `CHECKSUM_PARTIAL` mode (e.g., ENA on AWS), the DPDK backend sets mbuf offload flags (`RTE_MBUF_F_TX_IP_CKSUM`, `RTE_MBUF_F_TX_UDP_CKSUM`) and writes the pseudo-header checksum so the NIC computes final checksums. Falls back to software checksums on NICs without offload or on non-DPDK backends.
+**Test depth** — real in-path loss for the TCP retransmit tests, and TCP integration tests on Graviton.
 
-**RX backpressure and drop counters** — Socket-level receive buffer accounting with a configurable byte limit (SO_RCVBUF equivalent) and lock-free atomic drop counters. Applications call `set_recv_buffer_size(bytes)` to tune the limit and `recv_drops()` to read a `RecvDropStats { packets, bytes }` snapshot for production monitoring. Drops are also surfaced via the existing `rx_drops_buffer_full` perf counter and rolled into the `rx_drops` rate on the perf reporter. Default is 256 KiB, mirroring Linux `net.core.rmem_default`.
+**TCP IPv6** — IPv6 address support in the TCP stack (additive over IPv4 TCP).
 
-**Gratuitous ARP** — Broadcasts an unsolicited ARP announcement on `bind()` so switches and routers learn the socket's MAC/IP mapping immediately, without waiting for inbound ARP requests. Configurable via `set_auto_garp(bool)` (enabled by default). Also available on-demand via `send_gratuitous_arp()` for failover or IP migration scenarios.
-
-**ICMP error handling** — ICMP error messages (Destination Unreachable, Time Exceeded, Redirect, Parameter Problem) are parsed and matched back to the originating socket using the embedded original datagram header. Errors are queued per-socket and surfaced via `take_error()`, mirroring Linux `SO_ERROR` behavior. Supported error types: Port/Host/Network Unreachable (`ConnectionRefused`), Fragmentation Needed with Next-Hop MTU (`Other`), TTL Exceeded (`TimedOut`), Admin Prohibited (`PermissionDenied`), and Parameter Problem (`InvalidData`). The error queue is bounded (16 entries) to prevent ICMP flood amplification.
-
-**VLAN (802.1Q)** — Full 802.1Q VLAN tag insert/strip with three operating modes matching Linux 8021q subinterface semantics. **Access mode**: RX accepts untagged + matching VID (strips tag), TX sends untagged. **Trunk mode**: RX accepts frames tagged with any VID in an allowed set (optional native VLAN for untagged), TX tags. **PortTagging mode** (default): RX only accepts matching VID (strips tag, drops untagged), TX always tags. Configurable per-socket via `set_vlan(Some(VlanConfig::new(100).access()))` or through `NetworkConfig::with_vlan()` on the builder. All protocol handlers (ARP, ICMP, UDP) handle VLAN-tagged frames. Checksum verification works correctly with VLAN-tagged frames.
-
-**Hardware VLAN offload** — NIC-assisted VLAN tag insert (TX) and strip (RX) when the hardware supports it, following the same pattern as checksum offload. NIC capabilities are queried at port init (`RTE_ETH_TX_OFFLOAD_VLAN_INSERT`, `RTE_ETH_RX_OFFLOAD_VLAN_STRIP`). On TX, the DPDK backend sets `mbuf.vlan_tci` and `RTE_MBUF_F_TX_VLAN` so the NIC inserts the 802.1Q tag on the wire. On RX, the NIC strips the tag into `mbuf.vlan_tci` with `RTE_MBUF_F_RX_VLAN_STRIPPED`; the hardware TCI is passed directly to `detect_vlan()` for zero-allocation VLAN filtering (see [NIC Hardware Offloads](#nic-hardware-offloads)). Falls back to software insert/strip on NICs without support or non-DPDK backends. Configurable via `VlanConfig::with_force_software(true)` to force software mode even when hardware offload is available. Offload status queryable via `has_tx_vlan_offload()` / `has_rx_vlan_offload()`.
-
-### Planned
-
-**IPv6** — Full dual-stack support. IPv6 is required for modern networks and public-facing services. Includes NDP (Neighbor Discovery Protocol) to replace ARP, ICMPv6, and IPv6 header construction/parsing throughout the stack.
-
-**UDP encapsulation (VXLAN/GUE/GENEVE)** — Support for UDP-based tunnel protocols. Enables the library to serve as a high-performance tunnel endpoint for overlay networks, which is a natural extension of DPDK's kernel-bypass advantage.
-
-### Not Currently Planned
-
-These are features the Linux kernel provides that we intentionally defer to the network infrastructure or consider out of scope:
-
-- **IP fragmentation/reassembly** — Modern networks use PMTUD; fragmentation is rare and problematic
-- **SO_REUSEPORT** — Use RSS to steer traffic to dedicated queues instead
-- **GSO/GRO** — DPDK's `rx_burst`/`tx_burst` already amortize per-packet costs
-- **Netfilter / iptables** — Rely on external filtering (Security Groups, hardware ACLs, upstream firewalls)
-- **Network namespaces** — Container isolation is a kernel concern
-- **BPF/XDP** — Not applicable to userspace DPDK. Hardware filtering is possible via DPDK's `rte_flow` API (FFI bindings exist but no safe wrapper yet — could be exposed if there is demand)
-- **TOS/DSCP** — Trivial to add when needed; most DPDK deployments use dedicated NICs where QoS is handled by the network
-- **Cork / MSG_MORE** — Scatter-gather send; low priority since DPDK's `tx_burst` already batches at the NIC level
-
-If you think a feature should be included, open an issue or feel free to cut a PR.
+**QUIC IPv6** — IPv6 address support in the QUIC provider (additive over IPv4 QUIC).
 
 ## DPDK Installation (Optional)
 
@@ -501,7 +625,7 @@ cdk deploy --profile your-aws-profile
 ```
 
 This creates:
-- 2x c6gn.large instances (sender/receiver)
+- 2x c5n.large instances (sender/receiver); the Graviton stack uses c7g.large
 - Dual ENIs (management + DPDK)
 - SSM access (no SSH keys needed)
 

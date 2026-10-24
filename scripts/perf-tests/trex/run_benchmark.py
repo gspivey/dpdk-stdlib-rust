@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
@@ -31,32 +32,56 @@ from trex.stl.api import STLClient, STLStream, STLTXCont, STLPktBuilder, STLFlow
 sys.path.insert(0, '/opt/trex/external_libs')
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, UDP
+from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
 
 
+def is_ipv6(addr):
+    """Check if an address string is IPv6."""
+    try:
+        return isinstance(ipaddress.ip_address(addr), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
 def build_streams(packet_size, src_ip, dst_ip, src_mac, dst_mac, src_port=12000, dst_port=9000):
-    """Build main traffic + latency measurement streams."""
-    min_payload = max(0, packet_size - 14 - 20 - 8 - 4)
+    """Build main traffic + latency measurement streams (IPv4 or IPv6)."""
+    use_ipv6 = is_ipv6(dst_ip)
+
+    if use_ipv6:
+        # IPv6: 14(eth) + 40(ipv6) + 8(udp) + 4(fcs) = 66 bytes minimum
+        ip_hdr_len = 40
+    else:
+        # IPv4: 14(eth) + 20(ipv4) + 8(udp) + 4(fcs) = 46 bytes minimum
+        ip_hdr_len = 20
+
+    min_payload = max(0, packet_size - 14 - ip_hdr_len - 8 - 4)
     payload = b'P' * min_payload
 
-    base_pkt = Ether(src=src_mac, dst=dst_mac) / IP(src=src_ip, dst=dst_ip) / \
-               UDP(sport=src_port, dport=dst_port) / Raw(payload)
+    if use_ipv6:
+        base_pkt = Ether(src=src_mac, dst=dst_mac) / IPv6(src=src_ip, dst=dst_ip) / \
+                   UDP(sport=src_port, dport=dst_port) / Raw(payload)
+    else:
+        base_pkt = Ether(src=src_mac, dst=dst_mac) / IP(src=src_ip, dst=dst_ip) / \
+                   UDP(sport=src_port, dport=dst_port) / Raw(payload)
 
     pad = max(0, packet_size - len(base_pkt) - 4)
     if pad > 0:
         base_pkt = base_pkt / Raw(b'\x00' * pad)
 
+    stream_prefix = 'udp6' if use_ipv6 else 'udp'
+
     main_stream = STLStream(
         packet=STLPktBuilder(pkt=base_pkt),
         mode=STLTXCont(),
-        name='udp_main'
+        name=f'{stream_prefix}_main'
     )
 
     latency_stream = STLStream(
         packet=STLPktBuilder(pkt=base_pkt),
         mode=STLTXCont(pps=1000),
         flow_stats=STLFlowLatencyStats(pg_id=0),
-        name='udp_latency'
+        name=f'{stream_prefix}_latency'
     )
 
     return [main_stream, latency_stream]

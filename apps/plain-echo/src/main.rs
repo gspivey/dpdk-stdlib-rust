@@ -14,9 +14,19 @@ struct Args {
     port: u16,
 }
 
+/// Build a `host:port` string valid for both IPv4 and IPv6 literals.
+/// IPv6 literals must be wrapped in brackets: `[2001:db8::1]:9000`.
+fn join_addr(ip: &str, port: u16) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{}]:{}", ip, port)
+    } else {
+        format!("{}:{}", ip, port)
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    let bind_addr = format!("{}:{}", args.ip, args.port);
+    let bind_addr = join_addr(&args.ip, args.port);
 
     let socket = UdpSocket::bind(&bind_addr)?;
     eprintln!("plain-echo listening on {}", socket.local_addr()?);

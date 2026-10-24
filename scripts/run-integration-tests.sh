@@ -29,10 +29,10 @@ CDK_DIR="$REPO_ROOT/deploy/cdk"
 
 SSM_READINESS_TIMEOUT=600    # 10 minutes to wait for SSM
 TEST_TIMEOUT=120             # 2 minutes per test scenario
-ENI_BIND_TIMEOUT=90          # 90 seconds for ENI bind/unbind (generous for SSM agent recovery)
+ENI_BIND_TIMEOUT=180         # ENI bind/unbind; CI binds regularly run 90-130s (see configure_eni)
 RESULTS_DIR="$REPO_ROOT/test-results"
 RESULTS_REMOTE_DIR="/tmp/test-results"
-CDK_STACK_NAME="DpdkTestStack"
+CDK_STACK_NAME="${CDK_STACK_NAME:-DpdkTestStack}"
 SSM_POLL_INTERVAL=15         # seconds between SSM readiness polls
 LOGS_DIR="$REPO_ROOT/instance-logs"
 FAILED_STEP=""               # Set by fail_with_logs; written to step summary / failure JSON
@@ -57,7 +57,8 @@ Arguments:
 Options:
   --teardown            Destroy AWS infrastructure after tests complete
   --skip-deploy         Skip CDK deployment (use existing infrastructure)
-  --tier <1|3>          Run only the specified test tier
+  --tier <value>        Run only the specified test tier
+                        (1|2|3|4|tcp1|tcp1a|tcp2|tcp-full|quic)
   --json-summary        Generate test-results/summary.json for agent consumption
   -h, --help            Show this help message
 
@@ -81,10 +82,13 @@ while [[ $# -gt 0 ]]; do
         --json-summary)  FLAG_JSON_SUMMARY=true;  shift ;;
         --tier)
             TIER_FILTER="$2"
-            if [[ "$TIER_FILTER" != "1" && "$TIER_FILTER" != "2" && "$TIER_FILTER" != "3" ]]; then
-                echo "ERROR: --tier must be 1, 2, or 3, got: $TIER_FILTER" >&2
-                exit 2
-            fi
+            case "$TIER_FILTER" in
+                1|2|3|4|tcp1|tcp1a|tcp2|tcp-full|quic) ;;
+                *)
+                    echo "ERROR: --tier must be one of: 1 2 3 4 tcp1 tcp1a tcp2 tcp-full quic, got: $TIER_FILTER" >&2
+                    exit 2
+                    ;;
+            esac
             shift 2
             ;;
         -h|--help)
@@ -158,7 +162,32 @@ post_pr_comment() {
 
 # ── Process cleanup and ARP warming ──────────────────────────────────────────
 
-CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+CLEANUP_CMD="pkill -f 'target/release/echo' 2>/dev/null || true; pkill -f 'target/release/test-client' 2>/dev/null || true; pkill -f 'target/release/tokio-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tokio-tcp-echo' 2>/dev/null || true; pkill -f 'target/release/tcp-test-client' 2>/dev/null || true; pkill -f 'target/release/tcp-kernel-client' 2>/dev/null || true; pkill -f 'target/release/plain-tcp-echo' 2>/dev/null || true; pkill -f 'python3.*udp_echo' 2>/dev/null || true; pkill -f 'ncat -l -k' 2>/dev/null || true; pkill -f 'iperf3 -s' 2>/dev/null || true; sleep 2; rm -rf /var/run/dpdk/ 2>/dev/null || true"
+
+# Runs on the instance after CLEANUP_CMD: wait until no process holds /dev/vfio
+# (escalating to SIGKILL at 5s), then print `dpdk_free: ok`, or list the holders and
+# exit 1. Single-quoted so it expands on the instance; it must contain no double
+# quotes or ${...}, because ssm_run_command embeds it in commands=["..."].
+# shellcheck disable=SC2016
+DPDK_FREE_CHECK='for i in $(seq 1 10); do h=$(for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q /dev/vfio/ && echo $(basename $p):$(cat $p/comm 2>/dev/null); done | paste -sd, -); if [ x$h = x ]; then echo dpdk_free: ok; exit 0; fi; if [ $i -eq 5 ]; then pkill -9 -f target/release/ 2>/dev/null; fi; sleep 1; done; echo dpdk_free: FAIL holders=$h; exit 1'
+
+# Kill leftover test binaries on both instances and confirm nothing still holds
+# the DPDK NIC before the next tier starts. A tier's listener script keeps its
+# server alive for up to max_wait (120s), and cancelling its SSM command does not
+# kill that child, so without this the previous tier's server still owns
+# /dev/vfio/noiommu-0 and the next DPDK server dies at EAL init with
+# "Device or resource busy" / "Port init failed: Invalid port ID: 0".
+ensure_dpdk_free() {
+    local label="$1" inst rc=0
+    for inst in "$SENDER_INSTANCE_ID" "$RECEIVER_INSTANCE_ID"; do
+        if ! ssm_run_command "$inst" 60 "${CLEANUP_CMD}; ${DPDK_FREE_CHECK}"; then
+            log_error "dpdk_free ($label): a process still holds /dev/vfio on $inst"
+            rc=1
+        fi
+    done
+    [[ $rc -eq 0 ]] && log_info "dpdk_free ($label): ok on both instances"
+    return $rc
+}
 
 # Warm the kernel ARP cache so DPDK can seed from /proc/net/arp.
 # In AWS VPC, the gateway MAC is needed for all DPDK outbound frames.
@@ -225,7 +254,7 @@ deploy_infrastructure() {
     # Pass pre-built AMI ID to CDK if available
     local cdk_context_args=""
     if [[ -n "${DPDK_AMI_ID:-}" ]]; then
-        cdk_context_args="-c amiId=${DPDK_AMI_ID}"
+        cdk_context_args="-c ${CDK_AMI_CONTEXT_KEY:-amiId}=${DPDK_AMI_ID}"
         log_info "Using pre-built DPDK AMI: $DPDK_AMI_ID"
     else
         log_info "No pre-built AMI specified, using stock AL2023 with full bootstrap"
@@ -431,37 +460,51 @@ wait_for_ssm_readiness() {
 }
 
 verify_build() {
-    log_info "Verifying project build on instances (parallel)..."
+    log_info "Verifying project build on instances (with retry for cloud-init build time)..."
 
-    local sender_cmd_id receiver_cmd_id
-    sender_cmd_id=$(ssm_run_command_async "$SENDER_INSTANCE_ID" 30 \
-        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
-    receiver_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" 30 \
-        "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
+    # The build runs inside cloud-init user-data and takes ~4-7 min on Graviton.
+    # SSM becomes responsive before the build completes, so we poll until the
+    # binary appears rather than checking once and failing immediately.
+    local BUILD_POLL_INTERVAL=20   # seconds between polls
+    local BUILD_TIMEOUT=600        # 10 minutes max (build is ~4-7 min)
 
-    for entry in "sender:${SENDER_INSTANCE_ID}:${sender_cmd_id}" "receiver:${RECEIVER_INSTANCE_ID}:${receiver_cmd_id}"; do
-        local label="${entry%%:*}"
-        local rest="${entry#*:}"
-        local instance_id="${rest%%:*}"
-        local cmd_id="${rest##*:}"
+    for role_entry in "sender:$SENDER_INSTANCE_ID" "receiver:$RECEIVER_INSTANCE_ID"; do
+        local label="${role_entry%%:*}"
+        local instance_id="${role_entry##*:}"
 
-        if [[ -z "$cmd_id" ]]; then
-            log_error "Failed to send build verification command to $label ($instance_id)"
-            return 1
-        fi
+        log_info "Waiting for build on $label ($instance_id)..."
+        local elapsed=0
+        local found=false
 
-        if ! ssm_wait_command "$instance_id" "$cmd_id" 60; then
-            log_error "Build verification command timed out on $label ($instance_id)"
-            return 1
-        fi
+        while [[ $elapsed -lt $BUILD_TIMEOUT ]]; do
+            local cmd_id
+            cmd_id=$(ssm_run_command_async "$instance_id" 30 \
+                "test -f /opt/dpdk-stdlib/target/release/echo && echo BUILD_OK || echo BUILD_MISSING")
 
-        local result
-        result=$(ssm_get_stdout "$instance_id" "$cmd_id")
+            if [[ -z "$cmd_id" ]]; then
+                log_error "Failed to send build check to $label — retrying in ${BUILD_POLL_INTERVAL}s"
+                sleep "$BUILD_POLL_INTERVAL"
+                elapsed=$((elapsed + BUILD_POLL_INTERVAL))
+                continue
+            fi
 
-        if echo "$result" | grep -q "BUILD_OK"; then
-            log_info "Build verified on $label ($instance_id)"
-        else
-            log_error "Build not found on $label ($instance_id) (output: $result)"
+            if ssm_wait_command "$instance_id" "$cmd_id" 60 2>/dev/null; then
+                local result
+                result=$(ssm_get_stdout "$instance_id" "$cmd_id")
+                if echo "$result" | grep -q "BUILD_OK"; then
+                    log_info "Build verified on $label ($instance_id) after ${elapsed}s"
+                    found=true
+                    break
+                fi
+            fi
+
+            log_info "Build not ready on $label (${elapsed}s elapsed) — cloud-init still running, waiting ${BUILD_POLL_INTERVAL}s..."
+            sleep "$BUILD_POLL_INTERVAL"
+            elapsed=$((elapsed + BUILD_POLL_INTERVAL))
+        done
+
+        if [[ "$found" != "true" ]]; then
+            log_error "Build verification timed out on $label ($instance_id) after ${BUILD_TIMEOUT}s — echo binary never appeared"
             return 1
         fi
     done
@@ -653,6 +696,74 @@ ssm_get_stdout() {
         --output text 2>/dev/null
 }
 
+# Run a command on an instance via SSM, wait for completion, and print its
+# StandardOutputContent to stdout. Used by the QUIC cert-transfer and
+# build-verification steps.
+#
+# NOTE on argument order: this uses (instance_id, timeout, command) to match the
+# orchestrator's own ssm_run_command / ssm_run_command_async convention. The
+# reference implementation at run-quic-perf.sh:175 uses the OPPOSITE order
+# (instance_id, command, timeout); the reordering here is deliberate — only the
+# send+wait+get-stdout logic is ported, not the signature.
+#
+# Remote commands passed to this helper SHOULD always exit 0 (e.g. append
+# `|| true`) so a not-yet-present file does not generate false SSM failure logs
+# while polling.
+#
+# Usage: ssm_run_get_output <instance_id> <timeout_seconds> <command_string>
+# Prints: remote StandardOutputContent on success; returns 1 on SSM failure.
+ssm_run_get_output() {
+    local instance_id="$1"
+    local timeout_secs="$2"
+    local command_str="$3"
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$command_str\"]" \
+        --timeout-seconds "$timeout_secs" \
+        --query "Command.CommandId" \
+        --output text 2>/dev/null || true)
+
+    if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then
+        log_error "ssm_run_get_output: send-command failed on $instance_id" >&2
+        return 1
+    fi
+
+    local poll_limit=$((timeout_secs + 30))
+    local elapsed=0
+    local status=""
+    while [[ $elapsed -lt $poll_limit ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+
+        status=$(aws ssm get-command-invocation \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" \
+            --output text 2>/dev/null || echo "Pending")
+
+        case "$status" in
+            Success)
+                aws ssm get-command-invocation \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query "StandardOutputContent" \
+                    --output text 2>/dev/null
+                return 0
+                ;;
+            Failed|TimedOut|Cancelled)
+                log_error "ssm_run_get_output: command $status on $instance_id (cmd: $cmd_id)" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    log_error "ssm_run_get_output: polling timed out on $instance_id after ${poll_limit}s (last status: $status)" >&2
+    return 1
+}
+
 # Cancel an in-flight SSM command (e.g., a listener that's still running).
 # Usage: ssm_cancel_command <instance_id> <command_id>
 ssm_cancel_command() {
@@ -681,12 +792,41 @@ configure_eni() {
         cmd+=" && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"
     fi
 
-    if ! ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
-        log_error "ENI $action failed on $instance_id — fetching ENI status for diagnostics..."
-        ssm_run_command "$instance_id" 30 \
-            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status" || true
-        return 1
+    if ssm_run_command "$instance_id" "$ENI_BIND_TIMEOUT" "$cmd"; then
+        return 0
     fi
+
+    # The SSM agent can go silent for minutes right after a driver change while
+    # it reconnects, although the change itself already happened (PR #131: the
+    # sender's vfio-pci bind is in dmesg, its SSM command still InProgress at
+    # 120s, and the phase was skipped as "bind failed"). Ask for the actual
+    # driver state, retrying while the agent recovers, before failing the step.
+    local want="STATUS: bound_to_vfio" attempt status_id status_out=""
+    [[ "$action" == "unbind" ]] && want="STATUS: bound_to_ena"
+    log_error "ENI $action on $instance_id did not report success — checking the actual driver state..."
+    for attempt in 1 2 3 4; do
+        status_id=$(ssm_run_command_async "$instance_id" 60 \
+            "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action status")
+        status_out=""
+        if [[ -n "$status_id" ]] && ssm_wait_command "$instance_id" "$status_id" 60; then
+            status_out=$(ssm_get_stdout "$instance_id" "$status_id" || true)
+        fi
+        [[ -n "$status_out" ]] && echo "$status_out"
+        if grep -qF "$want" <<< "$status_out"; then
+            # unbind also assigns the kernel IP; that step may not have run
+            # before the agent stalled, and do_assign_ip is idempotent.
+            if [[ "$action" == "unbind" && -n "$expected_ip" ]] && ! ssm_run_command "$instance_id" 60 \
+                "cd /opt/dpdk-stdlib && bash scripts/integration-tests/configure-eni.sh --action assign-ip --ip $expected_ip"; then
+                log_error "ENI unbind on $instance_id: driver is ena but assign-ip $expected_ip failed"
+                return 1
+            fi
+            log_info "ENI $action on $instance_id confirmed by status (${want#STATUS: }) on check $attempt"
+            return 0
+        fi
+        [[ -n "$status_out" ]] && break   # agent answered with the wrong state: a real failure
+    done
+    log_error "ENI $action failed on $instance_id (want ${want#STATUS: })"
+    return 1
 }
 
 # ── Tier execution ───────────────────────────────────────────────────────────
@@ -903,6 +1043,472 @@ run_tier4() {
     log_info "Tier 4 execution complete"
 }
 
+# ── TCP smoke tiers ──────────────────────────────────────────────────────────
+
+# Shared driver for a DPDK<->DPDK TCP echo pair (both instances on DPDK).
+# $1 = server binary name (tcp-echo | tokio-tcp-echo), $2 = output XML basename,
+# $3 = suite name for synthetic failure XML.
+_tier1_tcp_impl() {
+    local server_binary="$1"
+    local out_xml="$2"
+    local suite="$3"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    log_info "Starting TCP listener on receiver (server=$server_binary)..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary $server_binary"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener ($server_binary)"
+        generate_failure_xml "$suite" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    log_info "Starting TCP sender on sender..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/$out_xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "TCP sender test execution failed ($server_binary)"
+        generate_failure_xml "$suite" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+}
+
+run_tier1_tcp() {
+    log_section "Tier 1 TCP (sync): DPDK <-> DPDK TCP echo test"
+    _tier1_tcp_impl "tcp-echo" "tier1-tcp-echo.xml" "tier1-tcp-echo"
+    log_info "Tier 1 TCP (sync) execution complete"
+}
+
+run_tier1_tcp_async() {
+    log_section "Tier 1 TCP (async): DPDK <-> DPDK tokio TCP echo test"
+    _tier1_tcp_impl "tokio-tcp-echo" "tier1-tcp-echo-async.xml" "tier1-tcp-echo-async"
+    log_info "Tier 1 TCP (async) execution complete"
+}
+
+run_tier2_tcp() {
+    log_section "Tier 2 TCP: kernel client -> DPDK TCP server test"
+
+    # Bind receiver ENI (DPDK), unbind sender ENI (kernel) — mirrors run_tier2.
+    log_info "Configuring ENIs for Tier 2 TCP..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "tier2-tcp-echo" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    sleep 3
+    configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+
+    warm_arp_cache
+
+    log_info "Starting DPDK TCP listener on receiver..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener"
+        generate_failure_xml "tier2-tcp-echo" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    log_info "Starting kernel TCP client on sender (kernel networking)..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-tcp-echo.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "Kernel client test execution failed"
+        generate_failure_xml "tier2-tcp-echo" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+
+    log_info "Tier 2 TCP execution complete"
+}
+
+# ── TCP full test suite ──────────────────────────────────────────────────────
+#
+# Runs all TCP integration test scripts (tier1, tier2, tier3) in sequence.
+# Used by the tcp-integration-tests CI job which has continue-on-error: true.
+
+# Shared driver for DPDK<->DPDK TCP tests (both instances on DPDK).
+# $1 = test script basename, $2 = suite name for failure XML
+_run_tcp_dpdk_pair() {
+    local script_name="$1"
+    local suite="$2"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    # Start server on receiver
+    log_info "Starting TCP server on receiver for $suite..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$server_cmd")
+
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start TCP server ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP server on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # Run client on sender
+    log_info "Starting TCP client on sender for $suite..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+        log_error "TCP client execution failed ($suite)"
+        generate_failure_xml "$suite" "Client test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+}
+
+# Variant for scripts that use listener/sender role names (e.g., tier1-tcp-echo.sh)
+# $1 = test script basename, $2 = suite name for failure XML
+_run_tcp_dpdk_pair_lr() {
+    local script_name="$1"
+    local suite="$2"
+
+    log_info "Binding ENIs for $suite..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    warm_arp_cache
+
+    # Start listener on receiver
+    log_info "Starting TCP listener on receiver for $suite..."
+    local listener_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local listener_cmd_id
+    listener_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$listener_cmd")
+
+    if [[ -z "$listener_cmd_id" ]]; then
+        log_error "Failed to start TCP listener ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP listener on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # Run sender on sender instance
+    log_info "Starting TCP sender on sender for $suite..."
+    local sender_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$sender_cmd"; then
+        log_error "TCP sender execution failed ($suite)"
+        generate_failure_xml "$suite" "Sender test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
+    fi
+}
+
+# Shared driver for kernel-interop TCP tests (receiver DPDK, sender kernel).
+# $1 = test script basename, $2 = suite name for failure XML
+# Usage: _run_tcp_kernel_interop <script> <suite> <tests> <kernel-sender|dpdk-sender>
+#   kernel-sender: receiver DPDK, sender kernel (ncat -> DPDK echo, iperf3 path check)
+#   dpdk-sender:   both DPDK; the DPDK client targets the receiver's PRIMARY
+#                  (kernel) IP, where its ncat/iperf3 listeners actually answer
+_run_tcp_kernel_interop() {
+    local script_name="$1"
+    local suite="$2"
+    local tests="$3"
+    local mode="$4"
+
+    log_info "Configuring ENIs for $suite ($mode)..."
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+    sleep 3
+    if [[ "$mode" == "dpdk-sender" ]]; then
+        if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+            log_error "Failed to bind ENI on sender"
+            generate_failure_xml "$suite" "ENI bind failed on sender instance"
+            return 1
+        fi
+    else
+        configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+    fi
+
+    local receiver_kernel_ip
+    receiver_kernel_ip=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 30 "hostname -I | cut -d' ' -f1" | tr -d '[:space:]')
+    if [[ -z "$receiver_kernel_ip" ]]; then
+        log_error "Could not read the receiver's primary IP ($suite)"
+        generate_failure_xml "$suite" "Receiver primary IP lookup failed"
+        return 1
+    fi
+    log_info "Receiver primary (kernel) IP: $receiver_kernel_ip"
+
+    warm_arp_cache
+
+    # Start DPDK server on receiver
+    log_info "Starting DPDK TCP server on receiver for $suite..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT" "$server_cmd")
+
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start TCP server ($suite)"
+        generate_failure_xml "$suite" "Failed to start TCP server on receiver"
+        return 1
+    fi
+
+    sleep 10
+
+    # The client binds SENDER_DPDK_ENI_IP: the kernel holds it after an unbind
+    # (kernel-sender), DPDK owns it after a bind (dpdk-sender).
+    log_info "Starting TCP client on sender for $suite ($tests)..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/${script_name} --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --peer-kernel-ip $receiver_kernel_ip --tests $tests --port 9000 --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT" "$client_cmd"; then
+        log_error "Kernel TCP client execution failed ($suite)"
+        generate_failure_xml "$suite" "Client test execution failed or timed out"
+    fi
+
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+}
+
+run_tcp_full() {
+    log_section "TCP Full Test Suite"
+
+    # Grouped by ENI topology so each host moves between the kernel driver and
+    # vfio-pci at most once per run, as in the all-tiers Phase A/B/C flow.
+    # The suite used to unbind both ENIs after every sub-suite and rebind them
+    # for the next (6+ real cycles per host); repeated vfio bind/unbind cycles
+    # wedge the device (">120s unbind", "ENI bind failed on receiver").
+    #
+    #   Phase A — receiver DPDK, sender kernel: tier3 kernel interop
+    #   Phase B — both DPDK: every DPDK <-> DPDK sub-suite
+    #
+    # The per-suite helpers still call configure_eni; configure-eni.sh is a
+    # no-op when the ENI is already in the requested state, so within a phase
+    # those calls do not cycle the device. ensure_dpdk_free kills the previous
+    # sub-suite's server before the next starts (see ensure_dpdk_free).
+
+    # ── Phase A: receiver DPDK, sender kernel ───────────────────────────────
+    log_section "TCP Tier 3: Kernel Interop (ncat/iperf3 <-> DPDK)"
+    ensure_dpdk_free "tcp-full: before tier3-tcp-kernel-interop" || true
+    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop" \
+        "ncat_to_dpdk_echo,iperf3_throughput" kernel-sender || true
+
+    # ── Phase B: both instances on DPDK (sender binds once, here) ───────────
+    local entry script suite
+    for entry in \
+        "pair:tier1-tcp-handshake.sh:tier1-tcp-handshake" \
+        "pair_lr:tier1-tcp-echo.sh:tier1-tcp-echo-full" \
+        "pair:tier1-tcp-shutdown.sh:tier1-tcp-shutdown" \
+        "pair:tier2-tcp-retransmit.sh:tier2-tcp-retransmit" \
+        "pair:tier2-tcp-flow-control.sh:tier2-tcp-flow-control" \
+        "pair:tier3-tcp-std-parity.sh:tier3-tcp-std-parity"; do
+        IFS=: read -r kind script suite <<< "$entry"
+        log_section "TCP: ${suite} (DPDK <-> DPDK)"
+        ensure_dpdk_free "tcp-full: before ${suite}" || true
+        if [[ "$kind" == "pair_lr" ]]; then
+            _run_tcp_dpdk_pair_lr "$script" "$suite" || true
+        else
+            _run_tcp_dpdk_pair "$script" "$suite" || true
+        fi
+    done
+
+    # DPDK client -> kernel ncat needs DPDK on the sender, so it runs here.
+    log_section "TCP Tier 3: Kernel Interop, DPDK client (DPDK -> ncat)"
+    ensure_dpdk_free "tcp-full: before tier3-tcp-kernel-interop-dpdk" || true
+    _run_tcp_kernel_interop "tier3-tcp-kernel-interop.sh" "tier3-tcp-kernel-interop-dpdk" \
+        "dpdk_to_ncat_echo" dpdk-sender || true
+
+    log_info "TCP Full Test Suite execution complete"
+}
+
+# ── QUIC Tier 1 (DPDK <-> DPDK) ──────────────────────────────────────────────
+#
+# Additive QUIC wiring: these functions run only when `--tier quic` is selected
+# (see main()). They reuse the shared SSM/ENI/ARP helpers and do NOT alter any
+# existing tier function or the UDP `verify_build` step. The existing QUIC
+# harness (scripts/integration-tests/tier1-quic-handshake.sh) is treated as
+# correct and is invoked unmodified.
+
+# Verify the QUIC binaries exist on both instances before running the tier.
+# Emits a synthetic failure XML and returns 1 if either binary is missing.
+# Separate from the UDP verify_build; runs only for the QUIC tier (Req 2.7).
+# quic-echo-server runs on the receiver (server role); quic-test-client runs on
+# the sender (client role). Each remote check always exits 0 to suppress false
+# SSM failure logs.
+quic_verify_build() {
+    local suite="$1"
+    local bindir="/opt/dpdk-stdlib/target/release"
+
+    local recv_out
+    recv_out=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 60 \
+        "test -x $bindir/quic-echo-server && echo OK || echo MISSING") || recv_out=""
+    local send_out
+    send_out=$(ssm_run_get_output "$SENDER_INSTANCE_ID" 60 \
+        "test -x $bindir/quic-test-client && echo OK || echo MISSING") || send_out=""
+
+    if [[ "$recv_out" != *OK* || "$send_out" != *OK* ]]; then
+        log_error "QUIC build verification failed (receiver: '${recv_out:-<none>}', sender: '${send_out:-<none>}')"
+        generate_failure_xml "$suite" "QUIC build verification failed: quic-echo-server / quic-test-client missing at $bindir"
+        return 1
+    fi
+    log_info "QUIC binaries present: quic-echo-server (receiver), quic-test-client (sender)"
+}
+
+# Transfer the QUIC server's self-signed cert from the receiver (server) to the
+# sender (client). The server writes /tmp/quic-server-cert.pem only AFTER it logs
+# QUIC_SERVER_READY, so a non-empty cert observed on the server IS the readiness
+# check — there is no separate readiness signal to wait on.
+#
+# The cert is read base64-encoded (base64 -w 0, single line) and decoded on the
+# client. Base64 guarantees byte-exact PEM transfer and avoids shell-quoting /
+# newline / `%` corruption that a sed/printf-escaping approach would suffer.
+# Returns 0 on success; on failure emits a synthetic failure XML and returns 1.
+quic_transfer_cert() {
+    local suite="$1"
+    local cert_path="/tmp/quic-server-cert.pem"
+
+    # Bounded wait (up to ~60s) for a non-empty cert on the server. The
+    # `|| true` keeps the remote command exit 0 so a not-yet-written cert does
+    # not log a false SSM failure.
+    local waited=0 b64=""
+    while [[ $waited -lt 60 ]]; do
+        sleep 5
+        waited=$((waited + 5))
+        b64=$(ssm_run_get_output "$RECEIVER_INSTANCE_ID" 60 \
+            "base64 -w 0 $cert_path 2>/dev/null || true") || b64=""
+        b64=$(echo "$b64" | tr -d '[:space:]')
+        [[ -n "$b64" ]] && break
+    done
+
+    if [[ -z "$b64" ]]; then
+        log_error "QUIC server cert not available after ${waited}s"
+        generate_failure_xml "$suite" "QUIC certificate transfer failed: server cert unavailable"
+        return 1
+    fi
+
+    # Write the cert to the client, decoding base64 back to exact PEM bytes.
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" 60 \
+        "printf '%s' '$b64' | base64 -d > $cert_path"; then
+        log_error "Failed to write QUIC cert to client"
+        generate_failure_xml "$suite" "QUIC certificate transfer failed: could not write to client"
+        return 1
+    fi
+
+    log_info "QUIC server cert transferred to client at $cert_path"
+}
+
+# Run the QUIC Tier 1 test (DPDK <-> DPDK handshake + bidir echo). Modeled on
+# _run_tcp_dpdk_pair with the QUIC-specific cert handoff inserted between the
+# server start and the client run. Reuses configure_eni, warm_arp_cache,
+# ssm_run_command_async, ssm_run_command, ssm_wait_command, ssm_cancel_command.
+run_quic_tier1() {
+    log_section "QUIC Tier 1: Handshake + bidir echo (DPDK <-> DPDK)"
+
+    local suite="tier1-quic-handshake"
+    local port=4433
+
+    # Measurable SSM command timeouts (Requirement 1.9).
+    local QUIC_SERVER_TIMEOUT=300   # async server SSM command
+    local QUIC_CLIENT_TIMEOUT=240   # synchronous client SSM command
+
+    # 0. Verify QUIC binaries exist before anything else (Req 2.7). Does NOT
+    #    touch the UDP verify_build path.
+    if ! quic_verify_build "$suite"; then
+        return 1
+    fi
+
+    # 1. Bind ENIs on both instances (same as the TCP DPDK pair).
+    log_info "Binding ENIs for QUIC Tier 1..."
+    if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on sender"
+        generate_failure_xml "$suite" "ENI bind failed on sender instance"
+        return 1
+    fi
+    if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+        log_error "Failed to bind ENI on receiver"
+        generate_failure_xml "$suite" "ENI bind failed on receiver instance"
+        return 1
+    fi
+
+    # 2. Warm the kernel ARP cache so the QUIC binaries can seed the gateway MAC.
+    warm_arp_cache
+
+    # 3. Start the QUIC server (receiver) as an async SSM command.
+    log_info "Starting QUIC server on receiver..."
+    local server_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-quic-handshake.sh --role server --bind-ip $RECEIVER_DPDK_ENI_IP --port $port"
+    local server_cmd_id
+    server_cmd_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$QUIC_SERVER_TIMEOUT" "$server_cmd")
+    if [[ -z "$server_cmd_id" ]]; then
+        log_error "Failed to start QUIC server on receiver"
+        generate_failure_xml "$suite" "Failed to start QUIC server on receiver"
+        return 1
+    fi
+
+    # 4. Cert poll IS the readiness check: transfer the cert to the client.
+    if ! quic_transfer_cert "$suite"; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+        return 1
+    fi
+
+    # 5. Run the QUIC client (sender). This writes the JUnit XML.
+    log_info "Starting QUIC client on sender..."
+    local client_cmd="cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-quic-handshake.sh --role client --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port $port --output $RESULTS_REMOTE_DIR/${suite}.xml"
+    if ! ssm_run_command "$SENDER_INSTANCE_ID" "$QUIC_CLIENT_TIMEOUT" "$client_cmd"; then
+        log_error "QUIC client execution failed or timed out"
+        generate_failure_xml "$suite" "QUIC client execution failed or timed out"
+    fi
+
+    # 6. Wait for / cancel the server (same as the TCP pair).
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+        ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
+    fi
+
+    log_info "QUIC Tier 1 execution complete"
+}
+
 # ── Unbind ENIs between tiers ────────────────────────────────────────────────
 
 unbind_all_enis() {
@@ -1086,6 +1692,138 @@ print_summary() {
     fi
 }
 
+# ── Known-failures ratchet (tcp-ci-reliability Req 1.4) ──────────────────────
+# A PR MUST NOT add new xfail entries to ci/known-failures.txt. Runs before the
+# TCP suite. Delegates to the standalone gate script in --ratchet mode. If the
+# base ref is not available in the CI checkout (shallow clone), the ratchet is
+# skipped with a warning rather than failing the run — the standalone CI step
+# (if wired) fetches the base ref explicitly. A detected addition sets
+# TEST_EXIT_CODE=1 so the suite goes RED.
+run_known_failures_ratchet() {
+    local known_file="$REPO_ROOT/ci/known-failures.txt"
+    local gate="$SCRIPT_DIR/ci/check-known-failures.sh"
+    local base="${BASE_REF:-${GITHUB_BASE_REF:+origin/$GITHUB_BASE_REF}}"
+    base="${base:-origin/development}"
+
+    [[ -f "$known_file" ]] || return 0
+    [[ -x "$gate" ]] || { log_error "ratchet: $gate missing"; TEST_EXIT_CODE=1; return 0; }
+
+    if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+        log_info "ratchet: base ref '$base' not present in checkout — skipping ratchet"
+        return 0
+    fi
+
+    log_section "Known-failures ratchet"
+    if "$gate" --ratchet --base "$base" --known-file "$known_file"; then
+        log_info "ratchet: ok"
+    else
+        log_error "ratchet: PR adds xfail entries — suite is RED"
+        TEST_EXIT_CODE=1
+    fi
+}
+
+# ── Known-failures gate (tcp-ci-reliability Req 1) ───────────────────────────
+# Reconciles the raw pass/fail count with ci/known-failures.txt. The TCP suite
+# is GREEN (TEST_EXIT_CODE=0) only when:
+#   - every listed test failed as EXPECTED (Req 1.1),
+#   - no listed test passed unexpectedly (Req 1.2),
+#   - no listed test was skipped / did not run (Req 1.3),
+#   - no UNLISTED test failed.
+# Otherwise TEST_EXIT_CODE=1. If ci/known-failures.txt is absent the gate is a
+# no-op and the raw count stands (back-compat).
+evaluate_known_failures_gate() {
+    local known_file="$REPO_ROOT/ci/known-failures.txt"
+    local gate="$SCRIPT_DIR/ci/check-known-failures.sh"
+
+    if [[ ! -f "$known_file" ]]; then
+        log_info "known-failures gate: no ci/known-failures.txt — raw result stands"
+        return 0
+    fi
+    if [[ ! -x "$gate" ]]; then
+        log_error "known-failures gate: $gate missing or not executable"
+        TEST_EXIT_CODE=1
+        return 0
+    fi
+
+    log_section "Known-failures gate"
+
+    # 1. xfail evaluation of the listed tests.
+    local xfail_ok=0
+    if "$gate" --known-file "$known_file" --results-dir "$RESULTS_DIR"; then
+        xfail_ok=1
+    else
+        xfail_ok=0
+    fi
+
+    # 2. Any UNLISTED test that failed must still fail the suite. Compute the set
+    #    of failed (suite,name) pairs from the JUnit XMLs and subtract the listed
+    #    entries (bare name or suite/name).
+    local unlisted_fail
+    unlisted_fail=$(KNOWN_FILE="$known_file" RESULTS_DIR="$RESULTS_DIR" python3 - <<'PYEOF'
+import os, re, html
+results_dir = os.environ["RESULTS_DIR"]
+known_file  = os.environ["KNOWN_FILE"]
+
+listed = []
+with open(known_file, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if line:
+            listed.append(line)
+
+def is_listed(suite, name):
+    for e in listed:
+        if "/" in e:
+            s, n = e.split("/", 1)
+            if s == suite and n == name:
+                return True
+        elif e == name:
+            return True
+    return False
+
+unlisted = 0
+if os.path.isdir(results_dir):
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".xml"):
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        sm = re.search(r'<testsuite\s+([^>]*)>', content)
+        suite = "unknown"
+        if sm:
+            m = re.search(r'name="([^"]*)"', sm.group(1))
+            if m:
+                suite = html.unescape(m.group(1))
+        for tc in re.finditer(r'<testcase\s+([^>]*?)(/>|>(.*?)</testcase>)', content, re.DOTALL):
+            attrs = tc.group(1); body = tc.group(3) or ""
+            m = re.search(r'name="([^"]*)"', attrs)
+            name = html.unescape(m.group(1)) if m else "unknown"
+            failed = ("<failure" in body) or ("<error" in body)
+            if failed and not is_listed(suite, name):
+                unlisted += 1
+print(unlisted)
+PYEOF
+)
+    unlisted_fail="${unlisted_fail:-0}"
+
+    if [[ "$unlisted_fail" -gt 0 ]]; then
+        log_error "known-failures gate: $unlisted_fail unlisted test failure(s) — suite is RED"
+    fi
+
+    if [[ "$xfail_ok" -eq 1 && "$unlisted_fail" -eq 0 ]]; then
+        log_info "known-failures gate: GREEN (only expected failures remain)"
+        TEST_EXIT_CODE=0
+        # Rewrite the expected (listed) failures as <skipped> in the JUnit XMLs
+        # so downstream reporters (dorny/test-reporter, fail-on-error:true) do
+        # not fail the job on known bugs. Only done on a GREEN verdict, so an
+        # unlisted regression still leaves a <failure> for the reporter to catch.
+        "$gate" --rewrite-xfails --known-file "$known_file" --results-dir "$RESULTS_DIR" || true
+    else
+        log_error "known-failures gate: RED (xfail_ok=$xfail_ok unlisted_failures=$unlisted_fail)"
+        TEST_EXIT_CODE=1
+    fi
+}
+
 # ── JSON summary generation ──────────────────────────────────────────────────
 
 generate_json_summary() {
@@ -1215,25 +1953,149 @@ PYEOF
     log_info "JSON summary generated: $RESULTS_DIR/summary.json"
 }
 
+# Generate a self-contained, analyzable Markdown summary of all tiers: per-tier,
+# per-testcase pass/fail WITH the failure reason, classifying each failure as a
+# real test failure (JUnit type=AssertionError, from the tier scripts) vs an
+# infra/setup flake (type=ExecutionError, from generate_failure_xml — ENI bind /
+# SSM / listener-start timeouts). Written to summary.md so a reviewer can analyze
+# a run from the PR comment alone, without downloading artifacts or using gh.
+generate_markdown_summary() {
+    local commit_hash run_url label
+    commit_hash=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-gspivey/dpdk-stdlib-rust}/actions/runs/${GITHUB_RUN_ID:-0}"
+    label="${GITHUB_WORKFLOW:-Integration Tests}"
+    python3 - "$RESULTS_DIR" "$commit_hash" "$run_url" "$label" > "$RESULTS_DIR/summary.md" <<'PYEOF'
+import re, os, sys, html
+
+results_dir, commit, run_url, label = sys.argv[1:5]
+# Infra/setup failures use JUnit type=ExecutionError (generate_failure_xml); real
+# test failures use type=AssertionError (harness junit_add_failure). Fall back to
+# a keyword match if the type is missing.
+INFRA_RE = re.compile(r'ENI|SSM|Polling timeout|configure-eni|assign-ip|Failed to start|unbind|IP assignment|listener|readiness|instance', re.I)
+
+def classify(ftype, msg):
+    if (ftype or '') == 'ExecutionError':
+        return 'infra'
+    if (ftype or '') == 'AssertionError':
+        return 'real'
+    return 'infra' if INFRA_RE.search(msg or '') else 'real'
+
+def cell(s):
+    s = html.unescape(s or '').replace('\n', ' ').replace('|', r'\|').strip()
+    return (s[:90] + '…') if len(s) > 91 else s
+
+rows, reals, infras = [], [], []
+total = passed = n_real = n_infra = 0
+
+for xmlf in sorted(os.listdir(results_dir)):
+    if not xmlf.endswith('.xml'):
+        continue
+    with open(os.path.join(results_dir, xmlf)) as f:
+        content = f.read()
+    sm = re.search(r'<testsuite\s+([^>]+)>', content)
+    if not sm:
+        continue
+    m = re.search(r'name="([^"]*)"', sm.group(1))
+    suite = m.group(1) if m else xmlf
+    for tc in re.finditer(r'<testcase\s+([^>]*?)>(.*?)</testcase>', content, re.DOTALL):
+        attrs, body = tc.group(1), tc.group(2)
+        m = re.search(r'name="([^"]*)"', attrs)
+        name = m.group(1) if m else 'unknown'
+        m = re.search(r'time="([^"]*)"', attrs)
+        tsec = m.group(1) if m else '0'
+        fm = re.search(r'<failure\s+message="([^"]*)"(?:\s+type="([^"]*)")?[^>]*>(.*?)</failure>', body, re.DOTALL)
+        total += 1
+        if not fm:
+            passed += 1
+            rows.append((suite, name, '✅ pass', tsec, ''))
+            continue
+        msg = html.unescape(fm.group(1))
+        kind = classify(fm.group(2), msg)
+        details = html.unescape(fm.group(3)).strip()
+        if kind == 'infra':
+            n_infra += 1
+            rows.append((suite, name, '⚠️ infra', tsec, cell(msg)))
+            infras.append((suite, name, msg))
+        else:
+            n_real += 1
+            rows.append((suite, name, '❌ real', tsec, cell(msg)))
+            reals.append((suite, name, msg, details))
+
+def plural(n):
+    return '' if n == 1 else 's'
+
+if n_real:
+    verdict = f'❌ {n_real} real failure{plural(n_real)}'
+    if n_infra:
+        verdict += f' · ⚠️ {n_infra} infra flake{plural(n_infra)}'
+elif n_infra:
+    verdict = f'⚠️ {n_infra} infra flake{plural(n_infra)} · 0 real failures'
+else:
+    verdict = '✅ all passed'
+
+o = []
+o.append(f'## Integration Tests — {verdict}')
+o.append(f'`{commit}` · [run]({run_url}) · {label} · {total} tests: {passed} ✅ · {n_real} ❌ real · {n_infra} ⚠️ infra')
+o.append('')
+o.append('| Tier | Test | Result | Time | Reason |')
+o.append('|------|------|--------|-----:|--------|')
+for suite, name, result, tsec, reason in rows:
+    o.append(f'| {suite} | {name} | {result} | {tsec}s | {reason} |')
+o.append('')
+if reals:
+    o.append(f'### ❌ Real failures ({n_real}) — code/test issues')
+    for suite, name, msg, details in reals:
+        o.append(f'- **{suite} / {name}** — {html.unescape(msg)}')
+        if details:
+            o.append(f'  <details><summary>details</summary>\n\n```\n{details[:1500]}\n```\n</details>')
+    o.append('')
+if infras:
+    o.append(f'### ⚠️ Infra flakes ({n_infra}) — SSM/ENI setup, not code (task #10)')
+    for suite, name, msg in infras:
+        o.append(f'- {suite} / {name} — {html.unescape(msg)}')
+    o.append('')
+if not reals and not infras:
+    o.append(f'### ✅ All {total} tests passed')
+
+print('\n'.join(o))
+PYEOF
+    log_info "Markdown summary generated: $RESULTS_DIR/summary.md"
+}
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 
 teardown_infrastructure() {
     if [[ "$FLAG_TEARDOWN" != "true" ]]; then
         log_info "Teardown not requested. To destroy infrastructure manually:"
-        log_info "  cd $CDK_DIR && npx cdk destroy $CDK_STACK_NAME"
+        log_info "  scripts/ci/cleanup-cfn-stack.sh $CDK_STACK_NAME"
         return 0
     fi
 
     log_section "Tearing down infrastructure"
 
-    cd "$CDK_DIR"
-    if ! npx cdk destroy "$CDK_STACK_NAME" --force 2>&1; then
-        log_error "CDK teardown failed (test results are preserved)"
-        # Don't change TEST_EXIT_CODE - preserve test result
+    # Use the same force-delete script as the pre-deploy cleanup so a stuck
+    # DPDK ENI attachment (ReceiverDpdkAttachment) doesn't leave the stack in
+    # DELETE_FAILED between runs.  Plain 'cdk destroy' fails the same way a
+    # plain 'aws cloudformation delete-stack' does -- without
+    # --deletion-mode FORCE_DELETE_STACK the ENI attachment blocks every time.
+    if [[ -x "$REPO_ROOT/scripts/ci/cleanup-cfn-stack.sh" ]]; then
+        if ! bash "$REPO_ROOT/scripts/ci/cleanup-cfn-stack.sh" "$CDK_STACK_NAME"; then
+            log_error "CDK teardown failed (test results are preserved)"
+            # Don't change TEST_EXIT_CODE - preserve test result
+        else
+            log_info "Infrastructure destroyed"
+        fi
     else
-        log_info "Infrastructure destroyed"
+        # Fallback: script not found, try plain cdk destroy
+        log_info "cleanup-cfn-stack.sh not found, falling back to cdk destroy"
+        cd "$CDK_DIR"
+        if ! npx cdk destroy "$CDK_STACK_NAME" --force 2>&1; then
+            log_error "CDK teardown failed (test results are preserved)"
+        else
+            log_info "Infrastructure destroyed"
+        fi
+        cd "$REPO_ROOT"
     fi
-    cd "$REPO_ROOT"
 }
 
 # ── Instance log collection ──────────────────────────────────────────────────
@@ -1575,37 +2437,181 @@ Infrastructure ready.
     fi
 
     # Step 5: Run tiers
+    #
+    # ── ENI TRANSITION RULE ─────────────────────────────────────────────────
+    # Each EC2 instance's DPDK ENI must transition kernel→DPDK at most ONCE
+    # per run.  Repeated bind/unbind cycles leave the VFIO device in a reset
+    # loop (dmesg: "Relaying device request to user" every ~102s), making the
+    # SSM agent on that instance unresponsive for the rest of the run.  This
+    # was first observed for UDP and fixed by grouping tiers by ENI state.
+    #
+    # Execution is organised into THREE phases based on ENI topology, NOT by
+    # ascending tier number.  Results are still reported under their original
+    # tier names so CI/PR comments are unchanged.
+    #
+    # ENI topology per tier:
+    #   Tier                    | Sender (Host A) | Receiver (Host B)
+    #   ------------------------|-----------------|------------------
+    #   tier2 UDP interop       | kernel          | DPDK
+    #   tier2-tcp-echo          | kernel          | DPDK
+    #   tier1 UDP echo          | DPDK            | DPDK
+    #   tier1-tcp-echo (sync)   | DPDK            | DPDK
+    #   tier1-tcp-echo (async)  | DPDK            | DPDK
+    #   tier4 jumbo echo        | DPDK            | DPDK
+    #   tier3 UDP iperf         | DPDK            | kernel
+    #
+    #   Phase A — Sender kernel, Receiver DPDK
+    #     bind receiver only; sender stays on kernel (unbind+assign-ip)
+    #     → tier2 UDP kernel-interop, tier2-tcp-echo
+    #
+    #   Phase B — Both instances on DPDK
+    #     bind sender (receiver already on DPDK from Phase A)
+    #     → tier1 UDP echo, tier1-tcp-echo (sync+async), tier4 jumbo
+    #
+    #   Phase C — Sender DPDK, Receiver kernel
+    #     unbind receiver (sender stays on DPDK from Phase B)
+    #     → tier3 UDP iperf-interop
+    #
+    # If you add a new tier: find its ENI topology in the table above and
+    # insert it into the correct phase.  Do NOT append it after the last
+    # existing tier — that will add an extra bind/unbind cycle and break
+    # subsequent tests.
+    # ────────────────────────────────────────────────────────────────────────
+
     mkdir -p "$RESULTS_DIR"
 
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "1" ]]; then
-        run_tier1 || true
+    # Known-failures ratchet (Req 1.4): run before any TCP-bearing suite so a PR
+    # that adds xfail entries fails fast. Applies to all-tiers mode and the
+    # dedicated tcp-full suite; skipped for numeric single-tier and quic runs.
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp-full" ]]; then
+        run_known_failures_ratchet || true
     fi
 
-    # Unbind ENIs between tier 1 and tier 2
     if [[ -z "$TIER_FILTER" ]]; then
-        unbind_all_enis
+        # ── Phase A: Sender kernel, Receiver DPDK ───────────────────────────
+        log_section "Phase A: Receiver DPDK, Sender kernel"
+        log_info "Binding receiver ENI (DPDK); sender stays on kernel networking..."
+        if ! configure_eni "$RECEIVER_INSTANCE_ID" "bind"; then
+            log_error "Failed to bind receiver ENI — skipping all Phase A tests"
+            generate_failure_xml "tier2-kernel-interop" "ENI bind failed on receiver instance"
+            generate_failure_xml "tier2-tcp-echo"       "ENI bind failed on receiver instance"
+        else
+            configure_eni "$SENDER_INSTANCE_ID" "unbind" "$SENDER_DPDK_ENI_IP" || true
+            warm_arp_cache
+
+            # tier2 UDP kernel-interop (sender=kernel, receiver=DPDK)
+            ensure_dpdk_free "before tier2 UDP" || true
+            run_tier2 || true
+
+            # tier2-tcp-echo: same topology — no rebind
+            log_section "Tier 2 TCP: kernel client -> DPDK TCP server"
+            ensure_dpdk_free "before tier2-tcp-echo" || true
+            local t2tcp_listener_id
+            t2tcp_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000")
+            if [[ -z "$t2tcp_listener_id" ]]; then
+                generate_failure_xml "tier2-tcp-echo" "Failed to start TCP listener on receiver"
+            else
+                sleep 10
+                if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-tcp-echo.xml"; then
+                    generate_failure_xml "tier2-tcp-echo" "Sender test execution failed or timed out"
+                fi
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id"
+            fi
+            log_info "Phase A complete"
+        fi
+
+        # ── Phase B: Both instances on DPDK ─────────────────────────────────
+        log_section "Phase B: Both instances on DPDK"
+        log_info "Binding sender ENI (receiver already on DPDK from Phase A)..."
+        if ! configure_eni "$SENDER_INSTANCE_ID" "bind"; then
+            log_error "Failed to bind sender ENI — skipping all Phase B tests"
+            generate_failure_xml "tier1-dpdk-echo"      "ENI bind failed on sender instance"
+            generate_failure_xml "tier1-tcp-echo"       "ENI bind failed on sender instance"
+            generate_failure_xml "tier1-tcp-echo-async" "ENI bind failed on sender instance"
+            generate_failure_xml "tier4-jumbo-echo"     "ENI bind failed on sender instance"
+        else
+            warm_arp_cache
+
+            # tier1 UDP DPDK echo (sender=DPDK, receiver=DPDK)
+            ensure_dpdk_free "before tier1 UDP" || true
+            run_tier1 || true
+
+            # tier1-tcp-echo (sync) — no rebind
+            log_section "Tier 1 TCP (sync): DPDK <-> DPDK TCP echo"
+            ensure_dpdk_free "before tier1-tcp-echo sync" || true
+            warm_arp_cache
+            local t1tcp_listener_id
+            t1tcp_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tcp-echo")
+            if [[ -z "$t1tcp_listener_id" ]]; then
+                generate_failure_xml "tier1-tcp-echo" "Failed to start TCP listener on receiver"
+            else
+                sleep 10
+                if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo.xml"; then
+                    generate_failure_xml "tier1-tcp-echo" "Sender test execution failed or timed out"
+                fi
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id"
+            fi
+
+            # tier1-tcp-echo (async) — still on DPDK, no rebind
+            log_section "Tier 1 TCP (async): DPDK <-> DPDK tokio TCP echo"
+            ensure_dpdk_free "before tier1-tcp-echo async" || true
+            warm_arp_cache
+            local t1tcpa_listener_id
+            t1tcpa_listener_id=$(ssm_run_command_async "$RECEIVER_INSTANCE_ID" "$TEST_TIMEOUT"                 "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role listener --bind-ip $RECEIVER_DPDK_ENI_IP --port 9000 --server-binary tokio-tcp-echo")
+            if [[ -z "$t1tcpa_listener_id" ]]; then
+                generate_failure_xml "tier1-tcp-echo-async" "Failed to start TCP listener on receiver"
+            else
+                sleep 10
+                if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo-async.xml"; then
+                    generate_failure_xml "tier1-tcp-echo-async" "Sender test execution failed or timed out"
+                fi
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id"
+            fi
+
+            # tier4 jumbo (sender=DPDK, receiver=DPDK)
+            ensure_dpdk_free "before tier4 jumbo" || true
+            run_tier4 || true
+            log_info "Phase B complete"
+        fi
+
+        # ── Phase C: Sender DPDK, Receiver kernel ───────────────────────────
+        log_section "Phase C: Sender DPDK, Receiver kernel"
+        log_info "Unbinding receiver ENI (sender stays on DPDK from Phase B)..."
+        if ! configure_eni "$RECEIVER_INSTANCE_ID" "unbind" "$RECEIVER_DPDK_ENI_IP"; then
+            log_error "Failed to unbind receiver ENI — skipping Phase C tests"
+            generate_failure_xml "tier3-our-app-sends" "Receiver ENI unbind failed"
+            generate_failure_xml "tier3-iperf-sends"   "Receiver ENI unbind failed"
+        else
+            warm_arp_cache
+            # tier3 UDP iperf-interop (sender=DPDK, receiver=kernel)
+            ensure_dpdk_free "before tier3 UDP" || true
+            run_tier3 || true
+            log_info "Phase C complete"
+        fi
+
+    else
+        # ── Single-tier filter path ──────────────────────────────────────────
+        # Each filtered run does its own ENI setup via the individual run_tier*
+        # functions; they are safe to call in isolation.
+        [[ "$TIER_FILTER" == "1"    ]] && run_tier1          || true
+        [[ "$TIER_FILTER" == "2"    ]] && run_tier2          || true
+        [[ "$TIER_FILTER" == "3"    ]] && run_tier3          || true
+        [[ "$TIER_FILTER" == "4"    ]] && run_tier4          || true
+        [[ "$TIER_FILTER" == "tcp1" ]] && run_tier1_tcp      || true
+        [[ "$TIER_FILTER" == "tcp1a" ]] && run_tier1_tcp_async || true
+        [[ "$TIER_FILTER" == "tcp2" ]] && run_tier2_tcp      || true
     fi
 
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "2" ]]; then
-        run_tier2 || true
+    # TCP full test suite — dedicated CI job, has its own ENI lifecycle
+    if [[ "$TIER_FILTER" == "tcp-full" ]]; then
+        run_tcp_full || true
     fi
 
-    # Unbind ENIs between tier 2 and tier 3
-    if [[ -z "$TIER_FILTER" ]]; then
-        unbind_all_enis
-    fi
-
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "3" ]]; then
-        run_tier3 || true
-    fi
-
-    # Unbind ENIs between tier 3 and tier 4
-    if [[ -z "$TIER_FILTER" ]]; then
-        unbind_all_enis
-    fi
-
-    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "4" ]]; then
-        run_tier4 || true
+    # QUIC Tier 1 — dedicated CI job, quic-only (NOT part of run-all mode so the
+    # primary integration-tests job behavior is unchanged, Req 3.3). Runs its
+    # own ENI bind + cert transfer inside run_quic_tier1.
+    if [[ "$TIER_FILTER" == "quic" ]]; then
+        run_quic_tier1 || true
     fi
 
     # Step 6: Collect results
@@ -1615,28 +2621,34 @@ Infrastructure ready.
     print_summary
     generate_json_summary
 
+    # Step 7b: Known-failures gate (tcp-ci-reliability Req 1).
+    # The overall pass/fail is decided by the xfail gate rather than the raw
+    # count: a run is GREEN when every test listed in ci/known-failures.txt
+    # failed as expected, no listed test passed unexpectedly, no listed test was
+    # skipped, and no UNLISTED test failed. This lets a single-bug fix PR reach
+    # green while the other known bugs still fail.
+    #
+    # Applies to the paths that run the TCP suite and gate merge:
+    #   - all-tiers mode (TIER_FILTER empty) — the BLOCKING integration-tests
+    #     jobs (incl. Graviton) run the TCP tests here via Phase A/B.
+    #   - --tier tcp-full — the dedicated (non-blocking) TCP job.
+    # Numeric single-tier runs and --tier quic keep their existing raw-count
+    # semantics (the gate is a no-op there).
+    if [[ -z "$TIER_FILTER" || "$TIER_FILTER" == "tcp-full" ]]; then
+        evaluate_known_failures_gate
+    fi
+
     # Step 8: Collect instance logs + write step summary (always, before teardown)
     collect_instance_logs || true
     write_step_summary || true
 
-    # Post final summary to PR
-    local summary_body="## [CI] Stage: Summary\n"
-    if [[ "$TEST_EXIT_CODE" -eq 0 ]]; then
-        summary_body+="All tests **PASSED**."
-    else
-        summary_body+="Some tests **FAILED** (exit code: $TEST_EXIT_CODE)."
+    # Post the final analyzable summary to the PR: per-tier, per-testcase pass/
+    # fail with the failure reason, classifying real test failures vs infra/setup
+    # flakes. Self-contained — a run can be analyzed from this comment alone.
+    generate_markdown_summary
+    if [[ -f "$RESULTS_DIR/summary.md" ]]; then
+        post_pr_comment "$(cat "$RESULTS_DIR/summary.md")"
     fi
-    summary_body+="\n\nARP seeding: kernel /proc/net/arp (automatic)"
-    # Include JUnit results summary
-    for xml_file in "$RESULTS_DIR"/*.xml; do
-        [[ -f "$xml_file" ]] || continue
-        local suite_name tests failures
-        suite_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        tests=$(sed -n 's/.*tests="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        failures=$(sed -n 's/.*failures="\([^"]*\)".*/\1/p' "$xml_file" | head -1)
-        summary_body+="\n- **${suite_name:-unknown}**: ${tests:-0} tests, ${failures:-0} failures"
-    done
-    post_pr_comment "$(echo -e "$summary_body")"
 
     # Step 9: Teardown
     teardown_infrastructure
@@ -1645,4 +2657,8 @@ Infrastructure ready.
     exit "$TEST_EXIT_CODE"
 }
 
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by unit tests
+# that exercise individual functions such as evaluate_known_failures_gate).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

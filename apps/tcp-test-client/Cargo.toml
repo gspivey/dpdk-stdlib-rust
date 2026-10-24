@@ -1,0 +1,9 @@
+[package]
+name = "tcp-test-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+dpdk-stdlib-tcp = { path = "../../dpdk-stdlib-tcp" }

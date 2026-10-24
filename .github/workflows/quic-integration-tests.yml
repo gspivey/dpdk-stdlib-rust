@@ -1,0 +1,323 @@
+name: QUIC Integration Tests
+
+on:
+  # EC2 runs only when something the hardware tests exercise changed; docs,
+  # specs and ROADMAP-only PRs skip them (the Rust workflow still runs).
+  pull_request:
+    branches: [main, development]
+    paths:
+      - 'apps/**'
+      - 'dpdk/**'
+      - 'dpdk-sys/**'
+      - 'dpdk-stdlib-*/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - 'deploy/**'
+      - 'ci/**'
+      - '.github/workflows/quic-integration-tests.yml'
+  # The full run on development, without paths. nightly-gate skips it when
+  # this commit already passed a scheduled run, so quiet days cost nothing.
+  schedule:
+    - cron: '30 6 * * 0' # weekly, Sunday 06:30 UTC
+  workflow_dispatch: {}
+
+# Only one QUIC integration test run at a time — concurrent QUIC runs race to
+# create and destroy the same CloudFormation stack (DpdkTestStackQuic). The
+# QUIC workflow has its own dedicated stack (DpdkTestStackQuic) so it does NOT
+# collide with integration-tests.yml (which uses DpdkTestStack). The QUIC
+# concurrency group is therefore separate.
+# cancel-in-progress: false lets the in-flight run finish cleanly (including
+# teardown) rather than being killed mid-deploy.
+concurrency:
+  group: quic-integration-tests
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # Gate for the scheduled run: skip every EC2 job when development has not moved
+  # since the last successful scheduled run. PR and manual runs always proceed.
+  nightly-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: Skip a scheduled run whose commit already passed
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/quic-integration-tests.yml/runs?event=schedule&status=success&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""' || echo "")
+          if [ "$last" = "${{ github.sha }}" ]; then
+            echo "Commit ${{ github.sha }} already passed a scheduled run; skipping EC2 jobs."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Fast pre-flight validation (no AWS credentials needed) ──────────────────
+  # Synthesizes the CDK template locally and validates infrastructure invariants
+  # in seconds. Blocks the expensive quic-integration-tests job if anything is
+  # wrong. Mirrors the validate-cdk pre-flight in integration-tests.yml.
+  validate-cdk:
+    runs-on: ubuntu-latest
+    needs: nightly-gate
+    if: needs.nightly-gate.outputs.run == 'true'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Validate CDK template
+        run: |
+          chmod +x scripts/validate-cdk.sh
+          ./scripts/validate-cdk.sh
+
+  # ── QUIC integration tests (blocking) ───────────────────────────────────────
+  # Runs QUIC Tier 1 (DPDK <-> DPDK handshake + bidirectional echo) on EC2 with
+  # real DPDK hardware via the shared orchestrator (`--tier quic`). A QUIC
+  # failure fails CI.
+  quic-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    needs: validate-cdk
+    if: needs.validate-cdk.result == 'success'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch DPDK AMI ID from SSM
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$AMI_ID" ]]; then
+            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ami_id=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic
+
+      - name: Run QUIC integration tests
+        id: quic-tests
+        timeout-minutes: 45
+        run: |
+          chmod +x scripts/run-integration-tests.sh
+          chmod +x scripts/integration-tests/*.sh
+          ./scripts/run-integration-tests.sh --teardown --json-summary --tier quic
+        env:
+          CDK_STACK_NAME: DpdkTestStackQuic
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+
+      - name: Post QUIC test results to PR
+        if: always() && steps.quic-tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping QUIC result posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/quic-integration-report.md"
+          OUTCOME="${{ steps.quic-tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ QUIC Integration Tests Passed ([run](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ QUIC Integration Tests Failed ([run](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          TOTAL_TESTS=0
+          TOTAL_FAILURES=0
+          TOTAL_SKIPPED=0
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+            TOTAL_TESTS=$((TOTAL_TESTS + TESTS))
+            TOTAL_FAILURES=$((TOTAL_FAILURES + FAILURES))
+            TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -5 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+          echo "**Summary**: ${TOTAL_TESTS} tests, ${TOTAL_FAILURES} failures, ${TOTAL_SKIPPED} skipped" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Application logs (last 20 lines inline)
+          echo "<details><summary>Application Logs (last 20 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-quic-echo-server*.log instance-logs/*-quic-test-client*.log instance-logs/*-quic-*.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Network state
+          echo "<details><summary>Network State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-networking-diag-*.txt instance-logs/*-network-interfaces.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Truncate if too long
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-quic-report.md
+            echo "" >> /tmp/truncated-quic-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-quic-report.md
+            mv /tmp/truncated-quic-report.md "$REPORT"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post QUIC integration test PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload QUIC test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-integration-test-results
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload QUIC instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Publish QUIC test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: QUIC Integration Tests
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
+
+      # Re-assume the role first: the OIDC session from the first configure
+      # step lasts 1h, which a long run can outlive before teardown starts.
+      - name: Refresh AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own --teardown, and failure() is false on cancellation. The
+      # cleanup script is a no-op (plus orphaned-VPC purge) when nothing exists.
+      - name: Safety net teardown
+        if: always()
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic || echo "Safety net teardown failed (stack may already be gone)"

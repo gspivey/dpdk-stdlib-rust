@@ -10,5 +10,8 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "gh-pr-webhook-hooks@gh-pr-webhook-hooks": true
   }
 }

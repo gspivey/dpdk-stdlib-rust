@@ -1,0 +1,344 @@
+name: TCP Performance Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_sizes:
+        description: 'Comma-separated TCP payload sizes (bytes)'
+        required: false
+        default: '64,512,1400,65536'
+      duration:
+        description: 'Seconds per rate step'
+        required: false
+        default: '30'
+      cps_rates:
+        description: 'Comma-separated target connections-per-second values'
+        required: false
+        default: '100,500,1000,5000'
+      configs:
+        description: 'DUT configs to benchmark (plain-rust-tcp, rust-dpdk-tcp, tokio-dpdk-tcp)'
+        required: false
+        default: 'plain-rust-tcp,rust-dpdk-tcp,tokio-dpdk-tcp'
+      teardown:
+        description: 'Destroy stack after tests'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+# Only one TCP perf test run at a time (shared CloudFormation stack)
+concurrency:
+  group: perf-tests-tcp
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ── CDK pre-flight validation ───────────────────────────────────────────────
+  validate-cdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Synthesize PerfTestStack
+        run: |
+          cd deploy/cdk
+          npx cdk synth PerfTestStack --quiet
+
+  # ── Full TCP performance test suite ─────────────────────────────────────────
+  perf-tests-tcp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: validate-cdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch AMI IDs from SSM
+        id: amis
+        run: |
+          DPDK_AMI=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          TREX_AMI=$(aws ssm get-parameter \
+            --name /dpdk-stdlib-rust/ami/trex-latest \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          echo "dpdk_ami=${DPDK_AMI}" >> "$GITHUB_OUTPUT"
+          echo "trex_ami=${TREX_AMI}" >> "$GITHUB_OUTPUT"
+
+          echo "DPDK AMI: ${DPDK_AMI:-none}"
+          echo "TRex AMI: ${TREX_AMI:-none}"
+
+          if [[ -z "$TREX_AMI" ]]; then
+            echo "::warning::No TRex AMI found. Run the 'Build TRex AMI' workflow first."
+          fi
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          echo "PR number: ${PR:-none}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run TCP performance tests
+        id: tests
+        run: |
+          chmod +x scripts/run-perf-tests.sh
+
+          TEARDOWN_FLAG=""
+          if [[ "${{ inputs.teardown }}" == "false" ]]; then
+            TEARDOWN_FLAG="--no-teardown"
+          else
+            TEARDOWN_FLAG="--teardown"
+          fi
+
+          ./scripts/run-perf-tests.sh \
+            $TEARDOWN_FLAG \
+            --tcp-payload-sizes "${{ inputs.payload_sizes || '64,512,1400,65536' }}" \
+            --cps-rates "${{ inputs.cps_rates || '100,500,1000,5000' }}" \
+            --duration "${{ inputs.duration || '30' }}" \
+            --configs "${{ inputs.configs || 'plain-rust-tcp,rust-dpdk-tcp,tokio-dpdk-tcp' }}" \
+            --json-summary
+        env:
+          DPDK_AMI_ID: ${{ steps.amis.outputs.dpdk_ami }}
+          TREX_AMI_ID: ${{ steps.amis.outputs.trex_ami }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.ref_name }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== TCP Performance Test Failure Diagnostics ==="
+
+          REPORT="/tmp/perf-failure-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "## TCP Performance Test Failure (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "### failure-summary.json" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Environment info
+          for log in instance-logs/*-environment.txt; do
+            [ -f "$log" ] || continue
+            echo "<details><summary>$(basename "$log")</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # Application logs — last 20 lines shown inline for quick context,
+          # full log (last 200 lines) in collapsible section.
+          echo "### Application Logs (last 20 lines)" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-trex-server.log instance-logs/dut-*-app.log instance-logs/*-echo-*.log instance-logs/*-testpmd.log instance-logs/*-plain-echo.log instance-logs/*-tcp-echo*.log instance-logs/*-plain-tcp-echo.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log" 2>/dev/null || echo 0)
+            [ "$LOGSIZE" -gt 5 ] || continue
+            LOGNAME=$(basename "$log")
+            echo "**${LOGNAME}**" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "" >> "$REPORT"
+
+          # Full application logs in collapsible section
+          echo "<details><summary>Full Application Logs (last 200 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-trex-server.log instance-logs/dut-*-app.log instance-logs/*-echo-*.log instance-logs/*-testpmd.log instance-logs/*-plain-echo.log instance-logs/*-tcp-echo*.log instance-logs/*-plain-tcp-echo.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log" 2>/dev/null || echo 0)
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -200 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Network & PCI state
+          echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-network-interfaces.log instance-logs/*-networking-diag-*.txt; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # User-data logs
+          for log in instance-logs/*-user-data.log; do
+            [ -f "$log" ] || continue
+            echo "<details><summary>$(basename "$log") (last 80 lines)</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -80 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # Build listing (verify binaries exist on DUT)
+          for log in instance-logs/*-build-listing.log; do
+            [ -f "$log" ] || continue
+            grep -q 'no build dir' "$log" 2>/dev/null && continue
+            echo "<details><summary>$(basename "$log")</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # Crash diagnostics (dmesg + coredumps + crash reports)
+          HAS_CRASHES=false
+          for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+            [ -f "$log" ] || continue
+            if ! grep -qE '^(no crash|no coredump|no crash reports)' "$log" 2>/dev/null; then
+              HAS_CRASHES=true
+              break
+            fi
+          done
+          if [ "$HAS_CRASHES" = "true" ]; then
+            echo "<details><summary>⚠️ Crash Diagnostics</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+              [ -f "$log" ] || continue
+              grep -qE '^(no crash|no coredump|no crash reports)' "$log" 2>/dev/null && continue
+              echo "#### $(basename "$log")" >> "$REPORT"
+              echo '```' >> "$REPORT"
+              cat "$log" >> "$REPORT"
+              echo '```' >> "$REPORT"
+            done
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Console output (kernel dmesg — useful for vfio/ena driver transitions)
+          echo "<details><summary>Kernel Console (dmesg)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log") (PCI/driver events only)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            grep -E '(vfio|ena |pci )' "$log" 2>/dev/null | tail -30 >> "$REPORT" || echo "(no PCI events)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          cat "$REPORT"
+
+          # Truncate if too long
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated.md
+            echo "" >> /tmp/truncated.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated.md
+            mv /tmp/truncated.md "$REPORT"
+          fi
+
+          # Post to PR
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post failure report to PR"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload TCP performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-perf-results
+          path: perf-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-perf-instance-logs
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Safety net teardown
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          if [[ "${{ inputs.teardown }}" != "false" ]]; then
+            cd deploy/cdk
+            npx cdk destroy PerfTestStack --force || echo "Teardown failed (may already be destroyed)"
+          fi
