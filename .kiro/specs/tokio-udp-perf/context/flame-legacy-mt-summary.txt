@@ -1,0 +1,253 @@
+== threads
+ 31.3% tokio-echo
+ 68.7% tokio-rt-worker
+== top leaves
+  0.3% core::ptr::drop_glue::<alloc::boxed::Box<tokio::runtime::task::core::Cell<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::ru
+  0.0% ep_poll
+  0.0% tokio::macros::support::thread_rng_n
+  0.1% <std::sys::pal::unix::time::Timespec>::now
+  1.6% tokio_echo::async_main::{closure#0}::{closure#2}
+  0.1% <tokio::runtime::scheduler::multi_thread::park::Unparker>::unpark
+  0.0% __rustc::__rust_dealloc
+  0.3% futex_hash
+  0.4% <tokio::sync::batch_semaphore::Semaphore>::add_permits_locked
+  0.1% <tokio::runtime::scheduler::multi_thread::queue::Local<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::push_back::<tokio:
+  0.5% __realloc
+  0.0% <tokio::runtime::time::wheel::Wheel>::next_expiration
+  0.0% wake_q_add_safe
+  0.5% rte_vlog
+  0.1% <tokio::runtime::task::core::Core<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle
+  0.0% core::ptr::drop_glue::<alloc::vec::Vec<dpdk_stdlib::mbuf::Mbuf>>
+  0.1% __rustc::__rust_alloc
+  0.2% <dpdk_stdlib_udp::SocketBackend>::send_frame
+  0.3% <tokio::sync::semaphore::OwnedSemaphorePermit as core::ops::drop::Drop>::drop
+  1.1% <tokio::util::sharded_list::ShardedList<tokio::runtime::task::Task<alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>::remove
+  0.0% copy_user_short_string
+  0.1% <tokio::runtime::task::state::State>::transition_to_terminal
+  0.3% futex_wake_mark
+  0.0% __futex_unqueue
+  0.2% <tokio::sync::batch_semaphore::Acquire as core::future::future::Future>::poll
+  0.1% <std::sync::poison::mutex::Mutex<core::option::Option<core::net::socket_addr::SocketAddr>>>::lock
+  0.1% <tokio::signal::RxFuture>::poll_recv
+  0.0% __rustc::__rust_realloc
+  0.1% <dpdk_stdlib_udp::routing::RoutingTable>::lookup
+  0.0% __put_user_nocheck_4
+  0.4% <tokio::runtime::scheduler::Handle>::spawn::<tokio_echo::async_main::{closure#0}::{closure#2}>
+  0.2% ena_populate_rx_queue
+  0.0% <tokio::runtime::task_hooks::TaskHooks>::spawn
+  0.6% core::ptr::drop_glue::<tokio::time::timeout::Timeout<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<u
+  0.5% common_ring_mp_enqueue
+  0.3% <dpdk_stdlib_udp::arp::ArpCache>::insert
+  0.1% <tokio::runtime::task::state::State>::drop_join_handle_fast
+  0.2% __GI___lll_lock_wake_private
+  0.0% __rustc::__rdl_dealloc
+  0.0% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::send_to
+  0.2% rte_log_get_stream
+  0.0% rte_log_get_level@plt
+  0.1% _int_realloc
+  0.2% __schedule
+  0.6% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::recv_from::{closure#0}
+  0.1% <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_option_task_without_yield
+  0.2% [libm.so.6]
+  0.1% <parking_lot::raw_mutex::RawMutex>::lock_slow
+  0.0% __tls_get_addr@plt
+  0.1% ena_com_add_single_rx_desc.cold
+  0.1% <alloc::raw_vec::RawVecInner>::finish_grow
+  0.2% x64_sys_call
+  0.1% <alloc::string::String as core::fmt::Write>::write_str
+  0.1% __rustc::__rdl_alloc
+  0.1% schedule
+  2.0% _int_malloc
+  0.0% dpdk_stdlib_udp::udp_pseudo_header_checksum
+  0.1% <dpdk_stdlib::mbuf::Mempool>::alloc
+  0.1% rseq_ip_fixup
+  0.0% schedule_hrtimeout_range_clock
+  0.6% _mid_memalign.constprop.0
+  0.0% <std::sync::poison::rwlock::RwLockWriteGuard<core::option::Option<dpdk_stdlib_udp::ConnectionState>> as core::ops::drop::Drop>::drop
+  3.0% _int_free
+  0.5% dpdk_stdlib_udp::udp_checksum
+  0.3% <tokio::runtime::task::core::Core<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle
+  0.0% _raw_spin_unlock
+  0.0% <tokio::runtime::driver::Handle>::unpark
+  0.1% <tokio::runtime::io::driver::Driver>::turn
+  0.0% mutex_lock
+  0.2% <core::future::poll_fn::PollFn<tokio_echo::async_main::{closure#0}::{closure#1}::{closure#0}> as core::future::future::Future>::poll
+  0.1% __rustc::__rdl_realloc
+  0.0% dpdk_shim_set_mbuf_tx_offload
+  1.0% <dpdk_stdlib_udp::UdpSocket>::send_to_addr
+  0.1% ena_com_write_bounce_buffer_to_dev.cold
+  0.5% <tokio::util::sharded_list::ShardGuard<tokio::runtime::task::Task<alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>::push
+  0.0% <tokio::sync::batch_semaphore::Acquire as core::ops::drop::Drop>::drop
+  0.0% <tokio::runtime::park::CachedParkThread>::park
+  0.4% dpdk_stdlib_udp::build_udp_frame_into
+  0.2% <tokio::runtime::task::core::TaskIdGuard as core::ops::drop::Drop>::drop
+  0.1% futex_unqueue
+  0.2% <tokio::time::sleep::Sleep>::new_timeout
+  0.1% <std::time::Instant>::elapsed
+  0.2% <tokio::runtime::scheduler::multi_thread::park::Inner>::park_condvar
+  0.1% <tokio::runtime::scheduler::multi_thread::handle::Handle>::notify_if_work_pending
+  0.1% do_syscall_64
+  0.1% __GI___write
+  0.0% rseq_get_rseq_cs.isra.0
+  0.1% __memset_evex_unaligned_erms
+  0.1% __posix_memalign
+  0.2% get_futex_key
+  0.1% exit_to_user_mode_loop
+  0.1% <std::hash::random::DefaultHasher as core::hash::Hasher>::write
+  0.1% core::ptr::drop_glue::<tokio::runtime::task::core::Stage<tokio_echo::async_main::{closure#0}::{closure#2}>>
+  0.0% __fdget
+  0.0% __list_del_entry_valid
+  0.1% <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::thread_rng_n::{closure#0}, u32>
+  0.1% <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&core::net::ip_addr::Ipv4Addr>
+  0.1% <tokio::runtime::task::core::TaskIdGuard>::enter
+  0.1% <std::sync::poison::mutex::Mutex<dpdk_stdlib_udp::ReceiveQueue>>::lock
+  0.5% <dpdk_stdlib_udp::UdpSocket>::process_frame_zerocopy
+  0.0% dpdk_shim_set_mbuf_data_len
+  0.3% tokio::signal::make_future::{closure#0}
+  0.3% alloc::fmt::format::format_inner
+  1.5% <alloc::vec::drain::Drain<dpdk_stdlib::mbuf::Mbuf> as core::ops::drop::Drop>::drop
+  0.0% <std::sys::pal::unix::time::Timespec>::sub_timespec
+  0.1% parking_lot_core::parking_lot::lock_bucket_pair
+  0.1% __fget_light
+  0.7% <tokio::sync::notify::NotifiedProject>::poll_notified
+  0.7% <tokio::runtime::task::list::OwnedTasks<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::bind_inner
+  0.1% rte_log@plt
+  0.2% <dpdk_stdlib_udp::ReceiveQueue>::push
+  0.2% do_futex
+  0.1% <mio::sys::unix::waker::Waker>::wake
+  0.1% rte_log_get_stream@plt
+  1.2% syscall
+  0.1% <alloc::borrow::Cow<str> as core::fmt::Display>::fmt
+  0.4% dpdk_stdlib_udp::verify_udp_checksum
+  0.3% <tokio::runtime::task::core::Cell<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::
+  0.0% selinux_file_permission
+  1.8% __memcpy_evex_unaligned_erms
+  0.1% <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  0.0% <tokio::runtime::scheduler::multi_thread::queue::Steal<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::steal_into
+  0.1% epoll_wait
+  0.0% plist_del
+  0.1% dpdk_shim_rte_eth_tx_burst
+  0.1% __floattidf
+  0.0% ksys_write
+  0.0% rte_log_get_global_level
+  0.0% rte_log_get_global_level@plt
+  0.3% <tokio::task::coop::Coop<tokio::sync::watch::changed_impl<()>::{closure#0}> as core::future::future::Future>::poll
+  0.0% <tokio::runtime::signal::Driver>::process
+  0.3% <tokio::runtime::scheduler::inject::Inject<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::pop_n::<core::option::Option<t
+  0.0% security_file_permission
+  0.1% ena_com_create_meta
+  0.3% <alloc::string::String>::from_utf8_lossy
+  0.0% <tokio::runtime::driver::Driver>::park
+  0.2% core::ptr::drop_glue::<std::sync::poison::mutex::MutexGuard<core::option::Option<alloc::sync::Arc<dpdk_stdlib_udp::DpdkResources>>>>
+  0.1% futex_q_unlock
+  0.1% <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+  0.1% <dpdk_stdlib::mbuf::Mbuf>::data_mut
+  0.0% <tokio::runtime::time::handle::Handle>::process_at_time
+  0.1% <parking_lot::condvar::Condvar>::notify_one_slow
+  0.1% __put_user_nocheck_8
+  0.1% rte_vlog@plt
+  0.1% tokio::runtime::context::with_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::with_current<(), <tokio::runtime::scheduler::multi_thre
+  0.2% eth_ena_recv_pkts
+  0.0% <tokio::sync::batch_semaphore::Semaphore>::acquire
+  0.1% __clock_gettime_2
+  0.1% <tokio::runtime::task::harness::Harness<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::ha
+  0.2% <tokio::runtime::scheduler::multi_thread::idle::Idle>::transition_worker_to_parked
+  0.2% tokio::task::spawn::spawn::<tokio_echo::async_main::{closure#0}::{closure#2}>
+  0.2% dpdk_stdlib_udp::verify_ipv4_checksum
+  0.6% rte_pktmbuf_free
+  0.4% <tokio::runtime::scheduler::inject::Inject<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::push
+  0.1% native_queued_spin_lock_slowpath
+  1.1% <tokio::runtime::scheduler::multi_thread::worker::Context>::run
+  0.0% schedule_debug.constprop.0
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::data_offset
+  0.6% rte_log
+  0.1% blkcg_maybe_throttle_current
+  0.3% <tokio::runtime::scheduler::multi_thread::handle::Handle>::notify_parked_remote
+  0.6% __free
+  0.6% common_ring_mc_dequeue
+  0.0% dpdk_shim_get_mbuf_data_len
+  0.1% try_to_wake_up
+  0.3% ena_com_write_bounce_buffer_to_dev
+  0.7% <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+  0.1% fput
+  0.2% futex_wait_queue
+  0.2% <dpdk_stdlib_udp::arp::ArpCache>::lookup
+  0.0% plist_add
+  0.2% core::fmt::write
+  1.7% syscall_enter_from_user_mode
+  0.1% <core::pin::Pin<&mut tokio_echo::async_main::{closure#0}::{closure#1}> as core::future::future::Future>::poll
+  0.1% _raw_spin_lock
+  0.1% syscall_exit_to_user_mode_prepare
+  0.1% <hashbrown::map::HashMap<core::net::ip_addr::Ipv4Addr, dpdk_stdlib_udp::arp::ArpCacheEntry, std::hash::random::RandomState>>::insert
+  0.3% unlink_chunk.constprop.0
+  0.2% __get_user_8
+  1.3% __GI___libc_malloc
+  2.4% _raw_spin_unlock_irq
+  0.4% rte_log_can_log
+  0.0% rte_log_can_log@plt
+  1.2% <core::pin::Pin<alloc::boxed::Box<tokio_echo::async_main::{closure#0}>> as core::future::future::Future>::poll
+  0.4% malloc_consolidate
+  0.3% __get_user_nocheck_4
+ 18.1% finish_task_switch.isra.0
+  0.2% <core::fmt::Formatter>::pad
+  0.5% dpdk_shim_rte_pktmbuf_alloc
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::buf_len
+  0.1% <std::time::Instant>::now
+  0.0% ena_com_close_bounce_buffer
+  0.0% core::ptr::drop_glue::<<dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::recv_from::{closure#0}>
+  0.1% <dpdk_stdlib::port::Port>::rx_burst
+  0.5% futex_q_lock
+  0.1% futex_wait_setup
+  0.1% core::ptr::drop_glue::<tokio_echo::async_main::{closure#0}::{closure#2}>
+  0.1% <std::time::Instant>::checked_add
+  0.1% ena_com_write_sq_doorbell.isra.0
+  0.1% dpdk_shim_rte_pktmbuf_free
+  0.2% ena_com_rx_pkt.cold
+  0.0% vfs_write
+  0.3% futex_wait
+  0.5% <tokio::runtime::scheduler::Handle>::current
+  1.0% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::send_to::{closure#0}
+  0.2% ena_com_sq_update_tail
+  0.3% __x64_sys_futex
+  0.0% tokio::runtime::task::raw::poll::<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::
+  0.0% __x64_sys_epoll_wait
+  0.1% __rustc::__rust_no_alloc_shim_is_unstable_v2
+  0.3% <tokio::runtime::task::state::State>::transition_to_running
+  0.0% <&std::fs::File as core::io::write::Write>::write
+  0.0% syscall_exit_to_user_mode
+  0.3% <tokio::runtime::scheduler::multi_thread::handle::Handle>::transition_worker_from_searching
+  0.2% ena_com_rx_pkt
+ 16.2% _raw_spin_unlock_irqrestore
+  0.1% <parking_lot::condvar::Condvar>::wait_until_internal
+  0.1% wake_up_q
+  0.2% __GI___lll_lock_wait_private
+  0.0% <tokio::runtime::time::Driver>::park_internal
+  0.1% __GI___pthread_disable_asynccancel
+  0.0% <tokio::runtime::context::CONTEXT::{K#0}::{closure#0} as core::ops::function::FnOnce<(core::option::Option<&mut core::option::Option<tokio::runtime::c
+  0.1% core::ptr::drop_glue::<core::option::Option<tokio::runtime::Timer>>
+  1.1% eth_ena_xmit_pkts
+  0.1% rte_log_get_level
+  0.1% __list_add_valid
+  0.1% _int_memalign
+  0.1% <core::future::poll_fn::PollFn<tokio_echo::async_main::{closure#0}::{closure#3}> as core::future::future::Future>::poll
+  0.1% <std::time::Instant as core::ops::arith::Sub>::sub
+  0.0% <tokio::process::imp::orphan::OrphanQueueImpl<std::process::Child>>::reap_orphans
+  0.1% __rseq_handle_notify_resume
+  0.0% handle_softirqs
+  0.0% its_return_thunk
+  0.3% <alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle> as tokio::runtime::task::Schedule>::release
+  0.0% dpdk_shim_set_mbuf_pkt_len
+  0.6% ena_com_prepare_tx
+  0.9% <core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next
+  0.1% <tokio::runtime::task::state::State>::transition_to_complete
+  0.0% __GI___pthread_enable_asynccancel
+  0.3% ena_tx_cleanup
+  0.8% futex_wake
+  0.3% <tokio::runtime::task::harness::Harness<tokio_echo::async_main::{closure#0}::{closure#2}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::ha
+  0.0% mem_cgroup_handle_over_high
+  4.1% <std::sys::sync::mutex::futex::Mutex>::lock_contended
+  0.0% memset@plt
+  0.1% <dpdk_stdlib::port::Port>::tx_burst
+  0.3% <dpdk_stdlib_udp::UdpSocket>::try_recv_from
+  0.0% <str as core::fmt::Display>::fmt
+  0.1% eth_ena_xmit_pkts.cold

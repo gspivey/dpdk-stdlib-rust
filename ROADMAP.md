@@ -425,6 +425,66 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 - Spec: `.kiro/specs/ci-cost-reduction/` · Tasks 3-4
 - [x] Complete · PR: #132
 
+---
+
+### 45. tokio UDP perf (0.3.1): tokio-echo fair/concurrent modes
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `1.1`-`1.7` (PR 1).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.4a`, `1.5`, `1.6`, `1.7`
+- [ ] Complete · PR: —
+
+---
+
+### 46. tokio UDP perf (0.3.1): perf gates, targets, DUT latency, counters, log discipline
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `2.1`-`2.10` (PR 2). Depends on item 45 (the gates judge the fair default and the `--mode concurrent` config).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `2.1`, `2.2`, `2.3`, `2.3a`, `2.4`, `2.4a`, `2.5`, `2.6`, `2.7`, `2.7a`, `2.8`, `2.9`, `2.9a`, `2.10`
+- [ ] Complete · PR: —
+
+---
+
+### 47. tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` (soundness fix)
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `3.1`-`3.10` (PR 3). Must land before item 48 (dropping the tokio outer mutex is only sound with these guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.4a`, `3.5`, `3.5a`, `3.6`, `3.6a`, `3.7`, `3.8`, `3.9`, `3.9a`, `3.10`
+- [ ] Complete · PR: —
+
+---
+
+### 48. tokio UDP perf (0.3.1): drop the tokio outer mutex
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `4.1`-`4.6` (PR 4). Depends on item 47 (per-direction and per-queue guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `4.1`, `4.2`, `4.3`, `4.4`, `4.4a`, `4.5`, `4.6`
+- [ ] Complete · PR: —
+
+---
+
+### 49. tokio UDP perf (0.3.1): burst RX allocation + opt-in tokio idle backoff
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `5.1`-`5.6a` (PR 5). Depends on items 47 and 48 (same files as item 48; serialized).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `5.1`, `5.2`, `5.3`, `5.4`, `5.4a`, `5.4b`, `5.5`, `5.6`, `5.6a`
+- [ ] Complete · PR: —
+
+---
+
+### 50. tokio UDP perf (0.3.1): semver check, proving perf run, perf-log entry
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `6.1`-`6.5` (PR 6). Depends on items 45-49 (this is the done-gate evidence for the 0.3.1 release).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `6.1`, `6.2`, `6.3`, `6.4`, `6.4b`, `6.5`
+- [ ] Complete · PR: —
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
