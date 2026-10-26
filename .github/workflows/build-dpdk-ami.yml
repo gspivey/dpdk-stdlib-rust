@@ -193,12 +193,14 @@ jobs:
 
       - name: Deregister old AMIs (keep last 3)
         run: |
-          # List only DPDK AMIs (exclude TRex AMIs which have their own lifecycle).
-          # Without the name filter, this step was deregistering TRex AMIs too,
-          # causing "image does not exist" errors in the perf test stack.
+          # List only x86 DPDK AMIs. TRex and Graviton AMIs have their own
+          # lifecycles. Every AMI name starts with "dpdk-stdlib-rust-", so a
+          # "*dpdk*" pattern matched TRex and Graviton AMIs too and deleted the
+          # live TRex AMI (ami-0e4c5917a5313cbfd, 2026-10-24). Match the exact
+          # DPDK name prefix and the x86_64 architecture instead.
           OLD_AMIS=$(aws ec2 describe-images \
             --owners self \
-            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=*dpdk*" \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=dpdk-stdlib-rust-dpdk-*" "Name=architecture,Values=x86_64" \
             --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
             --output text)
 
