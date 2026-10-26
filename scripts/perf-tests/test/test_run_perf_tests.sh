@@ -110,6 +110,95 @@ if [[ -s "$START_LOG" ]]; then bad "no restart when mode is unchanged"; else ok 
 ensure_trex_mode astf >/dev/null 2>&1
 if grep -qx astf "$START_LOG"; then ok "restarts to astf when switching from stl"; else bad "restarts to astf when switching from stl"; fi
 
+# ── 4. Aggregation, gates, DUT latency, idle%, exit-control inputs ───────────
+echo "== aggregate_results / evaluate_perf_gates / summary (fake data) =="
+FAKE="$(mktemp -d)"
+export RESULTS_DIR="$FAKE/results" LOGS_DIR="$FAKE/logs"
+mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
+python3 -I - "$RESULTS_DIR" "$LOGS_DIR" <<'PYEOF'
+import json, sys
+res, logs = sys.argv[1:3]
+T0 = 1_000_000.0
+def rows(size, per_step, base):
+    out, t = [], base
+    for step, rx in per_step:
+        out.append({"target_pps": step, "rx_pps": rx, "tx_pps": step, "drop_pct": 0.0,
+                    "ts_start_unix": t, "ts_end_unix": t + 30})
+        t += 40
+    return out
+STEPS = [70000, 140000, 350000]
+def cfg(name, rx700):
+    d = {"config_name": name, "results": {}}
+    for size in (64, 512, 1400):
+        d["results"][f"{size}B"] = rows(size, [(s, s - 1000) for s in STEPS] + [(700000, rx700[0])], T0)
+    return d
+def rep(name, rx700, n):
+    return {"config_name": name, "results": {f"{s}B": rows(s, [(700000, rx700)], T0 + 1000 * n) for s in (64, 512, 1400)}}
+for name, vals in (("native-dpdk", (699000, 699000, 699000)), ("rust-dpdk", (698000, 697000, 699000)),
+                   ("tokio-dpdk", (698000, 690000, 696000)), ("tokio-dpdk-concurrent", (300000, 305000, 310000))):
+    json.dump(cfg(name, vals), open(f"{res}/{name}.rep1.json", "w"))
+    for n in (2, 3):
+        json.dump(rep(name, vals[n - 1], n), open(f"{res}/{name}.rep{n}.json", "w"))
+# DUT [PERF] log for tokio-dpdk: an idle pre-traffic tick, then ticks inside / straddling a step.
+def perf(ts, rx, p50, p99, idle):
+    return (f"[PERF] ts_unix={ts:.3f} interval=10s rx_pps={rx} rx_bps=0 tx_pps={rx} tx_bps=0 rx_drops=0 "
+            f"rx_ring_drops=0 rx_buf_drops=0 tx_fails=0 nic_imissed=0 nic_ierrors=0 nic_rx_nombuf=0 "
+            f"lat_avg_us=1 lat_p50_us={p50} lat_p95_us=2 lat_p99_us={p99} lat_max_us=9 arp_hits=0 "
+            f"arp_misses=0 ring_drops=0 worker_idle_pct={idle} burst_avg=1.0")
+lines = [perf(T0 - 20, 0, 0.0, 0.0, 99.5),
+         perf(T0 + 85, 350000, 0.4, 1.1, 40.0),    # window [T0+75, T0+85]: inside the 350k step (T0+80..T0+110)? starts before -> straddles
+         perf(T0 + 95, 350000, 0.6, 2.5, 40.0),    # [T0+85, T0+95]: fully inside
+         perf(T0 + 105, 350000, 0.5, 1.9, 40.0)]   # [T0+95, T0+105]: fully inside
+open(f"{logs}/dut-tokio-dpdk-perf.log", "w").write("\n".join(lines) + "\n")
+PYEOF
+CONFIGS="rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"; PACKET_SIZES="64,512,1400"
+RATE_STEPS="70000,140000,350000,700000"
+aggregate_results >/dev/null 2>&1
+if [[ -f "$RESULTS_DIR/perf-report.json" ]]; then ok "perf-report.json written"; else bad "perf-report.json written"; fi
+python3 -I - "$RESULTS_DIR/perf-report.json" > "$FAKE/check.out" 2>&1 <<'PYEOF'
+import json, sys
+r = json.load(open(sys.argv[1]))["configs"]
+t = r["tokio-dpdk"]
+assert sorted(t["reps"]) == ["2", "3"], "reps kept separately from rep 1"
+assert t["results"]["64B"][3]["rx_pps"] == 698000, "rep 2/3 must not overwrite rep 1"
+assert t["idle_pct"] == 99.5, f"idle% from first rx_pps=0 tick: {t.get('idle_pct')}"
+step350 = t["results"]["64B"][2]
+assert step350["dut_lat_p99_us"] == 2.5 and step350["dut_lat_p50_us"] == 0.6, f"max of fully-contained ticks only: {step350}"
+assert "app_drops" in step350, "App Drops populated for tokio configs (0 is valid)"
+PYEOF
+if [[ $? -eq 0 ]]; then ok "reps keyed by (config, rep); idle% and contained-tick DUT p50/p99 extracted"; else bad "aggregation: $(cat "$FAKE/check.out")"; fi
+evaluate_perf_gates >/dev/null 2>&1
+if [[ "$(cat "$RESULTS_DIR/gate-verdict.txt" 2>/dev/null)" == PASS ]]; then ok "healthy fake run -> verdict PASS"; else bad "healthy fake run -> verdict PASS"; fi
+SUMMARY="$(generate_markdown_summary 2>/dev/null)"
+if [[ "$SUMMARY" == *"vs target"* && "$SUMMARY" == *"DUT p99 (us)"* && "$SUMMARY" == *"tokio-dpdk-concurrent"* ]]; then ok "summary has vs target, DUT latency columns and the concurrent config"; else bad "summary columns"; fi
+if [[ "$SUMMARY" == *"poll-idle %"* ]]; then ok "summary labels idle% as poll-idle"; else bad "summary labels idle% as poll-idle"; fi
+# Degrade tokio-dpdk's rep-1 700k below 95% of rust-dpdk -> FAIL with a GATE FAIL line.
+python3 -I - "$RESULTS_DIR" <<'PYEOF'
+import json, sys
+for n in (1, 2, 3):
+    f = f"{sys.argv[1]}/tokio-dpdk.rep{n}.json"
+    d = json.load(open(f))
+    for rows in d["results"].values():
+        for r in rows:
+            if r["target_pps"] == 700000:
+                r["rx_pps"] = 300000
+    json.dump(d, open(f, "w"))
+PYEOF
+aggregate_results >/dev/null 2>&1; evaluate_perf_gates > "$FAKE/gates.out" 2>&1
+if [[ "$(cat "$RESULTS_DIR/gate-verdict.txt" 2>/dev/null)" == FAIL ]] && grep -q "GATE FAIL: tokio-dpdk @ 64B" "$FAKE/gates.out"; then ok "degraded tokio-dpdk -> FAIL + GATE FAIL line"; else bad "degraded tokio-dpdk -> FAIL"; fi
+# Native missing entirely -> INVALID (run-invalid.txt, no verdict file).
+rm -f "$RESULTS_DIR"/native-dpdk.rep*.json
+aggregate_results >/dev/null 2>&1; evaluate_perf_gates >/dev/null 2>&1
+if [[ -f "$RESULTS_DIR/run-invalid.txt" && ! -f "$RESULTS_DIR/gate-verdict.txt" ]]; then ok "native-dpdk missing -> run-invalid.txt, no verdict"; else bad "native-dpdk missing -> INVALID"; fi
+# Crashed evaluator leaves no verdict (main() treats a missing verdict as FAIL).
+rm -f "$RESULTS_DIR/perf-report.json" "$RESULTS_DIR/run-invalid.txt"
+evaluate_perf_gates >/dev/null 2>&1
+if [[ ! -f "$RESULTS_DIR/gate-verdict.txt" ]]; then ok "evaluator crash leaves no verdict file (fail-closed in main)"; else bad "evaluator crash leaves no verdict file"; fi
+for t in tokio-dpdk-concurrent; do
+    if grep -q "start_dut_tokio_dpdk_concurrent" "$HARNESS" && grep -q -- "--mode concurrent" "$HARNESS"; then ok "$t runner launches tokio-echo --mode concurrent"; else bad "$t runner"; fi
+done
+rm -rf "$FAKE"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "== $PASS passed, $FAIL failed =="

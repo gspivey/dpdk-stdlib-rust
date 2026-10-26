@@ -1,0 +1,46 @@
+{
+  "step_pps": 700000,
+  "all_rate_steps": [70000, 140000, 350000, 700000],
+  "baseline_0_3_0": { "rust-dpdk": { "64": 698948, "512": 697552, "1400": 475898 } },
+  "invalid_run_rule": {
+    "config": "native-dpdk", "size": 64, "metric": "rx_pps", "min_abs": 600000, "exit_code": 2,
+    "note": "If native-dpdk median @64B < 600,000 the deployment is bad (not a regression): mark the run INVALID and exit 2 (infra), do not report a gate FAIL."
+  },
+  "gates": {
+    "tokio-dpdk": {
+      "rel_to": "rust-dpdk", "min_ratio": 0.95, "sizes": [64, 512, 1400],
+      "note": "Headline tokio-vs-rust gate. The 700k step is judged ONLY here (not per-step)."
+    },
+    "rust-dpdk": {
+      "rel_to": "native-dpdk", "min_ratio": 0.95, "sizes": [64, 512], "report_only_sizes": [1400],
+      "note": "Deployment-normalized sync no-regression gate: same-run native-dpdk is the denominator. 1400B is report-only (rust is 81-87% of native when TRex is not line-rate capped). The vs-0.3.0 absolute comparison is report-only (report_only_metrics.vs_0_3_0)."
+    },
+    "tokio-dpdk-concurrent": {
+      "abs_min": 290000, "sizes": [64], "report_only_sizes": [512, 1400], "enabled": false,
+      "note": "Floor at 64B only. enabled=false means report-only; the PR that drops the tokio outer mutex flips it to true."
+    },
+    "per_step_tokio_vs_rust": {
+      "rel_to": "rust-dpdk", "metric": "rx_pps", "min_ratio": 0.98,
+      "rate_steps": [70000, 140000, 350000], "sizes": [64, 512, 1400],
+      "note": "tokio-dpdk (fair) rx_pps >= 98% of the same-run rust-dpdk rx_pps at 70k/140k/350k (rep 1 only, a single sample). 700k is excluded."
+    }
+  },
+  "idle_cpu": {
+    "config": "tokio-dpdk", "max_pct_of_one_vcpu": 10, "enabled": false,
+    "note": "Judged only when the 0-pps step ran; enabled by the PR that adds that step."
+  },
+  "report_only_metrics": {
+    "dut_latency": {
+      "configs": ["rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent"],
+      "metric": ["dut_lat_p50_us", "dut_lat_p99_us"],
+      "source_fields": ["lat_p50_us", "lat_p99_us"],
+      "rate_steps": [70000, 140000, 350000, 700000],
+      "note": "DUT p50/p99 are reported, never gated."
+    },
+    "vs_0_3_0": {
+      "config": "rust-dpdk", "rel_to": "baseline_0_3_0", "sizes": [64, 512, 1400],
+      "warn_below_ratio": 0.98, "gates": false,
+      "note": "Report-only 'vs 0.3.0' comparison with a WARN marker below 98%. It never gates."
+    }
+  }
+}

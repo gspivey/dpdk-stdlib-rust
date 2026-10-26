@@ -2843,7 +2843,20 @@ impl UdpSocket {
         if self.has_pipeline.load(Ordering::Acquire) {
             return self.try_recv_from_pipeline(buf);
         }
-        self.try_recv_from_inline(buf)
+        let result = self.try_recv_from_inline(buf);
+        // RTC/tokio mode has no `worker_loop`, so feed the same counters the
+        // pipeline workers use: an empty poll is idle, a delivered packet is
+        // processed. This is what makes `worker_idle_pct` non-zero in tokio mode.
+        match &result {
+            Ok(None) => {
+                perf_inc!(self.perf_counters.worker_idle_polls);
+            }
+            Ok(Some(_)) => {
+                perf_inc!(self.perf_counters.worker_packets_processed);
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// Non-blocking pipeline recv: single dequeue attempt from app rings.
@@ -5979,6 +5992,20 @@ mod tests {
         // Perf counter is shared via Arc — the socket holds it directly.
         let snap = socket.perf_counters.snapshot();
         assert_eq!(snap.rx_drops_buffer_full, 2);
+    }
+
+    #[test]
+    fn try_recv_from_idle_polls_feed_worker_idle_counters() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let mut buf = [0u8; 64];
+        for _ in 0..5 {
+            assert!(socket.try_recv_from(&mut buf).expect("poll").is_none());
+        }
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.worker_idle_polls, 5);
+        assert_eq!(snap.worker_packets_processed, 0);
+        // All polls were empty, so the derived idle% is 100 (poll-idle, not CPU idle).
+        assert!(socket.perf_snapshot().worker_idle_pct > 0.0);
     }
 
     #[test]

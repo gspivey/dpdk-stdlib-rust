@@ -137,6 +137,15 @@ stuck stacks) still blocks feature work; fix or escalate it, do not work around 
 - **Use the stub system** - tests must pass without real DPDK (`cargo test` on any platform)
 - **Follow existing error patterns** - `UdpError`/`UdpResult` in dpdk-udp, `DpdkError`/`DpdkResult` in dpdk, `io::Result` for backend trait methods
 
+### Perf-log discipline
+
+- A "known limitation" / "No Regression on a flat ceiling" claim MUST NOT be written into
+  `docs/perf-test-log.md` unless it links a ROADMAP item that tracks the limitation; otherwise the
+  flat number is an unexplained regression.
+- Perf numbers come only from the GitHub Actions perf-tests job. Gates live in
+  `scripts/perf-targets.json`; a `GATE FAIL` line fails the run (exit 1), an INVALID run (native-dpdk
+  too slow or missing) exits 2 (redeploy).
+
 ### DON'T:
 - **Don't add DPDK-specific types to the `PacketBackend` trait** - it operates on `&[u8]` / `Vec<u8>`
 - **Don't modify `dpdk-sys/src/stubs.rs`** without understanding that it affects ALL tests

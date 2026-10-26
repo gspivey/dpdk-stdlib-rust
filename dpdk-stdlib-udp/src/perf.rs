@@ -609,8 +609,8 @@ impl PerfReporter {
                 "[PERF] ts_unix={:.3} interval={}s rx_pps={:.0} rx_bps={:.0} tx_pps={:.0} tx_bps={:.0} \
                  rx_drops={} rx_ring_drops={} rx_buf_drops={} tx_fails={} \
                  {} \
-                 lat_avg_us={:.0} lat_p50_us={:.0} lat_p95_us={:.0} \
-                 lat_p99_us={:.0} lat_max_us={:.0} arp_hits={} arp_misses={} ring_drops={} \
+                 lat_avg_us={:.0} lat_p50_us={:.1} lat_p95_us={:.0} \
+                 lat_p99_us={:.1} lat_max_us={:.0} arp_hits={} arp_misses={} ring_drops={} \
                  worker_idle_pct={:.1} burst_avg={:.1}",
                 ts_unix,
                 interval_secs,
