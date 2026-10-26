@@ -427,16 +427,6 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 
 ---
 
-### 45. tokio UDP perf (0.3.1): tokio-echo fair/concurrent modes
-
-Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
-then implement tasks `1.1`-`1.7` (PR 1).
-
-- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.4a`, `1.5`, `1.6`, `1.7`
-- [ ] Complete · PR: —
-
----
-
 ### 46. tokio UDP perf (0.3.1): perf gates, targets, DUT latency, counters, log discipline
 
 Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
@@ -501,4 +491,11 @@ These require new kiro spec files before agents can pick them up.
 
 Items move here after merge.
 
-*(none yet)*
+### 45. tokio UDP perf (0.3.1): tokio-echo fair/concurrent modes
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `1.1`-`1.7` (PR 1).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.4a`, `1.5`, `1.6`, `1.7`
+- [x] Complete · PR: #138
+

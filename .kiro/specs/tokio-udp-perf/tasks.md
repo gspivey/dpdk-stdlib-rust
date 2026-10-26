@@ -20,9 +20,9 @@ is needed.
 Ships independently; does not alter any published crate's API. ~150-250 lines.
 **Depends on:** nothing.
 
-- [ ] 1.1 Add a `--mode {fair|concurrent}` clap arg to `Args`, defaulting to `fair`; reject
+- [x] 1.1 Add a `--mode {fair|concurrent}` clap arg to `Args`, defaulting to `fair`; reject
   unknown values with a non-zero exit and a clear message. (Req 1.3)
-- [ ] 1.2 Refactor the main receive loop so that after `stats.record_recv(len)` it branches on
+- [x] 1.2 Refactor the main receive loop so that after `stats.record_recv(len)` it branches on
   mode:
   - `fair`: `socket.send_to(&buf[..len], from_addr).await` in the same task — no `to_vec`,
     no `Semaphore`, no `tokio::spawn`, no `tokio::time::timeout`. (Req 1.1, 1.4)
@@ -30,23 +30,23 @@ Ships independently; does not alter any published crate's API. ~150-250 lines.
     `tokio::time::timeout` — echoing the **exact received bytes** (`&data`), NOT the current
     `format!("echo: {}", ..)`. (Req 1.2)
   (Req 1.8: `--workers`/`--timeout` apply only in concurrent mode.)
-- [ ] 1.3 Gate all `String::from_utf8_lossy`/`format!` payload work behind `--verbose` in both
+- [x] 1.3 Gate all `String::from_utf8_lossy`/`format!` payload work behind `--verbose` in both
   modes; echo exact bytes when not verbose (removes the hot-path `format!` the app uses today).
   (Req 1.4, 1.5)
-- [ ] 1.4 Print `mode=<fair|concurrent>` at startup; keep the SIGTERM/SIGINT shutdown `select!`
+- [x] 1.4 Print `mode=<fair|concurrent>` at startup; keep the SIGTERM/SIGINT shutdown `select!`
   and the `disable_perf_reporting()` call intact so `[NIC-FINAL]` is still emitted. (Req 1.6, 1.7)
-- [ ] 1.4a Add a `--idle-backoff-ms <N>` clap arg (default absent = OFF). PR 1 **only parses the
+- [x] 1.4a Add a `--idle-backoff-ms <N>` clap arg (default absent = OFF). PR 1 **only parses the
   flag** and prints it at startup — it does **not** reference `set_idle_backoff` (that method only
   lands in PR 5, so referencing it in PR 1 would not compile — HIGH-3). The flag has no behavioural
   effect in PR 1. The full wiring (binding `DpdkUdpSocket` directly, calling `set_idle_backoff`,
   erasing to `Arc<dyn AsyncUdpSocket>`) is done in PR 5 task 5.4b. (Req 1.8)
-- [ ] 1.5 Add a test (LOW-10) that drives the `tokio-echo` binary via `assert_cmd` (or factors
+- [x] 1.5 Add a test (LOW-10) that drives the `tokio-echo` binary via `assert_cmd` (or factors
   the receive loop into a function the test calls directly), forcing the **tokio** backend
   (`--force-tokio`), asserting that `fair` echoes **exact bytes** over loopback, that
   `concurrent` also echoes exact bytes (no `echo: ` prefix), and that `--mode bogus` exits
   non-zero. (Req 1.1, 1.2, 1.3)
-- [ ] 1.6 `cargo build && cargo test` from workspace root.
-- [ ] 1.7 **Run the perf workflow for PR 1 (LOW-7).** PR 1 changes the benchmarked app (the
+- [x] 1.6 `cargo build && cargo test` from workspace root.
+- [x] 1.7 **Run the perf workflow for PR 1 (LOW-7).** PR 1 changes the benchmarked app (the
   `tokio-dpdk` config now runs the fair loop, so its numbers move ~2.3×), and CLAUDE.md step 5
   applies to **every** code change. Run `gh workflow run perf-tests.yml`, poll with `gh run view
   --json status,conclusion`, and **record the new `tokio-dpdk` numbers** in a `docs/perf-test-log.md`
