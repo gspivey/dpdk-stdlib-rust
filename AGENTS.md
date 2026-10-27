@@ -128,6 +128,13 @@ If any of them is `failure`, fixing it is the ONLY work for this cycle: open a f
 No new ROADMAP items or features land on a red `development`. A red that comes from infrastructure (AWS limits,
 stuck stacks) still blocks feature work; fix or escalate it, do not work around it.
 
+### No "known limitation" without a ROADMAP item
+
+When writing up a perf run (`docs/perf-test-log.md`) or a PR, do NOT label a plateau a
+"known limitation", or call a flat result "No Regression", unless it is linked to a
+`ROADMAP.md` item that fixes it. Flat-vs-last-run does not pass a run that misses its
+absolute target in `scripts/perf-targets.json`; report **vs last run** AND **vs target**.
+
 ### DO:
 - **Run `cargo build` and `cargo test` from the workspace root** after any changes
 - **Read files before modifying them** - understand existing patterns first

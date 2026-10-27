@@ -18,7 +18,7 @@ on:
       configs:
         description: 'DUT configs to benchmark'
         required: false
-        default: 'plain-rust,rust-dpdk,tokio-dpdk,native-dpdk'
+        default: 'plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk'
       teardown:
         description: 'Destroy stack after tests'
         required: false
@@ -74,7 +74,10 @@ jobs:
   # ── Full performance test suite ─────────────────────────────────────────────
   perf-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 150 min (was 90): the 700k step now runs 3 reps for the judged configs.
+    # Extra traffic = 4 judged configs x 2 extra reps x 3 sizes x 30 s ~= 12 min,
+    # plus per-rep SSM/TRex overhead. No D8 re-run exists (removed).
+    timeout-minutes: 150
     needs: validate-cdk
 
     steps:
@@ -151,7 +154,7 @@ jobs:
             --packet-sizes "${{ inputs.packet_sizes || '64,512,1400,8500' }}" \
             --duration "${{ inputs.duration || '30' }}" \
             --rate-steps "${{ inputs.rate_steps || '70000,140000,350000,700000' }}" \
-            --configs "${{ inputs.configs || 'plain-rust,rust-dpdk,tokio-dpdk,native-dpdk' }}" \
+            --configs "${{ inputs.configs || 'plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk' }}" \
             --json-summary
         env:
           DPDK_AMI_ID: ${{ steps.amis.outputs.dpdk_ami }}

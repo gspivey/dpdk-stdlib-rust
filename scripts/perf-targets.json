@@ -1,0 +1,62 @@
+{
+  "_comment": "Absolute/relative perf targets judged by evaluate_perf_gates (scripts/perf-tests/evaluate_perf_gates.py). Spec: .kiro/specs/tokio-udp-perf (design D2-D9). Each gate pins its OWN sizes list.",
+  "judged_step": 700000,
+  "all_rate_steps": [70000, 140000, 350000, 700000],
+  "baseline_0_3_0": {
+    "config": "rust-dpdk",
+    "rx_pps": {"64": 698948, "512": 697552, "1400": 475898}
+  },
+  "invalid_run_rule": {
+    "config": "native-dpdk",
+    "size": 64,
+    "min_abs": 600000,
+    "exit_code": 2
+  },
+  "gates": {
+    "tokio-dpdk": {
+      "rel_to": "rust-dpdk",
+      "min_ratio": 0.95,
+      "sizes": [64, 512, 1400],
+      "enabled": true
+    },
+    "rust-dpdk": {
+      "rel_to": "native-dpdk",
+      "min_ratio": 0.95,
+      "sizes": [64, 512],
+      "report_only_sizes": [1400],
+      "enabled": true
+    },
+    "tokio-dpdk-concurrent": {
+      "abs_min": 290000,
+      "sizes": [64],
+      "report_only_sizes": [512, 1400],
+      "enabled": false
+    }
+  },
+  "per_step_tokio_vs_rust": {
+    "config": "tokio-dpdk",
+    "rel_to": "rust-dpdk",
+    "metric": "rx_pps",
+    "min_ratio": 0.98,
+    "rate_steps": [70000, 140000, 350000],
+    "sizes": [64, 512, 1400]
+  },
+  "idle_cpu": {
+    "config": "tokio-dpdk",
+    "max_pct_of_one_vcpu": 10,
+    "enabled": false
+  },
+  "report_only_metrics": {
+    "vs_0_3_0": {
+      "rel_to": "baseline_0_3_0",
+      "warn_below_ratio": 0.98,
+      "gates": false
+    },
+    "dut_latency": {
+      "configs": ["rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent"],
+      "steps": [70000, 140000, 350000, 700000],
+      "keys": ["dut_lat_p50_us", "dut_lat_p99_us"],
+      "gates": false
+    }
+  }
+}

@@ -110,6 +110,90 @@ if [[ -s "$START_LOG" ]]; then bad "no restart when mode is unchanged"; else ok 
 ensure_trex_mode astf >/dev/null 2>&1
 if grep -qx astf "$START_LOG"; then ok "restarts to astf when switching from stl"; else bad "restarts to astf when switching from stl"; fi
 
+# ── 4. Perf gates end to end: reps keying, medians, verdict, summary ─────────
+echo "== aggregate -> evaluate_perf_gates -> summary (synthetic reps) =="
+GATE_TMP="$(mktemp -d)"
+build_fixture() {   # $1=tokio 700k rx_pps  $2=native 700k rx_pps
+    local d="$1" tokio_pps="$2" native_pps="$3"
+    mkdir -p "$d/results" "$d/logs"
+    python3 - "$d" "$tokio_pps" "$native_pps" <<'PYFIX'
+import json, sys
+d, tokio, native = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+T0 = 1_000_000.0
+def steps(pps700, with_low=True):
+    out = []
+    t = T0
+    plan = ([(70000, 69000), (140000, 138000), (350000, 340000)] if with_low else []) + [(700000, pps700)]
+    for tgt, rx in plan:
+        out.append({"target_pps": tgt, "rx_pps": rx, "tx_pps": tgt, "drop_pct": 0.0,
+                    "ts_start_unix": t, "ts_end_unix": t + 30})
+        t += 40
+    return out
+for cfg, pps in (("native-dpdk", native), ("rust-dpdk", 698000), ("tokio-dpdk", tokio), ("tokio-dpdk-concurrent", 300000)):
+    for rep in (1, 2, 3):
+        data = {"config_name": cfg, "results": {"64B": steps(pps, with_low=(rep == 1))}}
+        json.dump(data, open(f"{d}/results/{cfg}.rep{rep}.json", "w"))
+# tokio DUT log: an idle tick (rx_pps=0) then a tick fully inside the first step window.
+with open(f"{d}/logs/dut-tokio-dpdk-perf.log", "w") as fh:
+    fh.write("[PERF] ts_unix=999990.000 interval=10s rx_pps=0 rx_drops=0 rx_ring_drops=0 rx_buf_drops=0 "
+             "lat_p50_us=0.0 lat_p99_us=0.0 worker_idle_pct=97.5 burst_avg=0.0\n")
+    fh.write("[PERF] ts_unix=1000020.000 interval=10s rx_pps=69000 rx_drops=0 rx_ring_drops=0 rx_buf_drops=0 "
+             "lat_p50_us=0.8 lat_p99_us=4.2 worker_idle_pct=10.0 burst_avg=3.0\n")
+    fh.write("[PERF] ts_unix=1000030.000 interval=10s rx_pps=69000 rx_drops=0 rx_ring_drops=0 rx_buf_drops=0 "
+             "lat_p50_us=0.9 lat_p99_us=9.9 worker_idle_pct=10.0 burst_avg=3.0\n")
+PYFIX
+}
+run_pipeline() {    # $1=fixture dir; leaves verdict files in results/
+    RESULTS_DIR="$1/results"; LOGS_DIR="$1/logs"; export RESULTS_DIR LOGS_DIR
+    CONFIGS="rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"
+    PACKET_SIZES="64"; RATE_STEPS="70000,140000,350000,700000"
+    aggregate_results >/dev/null 2>&1
+    evaluate_perf_gates >/dev/null 2>&1
+}
+
+build_fixture "$GATE_TMP/good" 690000 699000
+run_pipeline "$GATE_TMP/good"
+if [[ "$(cat "$GATE_TMP/good/results/gate-verdict.txt" 2>/dev/null)" == PASS ]]; then ok "healthy fixture => gate-verdict PASS"; else bad "healthy fixture => gate-verdict PASS"; fi
+if python3 - "$GATE_TMP/good/results/perf-report.json" <<'PYCHK'
+import json, sys
+r = json.load(open(sys.argv[1]))
+vals = r["rep_values"]["tokio-dpdk"]["64B"]["700000"]
+t = r["configs"]["tokio-dpdk"]
+assert len(vals) == 3, vals                      # rep2/rep3 did not overwrite rep1
+assert t["idle_pct"] == 97.5, t.get("idle_pct")  # first rx_pps=0 tick
+step = t["results"]["64B"][0]                    # 70k step window [1000000, 1000030]
+assert step["dut_lat_p50_us"] == 0.9 and step["dut_lat_p99_us"] == 9.9, step  # MAX of in-window ticks (the 999990 tick is outside), no averaging
+PYCHK
+then ok "aggregator keys by (config,rep), extracts idle% and in-window DUT latency"; else bad "aggregator keys by (config,rep), extracts idle% and in-window DUT latency"; fi
+SUMMARY="$(generate_markdown_summary 2>/dev/null)"
+if [[ "$SUMMARY" == *"vs target"* && "$SUMMARY" == *"DUT p99 (us)"* && "$SUMMARY" == *"Idle Worker %"* ]]; then ok "summary has vs-target, DUT latency and idle% sections"; else bad "summary has vs-target, DUT latency and idle% sections"; fi
+if [[ "$SUMMARY" == *"tokio-dpdk-concurrent"* ]]; then ok "summary lists tokio-dpdk-concurrent"; else bad "summary lists tokio-dpdk-concurrent"; fi
+
+build_fixture "$GATE_TMP/slow" 300000 699000
+run_pipeline "$GATE_TMP/slow"
+if [[ "$(cat "$GATE_TMP/slow/results/gate-verdict.txt" 2>/dev/null)" == FAIL ]]; then ok "tokio @ 300k vs rust 698k => gate-verdict FAIL"; else bad "tokio @ 300k => gate-verdict FAIL"; fi
+
+build_fixture "$GATE_TMP/bad" 690000 100000
+run_pipeline "$GATE_TMP/bad"
+if [[ -f "$GATE_TMP/bad/results/run-invalid.txt" && ! -f "$GATE_TMP/bad/results/gate-verdict.txt" ]]; then ok "native @64B < 600k => run-invalid.txt (exit 2 path), no verdict"; else bad "native sanity => run-invalid.txt"; fi
+
+# reps plan: requested sizes/configs only, never 8500.
+PLAN="$(python3 "$PERF_GATES_PY" reps-plan --targets "$PERF_TARGETS_FILE" \
+    --configs "plain-rust,rust-dpdk,tokio-dpdk,native-dpdk" --sizes "64,512,1400,8500" --steps "70000,700000")"
+if [[ "$(echo "$PLAN" | sed -n 2p)" == "64,512,1400" ]]; then ok "reps plan sizes exclude 8500"; else bad "reps plan sizes exclude 8500 (got: $PLAN)"; fi
+if [[ "$(echo "$PLAN" | sed -n 1p)" == "rust-dpdk,tokio-dpdk,native-dpdk" ]]; then ok "reps plan configs exclude non-judged plain-rust"; else bad "reps plan configs (got: $PLAN)"; fi
+
+echo "== tokio-dpdk-concurrent wired end to end =="
+if declare -F start_dut_tokio_dpdk_concurrent >/dev/null; then ok "start_dut_tokio_dpdk_concurrent defined"; else bad "start_dut_tokio_dpdk_concurrent defined"; fi
+if grep -q 'tokio-echo --mode concurrent' "$HARNESS" && grep -q 'echo-tokio-dpdk-concurrent.log' "$HARNESS"; then ok "concurrent DUT launches tokio-echo --mode concurrent to its own log"; else bad "concurrent DUT launch/log"; fi
+if [[ "$CONFIGS" == *tokio-dpdk-concurrent* ]] || grep -q '^CONFIGS=".*tokio-dpdk-concurrent' "$HARNESS"; then ok "default CONFIGS include tokio-dpdk-concurrent"; else bad "default CONFIGS include tokio-dpdk-concurrent"; fi
+WF="$TEST_DIR/../../../.github/workflows/perf-tests.yml"
+if [[ "$(grep -c 'tokio-dpdk-concurrent' "$WF")" -ge 2 ]]; then ok "perf-tests.yml default + --configs fallback include tokio-dpdk-concurrent"; else bad "perf-tests.yml default + --configs fallback include tokio-dpdk-concurrent"; fi
+rm -rf "$GATE_TMP"
+
+echo "== evaluate_perf_gates.py unit tests =="
+if python3 -m unittest "$TEST_DIR/test_evaluate_perf_gates.py" >/dev/null 2>&1; then ok "python unit tests pass"; else bad "python unit tests pass"; fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "== $PASS passed, $FAIL failed =="

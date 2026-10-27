@@ -63,7 +63,7 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
 ~300-450 lines.
 **Depends on:** PR 1 (gates judge `tokio-echo` fair default and the `--mode concurrent` config).
 
-- [ ] 2.1 Wire `tokio-dpdk-concurrent` end to end: add `start_dut_tokio_dpdk_concurrent`
+- [x] 2.1 Wire `tokio-dpdk-concurrent` end to end: add `start_dut_tokio_dpdk_concurrent`
   (mirror of `start_dut_tokio_dpdk`, launching `tokio-echo --mode concurrent --perf-interval 10`
   to `/var/log/echo-tokio-dpdk-concurrent.log`); add its arm to the config→runner dispatch
   `case` (~2599) and the DUT-log `case` (~2676); add it to the harness default `CONFIGS` (~40),
@@ -71,7 +71,7 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   fallback at ~L154** (`${{ inputs.configs || '...' }}` — LOW-7); add it to the
   `generate_markdown_summary` per-size table config list (~1870) and the NIC self-check list
   (~1956). (Req 2.1, 4.4)
-- [ ] 2.2 Add `scripts/perf-targets.json` with the 700k step, the `all_rate_steps`
+- [x] 2.2 Add `scripts/perf-targets.json` with the 700k step, the `all_rate_steps`
   `[70000,140000,350000,700000]`, the 0.3.0 baseline numbers (698948/697552/475898), and the
   gate definitions with **each gate pinning its own `sizes` list** (D2 — not a shared
   `[64,512,1400]`):
@@ -93,7 +93,7 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   configs/steps (keys `dut_lat_p50_us`/`dut_lat_p99_us`) as **report-only**. Add the
   `idle_cpu` gate `{config:tokio-dpdk, max_pct_of_one_vcpu:10, enabled:false}`; PR 5 (task 5.6a)
   flips it to `enabled:true` when it adds the 0-pps step (round-5 LOW-3). (Req 2.2, 2.3, 5.4)
-- [ ] 2.3 Reps (D9): keep rep 1 as the full sweep, written to `${config}.rep1.json`; add a
+- [x] 2.3 Reps (D9): keep rep 1 as the full sweep, written to `${config}.rep1.json`; add a
   **700k-only rep mode** (`--rep-700k-only`, running `--rate-steps 700000 --packet-sizes
   <requested sizes ∩ applicable gate sizes>` — `64,512,1400` with default inputs, **never 8500**)
   that re-runs each requested and judged config **twice** more, only when 700k is requested
@@ -104,11 +104,11 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   budget inline (4 configs × 2 reps × 3 sizes × 30 s ≈ 12 min traffic + overhead; no D8 re-run —
   removed, HIGH-4/MEDIUM-4). Reps 2-3 run **inside the per-config loop before teardown**. (Req 2.1,
   2.12)
-- [ ] 2.3a Fix the aggregator keying (D9/MEDIUM-4): today `configs[name] = data` keys by
+- [x] 2.3a Fix the aggregator keying (D9/MEDIUM-4): today `configs[name] = data` keys by
   `config_name` (~1783), so rep2/rep3 files overwrite rep1. Read per-rep files by **(config, rep)**
   (parse the `.repN.json` suffix or an added `"rep":N` field), and collect all 700k rows per
   (config, size) before taking the median. (Req 2.1)
-- [ ] 2.4 In `aggregate_results`, compute the per-(config,size) **median** at 700k across the
+- [x] 2.4 In `aggregate_results`, compute the per-(config,size) **median** at 700k across the
   per-rep files; add an `evaluate_perf_gates` step that reads `perf-targets.json` and the
   per-(config,rep) files. **First apply the native-dpdk sanity rule** (`invalid_run_rule`): if the
   native-dpdk median @64B < 600,000 write `"$RESULTS_DIR/run-invalid.txt"` and stop gating (the
@@ -130,7 +130,7 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   `gates["tokio-dpdk-concurrent"].enabled == true` — `false` in PR 2 (report-only), flipped to
   `true` by PR 4's diff (MEDIUM-1; **not** keyed on `PR_NUMBER`). **No D8 re-run** (removed —
   HIGH-4/MEDIUM-4). (Req 2.1, 2.2, 2.4)
-- [ ] 2.4a **Exit control flow (D7/HIGH-6 + MEDIUM-5 + D8/HIGH-4):** `evaluate_perf_gates` writes
+- [x] 2.4a **Exit control flow (D7/HIGH-6 + MEDIUM-5 + D8/HIGH-4):** `evaluate_perf_gates` writes
   `"$RESULTS_DIR/gate-verdict.txt"` = `PASS|FAIL` (and the GATE FAIL lines into the summary), or
   `"$RESULTS_DIR/run-invalid.txt"` on the native-dpdk sanity miss. `main()` runs it inside the
   `set +e` reporting block, and **after `set -e` is restored (~2762), before the `failed_configs`
@@ -141,16 +141,16 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   `write_failure_json`/`set -e` path. So 0=pass, 1=gate miss OR missing/unreadable verdict, 2=infra
   (incl. invalid deploy). Show the inserted block against `run-perf-tests.sh:~2730-2764`.
   (Req 2.2, 2.4)
-- [ ] 2.5 Add a **"vs target"** column to the per-size summary tables (median % of applicable
+- [x] 2.5 Add a **"vs target"** column to the per-size summary tables (median % of applicable
   target + PASS/FAIL). (Req 2.5)
-- [ ] 2.6 Add DUT p50/p99 latency columns parsed from the DUT's `[PERF]` `lat_p50_us`/
+- [x] 2.6 Add DUT p50/p99 latency columns parsed from the DUT's `[PERF]` `lat_p50_us`/
   `lat_p99_us` fields (extend/add a regex in `aggregate_results`), attributing a tick to a step
   only if its whole interval is inside the step's TRex window and reporting the **max** of the
   per-interval p99s/p50s (no averaging). **Change the reporter's format specifiers for
   `lat_p50_us`/`lat_p99_us` from `{:.0}` to `{:.1}`** (`perf.rs:~608`) so sub-µs values print.
   Keep the existing TRex `Lat Avg`/`Lat Max` columns unchanged. Exclude native-dpdk (no `[PERF]`).
   These columns are **report-only — there is NO latency gate** (D5). (Req 2.6)
-- [ ] 2.7 Wire tokio-mode counters so the `PerfReporter` observes non-zero `worker_idle_pct`
+- [x] 2.7 Wire tokio-mode counters so the `PerfReporter` observes non-zero `worker_idle_pct`
   while idle: increment the existing `worker_idle_polls`/`worker_packets_processed` counters on
   the RTC/tokio `try_recv_from` path (HIGH-7 — these counters live in `worker_loop` today, not
   `rx_loop`, and RTC has no `worker_loop`; no new public fields on `PerfCounters`/
@@ -163,17 +163,17 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   as rust-dpdk (**0 is a valid value**). No App-Drops cross-check: App Drops is already the sum of
   `RateSnapshot.rx_drops` = `rx_ring_drops + rx_buf_drops`, so such a check is a tautology
   (round-4 MEDIUM-1); the stub overflow tests are the proof that the counter increments. (Req 2.7, 2.8)
-- [ ] 2.7a Extract tokio-mode **idle%** into the summary (Req 2.7 evidence source, LOW-5): for each
+- [x] 2.7a Extract tokio-mode **idle%** into the summary (Req 2.7 evidence source, LOW-5): for each
   `[PERF]`-emitting config, take the `worker_idle_pct=` field of the **first `rx_pps=0` tick**
   (the pre-traffic idle period every run already has — the app runs with `--perf-interval 10`
   while the harness sleeps 15 s and sets up TRex) and print it as an "idle%" column/line; for
   tokio configs it SHALL be > 0 after task 2.7. (Req 2.7)
-- [ ] 2.8 Add a run-entry template to `docs/perf-test-log.md` with **vs last run** AND
+- [x] 2.8 Add a run-entry template to `docs/perf-test-log.md` with **vs last run** AND
   **vs target** per judged (config,size). (Req 2.9)
-- [ ] 2.9 Add the known-limitation rule to the `docs/perf-test-log.md` header and to `AGENTS.md`
+- [x] 2.9 Add the known-limitation rule to the `docs/perf-test-log.md` header and to `AGENTS.md`
   (no "known limitation"/"No Regression on a flat ceiling" without a linked ROADMAP item).
   (Req 2.10)
-- [ ] 2.9a Install `sysstat` on the DUT (D14/MEDIUM-3/LOW-11): add `sysstat` to **BOTH** dnf lines
+- [x] 2.9a Install `sysstat` on the DUT (D14/MEDIUM-3/LOW-11): add `sysstat` to **BOTH** dnf lines
   in `deploy/cdk/lib/perf-test-stack.ts` — the **pre-built-AMI** line at **:291**
   (`dnf install -y clang-devel unzip`) **and** the **full-bootstrap** line at **:298**
   (`dnf install -y git pciutils iperf3 clang-devel unzip numactl`) — because the DUT takes
@@ -184,7 +184,7 @@ populate tokio-mode `worker_idle_pct`/drop counters in the reporter. No public A
   **no live instance to hot-replace** and zero replacement risk. Note this reasoning inline.
   (Req 5.4) **The 0-pps-window measurement STEP that uses mpstat/
   pidstat lands in PR 5** (task 5.6a), since it must run `tokio-echo --idle-backoff-ms`.
-- [ ] 2.10 `cargo build && cargo test`; keep perf workflow `workflow_dispatch`-only. The log
+- [x] 2.10 `cargo build && cargo test`; keep perf workflow `workflow_dispatch`-only. The log
   entry proving Req 2.11 is produced by PR 6's validation run.
 
 ---

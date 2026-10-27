@@ -2843,7 +2843,19 @@ impl UdpSocket {
         if self.has_pipeline.load(Ordering::Acquire) {
             return self.try_recv_from_pipeline(buf);
         }
-        self.try_recv_from_inline(buf)
+        // Run-to-completion / tokio path: there is no `worker_loop`, so this is
+        // the only place that can feed `worker_idle_pct` in the PerfReporter.
+        let result = self.try_recv_from_inline(buf);
+        match &result {
+            Ok(Some(_)) => {
+                perf_inc!(self.perf_counters.worker_packets_processed);
+            }
+            Ok(None) => {
+                perf_inc!(self.perf_counters.worker_idle_polls);
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// Non-blocking pipeline recv: single dequeue attempt from app rings.
@@ -5979,6 +5991,29 @@ mod tests {
         // Perf counter is shared via Arc — the socket holds it directly.
         let snap = socket.perf_counters.snapshot();
         assert_eq!(snap.rx_drops_buffer_full, 2);
+    }
+
+    #[test]
+    fn try_recv_from_feeds_worker_idle_counters() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let mut buf = [0u8; 64];
+
+        // Empty poll => idle.
+        assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+        assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.worker_idle_polls, 2);
+        assert_eq!(snap.worker_packets_processed, 0);
+
+        // A buffered packet => processed.
+        {
+            let mut q = socket.recv_queue.lock().unwrap();
+            q.push(vec![7u8; 10], test_src()).unwrap();
+        }
+        assert!(socket.try_recv_from(&mut buf).unwrap().is_some());
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.worker_idle_polls, 2);
+        assert_eq!(snap.worker_packets_processed, 1);
     }
 
     #[test]

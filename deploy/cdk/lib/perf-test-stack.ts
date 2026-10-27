@@ -288,14 +288,18 @@ export class PerfTestStack extends cdk.Stack {
       'rm -rf /var/lib/amazon/ssm/ipc/ /var/lib/amazon/ssm/Vault/ /var/lib/amazon/ssm/registration',
       'systemctl enable amazon-ssm-agent 2>/dev/null || true',
       'systemctl start amazon-ssm-agent 2>/dev/null || true',
-      'dnf install -y clang-devel unzip 2>/dev/null || echo "packages already installed"',
+      // sysstat (mpstat/pidstat) is installed here, not over SSM at run time: this
+      // stack is deployed fresh on every perf run (teardown defaults to true), so a
+      // UserData change only replaces instances on a fresh deploy — there is no live
+      // instance to hot-replace and zero replacement risk.
+      'dnf install -y clang-devel unzip sysstat 2>/dev/null || echo "packages already installed"',
     ];
 
     const dutFullBootstrap = [
       'echo "=== Full DUT bootstrap ==="',
       'dnf update -y',
       'dnf groupinstall -y "Development Tools"',
-      'dnf install -y git pciutils iperf3 clang-devel unzip numactl --allowerasing',
+      'dnf install -y git pciutils iperf3 clang-devel unzip numactl sysstat --allowerasing',
       'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
       'export HOME=/root',
       'source /root/.cargo/env',

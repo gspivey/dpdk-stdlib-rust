@@ -3,6 +3,51 @@
 Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
+## Rules for entries
+
+- **No unlinked "known limitation".** A run MUST NOT be written up as "known limitation",
+  "No Regression" on a flat ceiling, or similar unless the plateau is linked to a ROADMAP
+  item that fixes it (`ROADMAP.md` item number). Flat-vs-last-run is not a pass when the
+  absolute target (`scripts/perf-targets.json`) is missed — the 305k pps tokio ceiling was
+  logged as "No Regression" 33 times this way.
+- **Judge against targets, not just the last run.** Every entry reports both **vs last run**
+  and **vs target** for each judged (config, size). Targets and gates live in
+  `scripts/perf-targets.json`; the 700k step is judged by the **median of 3 reps**.
+- Only GitHub Actions `perf-tests.yml` results are logged — never local or synthetic data.
+
+### Run entry template
+
+```markdown
+## Run #N: <PR title> — <verdict>
+
+| Field | Value |
+|-------|-------|
+| **Date** | YYYY-MM-DD |
+| **Git Hash** | `abcdef0` |
+| **Branch** | `agent/<slug>` |
+| **PR** | [#NNN](https://github.com/gspivey/dpdk-stdlib-rust/pull/NNN) |
+| **GH Actions Run** | [ID](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/ID) |
+| **Instance Type** | c6in.xlarge |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS / FAIL / INVALID (exit 0 / 1 / 2) |
+
+### Changes Since Run #N-1
+
+### Results: Hardware (TRex)
+
+(per-size, per-step tables as in earlier runs)
+
+### Judged results — 700k median of 3 reps
+
+| Config | Size | Median rx_pps | vs last run | Target | vs target | Result |
+|--------|------|---------------|-------------|--------|-----------|--------|
+| tokio-dpdk | 64B | | +x.x% | 95% of rust-dpdk | xx.x% | PASS/FAIL |
+| rust-dpdk | 64B | | +x.x% | 95% of native-dpdk | xx.x% | PASS/FAIL |
+| tokio-dpdk-concurrent | 64B | | +x.x% | 290,000 (report-only) | xx.x% | report-only |
+
+### Analysis
+```
+
 
 ## Run #51: docs: mark ROADMAP #35 complete — No Regression
 
