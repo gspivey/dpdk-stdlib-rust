@@ -1,0 +1,70 @@
+{
+  "step_pps": 700000,
+  "all_rate_steps": [70000, 140000, 350000, 700000],
+  "baseline_0_3_0": {
+    "rust-dpdk": {"64": 698948, "512": 697552, "1400": 475898}
+  },
+  "invalid_run_rule": {
+    "config": "native-dpdk",
+    "size": 64,
+    "metric": "rx_pps",
+    "min_abs": 600000,
+    "exit_code": 2,
+    "note": "D8/HIGH-4: if the native-dpdk median @64B is < 600,000 the deployment is bad (not a regression). Mark the run INVALID and exit 2 (infra), do NOT report a gate FAIL (exit 1)."
+  },
+  "gates": {
+    "tokio-dpdk": {
+      "rel_to": "rust-dpdk",
+      "min_ratio": 0.95,
+      "sizes": [64, 512, 1400],
+      "note": "Headline tokio-vs-rust gate. The 700k step is judged ONLY here (not per-step - MEDIUM-7)."
+    },
+    "rust-dpdk": {
+      "rel_to": "native-dpdk",
+      "min_ratio": 0.95,
+      "sizes": [64, 512],
+      "report_only_sizes": [1400],
+      "note": "D3+D8/HIGH-4: this ONE deployment-normalized gate is BOTH the rust>=native gate AND the sync no-regression gate. Same-run native-dpdk is the denominator, so a slow deployment moves both numbers together and cannot cause a false regression. 1400B is report-only (rust is 81-87% of native when TRex is not line-rate capped - runs #43 #47 #48 #49 #51). The vs-0.3.0 absolute comparison is report-only (see report_only_metrics.vs_0_3_0)."
+    },
+    "tokio-dpdk-concurrent": {
+      "abs_min": 290000,
+      "sizes": [64],
+      "report_only_sizes": [512, 1400],
+      "enabled": false,
+      "note": "D2/LOW-3/MEDIUM-1: floor at 64B only (E2 spawn = 232k@512B, 176k@1400B); 512/1400 are report-only. enabled=false => REPORT-ONLY (not gated). PR 4's diff flips enabled:true (PR 4 makes the concurrent path fast). Not keyed on PR_NUMBER."
+    },
+    "per_step_tokio_vs_rust": {
+      "config": "tokio-dpdk",
+      "rel_to": "rust-dpdk",
+      "metric": "rx_pps",
+      "min_ratio": 0.98,
+      "rate_steps": [70000, 140000, 350000],
+      "sizes": [64, 512, 1400],
+      "note": "D6/HIGH-5/MEDIUM-7: the ONE per-step throughput rule, at 70k/140k/350k ONLY (700k excluded - judged by the headline tokio-dpdk 95%-of-rust gate). tokio-dpdk (fair) rx_pps >= 98% of the SAME-RUN rust-dpdk rx_pps at that step+size (rep 1, a single sample - LOW-9). No '% of offered rate' rule."
+    }
+  },
+  "idle_cpu": {
+    "config": "tokio-dpdk",
+    "max_pct_of_one_vcpu": 10,
+    "enabled": false,
+    "note": "Round-5 LOW-3: added by PR 2 as enabled:false (the 0-pps step does not exist yet); PR 5 adds the 0-pps step (task 5.6a) and flips enabled:true. Judged only when the 0-pps step ran (process CPU via pidstat)."
+  },
+  "report_only_metrics": {
+    "dut_latency": {
+      "configs": ["rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent"],
+      "metric": ["dut_lat_p50_us", "dut_lat_p99_us"],
+      "source_fields": ["lat_p50_us", "lat_p99_us"],
+      "precision": "{:.1} from ns",
+      "rate_steps": [70000, 140000, 350000, 700000],
+      "note": "D5/HIGH-4: DUT p50/p99 are REPORTED, NOT gated. The idle backoff is opt-in and default OFF, so there is no latency hazard in default 0.3.1. There is NO latency gate."
+    },
+    "vs_0_3_0": {
+      "config": "rust-dpdk",
+      "rel_to": "baseline_0_3_0",
+      "sizes": [64, 512, 1400],
+      "warn_below_ratio": 0.98,
+      "gates": false,
+      "note": "D8/HIGH-4/LOW-4: the rust-dpdk-vs-0.3.0-absolute comparison is REPORT-ONLY (a 'vs 0.3.0' column), with a WARN marker below 98% (the brief's sync number). It NEVER gates: CI runs #41 #42 #45 #50 dipped below 97% from deployment variance with same-run native equally low, so gating on the absolute would fail clean runs."
+    }
+  }
+}

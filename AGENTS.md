@@ -145,6 +145,16 @@ stuck stacks) still blocks feature work; fix or escalate it, do not work around 
 - **Don't assume DPDK is available** - always handle the stub/fallback case
 - **Don't change method signatures on `UdpSocket`** without updating the compat layer in `dpdk-tokio`
 
+### Perf-log write-ups need a tracked limitation
+
+Do not write a "known limitation" or a "No Regression on a flat ceiling" claim in
+`docs/perf-test-log.md` (or a PR description) unless it links a ROADMAP item that
+tracks the limitation. The perf workflow now gates on absolute targets
+(`scripts/perf-targets.json`, 3-rep median at the 700k step); a flat number with
+no linked item is an unexplained regression. New log entries use the run-entry
+template in `docs/perf-test-log.md` and carry both **vs last run** and
+**vs target** for every judged (config, size).
+
 ## Domain Knowledge
 
 Before debugging networking issues, **READ these documents first**:

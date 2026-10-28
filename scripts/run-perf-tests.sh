@@ -37,7 +37,7 @@ CPS_RATES="100,500,1000,5000"
 TCP_PAYLOAD_SIZES="64,512,1400,65536"
 # Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
 # This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
-CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,native-dpdk"
+CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"
 JSON_SUMMARY=false
 IP_VERSION="4"
 
@@ -52,6 +52,9 @@ export RESULTS_DIR LOGS_DIR
 SSM_READINESS_TIMEOUT=600
 TREX_START_TIMEOUT=120
 BENCHMARK_TIMEOUT=600
+# Gate thresholds, 0.3.0 baseline and per-gate sizes live in one auditable file.
+PERF_TARGETS="$SCRIPT_DIR/perf-targets.json"
+EVALUATE_GATES="$SCRIPT_DIR/perf-tests/evaluate_gates.py"
 
 TREX_INSTANCE_ID=""
 DUT_INSTANCE_ID=""
@@ -797,9 +800,21 @@ stop_trex_server() {
 
 # ── Benchmark Runner ──────────────────────────────────────────────────────────
 
+# Run the TRex STL benchmark for one UDP config and download the result.
+#   $1 config   $2 dst port (default 9000)
+#   $3 rep      1 = the full sweep (default); 2/3 = 700k-only repetitions on the
+#               already-deployed stack (tokio-udp-perf D9, no re-deploy)
+#   $4 sizes    packet sizes (default $PACKET_SIZES)
+#   $5 rates    rate steps  (default $RATE_STEPS)
+# Each rep writes its own file, $RESULTS_DIR/<config>.rep<N>.json, so the
+# aggregator can key results by (config, rep) and take the per-size median.
 run_benchmark_for_config() {
     local config_name="$1"
     local dst_port="${2:-9000}"
+    local rep="${3:-1}"
+    local sizes="${4:-$PACKET_SIZES}"
+    local rates="${5:-$RATE_STEPS}"
+    local result_name="${config_name}.rep${rep}"
 
     # TCP configs (token suffix -tcp) use the ASTF (stateful) TRex runner.
     if [[ "$config_name" == *-tcp ]]; then
@@ -810,8 +825,9 @@ run_benchmark_for_config() {
     # UDP configs need TRex in STL (stateless) mode.
     ensure_trex_mode stl || { log_error "Failed to start TRex in STL mode"; return 1; }
 
-    log_info "Running TRex benchmark for config: $config_name"
+    log_info "Running TRex benchmark for config: $config_name (rep $rep, sizes=$sizes, rates=$rates)"
 
+    if [[ "$rep" -eq 1 ]]; then
     # Copy benchmark script to TRex instance using base64 encoding.
     # Heredoc deployment was silently deploying stale content; base64
     # avoids shell quoting/escaping issues entirely.
@@ -825,11 +841,13 @@ run_benchmark_for_config() {
         return 1
     }
     log_info "Script deploy result: $deploy_out"
+    fi  # rep 1 only: deploy run_benchmark.py (already on the TRex host for reps 2-3)
 
     # Use the gateway MAC discovered during generate_trex_config
     log_info "Using gateway MAC: ${TREX_GATEWAY_MAC:-unknown}"
-    log_info "Benchmark params: src=${TREX_DATA_ENI_IP} dst=${DUT_DATA_ENI_IP} port=${dst_port} sizes=${PACKET_SIZES} rates=${RATE_STEPS} duration=${DURATION}"
+    log_info "Benchmark params: src=${TREX_DATA_ENI_IP} dst=${DUT_DATA_ENI_IP} port=${dst_port} sizes=${sizes} rates=${rates} duration=${DURATION}"
 
+    if [[ "$rep" -eq 1 ]]; then
     # Pre-flight: verify TRex API is accessible and benchmark script can import dependencies
     local preflight
     preflight=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
@@ -859,6 +877,7 @@ $preflight
         log_error "TRex API preflight failed — benchmark will likely fail"
         return 1
     fi
+    fi  # rep 1 only: TRex API preflight
 
     # Run benchmark via SSM — capture both stdout and stderr
     local bench_cmd="cd /opt/trex && python3 /opt/perf-tests/run_benchmark.py \
@@ -868,10 +887,10 @@ $preflight
         --dst-ip '$DUT_DATA_ENI_IP' \
         --dst-mac '${TREX_GATEWAY_MAC}' \
         --dst-port $dst_port \
-        --packet-sizes '$PACKET_SIZES' \
-        --rate-steps '$RATE_STEPS' \
+        --packet-sizes '$sizes' \
+        --rate-steps '$rates' \
         --duration $DURATION \
-        --output '/tmp/perf-results/${config_name}.json' 2>&1; echo EXIT_CODE=\$?"
+        --output '/tmp/perf-results/${result_name}.json' 2>&1; echo EXIT_CODE=\$?"
 
     log_info "Starting benchmark SSM command (timeout=${BENCHMARK_TIMEOUT}s)..."
     local output
@@ -879,13 +898,13 @@ $preflight
     local ssm_exit_code=$?
 
     mkdir -p "$LOGS_DIR"
-    echo "$output" > "$LOGS_DIR/trex-benchmark-${config_name}.log"
+    echo "$output" > "$LOGS_DIR/trex-benchmark-${result_name}.log"
     log_info "Benchmark SSM exit code: $ssm_exit_code"
 
     # Post benchmark output to PR for visibility
     local output_tail
     output_tail=$(echo "$output" | tail -30)
-    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` result
+    post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` rep $rep result
 SSM exit: $ssm_exit_code
 <details><summary>Output (last 30 lines)</summary>
 
@@ -913,7 +932,7 @@ ${output_tail}
     log_info "Downloading results for $config_name..."
     local results_json
     results_json=$(ssm_run_command "$TREX_INSTANCE_ID" 30 \
-        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---JSON_START---'; cat /tmp/perf-results/${config_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
+        "ls -la /tmp/perf-results/ 2>/dev/null; echo '---JSON_START---'; cat /tmp/perf-results/${result_name}.json 2>/dev/null || echo 'FILE_NOT_FOUND'")
     local dl_exit=$?
 
     log_info "Results download SSM exit: $dl_exit"
@@ -938,14 +957,14 @@ $(echo "$results_json" | head -10)
     json_content=$(echo "$results_json" | sed -n '/^---JSON_START---$/,$ p' | tail -n +2)
 
     mkdir -p "$RESULTS_DIR"
-    echo "$json_content" > "$RESULTS_DIR/${config_name}.json"
+    echo "$json_content" > "$RESULTS_DIR/${result_name}.json"
 
     # Verify the JSON is valid and has results
     local json_check
     json_check=$(python3 -c "
 import json, sys
 try:
-    d = json.load(open('$RESULTS_DIR/${config_name}.json'))
+    d = json.load(open('$RESULTS_DIR/${result_name}.json'))
     n = len(d.get('results', {}))
     print(f'Valid JSON: {n} packet sizes, config={d.get(\"config_name\", \"missing\")}')
     if n == 0:
@@ -963,12 +982,40 @@ except Exception as e:
         post_pr_comment "## [Perf] Benchmark Diag: \`$config_name\` JSON validation
 **FAILED**: $json_check
 \`\`\`
-$(head -5 "$RESULTS_DIR/${config_name}.json")
+$(head -5 "$RESULTS_DIR/${result_name}.json")
 \`\`\`"
         return 1
     fi
 
-    log_info "Results saved to $RESULTS_DIR/${config_name}.json"
+    log_info "Results saved to $RESULTS_DIR/${result_name}.json"
+}
+
+# Reps 2 and 3 of the 700k step (tokio-udp-perf D9). Re-runs ONLY the 700k step
+# at the requested gated sizes on the already-deployed stack, for each requested
+# config the gates judge (rust-dpdk, tokio-dpdk, tokio-dpdk-concurrent AND
+# native-dpdk — its median is the reference for the rust>=95%-of-native gate).
+# The config list and sizes come from perf-targets.json intersected with the
+# run's requested inputs, never a hard-coded list (so never 8500 by default).
+# No-op when 700k was not requested or the config is not judged.
+run_700k_reps() {
+    local config="$1"
+    local plan rep_configs rep_sizes
+    plan=$(python3 "$EVALUATE_GATES" rep-plan --targets "$PERF_TARGETS" \
+        --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS") || {
+        log_error "rep-plan failed for $config"
+        return 1
+    }
+    rep_configs=$(sed -n 's/^REP_CONFIGS=//p' <<< "$plan")
+    rep_sizes=$(sed -n 's/^REP_SIZES=//p' <<< "$plan")
+    if [[ -z "$rep_sizes" || ",$rep_configs," != *",$config,"* ]]; then
+        log_info "No 700k reps for $config (rep configs='$rep_configs' sizes='$rep_sizes')"
+        return 0
+    fi
+    local rep
+    for rep in 2 3; do
+        log_info "=== $config 700k rep $rep/3 (sizes: $rep_sizes) ==="
+        run_benchmark_for_config "$config" 9000 "$rep" "$rep_sizes" 700000 || return 1
+    done
 }
 
 # Run a TCP (ASTF/stateful) benchmark for a *-tcp config. Mirrors
@@ -1206,6 +1253,39 @@ start_dut_tokio_dpdk() {
     log_info "tokio-dpdk echo server running"
 }
 
+start_dut_tokio_dpdk_concurrent() {
+    log_info "Starting DUT: tokio-dpdk-concurrent (tokio-echo --mode concurrent, DPDK backend)"
+    dut_bind_dpdk || return 1
+
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+
+    # Same binary and --perf-interval as tokio-dpdk; --mode concurrent selects the
+    # per-packet spawn pattern (to_vec + Semaphore + tokio::spawn + timeout) that
+    # real users write, so it stays measured next to the fair-loop default.
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tokio-echo --mode concurrent --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 > /var/log/echo-tokio-dpdk-concurrent.log 2>&1 &"
+    sleep 15
+
+    local status=""
+    local verify_attempt
+    for verify_attempt in 1 2 3; do
+        status=$(ssm_run_command "$DUT_INSTANCE_ID" 30 \
+            "pgrep -f 'target/release/tokio-echo' >/dev/null && echo 'running' || echo 'not running'") || true
+        if [[ "$status" == *"running"* ]]; then
+            break
+        fi
+        log_warn "tokio-dpdk-concurrent verify attempt $verify_attempt: status='$status'"
+        sleep 5
+    done
+    if [[ "$status" != *"running"* ]]; then
+        log_error "tokio-dpdk-concurrent echo server failed to start (status='$status')"
+        ssm_run_command "$DUT_INSTANCE_ID" 30 "tail -30 /var/log/echo-tokio-dpdk-concurrent.log 2>/dev/null" || true
+        return 1
+    fi
+    log_info "tokio-dpdk-concurrent echo server running"
+}
+
 start_dut_native_dpdk() {
     log_info "Starting DUT: native-dpdk (testpmd 5tswap)"
     dut_bind_dpdk || return 1
@@ -1440,9 +1520,13 @@ aggregate_results() {
     log_info "Aggregating performance results..."
     mkdir -p "$RESULTS_DIR"
 
-    python3 - <<'PYEOF'
+    PERF_TESTS_DIR="$SCRIPT_DIR/perf-tests" python3 - <<'PYEOF'
 import json, glob, os, re, sys
 from datetime import datetime, timezone
+
+# Shared with evaluate_perf_gates: (config, rep) file keying and the 700k median.
+sys.path.insert(0, os.environ["PERF_TESTS_DIR"])
+import evaluate_gates as eg
 
 results_dir = os.environ.get("RESULTS_DIR", "perf-results")
 logs_dir = os.environ.get("LOGS_DIR", "perf-logs")
@@ -1463,6 +1547,17 @@ NIC_IMISSED_RE = re.compile(r"nic_imissed=(\d+|-)")
 NIC_IERRORS_RE = re.compile(r"nic_ierrors=(\d+|-)")
 NIC_RX_NOMBUF_RE = re.compile(r"nic_rx_nombuf=(\d+|-)")
 INTERVAL_RE = re.compile(r"interval=(\d+)s")
+# DUT-side fields of a [PERF] tick. lat_p50_us/lat_p99_us are the DUT's own
+# rx_burst-to-processed latency (printed {:.1}); the TRex rows already use the
+# keys lat_p50_us/lat_p99_us, so these are stored as dut_lat_p50_us/p99_us.
+RX_PPS_RE = re.compile(r"\brx_pps=([\d.]+)")
+LAT_P50_RE = re.compile(r"\blat_p50_us=([\d.]+)")
+LAT_P99_RE = re.compile(r"\blat_p99_us=([\d.]+)")
+IDLE_PCT_RE = re.compile(r"\bworker_idle_pct=([\d.]+)")
+
+def _opt_float(regex, line):
+    m = regex.search(line)
+    return float(m.group(1)) if m else None
 
 # [NIC-BASELINE] / [NIC-FINAL] are one-shot lines emitted by PerfReporter at
 # startup and at clean shutdown. They capture the RAW cumulative rte_eth_stats
@@ -1525,6 +1620,10 @@ def load_perf_lines(config_name):
                 samples.append({
                     "ts": float(m.group("ts")),
                     "interval": interval,
+                    "rx_pps": _opt_float(RX_PPS_RE, line),
+                    "dut_lat_p50_us": _opt_float(LAT_P50_RE, line),
+                    "dut_lat_p99_us": _opt_float(LAT_P99_RE, line),
+                    "worker_idle_pct": _opt_float(IDLE_PCT_RE, line),
                     "rx_drops": int(m.group("rx_drops")),
                     "rx_ring": int(m.group("rx_ring")),
                     "rx_buf": int(m.group("rx_buf")),
@@ -1728,6 +1827,14 @@ def annotate_with_app_drops(cfg_data):
         cfg_data["kernel_ethtool_delta"] = kernel_delta
     if not samples:
         return
+    # Pre-traffic idle%: worker_idle_pct of the FIRST rx_pps=0 tick (the app runs
+    # with --perf-interval 10 while the harness sleeps and sets up TRex, so every
+    # run has one). For tokio configs it is > 0 once the RTC try_recv_from path
+    # feeds worker_idle_polls. Poll-idle %, not CPU idle: it is the share of
+    # empty polls.
+    cfg_data["idle_pct"] = next(
+        (s["worker_idle_pct"] for s in samples
+         if s["rx_pps"] == 0 and s["worker_idle_pct"] is not None), None)
     _results = cfg_data.get("results", {})
     if not isinstance(_results, dict):
         # TCP/QUIC configs use a list-shaped 'results'; they carry no UDP-style
@@ -1746,9 +1853,20 @@ def annotate_with_app_drops(cfg_data):
             nic_ierrors_total = 0
             nic_nombuf_total = 0
             nic_has_data = False
+            lat_p50 = []
+            lat_p99 = []
             for s in samples:
                 window_start = s["ts"] - s["interval"]
                 window_end = s["ts"]
+                # DUT latency: only ticks whose WHOLE interval lies inside the
+                # step's TRex window (stricter than the overlap rule below, so
+                # a tick straddling a rate change cannot leak a neighbouring
+                # step's latency into this one).
+                if window_start >= ts_start and window_end <= ts_end:
+                    if s["dut_lat_p50_us"] is not None:
+                        lat_p50.append(s["dut_lat_p50_us"])
+                    if s["dut_lat_p99_us"] is not None:
+                        lat_p99.append(s["dut_lat_p99_us"])
                 # Attribute the sample if its window overlaps the step window
                 if window_end < ts_start or window_start > ts_end:
                     continue
@@ -1764,6 +1882,12 @@ def annotate_with_app_drops(cfg_data):
                 if s["nic_rx_nombuf"] is not None:
                     nic_nombuf_total += s["nic_rx_nombuf"]
                     nic_has_data = True
+            # Percentiles are never averaged: report the MAX of the per-interval
+            # values for the step.
+            if lat_p50:
+                step["dut_lat_p50_us"] = max(lat_p50)
+            if lat_p99:
+                step["dut_lat_p99_us"] = max(lat_p99)
             step["app_drops"] = drops_total
             step["app_ring_drops"] = ring_total
             step["app_buf_drops"] = buf_total
@@ -1772,18 +1896,50 @@ def annotate_with_app_drops(cfg_data):
                 step["nic_ierrors"] = nic_ierrors_total
                 step["nic_rx_nombuf"] = nic_nombuf_total
 
-configs = {}
+# Key results by (config, rep) from the file name (<config>.rep<N>.json), NOT by
+# data["config_name"]: that key is identical across reps, so rep2/rep3 would
+# overwrite rep1. A legacy un-suffixed <config>.json (TCP) is rep 1.
+by_cfg = {}
 for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
-    if os.path.basename(f) == "perf-report.json":
+    base = os.path.basename(f)
+    if base in eg.NON_RESULT_FILES:
         continue
     try:
         with open(f) as fh:
             data = json.load(fh)
-            name = data.get("config_name", os.path.basename(f).replace(".json", ""))
-            annotate_with_app_drops(data)
-            configs[name] = data
+        m = eg.REP_FILE_RE.match(base)
+        if m:
+            name, rep = m.group("config"), int(m.group("rep"))
+        else:
+            name, rep = data.get("config_name", base.replace(".json", "")), 1
+        data["config_name"] = name
+        annotate_with_app_drops(data)
+        by_cfg.setdefault(name, {})[rep] = data
     except Exception as e:
         print(f"Warning: failed to read {f}: {e}", file=sys.stderr)
+
+configs = {}
+for name, reps in by_cfg.items():
+    # Rep 1 (the full sweep) carries every step; reps 2-3 add 700k rows only.
+    cfg = reps[min(reps)]
+    cfg["reps"] = sorted(reps)
+    if isinstance(cfg.get("results"), dict):
+        for size_key, rows in cfg["results"].items():
+            size = int(size_key.rstrip("B"))
+            for row in rows:
+                if row.get("target_pps") != 700000:
+                    continue
+                med, n = eg.median_rx(reps, size, 700000)
+                if med is not None:
+                    row["rx_pps_median"] = med
+                    row["rx_pps_n"] = n
+                # DUT latency at 700k: max across the ticks of all reps.
+                for key in ("dut_lat_p50_us", "dut_lat_p99_us"):
+                    vals = [r[key] for rep_data in reps.values()
+                            for r in eg.step_rows(rep_data, size, 700000) if key in r]
+                    if vals:
+                        row[key] = max(vals)
+    configs[name] = cfg
 
 report = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1801,7 +1957,7 @@ PYEOF
 generate_markdown_summary() {
     log_info "Generating markdown summary..."
 
-    python3 - <<'PYEOF'
+    PERF_TARGETS="$PERF_TARGETS" python3 - <<'PYEOF'
 import json, os, sys
 
 results_dir = os.environ.get("RESULTS_DIR", "perf-results")
@@ -1814,6 +1970,48 @@ if not os.path.exists(report_file):
 
 with open(report_file) as f:
     report = json.load(f)
+
+# Gate evaluation (evaluate_perf_gates) feeds the "vs target" column; the 0.3.0
+# baseline feeds the report-only "vs 0.3.0" column. Both are optional so the
+# summary still renders when the gate step produced nothing.
+gate_entries = {}
+try:
+    with open(os.path.join(results_dir, "gate-report.json")) as f:
+        for e in json.load(f).get("entries", []):
+            gate_entries[(e["config"], e["size"])] = e
+except (OSError, ValueError):
+    pass
+baseline_0_3_0, warn_below = {}, 0.98
+try:
+    with open(os.environ["PERF_TARGETS"]) as f:
+        _t = json.load(f)
+    baseline_0_3_0 = _t.get("baseline_0_3_0", {})
+    warn_below = _t["report_only_metrics"]["vs_0_3_0"]["warn_below_ratio"]
+except (OSError, ValueError, KeyError):
+    pass
+
+def vs_target_cell(cfg_name, pkt_size, r):
+    """Median % of the config's applicable target + PASS/FAIL (700k step only —
+    that is the step the 3-rep median and the gates judge)."""
+    if r.get("target_pps") != 700000:
+        return "—"
+    e = gate_entries.get((cfg_name, int(pkt_size.rstrip("B"))))
+    if e is None or e.get("pct") is None:
+        return "—"
+    tag = "report-only" if e["status"] == "REPORT-ONLY" else e["status"]
+    return f"{e['pct']:.1f}% {tag}"
+
+def vs_0_3_0_cell(cfg_name, pkt_size, r):
+    base = baseline_0_3_0.get(cfg_name, {}).get(pkt_size.rstrip("B"))
+    med = r.get("rx_pps_median")
+    if r.get("target_pps") != 700000 or not base or med is None:
+        return "—"
+    ratio = med / base
+    return f"{ratio * 100:.1f}%" + (" WARN" if ratio < warn_below else "")
+
+def dut_lat_cell(r, key):
+    v = r.get(key)
+    return f"{v:.1f}" if isinstance(v, (int, float)) else "—"
 
 lines = []
 lines.append(f"## Performance Test Results — {report.get('instance_type', 'unknown')}")
@@ -1864,10 +2062,15 @@ else:
         # All four are only available for backends that emit [PERF] lines.
         # Non-zero wire drop (TX/RX delta) with imissed/nombuf/App all ≈ 0
         # points at wire loss (AWS ENA / VPC rate limiter / bad cabling).
-        lines.append("| Config | Target PPS | TX pps | RX pps | Drop % | NIC imissed | NIC ierrors | NIC nombuf | App Drops | Lat Avg (us) | Lat Max (us) | TX Mbps | RX Mbps |")
-        lines.append("|--------|-----------|--------|--------|--------|-------------|-------------|-----------|-----------|-------------|-------------|---------|---------|")
+        # RX pps at 700k is the rep-1 sample; "RX median" is the 3-rep median the
+        # gates judge. "vs target" = that median as % of the config's applicable
+        # target. DUT p50/p99 are the DUT's own [PERF] latency (max over the
+        # step's fully-contained ticks) — REPORTED, never gated. "vs 0.3.0" is a
+        # report-only WARN column.
+        lines.append("| Config | Target PPS | TX pps | RX pps | RX median (700k) | vs target | vs 0.3.0 | Drop % | NIC imissed | NIC ierrors | NIC nombuf | App Drops | Lat Avg (us) | Lat Max (us) | DUT p50 (us) | DUT p99 (us) | TX Mbps | RX Mbps |")
+        lines.append("|--------|-----------|--------|--------|------------------|-----------|----------|--------|-------------|-------------|-----------|-----------|-------------|-------------|--------------|--------------|---------|---------|")
 
-        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
+        for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
             cfg_data = configs.get(cfg_name, {})
             size_results = cfg_data.get("results", {})
             if not isinstance(size_results, dict):
@@ -1902,8 +2105,25 @@ else:
                     nic_ierrors = "—"
                     nic_nombuf = "—"
 
-                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {drop} | {nic_imissed} | {nic_ierrors} | {nic_nombuf} | {app_drops} | {lat_avg_s} | {lat_max_s} | {tx_mbps} | {rx_mbps} |")
+                med = r.get('rx_pps_median')
+                med_s = f"{med:,.0f} (n={r.get('rx_pps_n', 0)})" if med is not None else "—"
+                lines.append(f"| {cfg_name} | {target} | {tx_pps} | {rx_pps} | {med_s} | {vs_target_cell(cfg_name, pkt_size, r)} | {vs_0_3_0_cell(cfg_name, pkt_size, r)} | {drop} | {nic_imissed} | {nic_ierrors} | {nic_nombuf} | {app_drops} | {lat_avg_s} | {lat_max_s} | {dut_lat_cell(r, 'dut_lat_p50_us')} | {dut_lat_cell(r, 'dut_lat_p99_us')} | {tx_mbps} | {rx_mbps} |")
 
+        lines.append("")
+
+    # ── Pre-traffic poll-idle % ─────────────────────────────────────────
+    # worker_idle_pct of each DPDK config's first rx_pps=0 [PERF] tick. For the
+    # tokio configs this is the share of EMPTY POLLS on the RTC try_recv_from
+    # path, not CPU idle, so it reads near 100 % while idle.
+    idle_rows = [(n, configs[n]["idle_pct"]) for n in sorted(configs)
+                 if isinstance(configs[n], dict) and configs[n].get("idle_pct") is not None]
+    if idle_rows:
+        lines.append("### poll-idle % (tokio: share of empty polls, not CPU idle)")
+        lines.append("")
+        lines.append("| Config | idle% (first rx_pps=0 tick) |")
+        lines.append("|--------|-----------------------------|")
+        for n, v in idle_rows:
+            lines.append(f"| {n} | {v:.1f} |")
         lines.append("")
 
     # ── TCP (ASTF) results ──────────────────────────────────────────────
@@ -1953,7 +2173,7 @@ else:
     lines.append("")
     lines.append("| Config | Status | imissed (expected / actual / Δ) | ierrors (expected / actual / Δ) | rx_nombuf (expected / actual / Δ) |")
     lines.append("|--------|--------|--------------------------------|----------------------------------|-----------------------------------|")
-    for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
+    for cfg_name in ["native-dpdk", "rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent", "plain-rust", "native-dpdk-v6", "rust-dpdk-v6"]:
         cfg_data = configs.get(cfg_name, {})
         check = cfg_data.get("nic_consistency")
         if check is None:
@@ -2051,6 +2271,41 @@ with open(md_file, "w") as f:
 # Also print for step summary
 print(md_content)
 PYEOF
+}
+
+# Judge the perf gates in perf-targets.json (tokio-udp-perf 2.4 / 2.4a).
+# Writes, under $RESULTS_DIR: gate-verdict.txt (PASS|FAIL), run-invalid.txt (the
+# native-dpdk sanity rule missed: bad deployment), gate-lines.md and
+# gate-report.json. It never exits non-zero for a gate miss — main() reads the
+# verdict file AFTER the set +e reporting block, so a miss cannot be swallowed
+# by the reporting phase. If this crashes and writes nothing, main() treats the
+# missing verdict as FAIL (fail-closed).
+evaluate_perf_gates() {
+    log_info "Evaluating perf gates (${PERF_TARGETS##*/})..."
+    mkdir -p "$RESULTS_DIR"
+    python3 "$EVALUATE_GATES" evaluate \
+        --results-dir "$RESULTS_DIR" \
+        --targets "$PERF_TARGETS" \
+        --configs "$CONFIGS" \
+        --packet-sizes "$PACKET_SIZES" \
+        --rate-steps "$RATE_STEPS"
+}
+
+# Exit control flow for the gate outcome (run after set -e is restored).
+#   run-invalid.txt present            -> exit 2 (infra: bad deployment, redeploy)
+#   gate-verdict.txt not exactly PASS  -> exit 1 (miss, OR missing/unreadable verdict)
+# 0 = pass, 1 = gate miss / no verdict, 2 = infra incl. invalid deploy.
+perf_gate_exit_check() {
+    if [[ -f "$RESULTS_DIR/run-invalid.txt" ]]; then
+        log_error "Perf run INVALID: $(cat "$RESULTS_DIR/run-invalid.txt" 2>/dev/null) — redeploy"
+        exit 2
+    fi
+    local verdict
+    verdict="$(cat "$RESULTS_DIR/gate-verdict.txt" 2>/dev/null || true)"
+    if [[ "$verdict" != PASS ]]; then   # FAIL, missing, unreadable, empty, garbage
+        log_error "Perf gate verdict is '${verdict:-<missing/unreadable>}' — see GATE FAIL lines above"
+        exit 1
+    fi
 }
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
@@ -2600,6 +2855,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
             rust-dpdk)           start_dut_rust_dpdk           || start_ok=false ;;
             rust-dpdk-multicore) start_dut_rust_dpdk_multicore || start_ok=false ;;
             tokio-dpdk)          start_dut_tokio_dpdk          || start_ok=false ;;
+            tokio-dpdk-concurrent) start_dut_tokio_dpdk_concurrent || start_ok=false ;;
             native-dpdk)         start_dut_native_dpdk         || start_ok=false ;;
             rust-stdlib)         start_dut_rust_stdlib          || start_ok=false ;;
             plain-rust)          start_dut_plain_rust           || start_ok=false ;;
@@ -2637,7 +2893,10 @@ ${dut_diag}
         fi
 
         # Run the benchmark
-        if ! run_benchmark_for_config "$config"; then
+        # Rep 1 is the full sweep; reps 2-3 re-run only the 700k step before the
+        # config is torn down (no re-deploy), so the gates judge a 3-rep median.
+        if ! run_benchmark_for_config "$config" 9000 1 \
+            || { [[ "$config" != *-tcp ]] && ! run_700k_reps "$config"; }; then
             log_error "Benchmark failed for config: $config"
             failed_configs+=("$config")
             collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
@@ -2677,6 +2936,7 @@ ${dut_diag}
             rust-dpdk)           log_file="/var/log/echo-rust-dpdk.log" ;;
             rust-dpdk-multicore) log_file="/var/log/echo-rust-dpdk-multicore.log" ;;
             tokio-dpdk)          log_file="/var/log/echo-tokio-dpdk.log" ;;
+            tokio-dpdk-concurrent) log_file="/var/log/echo-tokio-dpdk-concurrent.log" ;;
             native-dpdk)         log_file="/var/log/testpmd.log" ;;
             rust-stdlib)         log_file="/var/log/echo-rust-stdlib.log" ;;
             plain-rust)          log_file="/var/log/plain-echo.log" ;;
@@ -2731,8 +2991,20 @@ ${testpmd_diag}
 
     log_info "Phase 6: Aggregating results..."
     aggregate_results
+    evaluate_perf_gates
     local summary
     summary=$(generate_markdown_summary)
+
+    # Gate lines (GATE FAIL / gate skipped / WARN / report-only) go into the
+    # posted summary so a reader sees why a run failed without opening logs.
+    if [[ -s "$RESULTS_DIR/gate-lines.md" ]]; then
+        summary="$summary
+
+### Perf Gates
+Verdict: \`$(cat "$RESULTS_DIR/gate-verdict.txt" 2>/dev/null || echo "INVALID/MISSING")\`
+
+$(cat "$RESULTS_DIR/gate-lines.md")"
+    fi
 
     # Add failure info if any
     if [[ ${#failed_configs[@]} -gt 0 ]]; then
@@ -2759,6 +3031,10 @@ $summary
     collect_instance_logs "$TREX_INSTANCE_ID" "trex"
 
     set -e
+
+    # Gate outcome: exit 2 on an invalid deploy, exit 1 unless the verdict is
+    # exactly PASS (a missing verdict is a FAIL, never a silent pass).
+    perf_gate_exit_check
 
     # Exit with failure if any configs failed
     if [[ ${#failed_configs[@]} -gt 0 ]]; then
