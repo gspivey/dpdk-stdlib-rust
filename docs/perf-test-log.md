@@ -3,6 +3,74 @@
 Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
+> **Known-limitation rule.** Do NOT write up a "known limitation" or a
+> "No Regression" verdict on a flat ceiling unless the entry links a ROADMAP item
+> that tracks the limitation. Without that link, a flat number is an unexplained
+> regression and the reviewer treats it as one. (tokio-dpdk sat at ~305k pps for
+> 33 runs under "No Regression" before the benchmark-app cause was found.)
+>
+> **Gates.** Since 0.3.1 the perf workflow judges absolute targets from
+> `scripts/perf-targets.json` over the 3-rep median at the 700k step, and exits
+> non-zero on a miss. Every judged (config, size) in a new entry carries both
+> **vs last run** and **vs target**. Results come only from the GitHub Actions
+> perf workflow, never from local or synthetic runs.
+
+### Run-entry template
+
+Copy this block for each new run. Replace every `<...>`; keep both comparison
+columns for every judged (config, size).
+
+```markdown
+## Run #<N>: <PR title>
+
+| Field | Value |
+|-------|-------|
+| **Date** | <YYYY-MM-DD> |
+| **Git Hash** | `<sha>` |
+| **Branch** | `<branch>` |
+| **PR** | [#<n>](<url>) |
+| **GH Actions Run** | [<run id>](<url>) |
+| **Instance Type** | <type> |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #<N-1>
+
+1. `<sha>` — <what changed in the data path, or "docs-only">.
+
+### Results: 700k step, 3-rep median RX pps
+
+Judged configs and sizes follow `scripts/perf-targets.json` (rust-dpdk and
+native-dpdk at 64/512 B, tokio-dpdk at 64/512/1400 B, tokio-dpdk-concurrent at 64 B
+once its gate is enabled; 1400 B rust-dpdk and the concurrent 512/1400 B are
+report-only).
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) | App Drops |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|-----------|
+| native-dpdk | 64 B | <pps> | <+/-%> | <% of target, PASS/FAIL/report-only> | — | — | — | — |
+| rust-dpdk | 64 B | <pps> | <+/-%> | <%> <PASS/FAIL> | <% (WARN < 98%)> | <p50> | <p99> | <n> |
+| tokio-dpdk | 64 B | <pps> | <+/-%> | <%> <PASS/FAIL> | — | <p50> | <p99> | <n> |
+
+### Per-step throughput (rep 1; tokio-dpdk vs same-run rust-dpdk, gate >= 98 %)
+
+| Size | 70k | 140k | 350k |
+|------|-----|------|------|
+| 64 B | <%> | <%> | <%> |
+
+### poll-idle % (pre-traffic; tokio: share of empty polls, not CPU idle)
+
+| Config | idle% (first rx_pps=0 tick) |
+|--------|-----------------------------|
+| tokio-dpdk | <n> |
+
+### Gate verdict
+
+<PASS | FAIL | INVALID + the GATE FAIL / WARN / gate skipped lines verbatim>
+
+### Analysis
+
+<What moved and why. Any "known limitation" must link its ROADMAP item.>
+```
+
 
 ## Run #51: docs: mark ROADMAP #35 complete — No Regression
 

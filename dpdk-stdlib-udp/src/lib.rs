@@ -2902,7 +2902,26 @@ impl UdpSocket {
     }
 
     /// Non-blocking inline recv: single poll of the backend, no sleep.
+    ///
+    /// Run-to-completion (RTC/tokio) mode has no pipeline `worker_loop`, so the
+    /// `worker_idle_polls` / `worker_packets_processed` counters that feed
+    /// `worker_idle_pct` would otherwise stay 0. Count them here: an empty poll
+    /// is an idle poll, a delivered packet is a processed packet. The counters
+    /// are existing `PerfCounters` fields; no new public surface.
     fn try_recv_from_inline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        let result = self.try_recv_from_inline_poll(buf)?;
+        match result {
+            Some(_) => {
+                perf_inc!(self.perf_counters.worker_packets_processed);
+            }
+            None => {
+                perf_inc!(self.perf_counters.worker_idle_polls);
+            }
+        }
+        Ok(result)
+    }
+
+    fn try_recv_from_inline_poll(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
             SocketAddr::V6(v6) => v6.port(),
@@ -6020,6 +6039,43 @@ mod tests {
         assert_eq!(drops.packets, 1);
         assert_eq!(drops.bytes, rejected_len as u64);
         assert_eq!(socket.recv_buffer_bytes(), 900, "queued bytes unchanged");
+    }
+
+    /// RTC/tokio mode has no pipeline `worker_loop`; the inline `try_recv_from`
+    /// path must feed `worker_idle_polls` / `worker_packets_processed` so the
+    /// reporter's `worker_idle_pct` is non-zero while the receiver is idle.
+    #[cfg(feature = "perf-counters")]
+    #[test]
+    fn try_recv_from_inline_feeds_worker_idle_counters() {
+        use std::sync::atomic::Ordering;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let mut buf = [0u8; 64];
+
+        // Empty polls count as idle polls.
+        for _ in 0..3 {
+            assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+        }
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.worker_idle_polls, 3);
+        assert_eq!(snap.worker_packets_processed, 0);
+        assert!(socket.perf_snapshot().worker_idle_pct > 99.0);
+
+        // A delivered (buffered) packet counts as processed.
+        {
+            let mut q = socket.recv_queue.lock().unwrap();
+            q.push(vec![7u8; 16], test_src()).unwrap();
+        }
+        let got = socket.try_recv_from(&mut buf).unwrap();
+        assert_eq!(got.map(|(n, _)| n), Some(16));
+        assert_eq!(
+            socket.perf_counters.worker_packets_processed.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            socket.perf_counters.worker_idle_polls.load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[test]
