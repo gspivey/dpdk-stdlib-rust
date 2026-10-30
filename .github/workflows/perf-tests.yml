@@ -109,6 +109,10 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          # The run takes 70+ min; the 1h default session expired mid-run in
+          # 40680787215 and 40780926044 (ExpiredToken on SSM, then teardown).
+          # Needs the role's MaxSessionDuration >= 10800.
+          role-duration-seconds: 10800
 
       - name: Fetch AMI IDs from SSM
         id: amis
@@ -340,10 +344,21 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+      # Fresh OIDC credentials for teardown, so an expired run session can't
+      # leave PerfTestStack running. Also covers a cancel/timeout.
+      - name: Refresh AWS credentials for teardown
+        if: always() && (steps.tests.outcome == 'failure' || steps.tests.outcome == 'cancelled')
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Safety net teardown
-        if: failure() && steps.tests.outcome == 'failure'
+        if: always() && (steps.tests.outcome == 'failure' || steps.tests.outcome == 'cancelled')
         run: |
           if [[ "${{ inputs.teardown }}" != "false" ]]; then
             cd deploy/cdk
-            npx cdk destroy PerfTestStack --force || echo "Teardown failed (may already be destroyed)"
+            # No `|| echo`: a failed teardown must turn this step red.
+            # Destroying an absent stack already succeeds.
+            npx cdk destroy PerfTestStack --force
           fi
