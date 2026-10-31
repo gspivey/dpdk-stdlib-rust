@@ -427,16 +427,6 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 
 ---
 
-### 46. tokio UDP perf (0.3.1): perf gates, targets, DUT latency, counters, log discipline
-
-Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
-then implement tasks `2.1`-`2.10` (PR 2). Depends on item 45 (the gates judge the fair default and the `--mode concurrent` config).
-
-- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `2.1`, `2.2`, `2.3`, `2.3a`, `2.4`, `2.4a`, `2.5`, `2.6`, `2.7`, `2.7a`, `2.8`, `2.9`, `2.9a`, `2.10`
-- [ ] Complete · PR: —
-
----
-
 ### 47. tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` (soundness fix)
 
 Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
@@ -499,3 +489,10 @@ then implement tasks `1.1`-`1.7` (PR 1).
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.4a`, `1.5`, `1.6`, `1.7`
 - [x] Complete · PR: #138
 
+### 46. tokio UDP perf (0.3.1): perf gates, targets, DUT latency, counters, log discipline
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `2.1`-`2.10` (PR 2). Depends on item 45 (the gates judge the fair default and the `--mode concurrent` config).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `2.1`, `2.2`, `2.3`, `2.3a`, `2.4`, `2.4a`, `2.5`, `2.6`, `2.7`, `2.7a`, `2.8`, `2.9`, `2.9a`, `2.10`
+- [x] Complete · PR: #143
