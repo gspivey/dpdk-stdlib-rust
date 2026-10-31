@@ -80,6 +80,43 @@ The `dpdk-tokio` crate provides drop-in replacement sockets in `dpdk_tokio::comp
 
 These traits don't apply to DPDK since it bypasses the kernel networking stack.
 
+### Thread Safety (`dpdk_udp::UdpSocket`)
+
+`UdpSocket` is `Send + Sync` and safe to share across threads via `Arc`, like
+`std::net::UdpSocket`. Concurrent `send_to` and `recv_from` from multiple threads are sound.
+
+- **Per direction.** Each socket serializes its TX side (`tx_state`: the frame scratch buffer)
+  and its RX side (`rx_state`: the buffered receive queue and the app-ring round-robin index)
+  independently, so a sender and a receiver never contend on socket state.
+- **Per hardware queue.** All sockets on a port serialize on shared guards for the actual burst
+  (`q_rx0`, `q_tx0`, and the pipeline's worker-direct TX queue `q_tx_direct`), because DPDK forbids
+  concurrent `rx_burst`/`tx_burst` on one queue. N senders are therefore serialized among
+  themselves, as `std::net::UdpSocket` effectively is at the syscall level.
+- **Lock order** (the only nesting that exists): `rx_state < q_rx0 < tx_state < q_tx0 < q_tx_direct`.
+  A send takes `tx_state` then a TX queue guard. A receive takes `rx_state` then `q_rx0`; an
+  ARP/ICMP/NDP/ICMPv6 auto-reply is a prebuilt frame and takes only `q_tx0`. `resolve_arp` locks
+  per poll iteration and holds nothing across its sleep.
+- **Leaf locks** (`connected_addr`, `connection_state`, the ARP/NDP caches, `error_queue`) may be
+  taken under the guards above but are never held while acquiring one.
+- **Poisoning.** No critical section panics; every guard is taken through a poison-tolerant helper
+  so one unrelated panic cannot wedge a socket.
+- **No loom model.** The design adds no lock-free protocol, only `std::sync::Mutex` guards.
+- **`Generic` backends** (`bind_with_backend`) bypass the queue guards; the backend synchronizes
+  itself.
+
+Behaviour notes for the non-blocking entry points (`#[doc(hidden)]` `try_send_to_nb`,
+`try_send_nb`, `try_recv_from_nb`, used by the tokio compat layer):
+
+1. They return `WouldBlock` when the per-direction or queue guard is held, but a `try_send_to` to
+   an **unresolved** peer still reaches `resolve_arp`, which can block up to ~3 s on an ARP miss
+   (unchanged 0.3.0 behaviour).
+2. On a `Generic` backend they can still wait inside the backend's own lock (for example
+   `DpdkBackend`'s single `Mutex<Port>`); the non-blocking contract covers only the guards above.
+   In pipeline mode the worker-direct send briefly waits on `q_tx_direct`.
+3. If a non-blocking receive pulls an ARP/ICMP/NDP/ICMPv6 frame while `q_tx0` is busy, the
+   auto-reply is **dropped and counted** in `auto_reply_drops()` rather than waited for (not in
+   App Drops). The peer retransmits; the next uncontended receive answers.
+
 ---
 
 ## DPDK Backend Implementation Status
