@@ -197,7 +197,7 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
 `Send + Sync`. ~350-500 lines.
 **Depends on:** nothing (but MUST land before PR 4).
 
-- [ ] 3.1 Add the **per-hardware-queue guards** to the shared `DpdkResources` — `q_rx0`,
+- [x] 3.1 Add the **per-hardware-queue guards** to the shared `DpdkResources` — `q_rx0`,
   `q_tx0`, `q_tx_direct` (`Mutex<()>`) — and the guarded helpers: `send_guarded` → `q_tx0` +
   `tx_burst(0)`, `send_direct_guarded` → `q_tx_direct` + `tx_burst(1)`, and **two RX helpers that
   share `q_rx0`**: `recv_guarded(max) -> Vec<Mbuf>` (takes `q_rx0`, calls `rx_burst(0,max)`,
@@ -209,17 +209,17 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   `lib.rs:3157` (`recv_from_inline`), which call `rx_burst` **directly, not via `recv_frames`** —
   so no RX site is left racing (Generic `PacketBackend` paths excepted — they self-sync).
   (Req 3.1a, 3.2)
-- [ ] 3.2 Introduce per-socket `tx_state: Mutex<TxState>` (scratch `Vec<u8>`) and
+- [x] 3.2 Introduce per-socket `tx_state: Mutex<TxState>` (scratch `Vec<u8>`) and
   `rx_state: Mutex<RxState>` (the former `recv_queue` folded in + the round-robin index) on
   `UdpSocket`; remove the standalone `recv_queue: Mutex<ReceiveQueue>` field; delete
   `struct TxBuffer`, `unsafe impl Sync for TxBuffer`, and `TxBufferGuard`. Add the
   poison-tolerant `lock_or_recover` helper (`into_inner`) used by every `.lock()`. (Req 3.1,
   3.4, 3.4a, 3.5, 3.6)
-- [ ] 3.3 Convert every TX path to take `tx_state` then the guarded send helper where it used
+- [x] 3.3 Convert every TX path to take `tx_state` then the guarded send helper where it used
   `self.tx_buf.borrow_mut()` + `send_frame`/`cached_direct_send`: `send_to_v4`, `send_to_v6`
   (incl. the pre-lock NDP solicitation), and the VXLAN/GENEVE/GUE/VLAN branches. Keep blocking
   `resolve_arp` before the TX lock. (Req 3.1)
-- [ ] 3.4 Convert every RX path to take `rx_state` around draining `rx.queue`, the guarded
+- [x] 3.4 Convert every RX path to take `rx_state` around draining `rx.queue`, the guarded
   receive helper, and the single-consumer app-ring dequeue (`dequeue_app_rings` + `rx.rr_index`):
   `recv_from_inline`, `try_recv_from_inline`, `recv_from_pipeline`, `try_recv_from_pipeline`,
   v4 and v6; drop the guard before any sleep/`yield`. Keep the `is_connected`/
@@ -230,13 +230,13 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   The sites that must change from `self.recv_queue.lock()` to the passed state are the 10 push
   sites in `process_frame_zerocopy` (3405, 3419, 3451, 3465, 3497, 3511, 3557, 3578, 3619, 3640)
   and the `resolve_arp` push (4090). (Req 3.2)
-- [ ] 3.4a `has_buffered_packets` discipline (D10/MEDIUM-1): set the flag `true` after **every**
+- [x] 3.4a `has_buffered_packets` discipline (D10/MEDIUM-1): set the flag `true` after **every**
   successful push into `rx.queue` on **all** paths — the 10 `process_frame_zerocopy` sites, the
   pipeline re-buffer sites (~2887, ~3083), and the `resolve_arp` push (~4090) — and clear it when
   `rx.queue.is_empty()` after a pop. Then the pre-lock `has_buffered_packets` fast-path check is
   valid on the inline paths too (round 1 left the inline paths stranding buffered packets). All
   push/pop happen under `rx_state`, so flag and contents stay consistent. (Req 3.2)
-- [ ] 3.5 Make the ARP/ICMP/NDP/ICMPv6 auto-replies inside `process_frame_zerocopy` take
+- [x] 3.5 Make the ARP/ICMP/NDP/ICMPv6 auto-replies inside `process_frame_zerocopy` take
   **only `q_tx0`** for their guarded send — they are **prebuilt frames**, so **no `tx_state`** is
   acquired (MEDIUM-3) — and rework `resolve_arp` (whose request/reply sends are also prebuilt) to
   acquire/release locks per iteration in the subsequence `rx_state < q_rx0 < q_tx0` (no `tx_state`),
@@ -246,7 +246,7 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   held while acquiring a guard — LOW-13/D12), and the deadlock-freedom argument (including that
   `process_frame_zerocopy` runs with `rx_state` already held and takes `&mut RxState`). (Req
   3.3, 3.3a)
-- [ ] 3.5a **Extract and guard the pipeline builder closures (D1/CRITICAL-1 + D13/HIGH-2).**
+- [x] 3.5a **Extract and guard the pipeline builder closures (D1/CRITICAL-1 + D13/HIGH-2).**
   Refactor the three inline pipeline closures in `UdpSocketBuilder::bind` into named free-function
   constructors on `DpdkResources` — `make_send_fn(res)`, `make_recv_fn(res)`,
   `make_direct_send_fn(res)` — and have the builder call them (production path unchanged). Inside
@@ -257,7 +257,7 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   `tx_ring`/ARP/ICMP replies, `topology.rs:445,486,498,530`) and app-thread queue-0 sends, and
   makes the guards testable in stub mode (task 3.7 calls the constructors directly, since
   `detect_topology` is always RTC under stubs — `topology.rs:661-669`). (Req 3.1a)
-- [ ] 3.6 Add additive **`pub` `#[doc(hidden)]`** (not private — LOW-9) non-blocking `try_*`
+- [x] 3.6 Add additive **`pub` `#[doc(hidden)]`** (not private — LOW-9) non-blocking `try_*`
   entry points on `UdpSocket` that `try_lock` the per-direction + queue guards and return
   `WouldBlock` on contention (consumed by PR 4's compat `try_*`). The RX try variant that pulls
   an ARP/ICMP/NDP/ICMPv6 frame needing an auto-reply SHALL `try_lock` **only `q_tx0`** (the reply
@@ -265,13 +265,13 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   count it** in `auto_reply_drops` (a new private `AtomicU64` on `UdpSocket`, read through an additive
   `#[doc(hidden)] pub fn auto_reply_drops(&self) -> u64`; not `rx_arp_handled` or
   `rx_drops_buffer_full` — round-6 LOW-4) rather than block (D11/MEDIUM-5). (Req 4.2a)
-- [ ] 3.6a Add `static_assertions = "1"` under a new `[dev-dependencies]` section in
+- [x] 3.6a Add `static_assertions = "1"` under a new `[dev-dependencies]` section in
   `dpdk-stdlib-udp/Cargo.toml` (none exists today, and the workspace has no `static_assertions`
   dependency — round-5 LOW-8), then add `static_assertions::assert_impl_all!(dpdk_udp::UdpSocket: Send, Sync, Unpin);`
   as a compile-time check (D4 — this is the PR that changes `UdpSocket`'s fields; round 1 had no
   task for it). Assert exactly the 0.3.0 set: `UdpSocket` is **not** `UnwindSafe`/`RefUnwindSafe`
   because it holds `Arc<dyn PacketBackend>` and `Option<Arc<dyn Fn+Send+Sync>>`. (Req 6.2)
-- [ ] 3.7 Add stub-backend tests (Req 3.7, D13/MEDIUM-2):
+- [x] 3.7 Add stub-backend tests (Req 3.7, D13/MEDIUM-2):
   - a **mock `PacketBackend`** that **validates each frame inside `send_frame`** (valid v4/v6+UDP
     checksum, payload == one sender's pattern, no interleaving) and keeps **only counters**
     (`frames_seen`, `frames_bad`) — **not** the frames themselves (LOW-4/Req 3.7), staying within
@@ -304,11 +304,11 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
     callable cross-crate, so reuse it for the mock-backend tests and the PR-4 tokio-layer tests
     (LOW-2); do not add a redundant `#[doc(hidden)]` constructor.
   (Req 3.7, 2.8)
-- [ ] 3.8 Confirm no loom model is needed (design uses `Mutex`, not a new lock-free protocol);
+- [x] 3.8 Confirm no loom model is needed (design uses `Mutex`, not a new lock-free protocol);
   if any atomic protocol was introduced, add a loom model instead. (Req 3.8)
-- [ ] 3.9 Document the thread-safety contract (per-direction + per-queue guards, lock order,
+- [x] 3.9 Document the thread-safety contract (per-direction + per-queue guards, lock order,
   leaf locks) in `API_COMPATIBILITY.md` and the `dpdk-stdlib-udp` README. (Req 3.9)
-- [ ] 3.9a Add three behaviour notes to `API_COMPATIBILITY.md` (round-5 LOW-5): (1) the compat
+- [x] 3.9a Add three behaviour notes to `API_COMPATIBILITY.md` (round-5 LOW-5): (1) the compat
   `try_send_to` can still block up to ~3 s in `resolve_arp` on an ARP miss (unchanged 0.3.0
   behaviour, Req 4.2a); (2) on a `Generic` backend, the compat `try_*` can wait inside the
   backend's own lock (e.g. `DpdkBackend`'s single `Mutex<Port>`, `backend_dpdk.rs:25`) — the
