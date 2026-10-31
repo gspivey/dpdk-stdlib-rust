@@ -30,7 +30,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEARDOWN=true
 SKIP_DEPLOY=false
 PACKET_SIZES="64,512,1400,8500"
-DURATION=30
+DURATION=20
 RATE_STEPS="70000,140000,350000,700000"
 # TCP (ASTF) benchmark params — used only for *-tcp config tokens.
 CPS_RATES="100,500,1000,5000"
