@@ -14,6 +14,9 @@
 #      configuration mismatch.
 #
 # Usage:  bash scripts/perf-tests/test/test_run_perf_tests.sh
+# (Section 6 also covers the 1h AWS session budget: plan fit, guard, teardown and
+# ExpiredToken handling, using an injected clock via PERF_NOW_EPOCH.)
+# shellcheck disable=SC2034,SC1090
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,7 +207,112 @@ PACKET_SIZES="64,512,1400,8500"; RATE_STEPS="70000,140000,350000,700000"
 CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"
 PLAN="$(python3 "$EVALUATE_GATES" rep-plan --targets "$PERF_TARGETS" --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS")"
 if grep -qx 'REP_SIZES=64,512,1400' <<< "$PLAN"; then ok "rep sizes exclude 8500"; else bad "rep sizes exclude 8500 ($PLAN)"; fi
-if grep -qx 'REP_CONFIGS=rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk' <<< "$PLAN"; then ok "rep configs = judged set incl. native-dpdk, excl. plain-rust"; else bad "rep configs ($PLAN)"; fi
+if grep -qx 'REP_CONFIGS=rust-dpdk,tokio-dpdk,native-dpdk' <<< "$PLAN"; then ok "rep configs = enabled-gate set incl. native-dpdk, excl. plain-rust and report-only concurrent"; else bad "rep configs ($PLAN)"; fi
+
+
+# ── 6. AWS session budget: plan fit, guard, teardown, ExpiredToken ───────────
+echo "== session budget: the default plan fits <= 50 min =="
+DURATION=20; FULL_PLAN=false
+PACKET_SIZES="64,512,1400,8500"; RATE_STEPS="70000,140000,350000,700000"
+CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"
+ORDER="$(order_configs)"
+if [[ "$ORDER" == native-dpdk,rust-dpdk,tokio-dpdk,* ]]; then ok "reference native-dpdk runs first ($ORDER)"; else bad "native-dpdk first (got $ORDER)"; fi
+compute_run_plan "$ORDER"
+PLAN_TOTAL=0; PLAN_STEPS=0
+IFS=',' read -ra _CL <<< "$ORDER"
+for c in "${_CL[@]}"; do
+    PLAN_TOTAL=$((PLAN_TOTAL + $(estimate_config_secs "$c")))
+    PLAN_STEPS=$((PLAN_STEPS + $(count_csv "${PLAN_SIZES[$c]}") * $(count_csv "${PLAN_RATES[$c]}")))
+    if [[ -n "${PLAN_REP_SIZES[$c]}" ]]; then PLAN_STEPS=$((PLAN_STEPS + 2 * $(count_csv "${PLAN_REP_SIZES[$c]}"))); fi
+done
+# Measured (run 41231404986): credentials issued 18:52:01 -> Phase 5 start
+# 19:05:19 = 13m18s (this already contains the real credential lead); Phase 6 ~1 min.
+SETUP=$((13 * 60 + 18)); PHASE6=60
+TOTAL=$((SETUP + PLAN_TOTAL + PHASE6 + TEARDOWN_RESERVE_SECS))
+echo "     test steps: $PLAN_STEPS, tests est $(fmt_mmss "$PLAN_TOTAL"); creds->Phase5 $(fmt_mmss "$SETUP") + tests + phase6 $(fmt_mmss "$PHASE6") + teardown reserve $(fmt_mmss "$TEARDOWN_RESERVE_SECS") = $(fmt_mmss "$TOTAL")"
+if (( TOTAL <= 50 * 60 )); then ok "deploy + all tests + teardown reserve <= 50 min ($(fmt_mmss "$TOTAL"))"; else bad "plan too long: $(fmt_mmss "$TOTAL") > 50m00s"; fi
+if [[ "${PLAN_SIZES[native-dpdk]}" == "64,512,1400" && "${PLAN_RATES[native-dpdk]}" == "700000" && -n "${PLAN_REP_SIZES[native-dpdk]}" ]]; then ok "no config dropped; native-dpdk keeps its 700k step + reps"; else bad "native-dpdk plan"; fi
+FULL_PLAN=true; compute_run_plan "rust-dpdk"; FULL_PLAN=false
+if [[ "${PLAN_SIZES[rust-dpdk]}" == "$PACKET_SIZES" && "${PLAN_RATES[rust-dpdk]}" == "$RATE_STEPS" ]]; then ok "--full-plan restores the full sweep"; else bad "--full-plan"; fi
+compute_run_plan "$ORDER"
+
+echo "== session budget: guard skips the rest and tears down =="
+fake_elapsed() { PERF_NOW_EPOCH=$((SCRIPT_START_EPOCH + $1 - AWS_SESSION_LEAD_SECS)); }
+SCRIPT_START_EPOCH=1000000; AWS_SESSION_BUDGET_SECS=3600
+CONFIG_LIST=("${_CL[@]}")
+fake_elapsed $((13 * 60 + 11)); BUDGET_SKIPPED=()
+if budget_guard_config 1 "${CONFIG_LIST[0]}"; then ok "fresh session: first config allowed"; else bad "first config allowed"; fi
+# Leave exactly (rust-dpdk estimate + reserve - 1s): config 2 must be refused.
+EST2=$(estimate_config_secs "${CONFIG_LIST[1]}")
+fake_elapsed $((AWS_SESSION_BUDGET_SECS - EST2 - TEARDOWN_RESERVE_SECS + 1)); BUDGET_SKIPPED=()
+if budget_guard_config 2 "${CONFIG_LIST[1]}"; then bad "config refused 1s short of est+reserve"; else ok "config refused 1s short of est+reserve"; fi
+if [[ "${BUDGET_SKIPPED[*]}" == "${CONFIG_LIST[*]:1}" ]]; then ok "skips this config and every later one (${BUDGET_SKIPPED[*]})"; else bad "skip list (got ${BUDGET_SKIPPED[*]})"; fi
+fake_elapsed $((AWS_SESSION_BUDGET_SECS - EST2 - TEARDOWN_RESERVE_SECS)); BUDGET_SKIPPED=()
+if budget_guard_config 2 "${CONFIG_LIST[1]}"; then ok "config allowed at exactly est+reserve"; else bad "config allowed at exactly est+reserve"; fi
+# Rep-level: stub the benchmark call, leave room for rep 2 but not rep 3.
+REPS_RUN=""; run_benchmark_for_config() { REPS_RUN="$REPS_RUN $1:rep$3"; fake_elapsed $(( $(elapsed_secs) + $(estimate_call_secs "$4" "$5") )); }
+NEED=$(estimate_call_secs "${PLAN_REP_SIZES[native-dpdk]}" 700000)
+fake_elapsed $((AWS_SESSION_BUDGET_SECS - TEARDOWN_RESERVE_SECS - NEED - 5)); BUDGET_SKIPPED=()
+run_700k_reps native-dpdk; rc=$?
+if [[ $rc -eq 10 && "$REPS_RUN" == " native-dpdk:rep2" && "${BUDGET_SKIPPED[*]}" == "native-dpdk:rep3" ]]; then ok "rep 2 ran, rep 3 skipped with rc=10 (ran:$REPS_RUN skipped:${BUDGET_SKIPPED[*]})"; else bad "rep-level guard (rc=$rc ran:$REPS_RUN skipped:${BUDGET_SKIPPED[*]})"; fi
+unset -f run_benchmark_for_config; source "$HARNESS"; set +e +u +o pipefail; trap - EXIT ERR INT TERM
+SCRIPT_START_EPOCH=1000000
+
+# teardown on an exhausted budget: cleanup() must call the cfn script (not swallow it)
+TD_LOG="$STUB_DIR/teardown.log"; : > "$TD_LOG"
+cat > "$STUB_DIR/cleanup-ok.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "cleanup-cfn-stack $*" >> "$TD_LOG"
+STUB
+cat > "$STUB_DIR/cleanup-fail.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "::error::Could not delete stuck stack $1 (status: DELETE_FAILED)"
+exit 1
+STUB
+chmod +x "$STUB_DIR"/cleanup-*.sh; export TD_LOG
+TEARDOWN=true; SKIP_DEPLOY=false; CDK_STACK_NAME=PerfTestStack; DUT_INSTANCE_ID=""; TREX_INSTANCE_ID=""
+fake_elapsed $((40 * 60)); CLEANUP_CFN_STACK_SCRIPT="$STUB_DIR/cleanup-ok.sh"
+OUT="$( (exit 0); cleanup 2>&1 )"; rc=$?
+if [[ $rc -eq 0 && "$(cat "$TD_LOG")" == "cleanup-cfn-stack PerfTestStack" ]]; then ok "cleanup() tears the stack down via cleanup-cfn-stack.sh (exit 0)"; else bad "cleanup teardown (rc=$rc log=$(cat "$TD_LOG"))"; fi
+CLEANUP_CFN_STACK_SCRIPT="$STUB_DIR/cleanup-fail.sh"
+OUT="$( (exit 0); cleanup 2>&1 )"; rc=$?
+if [[ $rc -ne 0 ]]; then ok "delete failure on an otherwise green run -> non-zero exit"; else bad "delete failure must fail the run (rc=$rc)"; fi
+if [[ "$OUT" == *"DELETE_FAILED"* && "$OUT" == *"TEARDOWN FAILED for PerfTestStack"* ]]; then ok "delete error is logged, not swallowed"; else bad "delete error logged (got: $OUT)"; fi
+OUT="$( (exit 3); cleanup 2>&1 )"; rc=$?
+if [[ $rc -eq 3 ]]; then ok "an existing failure code is preserved when teardown also fails"; else bad "exit code preserved (rc=$rc)"; fi
+
+echo "== ExpiredToken is named, not reported as 'testpmd failed' =="
+rm -f "$CRED_EXPIRED_FLAG"
+cat > "$STUB_DIR/aws" <<'STUB'
+#!/usr/bin/env bash
+echo "aws $*" >> "$AWS_LOG"
+case "$*" in
+    *send-command*)
+        if [[ "${EXPIRE_AT:-send}" == send ]]; then
+            echo "An error occurred (ExpiredTokenException) when calling the SendCommand operation: The security token included in the request is expired" >&2; exit 254
+        fi
+        echo "cmd-stub-0000" ;;
+    *get-command-invocation*)
+        echo "An error occurred (ExpiredTokenException) when calling the GetCommandInvocation operation: The security token included in the request is expired" >&2; exit 254 ;;
+    *) echo "" ;;
+esac
+STUB
+SCRIPT_START_EPOCH=1000000; fake_elapsed $((59 * 60 + 58))
+: > "$AWS_LOG"; EXPIRE_AT=send ssm_run_command i-x 30 "echo hi" >"$STUB_DIR/o" 2>"$STUB_DIR/e"; rc=$?
+if [[ $rc -ne 0 && -e "$CRED_EXPIRED_FLAG" ]]; then ok "send-command ExpiredToken -> failure + expiry flag"; else bad "send ExpiredToken (rc=$rc)"; fi
+if grep -q 'AWS credentials expired at 59m58s' "$STUB_DIR/e"; then ok "message: 'AWS credentials expired at 59m58s'"; else bad "named error (got: $(cat "$STUB_DIR/e"))"; fi
+if [[ $(grep -c 'send-command' "$AWS_LOG") -eq 1 ]]; then ok "no 3x retry on ExpiredToken"; else bad "retried ($(grep -c 'send-command' "$AWS_LOG") sends)"; fi
+if grep -qi 'testpmd' "$STUB_DIR/e" "$STUB_DIR/o"; then bad "must not mention testpmd"; else ok "does not surface as 'testpmd failed'"; fi
+: > "$AWS_LOG"; ssm_run_command i-x 30 "echo hi" >/dev/null 2>&1; rc=$?
+if [[ $rc -ne 0 && ! -s "$AWS_LOG" ]]; then ok "later SSM calls fail instantly without touching AWS"; else bad "fail-fast (rc=$rc log=$(cat "$AWS_LOG"))"; fi
+if ( abort_if_credentials_expired ) >/dev/null 2>&1; then bad "abort_if_credentials_expired must exit"; else ok "abort_if_credentials_expired exits the run"; fi
+rm -f "$CRED_EXPIRED_FLAG"
+: > "$AWS_LOG"; EXPIRE_AT=poll ssm_run_command i-x 30 "echo hi" >"$STUB_DIR/o" 2>"$STUB_DIR/e"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'AWS credentials expired at' "$STUB_DIR/e" && [[ $(grep -c 'get-command-invocation' "$AWS_LOG") -eq 1 ]]; then ok "poll ExpiredToken fails on the first poll (not after the 600s timeout)"; else bad "poll ExpiredToken (rc=$rc, polls=$(grep -c 'get-command-invocation' "$AWS_LOG"))"; fi
+rm -f "$CRED_EXPIRED_FLAG"
+: > "$AWS_LOG"; EXPIRE_AT=send ssm_run_command_fire_and_forget i-x 30 "echo hi" >/dev/null 2>"$STUB_DIR/e"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'AWS credentials expired at' "$STUB_DIR/e"; then ok "fire-and-forget names ExpiredToken too"; else bad "fire-and-forget ExpiredToken (rc=$rc)"; fi
+rm -f "$CRED_EXPIRED_FLAG"
 
 echo "== evaluate_gates.py unit tests =="
 if python3 "$TEST_DIR/test_evaluate_gates.py" >/dev/null 2>&1; then ok "test_evaluate_gates.py passes"; else bad "test_evaluate_gates.py passes"; fi

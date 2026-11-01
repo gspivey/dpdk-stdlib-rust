@@ -16,6 +16,8 @@
 #   --duration          Seconds per rate step (default: 30)
 #   --rate-steps        Comma-separated target PPS values (default: 70000,140000,350000,700000)
 #   --configs           Comma-separated DUT configs (default: plain-rust,rust-dpdk,native-dpdk)
+#   --full-plan         Run the full sizes x rates sweep for every config (default: trimmed
+#                       to what the gates read so the suite fits the 1h AWS session)
 #   --json-summary      Write JSON summary file
 #   -h, --help          Show help
 # =============================================================================
@@ -35,11 +37,33 @@ RATE_STEPS="70000,140000,350000,700000"
 # TCP (ASTF) benchmark params — used only for *-tcp config tokens.
 CPS_RATES="100,500,1000,5000"
 TCP_PAYLOAD_SIZES="64,512,1400,65536"
-# Kernel configs first (NIC starts in kernel mode from boot), then DPDK configs.
-# This minimizes NIC rebinding — only one kernel→vfio-pci transition needed.
+# Requested set. EXECUTION order is chosen by order_configs (reference first), not
+# by this string; the dut_bind_* helpers are idempotent so any order is safe.
 CONFIGS="plain-rust,rust-dpdk,tokio-dpdk,tokio-dpdk-concurrent,native-dpdk"
 JSON_SUMMARY=false
 IP_VERSION="4"
+FULL_PLAN=false
+
+# ── AWS session budget ────────────────────────────────────────────────────────
+# configure-aws-credentials issues 1h OIDC credentials; nothing renews them, so
+# every AWS call (SSM, CloudFormation teardown) dies at ~60 min and leaves the
+# paid PerfTestStack running. The script tracks its own elapsed time and stops
+# starting work it cannot finish AND tear down inside the session.
+AWS_SESSION_BUDGET_SECS="${AWS_SESSION_BUDGET_SECS:-3600}"
+# Credentials are issued before this script starts (run 41231404986: 7s; allow
+# for slower runner setup), so charge that head start against the session.
+AWS_SESSION_LEAD_SECS="${AWS_SESSION_LEAD_SECS:-120}"
+# Held back for Phase 6 (aggregate/gates/summary) + stack teardown. Floor: 8 min.
+TEARDOWN_RESERVE_SECS="${PERF_TEARDOWN_RESERVE_SECS:-480}"
+if (( TEARDOWN_RESERVE_SECS < 480 )); then TEARDOWN_RESERVE_SECS=480; fi
+# Wall-clock model measured from run 41231404986 (20s steps): one step costs
+# DURATION + ~3-4s, one run_benchmark_for_config call ~10s, and each config
+# ~81s of DUT settle/start/stop/log pull (padded to 90).
+PERF_STEP_OVERHEAD_SECS=4
+PERF_CALL_OVERHEAD_SECS=10
+PERF_CONFIG_OVERHEAD_SECS=90
+# Test seam: when set, now_epoch returns this instead of the real clock.
+PERF_NOW_EPOCH="${PERF_NOW_EPOCH:-}"
 
 CDK_STACK_NAME="${CDK_STACK_NAME:-PerfTestStack}"
 CDK_DIR="$REPO_ROOT/deploy/cdk"
@@ -49,6 +73,7 @@ LOGS_DIR="$REPO_ROOT/instance-logs"
 # can find both directories without hard-coding paths.
 export RESULTS_DIR LOGS_DIR
 
+CLEANUP_CFN_STACK_SCRIPT="${CLEANUP_CFN_STACK_SCRIPT:-$SCRIPT_DIR/ci/cleanup-cfn-stack.sh}"
 SSM_READINESS_TIMEOUT=600
 TREX_START_TIMEOUT=120
 BENCHMARK_TIMEOUT=600
@@ -78,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --cps-rates)      CPS_RATES="$2"; shift 2 ;;
         --tcp-payload-sizes) TCP_PAYLOAD_SIZES="$2"; shift 2 ;;
         --configs)        CONFIGS="$2"; shift 2 ;;
+        --full-plan)      FULL_PLAN=true; shift ;;
         --ip-version)     IP_VERSION="$2"; shift 2 ;;
         --json-summary)   JSON_SUMMARY=true; shift ;;
         -h|--help)
@@ -93,6 +119,51 @@ done
 log_info()  { echo "[$(date -u +%H:%M:%S)] INFO  $*"; }
 log_warn()  { echo "[$(date -u +%H:%M:%S)] WARN  $*" >&2; }
 log_error() { echo "[$(date -u +%H:%M:%S)] ERROR $*" >&2; }
+
+# ── Session budget & credential-expiry helpers ────────────────────────────────
+
+now_epoch() {
+    if [[ -n "$PERF_NOW_EPOCH" ]]; then echo "$PERF_NOW_EPOCH"; else date +%s; fi
+}
+SCRIPT_START_EPOCH="$(now_epoch)"
+
+# Seconds of the AWS session already used (script runtime + credential lead).
+elapsed_secs() { echo $(( $(now_epoch) - SCRIPT_START_EPOCH + AWS_SESSION_LEAD_SECS )); }
+remaining_secs() { echo $(( AWS_SESSION_BUDGET_SECS - $(elapsed_secs) )); }
+fmt_mmss() { printf '%dm%02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+# Number of items in a comma list (0 for empty).
+count_csv() { if [[ -z "$1" ]]; then echo 0; else awk -F, '{print NF}' <<< "$1"; fi; }
+
+# Estimated wall-clock of one run_benchmark_for_config call: $1 sizes, $2 rates.
+estimate_call_secs() {
+    local steps=$(( $(count_csv "$1") * $(count_csv "$2") ))
+    echo $(( PERF_CALL_OVERHEAD_SECS + steps * (DURATION + PERF_STEP_OVERHEAD_SECS) ))
+}
+
+# True when `$1` seconds of work still leaves the teardown reserve in the session.
+budget_allows() { (( $(remaining_secs) >= $1 + TEARDOWN_RESERVE_SECS )); }
+
+# AWS error text for an expired session (ExpiredToken / ExpiredTokenException).
+is_expired_token_msg() { [[ "$1" == *ExpiredToken* ]]; }
+
+# A flag file (not a variable) so it survives the $(...) subshells that run the
+# SSM helpers, letting every later call fail fast instead of retrying/polling.
+CRED_EXPIRED_FLAG="${TMPDIR:-/tmp}/perf-aws-expired.$$"
+credentials_expired() { [[ -e "$CRED_EXPIRED_FLAG" ]]; }
+mark_credentials_expired() {
+    if ! credentials_expired; then
+        log_error "AWS credentials expired at $(fmt_mmss "$(elapsed_secs)") (session budget ${AWS_SESSION_BUDGET_SECS}s)"
+        : > "$CRED_EXPIRED_FLAG"
+    fi
+}
+# For the main shell only: stop the run now that no AWS call can succeed.
+abort_if_credentials_expired() {
+    if credentials_expired; then
+        log_error "Aborting run: AWS credentials expired — no further AWS calls can succeed"
+        exit 2
+    fi
+}
 
 # ── PR Comment Helper ─────────────────────────────────────────────────────────
 
@@ -148,6 +219,9 @@ ssm_run_command() {
     shift 2
     local command="$*"
 
+    # Expired credentials never recover; fail instantly instead of retrying.
+    if credentials_expired; then return 3; fi
+
     # JSON-escape the command string (handle double quotes and backslashes)
     local escaped_command
     escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
@@ -165,6 +239,10 @@ ssm_run_command() {
             --query "Command.CommandId" \
             --output text 2>&1)
         local send_exit=$?
+        if is_expired_token_msg "$send_err"; then
+            mark_credentials_expired
+            return 3
+        fi
         if [[ $send_exit -eq 0 && -n "$send_err" && "$send_err" != *"error"* && "$send_err" != *"Error"* ]]; then
             cmd_id="$send_err"
             break
@@ -182,12 +260,17 @@ ssm_run_command() {
     local elapsed=0
     local completed=false
     while [[ $elapsed -lt $timeout_sec ]]; do
-        local status
+        local status status_rc=0
         status=$(aws ssm get-command-invocation \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
             --query "Status" \
-            --output text 2>/dev/null || echo "Pending")
+            --output text 2>&1) || status_rc=$?
+        if is_expired_token_msg "$status"; then
+            mark_credentials_expired
+            return 3
+        fi
+        if [[ $status_rc -ne 0 ]]; then status="Pending"; fi
 
         case "$status" in
             Success)
@@ -238,16 +321,28 @@ ssm_run_command_fire_and_forget() {
     shift 2
     local command="$*"
 
+    if credentials_expired; then return 3; fi
+
     local escaped_command
     escaped_command=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$command")
 
-    aws ssm send-command \
+    local out rc=0
+    out=$(aws ssm send-command \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters "{\"commands\":[${escaped_command}]}" \
         --timeout-seconds "$timeout_sec" \
         --query "Command.CommandId" \
-        --output text 2>/dev/null
+        --output text 2>&1) || rc=$?
+    if is_expired_token_msg "$out"; then
+        mark_credentials_expired
+        return 3
+    fi
+    if [[ $rc -ne 0 ]]; then
+        log_warn "fire-and-forget send-command to $instance_id failed (exit $rc): $out"
+        return "$rc"
+    fi
+    echo "$out"
 }
 
 wait_ssm_ready() {
@@ -991,31 +1086,99 @@ $(head -5 "$RESULTS_DIR/${result_name}.json")
 }
 
 # Reps 2 and 3 of the 700k step (tokio-udp-perf D9). Re-runs ONLY the 700k step
-# at the requested gated sizes on the already-deployed stack, for each requested
-# config the gates judge (rust-dpdk, tokio-dpdk, tokio-dpdk-concurrent AND
-# native-dpdk — its median is the reference for the rust>=95%-of-native gate).
-# The config list and sizes come from perf-targets.json intersected with the
-# run's requested inputs, never a hard-coded list (so never 8500 by default).
+# on the already-deployed stack, for each requested config the ENABLED gates
+# judge or use as a reference (rust-dpdk, tokio-dpdk, native-dpdk; a report-only
+# config such as tokio-dpdk-concurrent runs rep 1 only). Sizes are per config
+# (PLAN_REP_SIZES, from evaluate_gates.py rep-plan --config): native-dpdk only
+# needs the sizes its gates read, never 8500.
 # No-op when 700k was not requested or the config is not judged.
+# Returns 10 when the session budget cannot cover a rep (BUDGET_SKIPPED updated).
 run_700k_reps() {
     local config="$1"
-    local plan rep_configs rep_sizes
-    plan=$(python3 "$EVALUATE_GATES" rep-plan --targets "$PERF_TARGETS" \
-        --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS") || {
-        log_error "rep-plan failed for $config"
-        return 1
-    }
-    rep_configs=$(sed -n 's/^REP_CONFIGS=//p' <<< "$plan")
-    rep_sizes=$(sed -n 's/^REP_SIZES=//p' <<< "$plan")
-    if [[ -z "$rep_sizes" || ",$rep_configs," != *",$config,"* ]]; then
-        log_info "No 700k reps for $config (rep configs='$rep_configs' sizes='$rep_sizes')"
+    local rep_sizes="${PLAN_REP_SIZES[$config]-}"
+    if [[ -z "$rep_sizes" ]]; then
+        log_info "No 700k reps for $config"
         return 0
     fi
-    local rep
+    local rep need
+    need=$(estimate_call_secs "$rep_sizes" 700000)
     for rep in 2 3; do
+        if ! budget_allows "$need"; then
+            BUDGET_SKIPPED+=("${config}:rep${rep}")
+            if [[ $rep -eq 2 ]]; then BUDGET_SKIPPED+=("${config}:rep3"); fi
+            return 10
+        fi
         log_info "=== $config 700k rep $rep/3 (sizes: $rep_sizes) ==="
         run_benchmark_for_config "$config" 9000 "$rep" "$rep_sizes" 700000 || return 1
     done
+}
+
+# ── Run plan ──────────────────────────────────────────────────────────────────
+# The plan is derived from perf-targets.json (what the gates actually read), not
+# a hard-coded list, so it follows the gate file. --full-plan restores the old
+# "every config x every size x every rate" sweep.
+
+declare -A PLAN_SIZES=() PLAN_RATES=() PLAN_REP_SIZES=()
+BUDGET_SKIPPED=()
+
+# Run order: reference chain first so a truncated run still has native-dpdk.
+order_configs() {
+    local out order
+    if out=$(python3 "$EVALUATE_GATES" exec-order --targets "$PERF_TARGETS" \
+            --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS" 2>&1); then
+        order=$(sed -n 's/^EXEC_ORDER=//p' <<< "$out")
+    fi
+    if [[ -z "${order:-}" ]]; then
+        log_warn "exec-order failed (${out:-no output}) — keeping requested order"
+        order="$CONFIGS"
+    fi
+    echo "$order"
+}
+
+# Fill PLAN_SIZES / PLAN_RATES / PLAN_REP_SIZES for every config in $1 (csv).
+compute_run_plan() {
+    local config out
+    local -a list
+    IFS=',' read -ra list <<< "$1"
+    for config in "${list[@]}"; do
+        if [[ "$config" == *-tcp ]]; then
+            PLAN_SIZES[$config]="$TCP_PAYLOAD_SIZES"; PLAN_RATES[$config]="$CPS_RATES"
+            PLAN_REP_SIZES[$config]=""
+            continue
+        fi
+        PLAN_SIZES[$config]="$PACKET_SIZES"; PLAN_RATES[$config]="$RATE_STEPS"
+        if [[ "$FULL_PLAN" != "true" ]]; then
+            out=$(python3 "$EVALUATE_GATES" step-plan --config "$config" --targets "$PERF_TARGETS" \
+                --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS") || {
+                log_error "step-plan failed for $config"; return 1; }
+            PLAN_SIZES[$config]=$(sed -n 's/^PLAN_SIZES=//p' <<< "$out")
+            PLAN_RATES[$config]=$(sed -n 's/^PLAN_RATES=//p' <<< "$out")
+        fi
+        if [[ "$FULL_PLAN" == "true" ]]; then
+            out=$(python3 "$EVALUATE_GATES" rep-plan --targets "$PERF_TARGETS" \
+                --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS") || {
+                log_error "rep-plan failed for $config"; return 1; }
+        else
+            out=$(python3 "$EVALUATE_GATES" rep-plan --config "$config" --targets "$PERF_TARGETS" \
+                --configs "$CONFIGS" --packet-sizes "$PACKET_SIZES" --rate-steps "$RATE_STEPS") || {
+                log_error "rep-plan failed for $config"; return 1; }
+        fi
+        if [[ ",$(sed -n 's/^REP_CONFIGS=//p' <<< "$out")," == *",$config,"* ]]; then
+            PLAN_REP_SIZES[$config]=$(sed -n 's/^REP_SIZES=//p' <<< "$out")
+        else
+            PLAN_REP_SIZES[$config]=""
+        fi
+    done
+}
+
+# Estimated wall-clock of one whole config: DUT overhead + rep 1 + reps 2-3.
+estimate_config_secs() {
+    local config="$1" total=$PERF_CONFIG_OVERHEAD_SECS
+    total=$(( total + $(estimate_call_secs "${PLAN_SIZES[$config]-}" "${PLAN_RATES[$config]-}") ))
+    if [[ -n "${PLAN_REP_SIZES[$config]-}" ]]; then
+        total=$(( total + 2 * $(estimate_call_secs "${PLAN_REP_SIZES[$config]}" 700000) ))
+    fi
+    echo "$total"
 }
 
 # Run a TCP (ASTF/stateful) benchmark for a *-tcp config. Mirrors
@@ -2308,32 +2471,76 @@ perf_gate_exit_check() {
     fi
 }
 
+# Config-level guard: 0 if `$2` (the `$1`-th, 1-based, entry of CONFIG_LIST)
+# fits with the teardown reserve; otherwise records it and every later config in
+# BUDGET_SKIPPED and returns 1 (caller stops the loop).
+budget_guard_config() {
+    local idx="$1" config="$2"
+    if budget_allows "$(estimate_config_secs "$config")"; then return 0; fi
+    BUDGET_SKIPPED+=("${CONFIG_LIST[@]:$((idx - 1))}")
+    return 1
+}
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
+
+# Delete the stack through scripts/ci/cleanup-cfn-stack.sh (waits for deletion,
+# force-deletes DELETE_FAILED, purges orphaned VPCs). Its output is NOT
+# swallowed: a stack we cannot delete is a paid leak and must be loud. The wait
+# is capped to what is left of the session so it fails with a clear message
+# rather than dying on ExpiredToken mid-wait.
+teardown_stack() {
+    local remaining wait_cap rc=0
+    remaining=$(remaining_secs)
+    wait_cap=$(( remaining - 60 ))
+    if (( wait_cap < 120 )); then wait_cap=120; fi
+    if (( wait_cap > 1080 )); then wait_cap=1080; fi
+    log_info "Tearing down $CDK_STACK_NAME (session remaining $(fmt_mmss "$remaining"), wait cap ${wait_cap}s)..."
+    timeout -k 10 "$wait_cap" bash "$CLEANUP_CFN_STACK_SCRIPT" "$CDK_STACK_NAME" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log_info "$CDK_STACK_NAME torn down"
+        return 0
+    fi
+    local why="exit $rc"
+    if [[ $rc -eq 124 ]]; then why="still deleting after ${wait_cap}s"; fi
+    log_error "TEARDOWN FAILED for $CDK_STACK_NAME ($why) — the stack may still be running and billing; delete it manually"
+    if credentials_expired; then
+        log_error "AWS credentials had already expired; only a teardown with fresh credentials can remove the stack"
+    fi
+    return 1
+}
 
 cleanup() {
     local exit_code=$?
+    trap - EXIT
 
     if [[ $exit_code -ne 0 ]]; then
-        log_warn "Script exiting with code $exit_code, collecting failure diagnostics..."
+        if credentials_expired; then
+            # Every SSM call fails instantly now; diagnostics would collect nothing.
+            log_warn "Script exiting with code $exit_code; skipping failure diagnostics (AWS credentials expired)"
+        else
+            log_warn "Script exiting with code $exit_code, collecting failure diagnostics..."
 
-        if [[ -n "$DUT_INSTANCE_ID" ]]; then
-            collect_instance_logs "$DUT_INSTANCE_ID" "dut" || true
-            collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure" || true
-        fi
-        if [[ -n "$TREX_INSTANCE_ID" ]]; then
-            collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
-            collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure" || true
+            if [[ -n "$DUT_INSTANCE_ID" ]]; then
+                collect_instance_logs "$DUT_INSTANCE_ID" "dut" || true
+                collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure" || true
+            fi
+            if [[ -n "$TREX_INSTANCE_ID" ]]; then
+                collect_instance_logs "$TREX_INSTANCE_ID" "trex" || true
+                collect_networking_diagnostics "$TREX_INSTANCE_ID" "trex" "failure" || true
+            fi
         fi
 
         write_failure_json "perf-test" "Script exited with code $exit_code"
     fi
 
     if [[ "$TEARDOWN" == "true" && "$SKIP_DEPLOY" == "false" ]]; then
-        log_info "Tearing down PerfTestStack..."
-        # Use non-blocking delete to avoid consuming OIDC token time.
-        # The safety-net teardown step in the workflow will also attempt cleanup.
-        aws cloudformation delete-stack --stack-name "$CDK_STACK_NAME" 2>/dev/null || log_warn "Teardown failed"
+        if ! teardown_stack && [[ $exit_code -eq 0 ]]; then
+            exit_code=1
+        fi
     fi
+
+    rm -f "$CRED_EXPIRED_FLAG"
+    exit "$exit_code"
 }
 
 trap cleanup EXIT
@@ -2802,13 +3009,31 @@ ${dut_check:-empty}
     post_pr_comment "## [Perf] DUT Ready
 DUT instance \`$DUT_INSTANCE_ID\` SSM working, build complete."
 
-    IFS=',' read -ra CONFIG_LIST <<< "$CONFIGS"
+    local run_order
+    run_order=$(order_configs)
+    compute_run_plan "$run_order" || { log_error "Could not compute the run plan"; exit 2; }
+    IFS=',' read -ra CONFIG_LIST <<< "$run_order"
     local total_configs=${#CONFIG_LIST[@]}
     local config_idx=0
     local failed_configs=()
 
+    local plan_total=0 plan_est
+    for config in "${CONFIG_LIST[@]}"; do
+        plan_est=$(estimate_config_secs "$config")
+        plan_total=$((plan_total + plan_est))
+        log_info "Plan: $config sizes=${PLAN_SIZES[$config]} rates=${PLAN_RATES[$config]} reps2-3=${PLAN_REP_SIZES[$config]:-none} est=$(fmt_mmss "$plan_est")"
+    done
+    log_info "Run order: $run_order"
+    log_info "Session: elapsed $(fmt_mmss "$(elapsed_secs)") of ${AWS_SESSION_BUDGET_SECS}s, plan est $(fmt_mmss "$plan_total"), teardown reserve $(fmt_mmss "$TEARDOWN_RESERVE_SECS"), remaining $(fmt_mmss "$(remaining_secs)")"
+
     for config in "${CONFIG_LIST[@]}"; do
         config_idx=$((config_idx + 1))
+        abort_if_credentials_expired
+
+        # Session-budget guard: do not start a config that cannot finish and
+        # still leave the teardown reserve. Skip the rest, tear down while the
+        # credentials still work.
+        budget_guard_config "$config_idx" "$config" || break
         log_info "=== Config $config_idx/$total_configs: $config ==="
 
         post_pr_comment "## [Perf] Stage: Benchmark ($config_idx/$total_configs)
@@ -2841,6 +3066,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
                 log_warn "DUT SSM not responsive (attempt $ssm_retry), waiting 15s..."
                 sleep 15
             done
+            abort_if_credentials_expired
             if [[ "$ssm_ok" == "false" ]]; then
                 log_error "DUT SSM agent not responding after 5 attempts — skipping remaining configs"
                 failed_configs+=("$config")
@@ -2872,6 +3098,7 @@ Packet sizes: \`$PACKET_SIZES\` | Duration: ${DURATION}s/step | Target PPS: \`$R
         esac
 
         if [[ "$start_ok" == "false" ]]; then
+            abort_if_credentials_expired
             log_error "Failed to start DUT for config: $config"
             failed_configs+=("$config")
             # Post diagnostic info about the DUT start failure — use set +e to
@@ -2895,8 +3122,13 @@ ${dut_diag}
         # Run the benchmark
         # Rep 1 is the full sweep; reps 2-3 re-run only the 700k step before the
         # config is torn down (no re-deploy), so the gates judge a 3-rep median.
-        if ! run_benchmark_for_config "$config" 9000 1 \
-            || { [[ "$config" != *-tcp ]] && ! run_700k_reps "$config"; }; then
+        local bench_rc=0
+        run_benchmark_for_config "$config" 9000 1 "${PLAN_SIZES[$config]}" "${PLAN_RATES[$config]}" || bench_rc=$?
+        if [[ $bench_rc -eq 0 && "$config" != *-tcp ]]; then
+            run_700k_reps "$config" || bench_rc=$?
+        fi
+        if [[ $bench_rc -ne 0 && $bench_rc -ne 10 ]]; then
+            abort_if_credentials_expired
             log_error "Benchmark failed for config: $config"
             failed_configs+=("$config")
             collect_networking_diagnostics "$DUT_INSTANCE_ID" "dut" "failure-${config}"
@@ -2978,7 +3210,22 @@ ${testpmd_diag}
 </details>"
             fi
         fi
+
+        # A rep was skipped for budget: the rest of the configs cannot run either.
+        if [[ $bench_rc -eq 10 ]]; then
+            BUDGET_SKIPPED+=("${CONFIG_LIST[@]:$config_idx}")
+            break
+        fi
     done
+
+    if [[ ${#BUDGET_SKIPPED[@]} -gt 0 ]]; then
+        local skipped_csv
+        skipped_csv=$(IFS=,; echo "${BUDGET_SKIPPED[*]}")
+        log_error "PERF BUDGET EXHAUSTED: skipped ${skipped_csv} (elapsed $(fmt_mmss "$(elapsed_secs)") of ${AWS_SESSION_BUDGET_SECS}s, teardown reserve $(fmt_mmss "$TEARDOWN_RESERVE_SECS"))"
+        post_pr_comment "## [Perf] Budget Exhausted
+\`PERF BUDGET EXHAUSTED: skipped ${skipped_csv}\`
+Elapsed $(fmt_mmss "$(elapsed_secs)") of ${AWS_SESSION_BUDGET_SECS}s; the remaining work would not leave the $(fmt_mmss "$TEARDOWN_RESERVE_SECS") teardown reserve. Tearing down while credentials still work."
+    fi
 
     # Stop TRex and DUT
     dut_stop_all_apps || true
@@ -3004,6 +3251,13 @@ ${testpmd_diag}
 Verdict: \`$(cat "$RESULTS_DIR/gate-verdict.txt" 2>/dev/null || echo "INVALID/MISSING")\`
 
 $(cat "$RESULTS_DIR/gate-lines.md")"
+    fi
+
+    if [[ ${#BUDGET_SKIPPED[@]} -gt 0 ]]; then
+        summary="$summary
+
+### Skipped (AWS session budget exhausted)
+$(printf -- '- `%s`\n' "${BUDGET_SKIPPED[@]}")"
     fi
 
     # Add failure info if any
@@ -3035,6 +3289,11 @@ $summary
     # Gate outcome: exit 2 on an invalid deploy, exit 1 unless the verdict is
     # exactly PASS (a missing verdict is a FAIL, never a silent pass).
     perf_gate_exit_check
+
+    if [[ ${#BUDGET_SKIPPED[@]} -gt 0 ]]; then
+        log_error "Incomplete run: skipped for session budget: ${BUDGET_SKIPPED[*]}"
+        exit 1
+    fi
 
     # Exit with failure if any configs failed
     if [[ ${#failed_configs[@]} -gt 0 ]]; then

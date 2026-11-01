@@ -38,9 +38,9 @@
       "rel_to": "rust-dpdk",
       "metric": "rx_pps",
       "min_ratio": 0.98,
-      "rate_steps": [70000, 140000, 350000],
+      "rate_steps": [140000, 350000],
       "sizes": [64, 512, 1400],
-      "note": "D6/HIGH-5/MEDIUM-7: the ONE per-step throughput rule, at 70k/140k/350k ONLY (700k excluded - judged by the headline tokio-dpdk 95%-of-rust gate). tokio-dpdk (fair) rx_pps >= 98% of the SAME-RUN rust-dpdk rx_pps at that step+size (rep 1, a single sample - LOW-9). No '% of offered rate' rule."
+      "note": "D6/HIGH-5/MEDIUM-7: the ONE per-step throughput rule, at 140k/350k ONLY (70k dropped to fit the 1h AWS session - at 70k pps the offered load is far below capacity so every config passes trivially, and the step cost ~2.3 min of EC2 time; 700k excluded - judged by the headline tokio-dpdk 95%-of-rust gate). tokio-dpdk (fair) rx_pps >= 98% of the SAME-RUN rust-dpdk rx_pps at that step+size (rep 1, a single sample - LOW-9). No '% of offered rate' rule."
     }
   },
   "idle_cpu": {

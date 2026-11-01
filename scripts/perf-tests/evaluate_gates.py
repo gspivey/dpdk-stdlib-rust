@@ -259,10 +259,15 @@ def write_outputs(results_dir, outcome):
 
 
 def judged_configs(targets):
-    """Configs the gates judge or use as a reference (reps 2-3 run for these)."""
+    """Configs the gates judge or use as a reference (reps 2-3 run for these).
+
+    A disabled (report-only) gate's own config is NOT judged, so it does not
+    earn extra reps; it still counts when another gate uses it as a reference.
+    """
     out = set()
     for name, gate in targets["gates"].items():
-        out.add(gate.get("config", name))
+        if gate.get("enabled", True):
+            out.add(gate.get("config", name))
         if gate.get("rel_to"):
             out.add(gate["rel_to"])
     rule = targets.get("invalid_run_rule")
@@ -286,10 +291,82 @@ def rep_plan(targets, configs, sizes, steps):
             [s for s in sizes if s in gate_sizes])
 
 
+# UDP configs whose rep-1 sweep is trimmed to what the gates read. Any other
+# token (-tcp, -v6, -multicore, rust-stdlib, ...) keeps the caller's full plan.
+UDP_PLAN_CONFIGS = ("plain-rust", "rust-dpdk", "tokio-dpdk",
+                    "tokio-dpdk-concurrent", "native-dpdk")
+
+
+def config_rep_sizes(targets, config, sizes):
+    """Sizes the 700k reps 2-3 need for `config`: requested sizes that a
+    *gated* (non-report-only) rule reads for it, either as the judged config or
+    as the reference (rel_to) of another gate, plus the invalid-run size."""
+    needed = set()
+    for name, gate in targets["gates"].items():
+        if gate.get("enabled", True) and gate.get("config", name) == config:
+            needed.update(gate.get("sizes", []))
+        if gate.get("rel_to") == config and gate.get("enabled", True):
+            needed.update(gate.get("sizes", []))
+    rule = targets.get("invalid_run_rule")
+    if rule and rule["config"] == config:
+        needed.add(rule["size"])
+    return [s for s in sizes if s in needed]
+
+
+def step_plan(targets, config, sizes, steps):
+    """(sizes, rates) of the rep-1 sweep for `config`.
+
+    Unknown config tokens get the full requested plan. Known UDP configs get
+    only what a gate or report column reads: sizes in the union of every gate's
+    sizes/report_only_sizes (so never 8500), and the 700k step, plus the
+    70k/140k/350k steps for the two configs the per-step rule compares.
+    """
+    if config not in UDP_PLAN_CONFIGS:
+        return list(sizes), list(steps)
+    gate_sizes = set()
+    for gate in targets["gates"].values():
+        gate_sizes.update(gate.get("sizes", []))
+        gate_sizes.update(gate.get("report_only_sizes", []))
+    wanted = {targets["step_pps"]}
+    ps = targets["gates"].get("per_step_tokio_vs_rust")
+    if ps and config in (ps.get("config", "tokio-dpdk"), ps["rel_to"]):
+        wanted.update(ps["rate_steps"])
+    return ([s for s in sizes if s in gate_sizes],
+            [r for r in steps if r in wanted])
+
+
+def exec_order(targets, configs):
+    """Order to RUN configs so a run cut short by the session budget still has
+    the data the gates need: reference chain first (native-dpdk, then rust-dpdk,
+    then tokio-dpdk), other gated configs next, ungated/report-only configs
+    last. Stable w.r.t. the requested order within a class. Pure ordering: it
+    never adds or drops a config, and result files are keyed by config name so
+    aggregation/gates do not depend on execution order."""
+    gates = targets["gates"]
+
+    def depth(cfg, seen=()):
+        g = gates.get(cfg)
+        if not g or not g.get("rel_to") or cfg in seen:
+            return 0
+        return 1 + depth(g["rel_to"], seen + (cfg,))
+
+    judged = judged_configs(targets)
+    indexed = list(enumerate(configs))
+
+    def key(item):
+        i, cfg = item
+        return (0 if cfg in judged else 1, depth(cfg) if cfg in judged else 0, i)
+
+    return [c for _, c in sorted(indexed, key=key)]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["evaluate", "rep-plan"],
-                    help="evaluate: write verdict files; rep-plan: print the reps 2-3 plan")
+    ap.add_argument("command", choices=["evaluate", "rep-plan", "step-plan", "exec-order"],
+                    help="evaluate: write verdict files; rep-plan: print the reps 2-3 plan; "
+                         "step-plan: print one config's rep-1 sizes/rates; "
+                         "exec-order: print the budget-safe config run order")
+    ap.add_argument("--config", help="step-plan / rep-plan: the config to plan for")
     ap.add_argument("--results-dir")
     ap.add_argument("--targets", required=True)
     ap.add_argument("--configs", required=True, help="comma list of requested configs")
@@ -303,8 +380,21 @@ def main(argv=None):
     if args.command == "rep-plan":
         rc, rs = rep_plan(targets, configs, parse_int_list(args.packet_sizes),
                           parse_int_list(args.rate_steps))
+        if args.config:
+            rs = config_rep_sizes(targets, args.config, rs)
         print(f"REP_CONFIGS={','.join(rc)}")
         print(f"REP_SIZES={','.join(str(x) for x in rs)}")
+        return 0
+    if args.command == "step-plan":
+        if not args.config:
+            ap.error("step-plan requires --config")
+        ps, pr = step_plan(targets, args.config, parse_int_list(args.packet_sizes),
+                           parse_int_list(args.rate_steps))
+        print(f"PLAN_SIZES={','.join(str(x) for x in ps)}")
+        print(f"PLAN_RATES={','.join(str(x) for x in pr)}")
+        return 0
+    if args.command == "exec-order":
+        print(f"EXEC_ORDER={','.join(exec_order(targets, configs))}")
         return 0
     if not args.results_dir:
         ap.error("evaluate requires --results-dir")
