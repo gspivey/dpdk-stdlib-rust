@@ -199,7 +199,14 @@ class PerStepTests(unittest.TestCase):
         reps["tokio-dpdk"][1] = data("tokio-dpdk", {64: {700000: 700000}})
         out = run(reps, sizes=[64])
         self.assertEqual(out["verdict"], "FAIL")
-        self.assertIn("per-step @ 64B @ 70000 missing data", "\n".join(out["lines"]))
+        self.assertIn("per-step @ 64B @ 140000 missing data", "\n".join(out["lines"]))
+
+    def test_70k_is_not_per_step_judged(self):
+        reps = fleet()
+        reps["tokio-dpdk"][1] = data("tokio-dpdk", {64: {70000: 1, 140000: 140000,
+                                                          350000: 350000, 700000: 700000}})
+        out = run(reps, sizes=[64])
+        self.assertEqual(out["verdict"], "PASS")
 
 
 class InvalidRunTests(unittest.TestCase):
@@ -233,8 +240,14 @@ class RepPlanTests(unittest.TestCase):
                                    "tokio-dpdk-concurrent", "native-dpdk"],
                                   [64, 512, 1400, 8500], STEPS)
         self.assertEqual(sizes, [64, 512, 1400])
-        self.assertEqual(cfgs, ["rust-dpdk", "tokio-dpdk", "tokio-dpdk-concurrent",
-                                "native-dpdk"])
+        # tokio-dpdk-concurrent's gate is disabled (report-only): rep 1 only.
+        self.assertEqual(cfgs, ["rust-dpdk", "tokio-dpdk", "native-dpdk"])
+
+    def test_enabling_the_concurrent_gate_earns_it_reps(self):
+        targets = json.loads(json.dumps(TARGETS))
+        targets["gates"]["tokio-dpdk-concurrent"]["enabled"] = True
+        cfgs, _ = eg.rep_plan(targets, ALL_CONFIGS, SIZES, STEPS)
+        self.assertIn("tokio-dpdk-concurrent", cfgs)
 
     def test_no_reps_without_700k(self):
         self.assertEqual(eg.rep_plan(TARGETS, ALL_CONFIGS, SIZES, [70000]), ([], []))
@@ -242,6 +255,56 @@ class RepPlanTests(unittest.TestCase):
     def test_requested_subset_only(self):
         cfgs, sizes = eg.rep_plan(TARGETS, ["rust-dpdk", "native-dpdk"], [64], STEPS)
         self.assertEqual((cfgs, sizes), (["rust-dpdk", "native-dpdk"], [64]))
+
+
+class SessionBudgetPlanTests(unittest.TestCase):
+    """The trimmed plan that lets the suite fit the 1h AWS session."""
+    REQ_SIZES = [64, 512, 1400, 8500]
+
+    def test_per_step_configs_keep_judged_rates_but_drop_70k_and_8500(self):
+        for cfg in ("rust-dpdk", "tokio-dpdk"):
+            self.assertEqual(eg.step_plan(TARGETS, cfg, self.REQ_SIZES, STEPS),
+                             ([64, 512, 1400], [140000, 350000, 700000]))
+
+    def test_other_udp_configs_run_only_the_700k_step(self):
+        for cfg in ("native-dpdk", "tokio-dpdk-concurrent", "plain-rust"):
+            self.assertEqual(eg.step_plan(TARGETS, cfg, self.REQ_SIZES, STEPS),
+                             ([64, 512, 1400], [700000]))
+
+    def test_unknown_config_tokens_keep_the_full_plan(self):
+        for cfg in ("rust-dpdk-tcp", "rust-dpdk-v6", "rust-stdlib"):
+            self.assertEqual(eg.step_plan(TARGETS, cfg, self.REQ_SIZES, STEPS),
+                             (self.REQ_SIZES, STEPS))
+
+    def test_native_reps_only_cover_gated_sizes(self):
+        self.assertEqual(eg.config_rep_sizes(TARGETS, "native-dpdk", self.REQ_SIZES), [64, 512])
+        self.assertEqual(eg.config_rep_sizes(TARGETS, "rust-dpdk", self.REQ_SIZES), [64, 512, 1400])
+        self.assertEqual(eg.config_rep_sizes(TARGETS, "tokio-dpdk", self.REQ_SIZES), [64, 512, 1400])
+        self.assertEqual(eg.config_rep_sizes(TARGETS, "tokio-dpdk-concurrent", self.REQ_SIZES), [])
+
+    def test_reference_chain_runs_first_ungated_last(self):
+        order = eg.exec_order(TARGETS, ["plain-rust", "rust-dpdk", "tokio-dpdk",
+                                        "tokio-dpdk-concurrent", "native-dpdk"])
+        self.assertEqual(order, ["native-dpdk", "rust-dpdk", "tokio-dpdk",
+                                 "plain-rust", "tokio-dpdk-concurrent"])
+
+    def test_order_never_adds_or_drops_configs(self):
+        req = ["quic-x", "native-dpdk", "rust-dpdk-tcp"]
+        self.assertEqual(sorted(eg.exec_order(TARGETS, req)), sorted(req))
+
+    def test_cli_step_plan_and_exec_order(self):
+        import contextlib
+        import io
+        base = ["--targets", TARGETS_PATH, "--configs", "plain-rust,native-dpdk",
+                "--packet-sizes", "64,512,1400,8500",
+                "--rate-steps", "70000,140000,350000,700000"]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(eg.main(["step-plan", "--config", "native-dpdk"] + base), 0)
+            self.assertEqual(eg.main(["exec-order"] + base), 0)
+        self.assertEqual(buf.getvalue().splitlines(),
+                         ["PLAN_SIZES=64,512,1400", "PLAN_RATES=700000",
+                          "EXEC_ORDER=native-dpdk,plain-rust"])
 
 
 class OutputTests(unittest.TestCase):
