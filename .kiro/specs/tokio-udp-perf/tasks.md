@@ -315,7 +315,7 @@ additive `pub #[doc(hidden)]` items (the non-blocking try entry points, task 3.6
   non-blocking contract covers only the new guards; (3) the D11 auto-reply drop-and-count when
   `q_tx0` is busy during a non-blocking RX try, recorded in `auto_reply_drops()` (not in App
   Drops). (Req 4.2a, 3.9)
-- [ ] 3.10 `cargo build && cargo test` (debug, stub). Verify perf (deployment-normalized sync
+- [x] 3.10 `cargo build && cargo test` (debug, stub). Verify perf (deployment-normalized sync
   gate: rust-dpdk ≥ **95 % of same-run native-dpdk** @[64,512]; vs-0.3.0 report-only — D8/HIGH-4)
   by running the perf workflow — `gh workflow run perf-tests.yml`, poll with `gh run view --json
   status,conclusion` (CLAUDE.md step 5) — **not** `ci-validate.sh` (which is the integration tier).
