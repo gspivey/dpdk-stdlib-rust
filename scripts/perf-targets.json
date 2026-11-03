@@ -30,8 +30,8 @@
       "abs_min": 290000,
       "sizes": [64],
       "report_only_sizes": [512, 1400],
-      "enabled": false,
-      "note": "D2/LOW-3/MEDIUM-1: floor at 64B only (E2 spawn = 232k@512B, 176k@1400B); 512/1400 are report-only. enabled=false => REPORT-ONLY (not gated). PR 4's diff flips enabled:true (PR 4 makes the concurrent path fast). Not keyed on PR_NUMBER."
+      "enabled": true,
+      "note": "D2/LOW-3/MEDIUM-1: floor at 64B only (E2 spawn = 232k@512B, 176k@1400B); 512/1400 are report-only. enabled=true => floor GATED at 64B (flipped by PR 4, which dropped the tokio outer mutex). Not keyed on PR_NUMBER."
     },
     "per_step_tokio_vs_rust": {
       "config": "tokio-dpdk",
