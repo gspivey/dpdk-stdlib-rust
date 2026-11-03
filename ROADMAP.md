@@ -427,16 +427,6 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 
 ---
 
-### 47. tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` (soundness fix)
-
-Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
-then implement tasks `3.1`-`3.10` (PR 3). Must land before item 48 (dropping the tokio outer mutex is only sound with these guards).
-
-- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.4a`, `3.5`, `3.5a`, `3.6`, `3.6a`, `3.7`, `3.8`, `3.9`, `3.9a`, `3.10`
-- [ ] Complete · PR: —
-
----
-
 ### 48. tokio UDP perf (0.3.1): drop the tokio outer mutex
 
 Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
@@ -496,3 +486,11 @@ then implement tasks `2.1`-`2.10` (PR 2). Depends on item 45 (the gates judge th
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `2.1`, `2.2`, `2.3`, `2.3a`, `2.4`, `2.4a`, `2.5`, `2.6`, `2.7`, `2.7a`, `2.8`, `2.9`, `2.9a`, `2.10`
 - [x] Complete · PR: #143
+
+### 47. tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` (soundness fix)
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `3.1`-`3.10` (PR 3). Must land before item 48 (dropping the tokio outer mutex is only sound with these guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.4a`, `3.5`, `3.5a`, `3.6`, `3.6a`, `3.7`, `3.8`, `3.9`, `3.9a`, `3.10`
+- [x] Complete · PR: #147

@@ -23,3 +23,6 @@ dpdk = { version = "0.3.0", path = "../dpdk", package = "dpdk-stdlib" }
 dpdk-sys = { version = "0.3.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 dpdk-stdlib-net = { version = "0.3.0", path = "../dpdk-stdlib-net" }
 libc = { workspace = true }
+
+[dev-dependencies]
+static_assertions = "1"
