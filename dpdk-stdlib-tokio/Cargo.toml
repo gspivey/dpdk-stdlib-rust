@@ -27,3 +27,4 @@ dpdk-stdlib-tcp = { version = "0.3.0", path = "../dpdk-stdlib-tcp", optional = t
 tokio = { version = "1", features = ["full"] }
 dpdk-stdlib-tcp = { version = "0.3.0", path = "../dpdk-stdlib-tcp" }
 proptest = "1.4"
+static_assertions = "1"
