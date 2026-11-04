@@ -73,6 +73,40 @@ The `dpdk-tokio` crate provides drop-in replacement sockets in `dpdk_tokio::comp
 | `into_std()` | ✅ | Implemented |
 | All socket options | ✅ | Same as std::net |
 
+### Opt-in idle backoff (additive extension, default OFF)
+
+`compat::tokio::UdpSocket` and `dpdk_stdlib_tokio::DpdkUdpSocket` gain two **additive inherent
+methods** (not on the `AsyncUdpSocket` trait, which is unchanged — semver-clean):
+
+| Method | Notes |
+|--------|-------|
+| `set_idle_backoff(&self, Option<Duration>)` | `Some(d)` enables the backoff; `None` disables (default). |
+| `idle_backoff(&self) -> Option<Duration>` | Returns the value exactly as passed (before clamping). |
+
+Behaviour when enabled: the DPDK `recv_from`/`recv` path keeps spinning with `yield_now` until the
+socket has had **no packet for `max(d, 2 ms)`**, then escalates to `tokio::time::sleep` in fixed
+~1 ms steps. The idle clock restarts the moment a packet arrives, so a loaded receiver never
+sleeps and throughput is unaffected. When disabled (the default) the path is exactly the 0.3.0
+spin (`try_recv_from` + `yield_now`), so callers who never opt in are unaffected.
+
+Tradeoffs and requirements:
+
+- **Latency:** tokio's timer resolution is ~1 ms, so the first packet after an idle period can be
+  delayed by up to **~1-2 ms**. Sub-millisecond precision is not claimed. This is why the feature
+  is opt-in.
+- **Time driver required:** the runtime must have the time driver enabled (`enable_time` /
+  `enable_all`; `#[tokio::main]` provides it). There is **no "cannot panic" guarantee**: on a
+  runtime built without timers, the backoff panics exactly like any other `tokio::time` call
+  once it reaches the sleep stage. A busy receiver never reaches that stage.
+- **Behaviour note:** with the backoff enabled the recv path sleeps when idle; with it disabled
+  nothing changes from 0.3.0.
+- On the kernel (`Tokio`) fallback variant of the compat socket the setter only stores the value
+  (`idle_backoff()` returns it): a kernel socket already parks on the reactor.
+
+`tokio-echo --idle-backoff-ms N` binds `DpdkUdpSocket` directly, calls `set_idle_backoff(Some(N ms))`
+and erases it to `Arc<dyn AsyncUdpSocket>`; if that bind fails it prints
+`idle backoff unavailable: falling back to the standard bind` and continues without backoff.
+
 ### Not Implemented (OS-specific, N/A for DPDK)
 
 - `AsRawFd` / `FromRawFd` / `IntoRawFd` (Unix)

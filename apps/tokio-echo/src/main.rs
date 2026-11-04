@@ -115,9 +115,11 @@ struct Args {
     /// Opt-in idle backoff for the DPDK recv path, in milliseconds
     /// (flag absent = OFF, the default 0.3.0 busy-spin behaviour).
     ///
-    /// PR 1 only parses this flag and prints it at startup; it has **no
-    /// behavioural effect** yet. The `set_idle_backoff` method it will drive
-    /// lands in PR 5, so PR 1 deliberately does not reference it.
+    /// When set (DPDK backend only), the socket is bound directly as a
+    /// `DpdkUdpSocket` and `set_idle_backoff(Some(N ms))` is applied: the recv
+    /// loop spins until the socket has been idle for `max(N, 2) ms`, then
+    /// sleeps in ~1 ms steps. Adds up to ~1-2 ms first-packet-after-idle
+    /// latency. Ignored with `--force-tokio`.
     #[arg(long)]
     idle_backoff_ms: Option<u64>,
 }
@@ -256,6 +258,44 @@ async fn echo_concurrent_handler(
     }
 }
 
+/// Bind a `DpdkUdpSocket` directly with the idle backoff enabled, then erase it to
+/// `Arc<dyn AsyncUdpSocket>`. If the direct DPDK bind fails, report it and fall back to the
+/// standard bind (without backoff), as the unflagged path does.
+#[cfg(feature = "dpdk")]
+async fn bind_with_idle_backoff(
+    bind_addr: &str,
+    ms: u64,
+    config: SocketConfig,
+) -> Result<Arc<dyn AsyncUdpSocket>, Box<dyn std::error::Error>> {
+    match dpdk_tokio::DpdkUdpSocket::bind(bind_addr).await {
+        Ok(socket) => {
+            socket.set_idle_backoff(Some(Duration::from_millis(ms)));
+            println!("Backend: {}", socket.backend_name());
+            Ok(Arc::new(socket))
+        }
+        Err(e) => {
+            eprintln!("DPDK bind failed: {}", e);
+            println!("idle backoff unavailable: falling back to the standard bind");
+            let boxed = dpdk_tokio::bind_udp_with_config(bind_addr, config).await?;
+            println!("Backend: {}", boxed.backend_name());
+            Ok(Arc::from(boxed))
+        }
+    }
+}
+
+/// Without the `dpdk` feature there is no DPDK socket to configure.
+#[cfg(not(feature = "dpdk"))]
+async fn bind_with_idle_backoff(
+    bind_addr: &str,
+    _ms: u64,
+    config: SocketConfig,
+) -> Result<Arc<dyn AsyncUdpSocket>, Box<dyn std::error::Error>> {
+    println!("idle backoff unavailable: falling back to the standard bind");
+    let boxed = dpdk_tokio::bind_udp_with_config(bind_addr, config).await?;
+    println!("Backend: {}", boxed.backend_name());
+    Ok(Arc::from(boxed))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--mode` is parsed here; an unknown value exits non-zero with a clear
@@ -279,9 +319,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefer_dpdk: true,
             ..Default::default()
         };
-        let boxed = dpdk_tokio::bind_udp_with_config(&bind_addr, config).await?;
-        println!("Backend: {}", boxed.backend_name());
-        Arc::from(boxed)
+        match args.idle_backoff_ms {
+            // Flag unset: binding path unchanged (default 0.3.0 behaviour).
+            None => {
+                let boxed = dpdk_tokio::bind_udp_with_config(&bind_addr, config).await?;
+                println!("Backend: {}", boxed.backend_name());
+                Arc::from(boxed)
+            }
+            // Flag set: `set_idle_backoff` is inherent on the concrete DpdkUdpSocket (not on
+            // the AsyncUdpSocket trait), so bind it directly, configure it, then erase it.
+            Some(ms) => bind_with_idle_backoff(&bind_addr, ms, config).await?,
+        }
     };
 
     println!("Local address: {}", socket.local_addr()?);
@@ -292,10 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Max concurrent handlers: {}", args.workers);
         println!("Request timeout: {}ms", args.timeout);
     }
-    // PR 1 parses --idle-backoff-ms and only reports it; the backoff itself is
-    // wired in PR 5 (it needs set_idle_backoff, which does not exist yet).
     match args.idle_backoff_ms {
-        Some(ms) => println!("Idle backoff: {}ms (parsed; no effect until a later release)", ms),
+        Some(ms) => println!("Idle backoff: {}ms (applies to the DPDK backend)", ms),
         None => println!("Idle backoff: off"),
     }
 

@@ -111,6 +111,100 @@ async fn compat_socket_concurrent_tasks_share_socket() {
     }
 }
 
+// ── Opt-in idle backoff (tokio-udp-perf Req 5.4) ────────────────────────────
+
+#[test]
+fn idle_backoff_default_off_and_roundtrips() {
+    let d = DpdkUdpSocket::from_udp_socket(mock_socket(7010)).unwrap();
+    assert_eq!(d.idle_backoff(), None);
+    d.set_idle_backoff(Some(std::time::Duration::from_millis(1)));
+    // Returned exactly as passed; the 2 ms clamp applies only to the effective threshold.
+    assert_eq!(d.idle_backoff(), Some(std::time::Duration::from_millis(1)));
+    d.set_idle_backoff(None);
+    assert_eq!(d.idle_backoff(), None);
+
+    let c = CompatSocket::from_dpdk_socket(mock_socket(7011)).unwrap();
+    assert_eq!(c.idle_backoff(), None);
+    c.set_idle_backoff(Some(std::time::Duration::from_millis(5)));
+    assert_eq!(c.idle_backoff(), Some(std::time::Duration::from_millis(5)));
+}
+
+#[tokio::test]
+async fn idle_backoff_kernel_variant_only_stores_the_value() {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let c = CompatSocket::from_std(std_sock).unwrap();
+    assert_eq!(c.idle_backoff(), None);
+    c.set_idle_backoff(Some(std::time::Duration::from_millis(9)));
+    assert_eq!(c.idle_backoff(), Some(std::time::Duration::from_millis(9)));
+    // Still receives normally through the reactor.
+    let addr = c.local_addr().unwrap();
+    let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    tx.send_to(b"k", addr).unwrap();
+    let mut buf = [0u8; 8];
+    let (n, _) = c.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"k");
+}
+
+/// A packet that arrives only after the socket went idle (past the 2 ms threshold, so the
+/// receiver is in its sleep stage) is still delivered, on a single-threaded runtime where
+/// the sender task can only run if the receiver yields/sleeps.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_backoff_delivers_packet_arriving_after_idle() {
+    let sock = Arc::new(CompatSocket::from_dpdk_socket(mock_socket(7012)).unwrap());
+    sock.set_idle_backoff(Some(std::time::Duration::from_millis(2)));
+
+    let tx = sock.clone();
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        tx.send_to(b"late", self_addr(7012)).await.unwrap();
+    });
+
+    let mut buf = [0u8; 16];
+    let started = std::time::Instant::now();
+    let (n, from) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("recv_from must complete")
+        .unwrap();
+    assert_eq!(&buf[..n], b"late");
+    assert_eq!(from.port(), 7012);
+    // First-packet-after-idle latency stays within the documented ~1-2 ms (+ scheduling slack).
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    sender.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_backoff_dpdk_socket_trait_path_delivers_after_idle() {
+    let sock = Arc::new(DpdkUdpSocket::from_udp_socket(mock_socket(7013)).unwrap());
+    sock.set_idle_backoff(Some(std::time::Duration::from_millis(2)));
+    let tx = sock.clone();
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send_to(b"late", self_addr(7013)).await.unwrap();
+    });
+    let mut buf = [0u8; 16];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("recv_from must complete")
+        .unwrap();
+    assert_eq!(&buf[..n], b"late");
+    sender.await.unwrap();
+}
+
+/// Busy path unchanged: with a packet already queued, recv returns immediately and the
+/// enabled backoff never reaches the sleep stage (no time driver needed).
+#[test]
+fn idle_backoff_busy_path_needs_no_timer() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap(); // no enable_time()
+    rt.block_on(async {
+        let sock = CompatSocket::from_dpdk_socket(mock_socket(7014)).unwrap();
+        sock.set_idle_backoff(Some(std::time::Duration::from_millis(2)));
+        sock.send_to(b"now", self_addr(7014)).await.unwrap();
+        let mut buf = [0u8; 8];
+        let (n, _) = sock.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"now");
+    });
+}
+
 #[test]
 fn auto_trait_set_matches_0_3_0() {
     use static_assertions::assert_impl_all;

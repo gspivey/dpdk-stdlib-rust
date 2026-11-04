@@ -307,6 +307,43 @@ class SessionBudgetPlanTests(unittest.TestCase):
                           "EXEC_ORDER=native-dpdk,plain-rust"])
 
 
+class IdleCpuTests(unittest.TestCase):
+    """Task 5.6a: the idle_cpu gate reads idle-cpu.json written by the 0-pps step."""
+
+    def judge(self, meas):
+        with tempfile.TemporaryDirectory() as d:
+            if meas is not None:
+                with open(os.path.join(d, "idle-cpu.json"), "w") as fh:
+                    json.dump(meas, fh)
+            return eg.evaluate(fleet(), TARGETS, ALL_CONFIGS, SIZES, STEPS, results_dir=d)
+
+    def test_enabled_in_targets(self):
+        self.assertTrue(TARGETS["idle_cpu"]["enabled"])
+
+    def test_no_file_means_gate_skipped_not_failed(self):
+        out = self.judge(None)
+        self.assertEqual(out["verdict"], "PASS")
+        self.assertTrue(any("gate skipped: idle_cpu" in l for l in out["lines"]))
+
+    def test_low_cpu_passes(self):
+        out = self.judge({"backend_ok": True, "idle_cpu_pct": 3.2})
+        self.assertEqual(out["verdict"], "PASS")
+
+    def test_high_cpu_fails_with_idle_cpu_line(self):
+        out = self.judge({"backend_ok": True, "idle_cpu_pct": 55.0})
+        self.assertEqual(out["verdict"], "FAIL")
+        self.assertTrue(any(l.startswith("GATE FAIL: idle-cpu 55.0%") for l in out["lines"]))
+
+    def test_kernel_fallback_fails_even_with_zero_cpu(self):
+        out = self.judge({"backend_ok": False, "idle_cpu_pct": 0.0})
+        self.assertEqual(out["verdict"], "FAIL")
+        self.assertIn("GATE FAIL: idle-cpu (DPDK backend not in use)", out["lines"])
+
+    def test_missing_sample_fails_closed(self):
+        out = self.judge({"backend_ok": True, "idle_cpu_pct": None})
+        self.assertEqual(out["verdict"], "FAIL")
+
+
 class OutputTests(unittest.TestCase):
     def test_verdict_file_pass_and_stale_files_removed(self):
         with tempfile.TemporaryDirectory() as d:
