@@ -332,7 +332,7 @@ change. ~150-250 lines.
 (`socket.rs`/`compat/tokio.rs`) and must be **landed serially** (PR 4 then PR 5) to avoid
 conflicting edits to the same methods.
 
-- [ ] 4.1 Change `DpdkUdpSocket.inner` (`socket.rs`) from
+- [x] 4.1 Change `DpdkUdpSocket.inner` (`socket.rs`) from
   `Arc<std::sync::Mutex<dpdk_udp::UdpSocket>>` to `Arc<dpdk_udp::UdpSocket>`. Change
   `DpdkAsyncSocket.socket` (`compat/tokio.rs`) from `Arc<std::sync::Mutex<dpdk_udp::UdpSocket>>` to
   `Arc<std::panic::AssertUnwindSafe<dpdk_udp::UdpSocket>>` (D4/CRITICAL-1) — the wrapper restores
@@ -340,19 +340,19 @@ conflicting edits to the same methods.
   is not `UnwindSafe`. Add a SAFETY comment on the field (guards recover from poisoning via
   `into_inner`; no broken invariant survives a panic). Method bodies use `self.socket.<method>()`
   via `AssertUnwindSafe`'s `Deref`. (Req 4.1)
-- [ ] 4.2 Update all method bodies to call `self.inner.<method>(..)` / `self.socket.<method>(..)`
+- [x] 4.2 Update all method bodies to call `self.inner.<method>(..)` / `self.socket.<method>(..)`
   directly, removing `.lock().unwrap()`; for `connect`/`disable_perf_reporting` keep
   `spawn_blocking` but clone the `Arc` instead of the mutex. **`enable_perf_reporting` does NOT
   use `spawn_blocking` today** (`socket.rs:~180` calls the inner method directly — LOW-5); after
   the mutex drop it becomes `self.inner.enable_perf_reporting(interval)` — do **not** add
   `spawn_blocking`. (Req 4.2)
-- [ ] 4.3 In `compat/tokio.rs`, change the `try_recv_from`/`try_send_to`/`try_recv`/`try_send`
+- [x] 4.3 In `compat/tokio.rs`, change the `try_recv_from`/`try_send_to`/`try_recv`/`try_send`
   arms (`~315`, `~333`, …) from the removed outer-mutex `try_lock` to the inner non-blocking try
   entry points (PR 3 task 3.6): `try_lock` the per-direction + queue guard, drop-and-count any
   auto-reply if `q_tx0` is busy (only `q_tx0`, no `tx_state` — D11/MEDIUM-3), and return
   `WouldBlock` on contention. Keep the
   methods non-blocking and the return types/semantics identical. (Req 4.2, 4.2a)
-- [ ] 4.4 Add `static_assertions = "1"` to `dpdk-stdlib-tokio`'s `[dev-dependencies]` (round-5
+- [x] 4.4 Add `static_assertions = "1"` to `dpdk-stdlib-tokio`'s `[dev-dependencies]` (round-5
   LOW-8), then add `static_assertions::assert_impl_all!` auto-trait assertions matching **the exact
   0.3.0 set each type has** (D4/CRITICAL-1): `DpdkUdpSocket: Send, Sync, Unpin`;
   `compat::tokio::UdpSocket: Send, Sync, Unpin, UnwindSafe, RefUnwindSafe`. `DpdkUdpSocket` needs
@@ -364,7 +364,7 @@ conflicting edits to the same methods.
   default / `synthetic-bench`) **and (b)** under `cargo test -p dpdk-stdlib-tokio` **without** the
   `dpdk` feature. Verify no signature change and `AsyncUdpSocket`/`async_trait` untouched. (Req
   4.2b, 4.3)
-- [ ] 4.4a Add **tokio-layer tests over the `Generic` mock backend** (D13/MEDIUM-2): construct the
+- [x] 4.4a Add **tokio-layer tests over the `Generic` mock backend** (D13/MEDIUM-2): construct the
   underlying `UdpSocket` via the **existing public** `UdpSocket::bind_with_backend` (`lib.rs:2346`,
   LOW-2 — no new udp-crate constructor) and wrap it in `DpdkUdpSocket` / `compat::tokio::UdpSocket`
   via a thin **`pub` `#[doc(hidden)]`** tokio-type helper (added here), and exercise
@@ -376,13 +376,13 @@ conflicting edits to the same methods.
   skips them (LOW-8). Run them from the workspace root (where the `dpdk` feature is unified on by
   `tokio-echo` default / `synthetic-bench`) — i.e. `cargo test` at the root — and ensure CI runs
   them from the workspace root.** (Req 4.5)
-- [ ] 4.5 **Enable the `tokio-dpdk-concurrent` ≥ 290k @64 floor gate in this PR (D2/LOW-3/MEDIUM-1).**
+- [x] 4.5 **Enable the `tokio-dpdk-concurrent` ≥ 290k @64 floor gate in this PR (D2/LOW-3/MEDIUM-1).**
   Flip `gates["tokio-dpdk-concurrent"].enabled` from `false` to `true` in `perf-targets.json` as
   part of PR 4's diff (the evaluator gates the floor only when `enabled == true`). This replaces
   the round-2 `active_from_pr:4` field, which was wrongly compared against the GitHub `PR_NUMBER`
   (a per-PR number already past 137, and empty on a `development` dispatch) rather than the ROADMAP
   ordinal. 512/1400 B stay report-only. (Req 2.2, 4.4)
-- [ ] 4.6 `cargo build && cargo test` (existing `compat/tokio.rs` loopback tests + the new
+- [x] 4.6 `cargo build && cargo test` (existing `compat/tokio.rs` loopback tests + the new
   tokio-layer mock tests pass). Verify `tokio-dpdk-concurrent` meets the floor and no sync
   regression by running the perf workflow — `gh workflow run perf-tests.yml`, poll with
   `gh run view --json` (CLAUDE.md step 5) — not `ci-validate.sh`. The deployment-normalized

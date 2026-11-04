@@ -5602,3 +5602,35 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 NIC drops instrumentation self-check: OK for rust-dpdk and tokio-dpdk (imissed 0, rx_nombuf 0; `ierrors` expected = actual).
 
 **Conclusion**: fair mode lifts the `tokio-dpdk` baseline from 320K to ~681K RX at 700K PPS/64B with no change to any other config's code path.
+
+## Run #37: tokio UDP perf — drop the tokio outer mutex (ROADMAP item 48)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-04 |
+| **Git Hash** | `c172d1a` |
+| **Branch** | `agent/tokio-drop-outer-mutex` |
+| **PR** | [#150](https://github.com/gspivey/dpdk-stdlib-rust/pull/150) |
+| **GH Actions Run** | [41755487034](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41755487034) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS (no `GATE FAIL` lines) |
+
+### Changes Since Run #36
+
+1. **`c172d1a` — `perf(tokio): drop the outer mutex around dpdk_udp::UdpSocket` (tasks 4.1-4.6).** `DpdkUdpSocket` now holds the socket directly, relying on the per-direction and per-queue guards from item 47. The `tokio-dpdk-concurrent` >= 290k @64B floor gate is enabled in this PR. Numbers are from the GitHub Actions perf-tests job.
+
+### Results: median at 700k PPS target
+
+| Config | 64B median RX | 512B median RX | 1400B median RX |
+|--------|--------------|---------------|----------------|
+| native-dpdk | 698,836 | 698,107 | 489,939 |
+| rust-dpdk | 695,655 | 693,024 | 487,988 |
+| tokio-dpdk | 696,177 | 691,614 | 489,304 (line-rate capped) |
+| tokio-dpdk-concurrent | 590,050 (floor gate PASS) | 413,496 | 334,093 |
+
+### Analysis
+
+**The tokio headline gap tracked since items 47-50 is closed at 64B/512B.** tokio-dpdk at 700k/64B is 696,177 vs rust-dpdk 695,655 and native-dpdk 698,836 (Run #36: 681,301). At 512B it reaches 691,614 (Run #36: 680,392). At 1400B tokio-dpdk (489,304) is ~= rust-dpdk (487,988); both are ENA line-rate capped.
+
+**`tokio-dpdk-concurrent`** clears its >= 290k @64B floor with 590,050, and is 142.6% / 115.2% of target at 512B / 1400B (report-only).

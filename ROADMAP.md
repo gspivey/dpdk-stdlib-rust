@@ -427,16 +427,6 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 
 ---
 
-### 48. tokio UDP perf (0.3.1): drop the tokio outer mutex
-
-Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
-then implement tasks `4.1`-`4.6` (PR 4). Depends on item 47 (per-direction and per-queue guards).
-
-- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `4.1`, `4.2`, `4.3`, `4.4`, `4.4a`, `4.5`, `4.6`
-- [ ] Complete · PR: —
-
----
-
 ### 49. tokio UDP perf (0.3.1): burst RX allocation + opt-in tokio idle backoff
 
 Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
@@ -494,3 +484,11 @@ then implement tasks `3.1`-`3.10` (PR 3). Must land before item 48 (dropping the
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.4a`, `3.5`, `3.5a`, `3.6`, `3.6a`, `3.7`, `3.8`, `3.9`, `3.9a`, `3.10`
 - [x] Complete · PR: #147
+
+### 48. tokio UDP perf (0.3.1): drop the tokio outer mutex
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `4.1`-`4.6` (PR 4). Depends on item 47 (per-direction and per-queue guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `4.1`, `4.2`, `4.3`, `4.4`, `4.4a`, `4.5`, `4.6`
+- [x] Complete · PR: #150
