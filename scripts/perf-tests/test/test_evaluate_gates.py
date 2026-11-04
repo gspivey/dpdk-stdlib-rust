@@ -344,6 +344,26 @@ class IdleCpuTests(unittest.TestCase):
         self.assertEqual(out["verdict"], "FAIL")
 
 
+class IdleCpuCliTests(unittest.TestCase):
+    def test_cli_reads_idle_cpu_json(self):
+        """Regression: main() must pass results_dir so idle-cpu.json is judged."""
+        with tempfile.TemporaryDirectory() as d:
+            for cfg in ("native-dpdk", "rust-dpdk", "tokio-dpdk"):
+                for rep in (1, 2, 3):
+                    with open(os.path.join(d, f"{cfg}.rep{rep}.json"), "w") as fh:
+                        json.dump(healthy(cfg), fh)
+            with open(os.path.join(d, "idle-cpu.json"), "w") as fh:
+                json.dump({"backend_ok": False, "idle_cpu_pct": 0.0}, fh)
+            rc = eg.main(["evaluate", "--results-dir", d, "--targets", TARGETS_PATH,
+                          "--configs", "native-dpdk,rust-dpdk,tokio-dpdk",
+                          "--packet-sizes", "64,512,1400",
+                          "--rate-steps", "70000,140000,350000,700000"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(open(os.path.join(d, "gate-verdict.txt")).read().strip(), "FAIL")
+            self.assertIn("idle-cpu (DPDK backend not in use)",
+                          open(os.path.join(d, "gate-lines.md")).read())
+
+
 class OutputTests(unittest.TestCase):
     def test_verdict_file_pass_and_stale_files_removed(self):
         with tempfile.TemporaryDirectory() as d:

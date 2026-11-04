@@ -413,7 +413,8 @@ def main(argv=None):
     if not args.results_dir:
         ap.error("evaluate requires --results-dir")
     outcome = evaluate(load_reps(args.results_dir), targets, configs,
-                       parse_int_list(args.packet_sizes), parse_int_list(args.rate_steps))
+                       parse_int_list(args.packet_sizes), parse_int_list(args.rate_steps),
+                       results_dir=args.results_dir)
     write_outputs(args.results_dir, outcome)
     if outcome["invalid"]:
         print(f"RUN INVALID: {outcome['invalid']}")
