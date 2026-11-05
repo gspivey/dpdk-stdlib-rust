@@ -645,14 +645,7 @@ pub fn verify_udp_checksum(frame: &[u8]) -> bool {
 
     // UDP segment (header + payload)
     let udp_data = &frame[udp_start..udp_start + udp_len];
-    for i in (0..udp_data.len()).step_by(2) {
-        let word = if i + 1 < udp_data.len() {
-            ((udp_data[i] as u32) << 8) | (udp_data[i + 1] as u32)
-        } else {
-            (udp_data[i] as u32) << 8
-        };
-        sum = sum.wrapping_add(word);
-    }
+    sum = sum.wrapping_add(ones_complement_sum(udp_data));
 
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
