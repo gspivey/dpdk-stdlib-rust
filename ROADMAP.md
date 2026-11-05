@@ -433,7 +433,7 @@ Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` i
 then implement tasks `6.1`-`6.5` (PR 6). Depends on items 45-49 (this is the done-gate evidence for the 0.3.1 release).
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `6.1`, `6.2`, `6.3`, `6.4`, `6.4b`, `6.5`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #152
 
 ### 51. Follow-up (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk — investigate
 

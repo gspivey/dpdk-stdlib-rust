@@ -487,7 +487,7 @@ serialized (PR 4 first).
   `AssertUnwindSafe` wrapper), confirming the compat assertion compiles from the workspace root
   (dpdk unified on) and under `cargo test -p dpdk-stdlib-tokio` without the feature; fix any
   additive-only violations surfaced. (Req 6.1, 6.2)
-- [ ] 6.2 Run the full perf workflow (`gh workflow run perf-tests.yml`; median of 3, 700k step,
+- [x] 6.2 Run the full perf workflow (`gh workflow run perf-tests.yml`; median of 3, 700k step,
   configs rust-dpdk/native-dpdk/tokio-dpdk/tokio-dpdk-concurrent) and confirm all gates pass:
   tokio-dpdk ≥95 % of rust-dpdk @[64,512,1400] (this is the sole 700k judge for tokio-vs-rust);
   rust-dpdk ≥ **95 % of same-run native** @**[64,512]** (1400 B report-only) — the
@@ -497,7 +497,7 @@ serialized (PR 4 first).
   only** (MEDIUM-7). DUT p50/p99 are
   **reported, not gated** (D5); confirm they print > 0.0 at the 350k and 700k steps (`{:.1}`).
   (Req 2.1-2.2, 6.3)
-- [ ] 6.3 Commit the `docs/perf-test-log.md` entry (new template, vs-target + vs-last-run, real
+- [x] 6.3 Commit the `docs/perf-test-log.md` entry (new template, vs-target + vs-last-run, real
   DUT p50/p99 at `{:.1}` > 0.0 at 350k/700k, tokio-mode idle% > 0 from the pre-traffic tick, App
   Drops columns present and populated — 0 allowed) proving Req 2.11. (Req 2.6, 2.7, 2.8, 2.11)
 - [x] 6.4 **Add the native-dpdk 1400 B ROADMAP follow-up (D3) — a NON-0.3.1 follow-up item**, not
