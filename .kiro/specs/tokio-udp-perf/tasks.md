@@ -477,7 +477,7 @@ serialized (PR 4 first).
 `docs/perf-test-log.md` entry from the validation run. No crate source change. ~100-200 lines.
 **Depends on:** PR 1-5 (this is the done-gate evidence).
 
-- [ ] 6.1 Add `cargo semver-checks` (or a documented equivalent) against 0.3.0 for every
+- [x] 6.1 Add `cargo semver-checks` (or a documented equivalent) against 0.3.0 for every
   published crate as a CI or pre-release step. Feature matrix per crate (round-5 LOW-9): only
   `dpdk-stdlib-tokio` has a `dpdk` feature, so run it **both with `--features dpdk` and without**
   (D4/CRITICAL-1 — the auto-trait outcome differs by feature); every other crate runs with its
@@ -500,17 +500,17 @@ serialized (PR 4 first).
 - [ ] 6.3 Commit the `docs/perf-test-log.md` entry (new template, vs-target + vs-last-run, real
   DUT p50/p99 at `{:.1}` > 0.0 at 350k/700k, tokio-mode idle% > 0 from the pre-traffic tick, App
   Drops columns present and populated — 0 allowed) proving Req 2.11. (Req 2.6, 2.7, 2.8, 2.11)
-- [ ] 6.4 **Add the native-dpdk 1400 B ROADMAP follow-up (D3) — a NON-0.3.1 follow-up item**, not
+- [x] 6.4 **Add the native-dpdk 1400 B ROADMAP follow-up (D3) — a NON-0.3.1 follow-up item**, not
   gated in this spec: "rust-dpdk 1400 B at 81-87 % of native-dpdk when TRex is not line-rate
   capped — investigate", citing runs #43 #47 #48 #49 #51 in `docs/perf-test-log.md`. Record it in
   `ROADMAP.md` and reference it from the perf-test-log entry. (Req 2.2)
-- [ ] 6.4b **Add a second non-0.3.1 ROADMAP follow-up (round-4 LOW-14):** "rust-dpdk 1400 B has no
+- [x] 6.4b **Add a second non-0.3.1 ROADMAP follow-up (round-4 LOW-14):** "rust-dpdk 1400 B has no
   regression gate in 0.3.1 (D3 + D8), and the tokio ≥ 95 % gate at 1400 B is backed only by
   line-rate-capped evidence (E1 476k); on uncapped deployments rust is CPU-bound at 1400 B (#51
   561k) and Stage 0's burst model puts fair async at 84-96 % of sync when CPU-bound — add a
   deployment-normalized 1400 B gate once the D3 investigation explains the native gap." Record it
   in `ROADMAP.md` next to the D3 item. (Req 2.2)
-- [ ] 6.5 Final `cargo build && cargo test` from workspace root.
+- [x] 6.5 Final `cargo build && cargo test` from workspace root.
 
 ---
 
