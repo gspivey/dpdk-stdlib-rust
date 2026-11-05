@@ -5634,3 +5634,58 @@ NIC drops instrumentation self-check: OK for rust-dpdk and tokio-dpdk (imissed 0
 **The tokio headline gap tracked since items 47-50 is closed at 64B/512B.** tokio-dpdk at 700k/64B is 696,177 vs rust-dpdk 695,655 and native-dpdk 698,836 (Run #36: 681,301). At 512B it reaches 691,614 (Run #36: 680,392). At 1400B tokio-dpdk (489,304) is ~= rust-dpdk (487,988); both are ENA line-rate capped.
 
 **`tokio-dpdk-concurrent`** clears its >= 290k @64B floor with 590,050, and is 142.6% / 115.2% of target at 512B / 1400B (report-only).
+
+## Run #38: tokio UDP perf — burst RX allocation + opt-in tokio idle backoff (ROADMAP item 49)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `f4a4974` |
+| **Branch** | `agent/tokio-udp-perf-cpu-efficiency` |
+| **PR** | [#151](https://github.com/gspivey/dpdk-stdlib-rust/pull/151) |
+| **GH Actions Run** | [41966836992](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41966836992) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #37
+
+1. **`44c8154` — `feat(udp,tokio): burst RX buffer reuse and opt-in tokio idle backoff` (tasks 5.1-5.6a).** Burst RX allocation reuse in the UDP receive path and an opt-in `--idle-backoff-ms` for tokio-echo.
+2. **`f4a4974` — `fix(perf): pass results_dir to evaluate so the idle-cpu gate is judged`.** Perf-harness only; makes the idle-CPU gate actually evaluated. Numbers are from the GitHub Actions perf-tests job.
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,425 | +0.08% | — | — | — | — |
+| native-dpdk | 512 B | 699,262 | +0.17% | — | — | — | — |
+| rust-dpdk | 64 B | 698,291 | +0.38% | 105.1% PASS | 99.9% | 3.9 | 6.3 |
+| rust-dpdk | 512 B | 697,452 | +0.64% | 105.0% PASS | 100.0% | — | — |
+| rust-dpdk | 1400 B | 489,588 | +0.33% | 105.0% report-only | 102.9% | — | — |
+| tokio-dpdk | 64 B | 698,054 | +0.27% | 105.2% PASS | — | 2.1 | 4.1 |
+| tokio-dpdk | 512 B | 695,093 | +0.50% | 104.9% PASS | — | — | — |
+| tokio-dpdk | 1400 B | 487,014 | -0.47% | 104.7% PASS | — | — | — |
+| tokio-dpdk-concurrent | 64 B | 625,005 | +5.9% | 215.5% PASS | — | 6.8 | 8.2 |
+| tokio-dpdk-concurrent | 512 B | 413,229 (n=1) | -0.06% | 142.5% report-only | — | — | — |
+| tokio-dpdk-concurrent | 1400 B | 307,092 (n=1) | -8.1% | 105.9% report-only | — | — | — |
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.16%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,588 target=466,280 (105.0% of target, 99.7% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=413,229 target=290,000 (142.5% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=307,092 target=290,000 (105.9% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+**No regression on any gated cell.** All judged cells pass their absolute targets (104.7%-105.2%) and move within +/-0.7% of Run #37. tokio-dpdk stays level with rust-dpdk (64 B 698,054 vs 698,291; 512 B 695,093 vs 697,452). The opt-in idle backoff takes tokio-echo to 0.00% of one vCPU at 0 pps.
+
+**tokio-dpdk-concurrent 1400 B is down 8.1%** (334,093 -> 307,092). It is a report-only cell with a single rep (n=1) and sits ENA bandwidth-limited at 37% drop; the gated concurrent 64 B cell rose 5.9% (590,050 -> 625,005). Treated as run-to-run variance on a non-gated, single-rep cell and flagged here so a repeat in the next run is investigated. The concurrent mode is not changed by the idle-backoff option.
+
+NIC drops instrumentation self-check: imissed 0 and rx_nombuf 0 for rust-dpdk, tokio-dpdk and tokio-dpdk-concurrent in all sizes.
