@@ -92,6 +92,7 @@ pub struct DpdkUdpSocket {
     inner: Arc<dpdk_udp::UdpSocket>,
     local_addr: SocketAddr,
     connected_addr: Arc<Mutex<Option<SocketAddr>>>,
+    idle_backoff: crate::idle_backoff::IdleBackoff,
 }
 
 #[cfg(feature = "dpdk")]
@@ -111,6 +112,7 @@ impl DpdkUdpSocket {
             local_addr: socket.local_addr()?,
             inner: Arc::new(socket),
             connected_addr: Arc::new(Mutex::new(None)),
+            idle_backoff: crate::idle_backoff::IdleBackoff::new(),
         })
     }
 
@@ -124,6 +126,7 @@ impl DpdkUdpSocket {
             local_addr: socket.local_addr()?,
             inner: Arc::new(socket),
             connected_addr: Arc::new(Mutex::new(None)),
+            idle_backoff: crate::idle_backoff::IdleBackoff::new(),
         })
     }
 
@@ -136,21 +139,44 @@ impl DpdkUdpSocket {
         // Future: pass EAL args from config
         Self::bind(addr).await
     }
+
+    /// Opt in to (or out of) the receive-side idle backoff. **Default: off.**
+    ///
+    /// `Some(d)` makes `recv_from`/`recv` keep spinning with `yield_now` while packets
+    /// flow, and once the socket has seen **no packet for `max(d, 2 ms)`** (values below
+    /// 2 ms are treated as 2 ms), escalate to `tokio::time::sleep` in fixed ~1 ms steps.
+    /// The idle clock resets the moment a packet arrives, so a loaded receiver never
+    /// sleeps and throughput is unaffected. `None` restores the default 0.3.0 behaviour
+    /// (`try_recv_from` + `yield_now`, no timer).
+    ///
+    /// **Latency tradeoff:** tokio's timer resolution is ~1 ms, so the first packet
+    /// after an idle period can be delayed by up to ~1-2 ms. Sub-millisecond precision
+    /// is not claimed.
+    ///
+    /// **Requires a time-enabled runtime** (`enable_time` / `enable_all`;
+    /// `#[tokio::main]` provides it). On a runtime built without the time driver the
+    /// backoff panics exactly like any other `tokio::time` call once it reaches the
+    /// sleep stage. Callers who never opt in are unaffected.
+    pub fn set_idle_backoff(&self, idle: Option<Duration>) {
+        self.idle_backoff.set(idle);
+    }
+
+    /// The idle threshold configured with [`set_idle_backoff`](Self::set_idle_backoff),
+    /// exactly as passed (before the 2 ms clamp), or `None` when the backoff is off.
+    pub fn idle_backoff(&self) -> Option<Duration> {
+        self.idle_backoff.get()
+    }
 }
 
 #[cfg(feature = "dpdk")]
 #[async_trait]
 impl AsyncUdpSocket for DpdkUdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        loop {
-            // try_recv_from does a single non-blocking poll — no sleep, no spawn_blocking.
-            // The socket synchronizes internally (per-direction + queue guards).
-            let result = self.inner.try_recv_from(buf)?;
-            match result {
-                Some(r) => return Ok(r),
-                None => tokio::task::yield_now().await,
-            }
-        }
+        // try_recv_from does a single non-blocking poll — no spawn_blocking. The socket
+        // synchronizes internally (per-direction + queue guards). With the idle backoff
+        // off (default) this is exactly the 0.3.0 spin: poll + yield_now.
+        crate::idle_backoff::recv_with_backoff(&self.idle_backoff, || self.inner.try_recv_from(buf))
+            .await
     }
 
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {

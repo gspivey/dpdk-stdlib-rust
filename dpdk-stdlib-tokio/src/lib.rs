@@ -31,6 +31,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub(crate) mod idle_backoff;
 pub mod socket;
 pub mod runtime;
 pub mod compat;

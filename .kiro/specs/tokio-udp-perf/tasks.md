@@ -402,19 +402,19 @@ methods (allowed per Req 6.1). ~250-400 lines.
 PR 5 touches the same `socket.rs`/`compat/tokio.rs` recv methods PR 4 edits, so the two PRs are
 serialized (PR 4 first).
 
-- [ ] 5.1 Add a reusable `Vec<u8>` free-list to the RX buffered queue (now in `RxState`) so
+- [x] 5.1 Add a reusable `Vec<u8>` free-list to the RX buffered queue (now in `RxState`) so
   `push`/`pop` recycle backing `Vec`s instead of allocating a fresh `Vec` per buffered burst
   packet; preserve the byte/packet limits and drop accounting. (Req 5.1, 5.3)
-- [ ] 5.2 Update `process_frame_zerocopy` and its callers to use the recycled buffers for the
+- [x] 5.2 Update `process_frame_zerocopy` and its callers to use the recycled buffers for the
   non-returned packets of a burst. (Req 5.1)
-- [ ] 5.3 Add a scoped counting-allocator test in its **own test binary**: a counting global
+- [x] 5.3 Add a scoped counting-allocator test in its **own test binary**: a counting global
   allocator read immediately before/after the single burst-refill call asserts zero per-packet
   payload allocations for the buffered (N−1) packets of an N-packet burst after warm-up, driven
   through the Dpdk-shaped path or a mock backend that returns frames without per-frame allocation,
   with payloads/addresses still correct. (The 23 % malloc/free in the flamegraph is from the
   per-packet `recv_queue` copies **and** `async_trait` boxing together — LOW-12; 5a removes only
   the `recv_queue` payload allocation, `async_trait` boxing is out of scope.) (Req 5.2, 5.3)
-- [ ] 5.4 Add the **opt-in idle backoff, default OFF** (D5/HIGH-4). Add additive, documented
+- [x] 5.4 Add the **opt-in idle backoff, default OFF** (D5/HIGH-4). Add additive, documented
   inherent methods `set_idle_backoff(Option<Duration>)` / `idle_backoff()` on `DpdkUdpSocket`
   (`socket.rs`) and `compat::tokio::UdpSocket` (`compat/tokio.rs`). When enabled, the DPDK recv
   path uses `yield_now` until no packet for the idle threshold **`max(d, 2 ms)`** (`d` = the
@@ -423,7 +423,7 @@ serialized (PR 4 first).
   (default)** the path is byte-for-byte the 0.3.0 spin (`try_recv_from` + `yield_now`). Document the
   ~1-2 ms first-packet-after-idle latency tradeoff in `API_COMPATIBILITY.md` and the method
   rustdoc. (Req 5.4, 1.8)
-- [ ] 5.4b **Wire `tokio-echo`'s `--idle-backoff-ms` (HIGH-3).** `set_idle_backoff` is an inherent
+- [x] 5.4b **Wire `tokio-echo`'s `--idle-backoff-ms` (HIGH-3).** `set_idle_backoff` is an inherent
   method on `DpdkUdpSocket` (`socket.rs`), not on the `AsyncUdpSocket` trait (which must not change,
   Req 4.3), so it cannot be called on the `Arc<dyn AsyncUdpSocket>` that `bind_udp_with_config`
   returns (`main.rs:140-152`). **When `--idle-backoff-ms` is set**, bind `DpdkUdpSocket::bind`
@@ -439,7 +439,7 @@ serialized (PR 4 first).
   On `compat::tokio::UdpSocket`, `set_idle_backoff` on the `Tokio` (kernel) variant is a no-op that
   only stores the value (`idle_backoff()` returns it), because the kernel socket already parks on
   the reactor (LOW-10). (Req 5.4, 1.8)
-- [ ] 5.4a **Time-driver requirement — document, do not over-promise (D5 revised/MEDIUM-2 r3).**
+- [x] 5.4a **Time-driver requirement — document, do not over-promise (D5 revised/MEDIUM-2 r3).**
   Do **not** claim the method "cannot panic": `tokio::runtime::Handle::try_current()` only detects
   a runtime context, not whether the time driver is enabled, so `tokio::time::sleep` still panics
   on a runtime built without `enable_time()`/`enable_all()`. Instead, `set_idle_backoff`'s rustdoc
@@ -448,16 +448,16 @@ serialized (PR 4 first).
   exactly like any other `tokio::time` call. Note that default-OFF means 0.3.0 users who never opt
   in are unaffected. Document the behaviour regression note (sleep in recv path when enabled) in
   `API_COMPATIBILITY.md`. (Req 5.4)
-- [ ] 5.5 Confirm the busy path is unchanged (first-poll success returns immediately, no sleep)
+- [x] 5.5 Confirm the busy path is unchanged (first-poll success returns immediately, no sleep)
   so throughput is unaffected; the per-step throughput check (tokio ≥ **98 % of same-run
   rust-dpdk**, D6) runs at **70k / 140k / 350k only**; the 700k step is judged by the headline
   tokio ≥ 95 %-of-rust gate (MEDIUM-7, round-4 MEDIUM-2). There is **no latency gate** (D5);
   DUT p50/p99 are reported only. (Req 5.5, 5.6, 5.7)
-- [ ] 5.6 `cargo build && cargo test`. Verify via the perf workflow (`gh workflow run
+- [x] 5.6 `cargo build && cargo test`. Verify via the perf workflow (`gh workflow run
   perf-tests.yml`, poll `gh run view --json`; CLAUDE.md step 5), including the per-step throughput
   checks (70k/140k/350k) and the deployment-normalized rust-dpdk sync check (≥ **95 % of same-run
   native** @[64,512] — D8/HIGH-4). (Req 5.4, 5.5, 6.3)
-- [ ] 5.6a **Add the 0-pps-window measurement STEP to `run-perf-tests.sh` (D14/MEDIUM-3).** Add a
+- [x] 5.6a **Add the 0-pps-window measurement STEP to `run-perf-tests.sh` (D14/MEDIUM-3).** Add a
   harness step that starts `tokio-echo` **with `--idle-backoff-ms`**, holds a ~30 s 0-pps window
   (before TRex traffic), and runs `mpstat` + (preferred) `pidstat -p <tokio-echo pid>` across it
   (`sysstat` is installed by PR 2 task 2.9a). Report the `tokio-echo` process CPU and judge it

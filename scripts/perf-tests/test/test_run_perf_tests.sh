@@ -314,6 +314,20 @@ rm -f "$CRED_EXPIRED_FLAG"
 if [[ $rc -ne 0 ]] && grep -q 'AWS credentials expired at' "$STUB_DIR/e"; then ok "fire-and-forget names ExpiredToken too"; else bad "fire-and-forget ExpiredToken (rc=$rc)"; fi
 rm -f "$CRED_EXPIRED_FLAG"
 
+echo "== idle-CPU window helpers (task 5.6a) =="
+PIDSTAT_OUT=$'Linux 6.1 (dut)  01/01/26  _x86_64_ (4 CPU)\n\n12:00:00      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command\n12:00:30        0      4242    0.50    1.20    0.00    0.00    1.70     2  tokio-echo\nAverage:        0      4242    0.50    1.20    0.00    0.00    1.70     -  tokio-echo'
+if [[ "$(parse_pidstat_avg_cpu <<< "$PIDSTAT_OUT")" == "1.70" ]]; then ok "pidstat Average %CPU parsed"; else bad "pidstat Average %CPU parsed (got '$(parse_pidstat_avg_cpu <<< "$PIDSTAT_OUT")')"; fi
+if [[ -z "$(parse_pidstat_avg_cpu <<< "no samples")" ]]; then ok "pidstat parse yields nothing without an Average line"; else bad "pidstat empty parse"; fi
+MPSTAT_OUT=$'Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle\nAverage:     all    0.50    0.00    1.00    0.00    0.00    0.00    0.00    0.00    0.00   98.50'
+if [[ "$(parse_mpstat_busy <<< "$MPSTAT_OUT")" == "1.50" ]]; then ok "mpstat all-CPU busy = 100 - idle"; else bad "mpstat busy (got '$(parse_mpstat_busy <<< "$MPSTAT_OUT")')"; fi
+if idle_backend_ok <<< $'Backend: dpdk\nIdle backoff: 5ms'; then ok "backend_ok when Backend: dpdk and no fallback"; else bad "backend_ok happy path"; fi
+if idle_backend_ok <<< $'DPDK bind failed: x\nidle backoff unavailable: falling back to the standard bind\nBackend: dpdk'; then bad "fallback line must fail backend check"; else ok "fallback line fails the backend check"; fi
+if idle_backend_ok <<< $'Backend: tokio'; then bad "kernel backend must fail backend check"; else ok "non-dpdk backend fails the backend check"; fi
+RESULTS_DIR="$(mktemp -d)"
+write_idle_cpu_json true 2.5 1.1 measured
+if python3 -c "import json,sys; d=json.load(open('$RESULTS_DIR/idle-cpu.json')); sys.exit(0 if d['backend_ok'] and d['idle_cpu_pct']==2.5 and d['mpstat_busy_pct']==1.1 else 1)"; then ok "idle-cpu.json written with parsed values"; else bad "idle-cpu.json contents"; fi
+rm -rf "$RESULTS_DIR"
+
 echo "== evaluate_gates.py unit tests =="
 if python3 "$TEST_DIR/test_evaluate_gates.py" >/dev/null 2>&1; then ok "test_evaluate_gates.py passes"; else bad "test_evaluate_gates.py passes"; fi
 

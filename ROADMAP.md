@@ -427,16 +427,6 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 
 ---
 
-### 49. tokio UDP perf (0.3.1): burst RX allocation + opt-in tokio idle backoff
-
-Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
-then implement tasks `5.1`-`5.6a` (PR 5). Depends on items 47 and 48 (same files as item 48; serialized).
-
-- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `5.1`, `5.2`, `5.3`, `5.4`, `5.4a`, `5.4b`, `5.5`, `5.6`, `5.6a`
-- [ ] Complete · PR: —
-
----
-
 ### 50. tokio UDP perf (0.3.1): semver check, proving perf run, perf-log entry
 
 Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
@@ -492,3 +482,11 @@ then implement tasks `4.1`-`4.6` (PR 4). Depends on item 47 (per-direction and p
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `4.1`, `4.2`, `4.3`, `4.4`, `4.4a`, `4.5`, `4.6`
 - [x] Complete · PR: #150
+
+### 49. tokio UDP perf (0.3.1): burst RX allocation + opt-in tokio idle backoff
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `5.1`-`5.6a` (PR 5). Depends on items 47 and 48 (same files as item 48; serialized).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `5.1`, `5.2`, `5.3`, `5.4`, `5.4a`, `5.4b`, `5.5`, `5.6`, `5.6a`
+- [x] Complete · PR: #151

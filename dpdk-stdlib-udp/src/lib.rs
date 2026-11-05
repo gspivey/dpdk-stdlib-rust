@@ -2014,7 +2014,14 @@ struct ReceiveQueue {
     max_bytes: usize,
     /// Current queued payload bytes.
     current_bytes: usize,
+    /// Free-list of recycled backing `Vec`s (capacity retained) so a buffered burst packet
+    /// reuses a prior allocation instead of calling the allocator. Bounded by `max_packets`
+    /// and `MAX_POOLED_BUFFERS`.
+    free_list: Vec<Vec<u8>>,
 }
+
+/// Upper bound on recycled buffers kept per queue (a burst is at most 32 packets).
+const MAX_POOLED_BUFFERS: usize = 256;
 
 impl ReceiveQueue {
     fn with_limits(max_packets: usize, max_bytes: usize) -> Self {
@@ -2024,12 +2031,44 @@ impl ReceiveQueue {
             max_packets,
             max_bytes,
             current_bytes: 0,
+            free_list: Vec::new(),
         }
+    }
+
+    /// Enqueue a copy of `payload`, reusing a recycled backing `Vec` when one is available.
+    /// Returns `false` (queue unchanged) when a packet or byte limit would be exceeded.
+    fn push_slice(&mut self, payload: &[u8], src: SocketAddr) -> bool {
+        let size = payload.len();
+        if self.packets.len() >= self.max_packets
+            || self.current_bytes.saturating_add(size) > self.max_bytes
+        {
+            return false;
+        }
+        let mut v = self.free_list.pop().unwrap_or_default();
+        v.clear();
+        v.extend_from_slice(payload);
+        self.current_bytes += size;
+        self.packets.push_back((v, src));
+        true
+    }
+
+    /// Pop the oldest packet, copy up to `buf.len()` bytes into `buf`, and recycle the
+    /// backing `Vec`. Returns `(copied_len, src)`.
+    fn pop_into(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        let (payload, src) = self.packets.pop_front()?;
+        self.current_bytes = self.current_bytes.saturating_sub(payload.len());
+        let copy_len = std::cmp::min(buf.len(), payload.len());
+        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        if self.free_list.len() < MAX_POOLED_BUFFERS {
+            self.free_list.push(payload);
+        }
+        Some((copy_len, src))
     }
 
     /// Try to enqueue a packet. On success returns `Ok(())`. On failure returns
     /// `Err(payload)` so the caller can inspect the dropped payload length for
     /// drop-counter accounting (and recover the allocation if desired).
+    #[cfg(test)]
     fn push(&mut self, payload: Vec<u8>, src: SocketAddr) -> Result<(), Vec<u8>> {
         let size = payload.len();
         if self.packets.len() >= self.max_packets
@@ -2042,6 +2081,7 @@ impl ReceiveQueue {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pop(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
         let (payload, src) = self.packets.pop_front()?;
         self.current_bytes = self.current_bytes.saturating_sub(payload.len());
@@ -3067,9 +3107,7 @@ impl UdpSocket {
 
         // Check buffered packets first.
         if self.has_buffered_packets.load(Ordering::Acquire) {
-            if let Some((payload, src_addr)) = self.rx_dequeue(&mut rx) {
-                let copy_len = std::cmp::min(buf.len(), payload.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+            if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
                 return Ok(Some((copy_len, src_addr)));
             }
             self.has_buffered_packets.store(false, Ordering::Release);
@@ -3090,7 +3128,7 @@ impl UdpSocket {
             if self.is_connected.load(Ordering::Acquire) {
                 if let Some(connected) = *self.connected_addr.lock().unwrap() {
                     if app_pkt.src_addr != connected {
-                        self.rx_enqueue(&mut rx, buf[..copy_len].to_vec(), app_pkt.src_addr, copy_len);
+                        self.rx_enqueue(&mut rx, &buf[..copy_len], app_pkt.src_addr, copy_len);
                         return Ok(None);
                     }
                 }
@@ -3131,9 +3169,7 @@ impl UdpSocket {
         let mut rx = self.lock_rx(blocking)?;
 
         // Check buffered packets first.
-        if let Some((payload, src_addr)) = self.rx_dequeue(&mut rx) {
-            let copy_len = std::cmp::min(buf.len(), payload.len());
-            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
             return Ok(Some((copy_len, src_addr)));
         }
 
@@ -3273,9 +3309,7 @@ impl UdpSocket {
             // Check buffered packets first (from connected socket filtering).
             // Fast-path: skip the queue when no packets are buffered.
             if self.has_buffered_packets.load(Ordering::Acquire) {
-                if let Some((payload, src_addr)) = self.rx_dequeue(&mut rx) {
-                    let copy_len = std::cmp::min(buf.len(), payload.len());
-                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
                     return Ok((copy_len, src_addr));
                 }
                 self.has_buffered_packets.store(false, Ordering::Release);
@@ -3304,7 +3338,7 @@ impl UdpSocket {
                 if self.is_connected.load(Ordering::Acquire) {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if app_pkt.src_addr != connected {
-                            self.rx_enqueue(&mut rx, buf[..copy_len].to_vec(), app_pkt.src_addr, copy_len);
+                            self.rx_enqueue(&mut rx, &buf[..copy_len], app_pkt.src_addr, copy_len);
                             continue;
                         }
                     }
@@ -3362,9 +3396,7 @@ impl UdpSocket {
             let mut rx = lock_or_recover(&self.rx_state);
 
             // First check if we have buffered packets
-            if let Some((payload, src_addr)) = self.rx_dequeue(&mut rx) {
-                let copy_len = std::cmp::min(buf.len(), payload.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+            if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
                 return Ok((copy_len, src_addr));
             }
 
@@ -3499,18 +3531,19 @@ impl UdpSocket {
 
     /// Push a received payload into the buffered queue (caller holds `rx_state`), keeping
     /// `has_buffered_packets` in step; a full queue counts as a receive drop.
-    fn rx_enqueue(&self, rx: &mut RxState, payload: Vec<u8>, src: SocketAddr, payload_len: usize) {
-        if rx.queue.push(payload, src).is_err() {
+    fn rx_enqueue(&self, rx: &mut RxState, payload: &[u8], src: SocketAddr, payload_len: usize) {
+        if !rx.queue.push_slice(payload, src) {
             self.record_rx_drop(payload_len);
         } else {
             self.has_buffered_packets.store(true, Ordering::Release);
         }
     }
 
-    /// Pop the oldest buffered packet (caller holds `rx_state`), clearing
-    /// `has_buffered_packets` once the queue is empty.
-    fn rx_dequeue(&self, rx: &mut RxState) -> Option<(Vec<u8>, SocketAddr)> {
-        let popped = rx.queue.pop();
+    /// Pop the oldest buffered packet into `buf` (caller holds `rx_state`), recycling its
+    /// backing `Vec` and clearing `has_buffered_packets` once the queue is empty.
+    /// Returns `(copied_len, src)`.
+    fn rx_dequeue_into(&self, rx: &mut RxState, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        let popped = rx.queue.pop_into(buf);
         if rx.queue.is_empty() {
             self.has_buffered_packets.store(false, Ordering::Release);
         }
@@ -3682,7 +3715,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3693,7 +3726,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3722,7 +3755,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3733,7 +3766,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3762,7 +3795,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3773,7 +3806,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        self.rx_enqueue(rx, decap.payload.to_vec(), src_addr, payload_len);
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3816,7 +3849,7 @@ impl UdpSocket {
             if let Some(connected) = *self.connected_addr.lock().unwrap() {
                 if src_addr != connected {
                     let payload_len = parsed.payload.len();
-                    self.rx_enqueue(rx, parsed.payload.to_vec(), src_addr, payload_len);
+                    self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
                     return None;
                 }
             }
@@ -3834,7 +3867,7 @@ impl UdpSocket {
                 *result = Some((copy_len, src_addr));
             } else {
                 let payload_len = parsed.payload.len();
-                self.rx_enqueue(rx, parsed.payload.to_vec(), src_addr, payload_len);
+                self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
             }
 
             return None;
@@ -3872,7 +3905,7 @@ impl UdpSocket {
             if let Some(connected) = *self.connected_addr.lock().unwrap() {
                 if src_addr != connected {
                     let payload_len = parsed.payload.len();
-                    self.rx_enqueue(rx, parsed.payload.to_vec(), src_addr, payload_len);
+                    self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
                     return None;
                 }
             }
@@ -3890,7 +3923,7 @@ impl UdpSocket {
                 *result = Some((copy_len, src_addr));
             } else {
                 let payload_len = parsed.payload.len();
-                self.rx_enqueue(rx, parsed.payload.to_vec(), src_addr, payload_len);
+                self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
             }
 
             return None;
@@ -4340,7 +4373,7 @@ impl UdpSocket {
                                     SocketAddrV4::new(parsed.src_ip, parsed.src_port)
                                 );
                                 let payload_len = parsed.payload.len();
-                                self.rx_enqueue(&mut rx, parsed.payload, src_addr, payload_len);
+                                self.rx_enqueue(&mut rx, &parsed.payload, src_addr, payload_len);
                             }
                         }
                     }

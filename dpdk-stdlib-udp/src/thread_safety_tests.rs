@@ -284,7 +284,7 @@ fn has_buffered_packets_tracks_queue_contents() {
 
     {
         let mut rx = lock_or_recover(&socket.rx_state);
-        socket.rx_enqueue(&mut rx, vec![1, 2, 3], src, 3);
+        socket.rx_enqueue(&mut rx, &[1, 2, 3], src, 3);
     }
     assert!(socket.has_buffered_packets.load(Ordering::Acquire));
 

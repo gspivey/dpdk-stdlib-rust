@@ -2436,6 +2436,79 @@ print(md_content)
 PYEOF
 }
 
+# ── Idle-CPU window (tokio-udp-perf task 5.6a) ───────────────────────────────
+# Starts tokio-echo WITH --idle-backoff-ms, holds a 0-pps window (no TRex traffic)
+# and measures the tokio-echo process CPU with pidstat (+ all-CPU mpstat as a
+# cross-check). Writes $RESULTS_DIR/idle-cpu.json for evaluate_gates.py, which
+# judges perf-targets.json "idle_cpu". It also confirms the DPDK backend is
+# really in use: a kernel-socket fallback parks on the reactor and would pass
+# without testing anything, so that case is recorded as backend_ok=false and the
+# gate FAILs ("GATE FAIL: idle-cpu (DPDK backend not in use)").
+IDLE_BACKOFF_MS="${IDLE_BACKOFF_MS:-5}"
+IDLE_WINDOW_SECS="${IDLE_WINDOW_SECS:-30}"
+IDLE_APP_LOG=/var/log/echo-tokio-dpdk-idle.log
+
+# Pure helper (unit-tested): average a pidstat "Average:" line's %CPU column.
+# Usage: parse_pidstat_avg_cpu <pidstat output on stdin> -> prints the %CPU or nothing.
+parse_pidstat_avg_cpu() {
+    awk '/^Average:/ && $0 !~ /%CPU/ { v=$(NF-2); if (v ~ /^[0-9.]+$/) cpu=v } END { if (cpu != "") print cpu }'
+}
+
+# Pure helper (unit-tested): all-CPU busy % = 100 - %idle from an mpstat "Average:" line.
+parse_mpstat_busy() {
+    awk '/^Average:/ && $2 == "all" { idle=$NF } END { if (idle != "") printf "%.2f\n", 100 - idle }'
+}
+
+# Pure helper (unit-tested): decide backend_ok from the app log on stdin.
+# 0 (ok) only when "Backend: dpdk" is present and the fallback line is absent.
+idle_backend_ok() {
+    local log; log="$(cat)"
+    grep -q 'Backend: dpdk' <<< "$log" && ! grep -q 'idle backoff unavailable' <<< "$log"
+}
+
+write_idle_cpu_json() {  # backend_ok(true|false) pid_cpu mpstat_busy reason
+    mkdir -p "$RESULTS_DIR"
+    python3 - "$RESULTS_DIR/idle-cpu.json" "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+path, ok, pid_cpu, busy, reason = sys.argv[1:6]
+num = lambda x: float(x) if x not in ("", "None") else None
+json.dump({"backend_ok": ok == "true", "idle_cpu_pct": num(pid_cpu),
+           "mpstat_busy_pct": num(busy), "reason": reason}, open(path, "w"))
+PYEOF
+}
+
+run_idle_cpu_window() {
+    log_info "Idle-CPU window: tokio-echo --idle-backoff-ms ${IDLE_BACKOFF_MS}, ${IDLE_WINDOW_SECS}s at 0 pps"
+    dut_stop_all_apps || true
+    dut_bind_dpdk || { write_idle_cpu_json false "" "" "dut_bind_dpdk failed"; return 1; }
+    ssm_run_command "$DUT_INSTANCE_ID" 30 \
+        "set +e; echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null; mkdir -p /mnt/huge; mount -t hugetlbfs nodev /mnt/huge 2>/dev/null; echo HUGEPAGES_SETUP_DONE" || true
+    ssm_run_command_fire_and_forget "$DUT_INSTANCE_ID" 300 \
+        "cd /opt/dpdk-stdlib && nohup ./target/release/tokio-echo --ip ${DUT_DATA_ENI_IP} --port 9000 --perf-interval 10 --idle-backoff-ms ${IDLE_BACKOFF_MS} > ${IDLE_APP_LOG} 2>&1 &"
+    sleep 15
+
+    local app_log
+    app_log=$(ssm_run_command "$DUT_INSTANCE_ID" 30 "cat ${IDLE_APP_LOG} 2>/dev/null") || true
+    if ! idle_backend_ok <<< "$app_log"; then
+        log_error "idle-cpu: DPDK backend not in use (no 'Backend: dpdk', or fallback line present)"
+        write_idle_cpu_json false "" "" "DPDK backend not in use"
+        return 0
+    fi
+
+    # 0-pps window: nothing is sending yet. pidstat is per-process (the gate);
+    # mpstat is all-CPU (cross-check, <= 2.5 % on the 4-vCPU DUT).
+    local out
+    out=$(ssm_run_command "$DUT_INSTANCE_ID" $(( IDLE_WINDOW_SECS + 60 )) \
+        "PID=\$(pgrep -f 'target/release/tokio-echo' | head -1); echo PID=\$PID; (mpstat ${IDLE_WINDOW_SECS} 1 > /tmp/idle-mpstat.txt 2>&1 &) ; pidstat -p \$PID ${IDLE_WINDOW_SECS} 1 2>&1; sleep 2; cat /tmp/idle-mpstat.txt") || true
+    local pid_cpu busy
+    pid_cpu=$(parse_pidstat_avg_cpu <<< "$out")
+    busy=$(parse_mpstat_busy <<< "$out")
+    log_info "idle-cpu: tokio-echo process CPU=${pid_cpu:-n/a}% of one vCPU, all-CPU busy=${busy:-n/a}% (4-vCPU DUT)"
+    write_idle_cpu_json true "$pid_cpu" "$busy" "measured"
+    post_pr_comment "## [Perf] Idle CPU (0-pps window, --idle-backoff-ms ${IDLE_BACKOFF_MS})
+tokio-echo process CPU: \`${pid_cpu:-n/a}%\` of one vCPU (target <= 10%); mpstat all-CPU busy: \`${busy:-n/a}%\`." || true
+}
+
 # Judge the perf gates in perf-targets.json (tokio-udp-perf 2.4 / 2.4a).
 # Writes, under $RESULTS_DIR: gate-verdict.txt (PASS|FAIL), run-invalid.txt (the
 # native-dpdk sanity rule missed: bad deployment), gate-lines.md and
@@ -3225,6 +3298,14 @@ ${testpmd_diag}
         post_pr_comment "## [Perf] Budget Exhausted
 \`PERF BUDGET EXHAUSTED: skipped ${skipped_csv}\`
 Elapsed $(fmt_mmss "$(elapsed_secs)") of ${AWS_SESSION_BUDGET_SECS}s; the remaining work would not leave the $(fmt_mmss "$TEARDOWN_RESERVE_SECS") teardown reserve. Tearing down while credentials still work."
+    fi
+
+    # Idle-CPU window (task 5.6a): runs when tokio-dpdk was requested, the gate is
+    # enabled, and the session budget leaves room (~1.5 min incl. app start).
+    if [[ ",${CONFIGS}," == *",tokio-dpdk,"* && ${#BUDGET_SKIPPED[@]} -eq 0 ]] \
+        && python3 -c "import json,sys; sys.exit(0 if json.load(open('$PERF_TARGETS')).get('idle_cpu',{}).get('enabled') else 1)" \
+        && budget_allows $(( IDLE_WINDOW_SECS + 120 )); then
+        run_idle_cpu_window || log_warn "idle-cpu window failed; the gate will FAIL/skip per idle-cpu.json"
     fi
 
     # Stop TRex and DUT

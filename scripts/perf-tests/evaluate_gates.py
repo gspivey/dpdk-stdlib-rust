@@ -222,13 +222,27 @@ def evaluate(reps, targets, configs, sizes, steps, results_dir=None):
     # ── idle CPU (PR 5) — judged only when enabled AND the 0-pps step ran ────
     idle = targets.get("idle_cpu")
     if idle and idle.get("enabled") and idle["config"] in configs:
-        data = reps.get(idle["config"], {}).get(1, {})
-        pct = data.get("idle_cpu_pct")
-        if pct is None:
+        # run-perf-tests.sh run_idle_cpu_window writes idle-cpu.json (task 5.6a).
+        meas = None
+        if results_dir:
+            try:
+                with open(os.path.join(results_dir, "idle-cpu.json")) as fh:
+                    meas = json.load(fh)
+            except (OSError, ValueError):
+                meas = None
+        if meas is None:
             lines.append("gate skipped: idle_cpu (0-pps step did not run)")
-        elif pct > idle["max_pct_of_one_vcpu"]:
-            fails.append(f"GATE FAIL: {idle['config']} idle cpu={pct:.1f}% of one vCPU "
+        elif not meas.get("backend_ok"):
+            # A kernel-socket fallback parks on the reactor and would pass vacuously.
+            fails.append("GATE FAIL: idle-cpu (DPDK backend not in use)")
+        elif meas.get("idle_cpu_pct") is None:
+            fails.append("GATE FAIL: idle-cpu (no pidstat sample captured)")
+        elif meas["idle_cpu_pct"] > idle["max_pct_of_one_vcpu"]:
+            fails.append(f"GATE FAIL: idle-cpu {meas['idle_cpu_pct']:.1f}% of one vCPU "
                          f"target<={idle['max_pct_of_one_vcpu']}%")
+        else:
+            lines.append(f"idle-cpu: {meas['idle_cpu_pct']:.1f}% of one vCPU "
+                         f"(target<={idle['max_pct_of_one_vcpu']}%) PASS")
 
     for f in fails:
         lines.insert(0, f)
@@ -399,7 +413,8 @@ def main(argv=None):
     if not args.results_dir:
         ap.error("evaluate requires --results-dir")
     outcome = evaluate(load_reps(args.results_dir), targets, configs,
-                       parse_int_list(args.packet_sizes), parse_int_list(args.rate_steps))
+                       parse_int_list(args.packet_sizes), parse_int_list(args.rate_steps),
+                       results_dir=args.results_dir)
     write_outputs(args.results_dir, outcome)
     if outcome["invalid"]:
         print(f"RUN INVALID: {outcome['invalid']}")

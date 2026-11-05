@@ -46,8 +46,8 @@
   "idle_cpu": {
     "config": "tokio-dpdk",
     "max_pct_of_one_vcpu": 10,
-    "enabled": false,
-    "note": "Round-5 LOW-3: added by PR 2 as enabled:false (the 0-pps step does not exist yet); PR 5 adds the 0-pps step (task 5.6a) and flips enabled:true. Judged only when the 0-pps step ran (process CPU via pidstat)."
+    "enabled": true,
+    "note": "Task 5.6a: run-perf-tests.sh starts tokio-echo --idle-backoff-ms, holds a ~30 s 0-pps window and measures the process CPU with pidstat (mpstat all-CPU <= 2.5% on the 4-vCPU DUT is the cross-check). Judged only when that step ran; a DPDK-backend fallback FAILs the gate (a kernel socket would pass without testing anything)."
   },
   "report_only_metrics": {
     "dut_latency": {

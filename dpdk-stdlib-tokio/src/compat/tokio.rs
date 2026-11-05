@@ -4,9 +4,11 @@
 //! `tokio::net::UdpSocket`, but uses DPDK for packet I/O when the `dpdk`
 //! feature is enabled.
 
+use crate::idle_backoff::{recv_with_backoff, IdleBackoff};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// A UDP socket compatible with `tokio::net::UdpSocket`
 ///
@@ -31,6 +33,9 @@ use std::task::{Context, Poll};
 /// ```
 pub struct UdpSocket {
     inner: UdpSocketInner,
+    /// Opt-in idle backoff (default off). Only the DPDK variant acts on it; the kernel
+    /// variant just stores it, since a kernel socket already parks on the reactor.
+    idle_backoff: IdleBackoff,
 }
 
 enum UdpSocketInner {
@@ -92,6 +97,7 @@ impl UdpSocket {
                                 socket: std::sync::Arc::new(std::panic::AssertUnwindSafe(socket)),
                                 local_addr,
                             }),
+                                                    idle_backoff: IdleBackoff::new(),
                         });
                     }
                     Ok(Err(e)) => {
@@ -108,6 +114,7 @@ impl UdpSocket {
         let socket = ::tokio::net::UdpSocket::bind(addr).await?;
         Ok(UdpSocket {
             inner: UdpSocketInner::Tokio(socket),
+                    idle_backoff: IdleBackoff::new(),
         })
     }
 
@@ -124,7 +131,40 @@ impl UdpSocket {
                 socket: std::sync::Arc::new(std::panic::AssertUnwindSafe(socket)),
                 local_addr,
             }),
+                    idle_backoff: IdleBackoff::new(),
         })
+    }
+
+    /// Opt in to (or out of) the DPDK receive-side idle backoff. **Default: off.**
+    ///
+    /// This is an extension method not present in `tokio::net::UdpSocket`.
+    ///
+    /// `Some(d)` makes `recv_from`/`recv` on the DPDK backend keep spinning with
+    /// `yield_now` while packets flow, and once the socket has seen **no packet for
+    /// `max(d, 2 ms)`** (values below 2 ms are treated as 2 ms), escalate to
+    /// `tokio::time::sleep` in fixed ~1 ms steps. The idle clock resets the moment a
+    /// packet arrives, so a loaded receiver never sleeps. `None` restores the default
+    /// 0.3.0 behaviour (`try_recv_from` + `yield_now`, no timer).
+    ///
+    /// **Latency tradeoff:** tokio's timer resolution is ~1 ms, so the first packet
+    /// after an idle period can be delayed by up to ~1-2 ms.
+    ///
+    /// **Requires a time-enabled runtime** (`enable_time` / `enable_all`;
+    /// `#[tokio::main]` provides it). On a runtime built without the time driver the
+    /// backoff panics exactly like any other `tokio::time` call once it reaches the
+    /// sleep stage. Callers who never opt in are unaffected.
+    ///
+    /// On the kernel (`tokio`) fallback backend this only stores the value
+    /// ([`idle_backoff`](Self::idle_backoff) returns it): a kernel socket already parks on
+    /// the reactor.
+    pub fn set_idle_backoff(&self, idle: Option<Duration>) {
+        self.idle_backoff.set(idle);
+    }
+
+    /// The idle threshold set with [`set_idle_backoff`](Self::set_idle_backoff), exactly as
+    /// passed (before the 2 ms clamp), or `None` when off.
+    pub fn idle_backoff(&self) -> Option<Duration> {
+        self.idle_backoff.get()
     }
 
     /// Creates new UdpSocket from a previously bound std::net::UdpSocket.
@@ -135,6 +175,7 @@ impl UdpSocket {
         let tokio_socket = ::tokio::net::UdpSocket::from_std(socket)?;
         Ok(UdpSocket {
             inner: UdpSocketInner::Tokio(tokio_socket),
+                    idle_backoff: IdleBackoff::new(),
         })
     }
 
@@ -206,13 +247,10 @@ impl UdpSocket {
             UdpSocketInner::Tokio(s) => s.recv(buf).await,
             #[cfg(feature = "dpdk")]
             UdpSocketInner::Dpdk(s) => {
-                // Non-blocking poll loop using try_recv_from.
-                loop {
-                    match s.socket.try_recv_from(buf)? {
-                        Some((len, _addr)) => return Ok(len),
-                        None => ::tokio::task::yield_now().await,
-                    }
-                }
+                // Non-blocking poll loop using try_recv_from (idle backoff off by default).
+                let (len, _addr) =
+                    recv_with_backoff(&self.idle_backoff, || s.socket.try_recv_from(buf)).await?;
+                Ok(len)
             }
         }
     }
@@ -240,12 +278,7 @@ impl UdpSocket {
             UdpSocketInner::Dpdk(s) => {
                 // Non-blocking poll loop using try_recv_from — no spawn_blocking,
                 // no buf.to_vec(), no 1-second timeout.
-                loop {
-                    match s.socket.try_recv_from(buf)? {
-                        Some(result) => return Ok(result),
-                        None => ::tokio::task::yield_now().await,
-                    }
-                }
+                recv_with_backoff(&self.idle_backoff, || s.socket.try_recv_from(buf)).await
             }
         }
     }
