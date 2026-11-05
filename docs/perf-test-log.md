@@ -5689,3 +5689,57 @@ PASS. Report-only lines:
 **tokio-dpdk-concurrent 1400 B is down 8.1%** (334,093 -> 307,092). It is a report-only cell with a single rep (n=1) and sits ENA bandwidth-limited at 37% drop; the gated concurrent 64 B cell rose 5.9% (590,050 -> 625,005). Treated as run-to-run variance on a non-gated, single-rep cell and flagged here so a repeat in the next run is investigated. The concurrent mode is not changed by the idle-backoff option.
 
 NIC drops instrumentation self-check: imissed 0 and rx_nombuf 0 for rust-dpdk, tokio-dpdk and tokio-dpdk-concurrent in all sizes.
+
+## Run #39: tokio UDP perf 0.3.1 — semver check, proving perf run (ROADMAP item 50)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `93532d2f` |
+| **Branch** | `agent/tokio-udp-semver-perf-proof` |
+| **PR** | [#152](https://github.com/gspivey/dpdk-stdlib-rust/pull/152) |
+| **GH Actions Run** | [41992394580](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41992394580) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #38
+
+1. CI/workflow only: new `semver` job in `rust.yml` (`cargo semver-checks` vs v0.3.0; `dpdk-stdlib-tokio` with and without `--features dpdk`) and ROADMAP follow-ups 51/52. No data-path change, so this run is the done-gate proof for the 0.3.1 tokio UDP perf work (items 45-49).
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,703 | +0.04% | — | — | — | — |
+| native-dpdk | 512 B | 699,789 | +0.08% | — | — | — | — |
+| rust-dpdk | 64 B | 698,545 | +0.04% | 105.1% PASS | 99.9% | 3.9 | 6.6 |
+| rust-dpdk | 512 B | 698,296 | +0.12% | 105.0% PASS | 100.1% | 9.1 | 14.6 |
+| rust-dpdk | 1400 B | 489,353 | -0.05% | 105.0% report-only | 102.8% | 18.7 | 27.5 |
+| tokio-dpdk | 64 B | 698,434 | +0.05% | 105.2% PASS | — | 2.1 | 5.5 |
+| tokio-dpdk | 512 B | 695,946 | +0.12% | 104.9% PASS | — | 4.8 | 11.7 |
+| tokio-dpdk | 1400 B | 487,984 | +0.20% | 105.0% PASS | — | 4.8 | 18.7 |
+| tokio-dpdk-concurrent | 64 B | 637,310 | +2.0% | 219.8% PASS | — | 7.0 | 8.3 |
+| tokio-dpdk-concurrent | 512 B | 443,203 (n=1) | +7.3% | 152.8% report-only | — | 13.7 | 15.3 |
+| tokio-dpdk-concurrent | 1400 B | 326,742 (n=1) | +6.4% | 112.7% report-only | — | 26.8 | 29.3 |
+
+DUT p50/p99 are reported, not gated; all are > 0.0 at the 350k and 700k steps. App Drops columns are present and populated (0). tokio poll-idle% from the pre-traffic tick: tokio-dpdk 100.0, tokio-dpdk-concurrent 100.0.
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.17%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,353 target=466,011 (105.0% of target, 99.8% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=443,203 target=290,000 (152.8% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=326,742 target=290,000 (112.7% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+All gated cells pass (104.9%-105.2% of target) and sit within +/-0.2% of Run #38; tokio-dpdk is level with rust-dpdk at 64/512/1400 B, and rust-dpdk is ~100% of the same-run native-dpdk at 64/512 B. The concurrent 1400 B dip seen in Run #38 did not repeat (326,742 vs 307,092), consistent with run-to-run variance on that single-rep cell. NIC drops self-check: imissed 0 and rx_nombuf 0 for all DPDK configs.
+
+Follow-ups (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk when TRex is not line-rate capped (runs #43 #47 #48 #49 #51 of this log) is ROADMAP item 51; a deployment-normalized 1400 B gate is ROADMAP item 52.

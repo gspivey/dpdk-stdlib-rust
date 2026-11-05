@@ -433,7 +433,25 @@ Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` i
 then implement tasks `6.1`-`6.5` (PR 6). Depends on items 45-49 (this is the done-gate evidence for the 0.3.1 release).
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · tasks `6.1`, `6.2`, `6.3`, `6.4`, `6.4b`, `6.5`
+- [x] Complete · PR: #152
+
+### 51. Follow-up (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk — investigate
+
+Not gated in 0.3.1 (tokio-udp-perf D3). rust-dpdk 1400 B sits at 81-87 % of native-dpdk when TRex is not line-rate capped; investigate the gap. Evidence: runs #43 #47 #48 #49 #51 in `docs/perf-test-log.md`.
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4`
 - [ ] Complete · PR: —
+
+---
+
+### 52. Follow-up (non-0.3.1): deployment-normalized 1400 B gate for rust-dpdk
+
+rust-dpdk 1400 B has no regression gate in 0.3.1 (D3 + D8), and the tokio ≥ 95 % gate at 1400 B is backed only by line-rate-capped evidence (E1 476k). On uncapped deployments rust is CPU-bound at 1400 B (#51 561k) and Stage 0's burst model puts fair async at 84-96 % of sync when CPU-bound. Add a deployment-normalized 1400 B gate once item 51 explains the native gap.
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4b`
+- [ ] Complete · PR: —
+
+---
 
 ## Future Specs (Not Yet Written)
 
