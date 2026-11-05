@@ -440,7 +440,9 @@ then implement tasks `6.1`-`6.5` (PR 6). Depends on items 45-49 (this is the don
 Not gated in 0.3.1 (tokio-udp-perf D3). rust-dpdk 1400 B sits at 81-87 % of native-dpdk when TRex is not line-rate capped; investigate the gap. Evidence: runs #43 #47 #48 #49 #51 in `docs/perf-test-log.md`.
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4`
-- [ ] Complete · PR: —
+- [x] Complete · PR: #153
+
+Outcome: a per-byte cost was found and removed (scalar 16-bit UDP checksum loop on TX build and RX verify, IPv4 and IPv6; now summed 4 bytes per step). Run #40 was line-rate capped at 1400 B (rust 489,680 vs native 489,638), so it cannot confirm the 81-87 % gap closed; confirmation is item 53.
 
 ---
 
@@ -449,6 +451,15 @@ Not gated in 0.3.1 (tokio-udp-perf D3). rust-dpdk 1400 B sits at 81-87 % of nati
 rust-dpdk 1400 B has no regression gate in 0.3.1 (D3 + D8), and the tokio ≥ 95 % gate at 1400 B is backed only by line-rate-capped evidence (E1 476k). On uncapped deployments rust is CPU-bound at 1400 B (#51 561k) and Stage 0's burst model puts fair async at 84-96 % of sync when CPU-bound. Add a deployment-normalized 1400 B gate once item 51 explains the native gap.
 
 - Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4b`
+- [ ] Complete · PR: —
+
+---
+
+### 53. Follow-up (non-0.3.1): confirm rust-dpdk 1400 B vs native-dpdk on an uncapped deployment
+
+Item 51's checksum fix is unverified at the size where the gap appeared: Run #40 at 1400 B was TRex line-rate capped (native 489,638, rust 489,680), the same condition under which earlier runs passed. Re-run `perf-tests.yml` on an uncapped deployment (or a higher-line-rate instance type) and record rust-dpdk 1400 B as a share of same-run native-dpdk. If still below ~95 %, open a new item for the remaining cost (candidates: extra frame copies on the echo path, `tx_burst` of 1 per send). Unblocks item 52.
+
+- Spec: `BACKLOG.md`-style follow-up (no spec; evidence in `docs/perf-test-log.md` Run #40)
 - [ ] Complete · PR: —
 
 ---

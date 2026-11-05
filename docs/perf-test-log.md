@@ -5743,3 +5743,57 @@ PASS. Report-only lines:
 All gated cells pass (104.9%-105.2% of target) and sit within +/-0.2% of Run #38; tokio-dpdk is level with rust-dpdk at 64/512/1400 B, and rust-dpdk is ~100% of the same-run native-dpdk at 64/512 B. The concurrent 1400 B dip seen in Run #38 did not repeat (326,742 vs 307,092), consistent with run-to-run variance on that single-rep cell. NIC drops self-check: imissed 0 and rx_nombuf 0 for all DPDK configs.
 
 Follow-ups (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk when TRex is not line-rate capped (runs #43 #47 #48 #49 #51 of this log) is ROADMAP item 51; a deployment-normalized 1400 B gate is ROADMAP item 52.
+
+
+## Run #40: UDP checksum word-wise sum (ROADMAP item 51)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `3f8a2530` |
+| **Branch** | `agent/udp-checksum-wordwise` |
+| **PR** | [#153](https://github.com/gspivey/dpdk-stdlib-rust/pull/153) |
+| **GH Actions Run** | [42121199815](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/42121199815) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #39
+
+1. `udp_checksum`, `verify_udp_checksum` (IPv4 RX) and the IPv6 `checksum_add` now sum the payload 4 bytes per step into a `u64` accumulator instead of a scalar 2-byte loop. Results are bit-identical (tested against the naive loop for lengths 0..=1600). Addresses ROADMAP item 51.
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,027 | -0.10% | — | — | — | — |
+| native-dpdk | 512 B | 694,015 | -0.83% | — | — | — | — |
+| native-dpdk | 1400 B | 489,638 (n=1) | — | — | — | — | — |
+| rust-dpdk | 64 B | 697,443 | -0.16% | 105.0% PASS | 99.8% | 3.8 | 6.4 |
+| rust-dpdk | 512 B | 689,780 | -1.22% | 104.6% PASS | 98.9% | 5.6 | 9.7 |
+| rust-dpdk | 1400 B | 489,680 | +0.07% | 105.3% report-only | 102.9% | 7.5 | 13.7 |
+| tokio-dpdk | 64 B | 696,949 | -0.21% | 105.2% PASS | — | 2.0 | 3.5 |
+| tokio-dpdk | 512 B | 695,156 | -0.11% | 106.1% PASS | — | 3.0 | 6.0 |
+| tokio-dpdk | 1400 B | 490,130 | +0.44% | 105.4% PASS | — | 1.6 | 4.5 |
+| tokio-dpdk-concurrent | 64 B | 629,255 | -1.26% | 217.0% PASS | — | 6.7 | 8.1 |
+| tokio-dpdk-concurrent | 512 B | 505,030 (n=1) | +13.9% | 174.1% report-only | — | 9.5 | 13.3 |
+| tokio-dpdk-concurrent | 1400 B | 391,730 (n=1) | +19.9% | 135.1% report-only | — | 14.4 | 21.6 |
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.24%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,680 target=465,156 (105.3% of target, 100.0% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=505,030 target=290,000 (174.1% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=391,730 target=290,000 (135.1% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+No regression: all gated cells pass at 104.6%-106.1% of target. The 64/512 B moves vs Run #39 are within about 1.3 %, in the direction of run noise since those sizes are NIC- and generator-bound (rust-dpdk 512 B is 99.4% of same-run native). NIC drops self-check: imissed 0 and rx_nombuf 0 for all DPDK configs.
+
+This run does **not** show whether the item 51 gap closed. At 1400 B TRex was line-rate capped (TX ~490.9k pps): native-dpdk 489,638 and rust-dpdk 489,680 are equal because both hit the cap, the same condition under which earlier runs passed a 95 % check. The 81-87 % gap only appeared when TRex was not capped, so confirming the fix needs an uncapped deployment; that is ROADMAP item 53.
