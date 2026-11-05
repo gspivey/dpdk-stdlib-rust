@@ -465,6 +465,30 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Sum `data` as big-endian 16-bit words (odd trailing byte padded with zero),
+/// folded to at most 16 bits. Equivalent to the naive 2-byte loop, but consumes
+/// 4 bytes per step into a `u64` accumulator: a big-endian 32-bit word `w`
+/// satisfies `w ≡ hi16 + lo16 (mod 65535)`, so adding whole words and folding
+/// at the end yields the same one's-complement sum.
+fn ones_complement_sum(data: &[u8]) -> u32 {
+    let mut acc: u64 = 0;
+    let mut chunks = data.chunks_exact(4);
+    for c in &mut chunks {
+        acc += u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as u64;
+    }
+    let rem = chunks.remainder();
+    if rem.len() >= 2 {
+        acc += (((rem[0] as u32) << 8) | rem[1] as u32) as u64;
+    }
+    if rem.len() % 2 == 1 {
+        acc += ((rem[rem.len() - 1] as u32) << 8) as u64;
+    }
+    while acc >> 16 != 0 {
+        acc = (acc & 0xFFFF) + (acc >> 16);
+    }
+    acc as u32
+}
+
 /// Calculate UDP checksum (optional for IPv4, but recommended)
 pub fn udp_checksum(
     src_ip: &[u8; 4],
@@ -496,15 +520,8 @@ pub fn udp_checksum(
         sum = sum.wrapping_add(word);
     }
 
-    // Payload
-    for i in (0..payload.len()).step_by(2) {
-        let word = if i + 1 < payload.len() {
-            ((payload[i] as u32) << 8) | (payload[i + 1] as u32)
-        } else {
-            (payload[i] as u32) << 8
-        };
-        sum = sum.wrapping_add(word);
-    }
+    // Payload (word-wise: this is the per-byte cost on the TX hot path)
+    sum = sum.wrapping_add(ones_complement_sum(payload));
 
     // Fold and complement
     while sum >> 16 != 0 {
@@ -5285,6 +5302,58 @@ mod tests {
         // Verify checksum is valid (recalculating should give 0)
         let verify = ipv4_checksum(&header);
         assert_eq!(verify, 0);
+    }
+
+    /// Reference implementation: the original naive 16-bit loop.
+    fn naive_udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], hdr: &[u8], payload: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        sum += ((src_ip[0] as u32) << 8) | src_ip[1] as u32;
+        sum += ((src_ip[2] as u32) << 8) | src_ip[3] as u32;
+        sum += ((dst_ip[0] as u32) << 8) | dst_ip[1] as u32;
+        sum += ((dst_ip[2] as u32) << 8) | dst_ip[3] as u32;
+        sum += IP_PROTO_UDP as u32;
+        sum += (UDP_HEADER_LEN + payload.len()) as u32;
+        for i in (0..hdr.len()).step_by(2) {
+            if i == 6 { continue; }
+            sum += ((hdr[i] as u32) << 8) | hdr[i + 1] as u32;
+        }
+        for i in (0..payload.len()).step_by(2) {
+            let w = if i + 1 < payload.len() {
+                ((payload[i] as u32) << 8) | payload[i + 1] as u32
+            } else {
+                (payload[i] as u32) << 8
+            };
+            sum += w;
+        }
+        while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+        let r = !(sum as u16);
+        if r == 0 { 0xFFFF } else { r }
+    }
+
+    #[test]
+    fn test_udp_checksum_matches_naive_reference() {
+        let src_ip = [10, 0, 1, 7];
+        let dst_ip = [10, 0, 2, 9];
+        let hdr = [0x30, 0x39, 0x23, 0x28, 0x00, 0x00, 0x00, 0x00];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..=1600usize {
+            // Random data plus all-0xFF data (maximises carries).
+            let random: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let ones = vec![0xFFu8; len];
+            for payload in [&random, &ones] {
+                assert_eq!(
+                    udp_checksum(&src_ip, &dst_ip, &hdr, payload),
+                    naive_udp_checksum(&src_ip, &dst_ip, &hdr, payload),
+                    "len {}", len
+                );
+            }
+        }
     }
 
     #[test]
