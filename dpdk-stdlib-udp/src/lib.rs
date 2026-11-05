@@ -470,7 +470,7 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
 /// 4 bytes per step into a `u64` accumulator: a big-endian 32-bit word `w`
 /// satisfies `w ≡ hi16 + lo16 (mod 65535)`, so adding whole words and folding
 /// at the end yields the same one's-complement sum.
-fn ones_complement_sum(data: &[u8]) -> u32 {
+pub(crate) fn ones_complement_sum(data: &[u8]) -> u32 {
     let mut acc: u64 = 0;
     let mut chunks = data.chunks_exact(4);
     for c in &mut chunks {
