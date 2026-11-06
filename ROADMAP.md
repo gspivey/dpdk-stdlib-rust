@@ -425,6 +425,45 @@ Implemented as path filters + a gated nightly run on `development` instead of ma
 - Spec: `.kiro/specs/ci-cost-reduction/` · Tasks 3-4
 - [x] Complete · PR: #132
 
+---
+
+### 50. tokio UDP perf (0.3.1): semver check, proving perf run, perf-log entry
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `6.1`-`6.5` (PR 6). Depends on items 45-49 (this is the done-gate evidence for the 0.3.1 release).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `6.1`, `6.2`, `6.3`, `6.4`, `6.4b`, `6.5`
+- [x] Complete · PR: #152
+
+### 51. Follow-up (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk — investigate
+
+Not gated in 0.3.1 (tokio-udp-perf D3). rust-dpdk 1400 B sits at 81-87 % of native-dpdk when TRex is not line-rate capped; investigate the gap. Evidence: runs #43 #47 #48 #49 #51 in `docs/perf-test-log.md`.
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4`
+- [x] Complete · PR: #153
+
+Outcome: a per-byte cost was found and removed (scalar 16-bit UDP checksum loop on TX build and RX verify, IPv4 and IPv6; now summed 4 bytes per step). Run #40 was line-rate capped at 1400 B (rust 489,680 vs native 489,638), so it cannot confirm the 81-87 % gap closed; confirmation is item 53.
+
+---
+
+### 52. Follow-up (non-0.3.1): deployment-normalized 1400 B gate for rust-dpdk
+
+rust-dpdk 1400 B has no regression gate in 0.3.1 (D3 + D8), and the tokio ≥ 95 % gate at 1400 B is backed only by line-rate-capped evidence (E1 476k). On uncapped deployments rust is CPU-bound at 1400 B (#51 561k) and Stage 0's burst model puts fair async at 84-96 % of sync when CPU-bound. Add a deployment-normalized 1400 B gate once item 51 explains the native gap.
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · task `6.4b`
+- [ ] Complete · PR: —
+
+---
+
+### 53. Follow-up (non-0.3.1): confirm rust-dpdk 1400 B vs native-dpdk on an uncapped deployment
+
+Item 51's checksum fix is unverified at the size where the gap appeared: Run #40 at 1400 B was TRex line-rate capped (native 489,638, rust 489,680), the same condition under which earlier runs passed. Re-run `perf-tests.yml` on an uncapped deployment (or a higher-line-rate instance type) and record rust-dpdk 1400 B as a share of same-run native-dpdk. If still below ~95 %, open a new item for the remaining cost (candidates: extra frame copies on the echo path, `tx_burst` of 1 per send). Unblocks item 52.
+
+- Spec: `BACKLOG.md`-style follow-up (no spec; evidence in `docs/perf-test-log.md` Run #40)
+- [ ] Complete · PR: —
+
+---
+
 ## Future Specs (Not Yet Written)
 
 These require new kiro spec files before agents can pick them up.
@@ -441,4 +480,42 @@ These require new kiro spec files before agents can pick them up.
 
 Items move here after merge.
 
-*(none yet)*
+### 45. tokio UDP perf (0.3.1): tokio-echo fair/concurrent modes
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `1.1`-`1.7` (PR 1).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `1.1`, `1.2`, `1.3`, `1.4`, `1.4a`, `1.5`, `1.6`, `1.7`
+- [x] Complete · PR: #138
+
+### 46. tokio UDP perf (0.3.1): perf gates, targets, DUT latency, counters, log discipline
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `2.1`-`2.10` (PR 2). Depends on item 45 (the gates judge the fair default and the `--mode concurrent` config).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `2.1`, `2.2`, `2.3`, `2.3a`, `2.4`, `2.4a`, `2.5`, `2.6`, `2.7`, `2.7a`, `2.8`, `2.9`, `2.9a`, `2.10`
+- [x] Complete · PR: #143
+
+### 47. tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` (soundness fix)
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `3.1`-`3.10` (PR 3). Must land before item 48 (dropping the tokio outer mutex is only sound with these guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `3.1`, `3.2`, `3.3`, `3.4`, `3.4a`, `3.5`, `3.5a`, `3.6`, `3.6a`, `3.7`, `3.8`, `3.9`, `3.9a`, `3.10`
+- [x] Complete · PR: #147
+
+### 48. tokio UDP perf (0.3.1): drop the tokio outer mutex
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `4.1`-`4.6` (PR 4). Depends on item 47 (per-direction and per-queue guards).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `4.1`, `4.2`, `4.3`, `4.4`, `4.4a`, `4.5`, `4.6`
+- [x] Complete · PR: #150
+
+### 49. tokio UDP perf (0.3.1): burst RX allocation + opt-in tokio idle backoff
+
+Read `.kiro/specs/tokio-udp-perf/requirements.md`, `design.md`, and `tasks.md` in full,
+then implement tasks `5.1`-`5.6a` (PR 5). Depends on items 47 and 48 (same files as item 48; serialized).
+
+- Spec: `.kiro/specs/tokio-udp-perf/` · tasks `5.1`, `5.2`, `5.3`, `5.4`, `5.4a`, `5.4b`, `5.5`, `5.6`, `5.6a`
+- [x] Complete · PR: #151

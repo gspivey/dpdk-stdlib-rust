@@ -20,3 +20,26 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  semver:
+    # Additive-only check against the v0.3.0 release (tokio-udp-perf spec, task 6.1).
+    # dpdk-stdlib-tokio is checked both with and without its `dpdk` feature because the
+    # auto-trait outcome differs by feature; every other crate uses default features only.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Install cargo-semver-checks
+      run: cargo install cargo-semver-checks --locked
+    - name: Semver check (default features)
+      run: |
+        cargo semver-checks --baseline-rev v0.3.0 \
+          -p dpdk-stdlib-sys -p dpdk-stdlib -p dpdk-stdlib-net -p dpdk-stdlib-udp \
+          -p dpdk-stdlib-tcp -p dpdk-stdlib-quic -p dpdk-stdlib-tokio
+    - name: Semver check (dpdk-stdlib-tokio --features dpdk)
+      run: cargo semver-checks --baseline-rev v0.3.0 -p dpdk-stdlib-tokio --features dpdk
+    - name: Auto-trait assertions (workspace root, dpdk feature unified on)
+      run: cargo test -p dpdk-stdlib-udp thread_safety && cargo test -p dpdk-stdlib-tokio --test dpdk_mock_backend
+    - name: Auto-trait assertions (dpdk-stdlib-tokio without feature)
+      run: cargo test -p dpdk-stdlib-tokio

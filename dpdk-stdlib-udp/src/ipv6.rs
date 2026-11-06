@@ -333,14 +333,7 @@ fn fold32(mut sum: u32) -> u16 {
 
 /// Add a byte slice to a running checksum accumulator (16-bit word aligned).
 fn checksum_add(sum: &mut u32, data: &[u8]) {
-    for i in (0..data.len()).step_by(2) {
-        let word = if i + 1 < data.len() {
-            ((data[i] as u32) << 8) | (data[i + 1] as u32)
-        } else {
-            (data[i] as u32) << 8
-        };
-        *sum = sum.wrapping_add(word);
-    }
+    *sum = sum.wrapping_add(crate::ones_complement_sum(data));
 }
 
 /// Compute the UDP checksum over an IPv6 pseudo-header + UDP header + payload.
@@ -807,6 +800,25 @@ mod tests {
     }
 
     // --- Checksum ---
+
+    #[test]
+    fn checksum_add_matches_naive_loop() {
+        let mut state: u64 = 0x1234_5678_9ABC_DEF1;
+        for len in 0..=1600usize {
+            let data: Vec<u8> = (0..len)
+                .map(|_| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as u8 })
+                .collect();
+            let mut naive: u32 = 0;
+            for i in (0..len).step_by(2) {
+                let w = if i + 1 < len { ((data[i] as u32) << 8) | data[i + 1] as u32 } else { (data[i] as u32) << 8 };
+                naive += w;
+            }
+            let mut fast: u32 = 0;
+            checksum_add(&mut fast, &data);
+            let fold = |mut x: u32| { while x >> 16 != 0 { x = (x & 0xFFFF) + (x >> 16); } x };
+            assert_eq!(fold(naive), fold(fast), "len {}", len);
+        }
+    }
 
     #[test]
     fn udp6_checksum_is_valid_on_built_frame() {

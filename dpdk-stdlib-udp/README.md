@@ -51,6 +51,16 @@ let socket = UdpSocket::bind_with_backend("0.0.0.0:9000", config)?;
 
 Both protocol handlers are backend-agnostic and operate on raw `&[u8]` frames.
 
+## Thread Safety
+
+`UdpSocket` is `Send + Sync`; share it across threads with `Arc`. Concurrent `send_to` and
+`recv_from` are sound: TX and RX state are guarded per direction, and all sockets on a port
+serialize on per-hardware-queue guards for the actual burst (so N senders are serialized among
+themselves, as with `std::net::UdpSocket` at the syscall level). The lock order is
+`rx_state < q_rx0 < tx_state < q_tx0 < q_tx_direct`; leaf locks (`connected_addr`,
+`connection_state`, ARP/NDP caches, `error_queue`) are never held while taking one of these. See
+`API_COMPATIBILITY.md` for the full contract.
+
 ## Constants
 
 ```rust

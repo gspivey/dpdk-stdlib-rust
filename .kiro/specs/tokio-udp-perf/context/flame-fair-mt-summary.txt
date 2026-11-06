@@ -1,0 +1,111 @@
+== threads
+100.0% tokio-echo
+== top leaves
+  1.8% tokio::macros::support::thread_rng_n
+  0.2% __rustc::__rust_dealloc
+  0.2% <tokio::task::coop::with_budget::ResetGuard as core::ops::drop::Drop>::drop
+  0.0% <std::sys::pal::unix::time::Timespec>::now
+  1.5% rte_vlog
+  0.0% core::ptr::drop_glue::<alloc::vec::Vec<dpdk_stdlib::mbuf::Mbuf>>
+  0.2% __rustc::__rust_alloc
+  1.6% <dpdk_stdlib_udp::SocketBackend>::send_frame
+  0.0% update_blocked_averages
+  0.6% <std::sync::poison::mutex::Mutex<core::option::Option<core::net::socket_addr::SocketAddr>>>::lock
+  0.3% <tokio::signal::RxFuture>::poll_recv
+  0.6% ena_populate_rx_queue
+  0.1% <dpdk_stdlib_udp::routing::RoutingTable>::lookup
+  1.7% common_ring_mp_enqueue
+  1.2% <dpdk_stdlib_udp::arp::ArpCache>::insert
+  0.2% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::send_to
+  0.0% rte_log_get_stream
+  0.0% rte_log_get_level@plt
+  7.6% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::recv_from::{closure#0}
+  0.3% ena_com_add_single_rx_desc.cold
+  1.6% tokio::runtime::park::wake_by_ref
+  0.0% __tls_get_addr@plt
+  0.1% __rustc::__rdl_alloc
+  0.8% _int_malloc
+  0.5% dpdk_stdlib_udp::udp_pseudo_header_checksum
+  0.2% ena_com_add_single_rx_desc
+  0.1% <std::sync::poison::rwlock::RwLockWriteGuard<core::option::Option<dpdk_stdlib_udp::ConnectionState>> as core::ops::drop::Drop>::drop
+  0.1% <dpdk_stdlib::mbuf::Mempool>::alloc
+  0.6% dpdk_stdlib_udp::udp_checksum
+  9.2% _int_free
+  1.1% <core::future::poll_fn::PollFn<tokio_echo::async_main::{closure#0}::{closure#1}::{closure#0}> as core::future::future::Future>::poll
+  1.9% <dpdk_stdlib_udp::UdpSocket>::send_to_addr
+  0.4% <tokio::runtime::park::CachedParkThread>::park
+  0.1% ena_com_write_bounce_buffer_to_dev.cold
+  0.5% dpdk_stdlib_udp::build_udp_frame_into
+  0.5% dpdk_shim_rte_eth_rx_burst
+  1.6% __memset_evex_unaligned_erms
+  0.3% <std::hash::random::DefaultHasher as core::hash::Hasher>::write
+  0.3% <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::thread_rng_n::{closure#0}, u32>
+  0.8% <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&core::net::ip_addr::Ipv4Addr>
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::data_len
+  0.6% <std::sync::poison::mutex::Mutex<dpdk_stdlib_udp::ReceiveQueue>>::lock
+  1.4% <dpdk_stdlib_udp::UdpSocket>::process_frame_zerocopy
+  1.4% tokio::signal::make_future::{closure#0}
+ 13.0% <tokio::sync::notify::NotifiedProject>::poll_notified
+  0.1% <alloc::vec::drain::Drain<dpdk_stdlib::mbuf::Mbuf> as core::ops::drop::Drop>::drop
+  0.1% <alloc::raw_vec::RawVecInner>::try_allocate_in
+  0.3% rte_log@plt
+  0.5% <dpdk_stdlib_udp::ReceiveQueue>::push
+  0.2% rte_log_get_stream@plt
+  1.1% dpdk_stdlib_udp::verify_udp_checksum
+  0.3% __memcpy_evex_unaligned_erms
+  0.1% __tls_get_addr
+  0.2% <alloc::vec::Vec<dpdk_stdlib::mbuf::Mbuf> as core::ops::drop::Drop>::drop
+  0.1% dpdk_shim_rte_eth_tx_burst
+  0.2% rte_log_get_global_level@plt
+  2.8% <tokio::task::coop::Coop<tokio::sync::watch::changed_impl<()>::{closure#0}> as core::future::future::Future>::poll
+  0.0% <dpdk_stdlib::mbuf::Mbuf as core::ops::drop::Drop>::drop
+  0.2% ena_com_create_meta
+  1.4% core::ptr::drop_glue::<std::sync::poison::mutex::MutexGuard<core::option::Option<alloc::sync::Arc<dpdk_stdlib_udp::DpdkResources>>>>
+  0.2% <dpdk_stdlib::mbuf::Mbuf>::data_mut
+  0.1% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::recv_from
+  0.2% rte_vlog@plt
+  1.7% eth_ena_recv_pkts
+  0.2% dpdk_stdlib_udp::verify_ipv4_checksum
+  0.0% __clock_gettime_2
+  0.8% rte_pktmbuf_free
+  0.7% rte_log
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::data_offset
+  0.2% dpdk_shim_get_mbuf_data_len
+  0.6% common_ring_mc_dequeue
+  3.0% __free
+  0.6% ena_com_write_bounce_buffer_to_dev
+  0.3% tokio::runtime::context::defer
+  0.1% <dpdk_stdlib_udp::arp::ArpCache>::lookup
+  0.8% <core::pin::Pin<&mut tokio_echo::async_main::{closure#0}::{closure#1}> as core::future::future::Future>::poll
+  0.5% <hashbrown::map::HashMap<core::net::ip_addr::Ipv4Addr, dpdk_stdlib_udp::arp::ArpCacheEntry, std::hash::random::RandomState>>::insert
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::set_data_len
+  1.1% rte_log_can_log
+  0.2% rte_log_can_log@plt
+  2.6% <core::pin::Pin<alloc::boxed::Box<tokio_echo::async_main::{closure#0}>> as core::future::future::Future>::poll
+  1.3% __GI___libc_malloc
+  0.0% core::ptr::drop_glue::<<dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::recv_from::{closure#0}>
+  1.5% dpdk_shim_rte_pktmbuf_alloc
+  0.7% <dpdk_stdlib::port::Port>::rx_burst
+  0.2% ena_com_close_bounce_buffer
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::buf_len
+  0.1% dpdk_shim_rte_pktmbuf_free
+  0.3% ena_com_write_sq_doorbell.isra.0
+  0.6% ena_com_rx_pkt.cold
+  0.5% ena_com_sq_update_tail
+  1.1% <dpdk_stdlib_tokio::socket::DpdkUdpSocket as dpdk_stdlib_tokio::AsyncUdpSocket>::send_to::{closure#0}
+  0.3% __rustc::__rust_no_alloc_shim_is_unstable_v2
+  2.1% ena_com_rx_pkt
+  0.0% <dpdk_stdlib::mbuf::Mbuf>::set_packet_len
+  2.0% <tokio::runtime::park::Inner>::park
+  0.1% <tokio::runtime::context::CONTEXT::{K#0}::{closure#0} as core::ops::function::FnOnce<(core::option::Option<&mut core::option::Option<tokio::runtime::c
+  0.3% rte_log_get_level
+  2.1% eth_ena_xmit_pkts
+  0.6% <core::future::poll_fn::PollFn<tokio_echo::async_main::{closure#0}::{closure#3}> as core::future::future::Future>::poll
+  0.0% handle_softirqs
+  0.3% <tokio::runtime::park::CachedParkThread>::block_on::<core::pin::Pin<alloc::boxed::Box<tokio_echo::async_main::{closure#0}>>>
+  1.2% ena_com_prepare_tx
+  0.7% ena_tx_cleanup
+  6.3% <dpdk_stdlib_udp::UdpSocket>::try_recv_from
+  0.3% <dpdk_stdlib::port::Port>::tx_burst
+  0.2% dpdk_shim_get_mbuf_data_off
+  0.3% eth_ena_xmit_pkts.cold

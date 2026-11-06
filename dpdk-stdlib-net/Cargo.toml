@@ -10,8 +10,8 @@ description = "Shared networking traits and backends for dpdk-stdlib crates"
 readme = "README.md"
 
 [dependencies]
-dpdk = { version = "0.3.0", path = "../dpdk", package = "dpdk-stdlib" }
-dpdk-sys = { version = "0.3.0", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
+dpdk = { version = "0.3.1", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-sys = { version = "0.3.1", path = "../dpdk-sys", package = "dpdk-stdlib-sys" }
 libc = { workspace = true }
 
 [dev-dependencies]

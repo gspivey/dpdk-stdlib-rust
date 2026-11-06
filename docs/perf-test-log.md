@@ -3,6 +3,132 @@
 Structured record of performance benchmark runs across optimization phases.
 Each entry captures the git context, test configuration, results, and analysis.
 
+> **Known-limitation rule.** Do NOT write up a "known limitation" or a
+> "No Regression" verdict on a flat ceiling unless the entry links a ROADMAP item
+> that tracks the limitation. Without that link, a flat number is an unexplained
+> regression and the reviewer treats it as one. (tokio-dpdk sat at ~305k pps for
+> 33 runs under "No Regression" before the benchmark-app cause was found.)
+>
+> **Gates.** Since 0.3.1 the perf workflow judges absolute targets from
+> `scripts/perf-targets.json` over the 3-rep median at the 700k step, and exits
+> non-zero on a miss. Every judged (config, size) in a new entry carries both
+> **vs last run** and **vs target**. Results come only from the GitHub Actions
+> perf workflow, never from local or synthetic runs.
+
+### Run-entry template
+
+Copy this block for each new run. Replace every `<...>`; keep both comparison
+columns for every judged (config, size).
+
+```markdown
+## Run #<N>: <PR title>
+
+| Field | Value |
+|-------|-------|
+| **Date** | <YYYY-MM-DD> |
+| **Git Hash** | `<sha>` |
+| **Branch** | `<branch>` |
+| **PR** | [#<n>](<url>) |
+| **GH Actions Run** | [<run id>](<url>) |
+| **Instance Type** | <type> |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #<N-1>
+
+1. `<sha>` — <what changed in the data path, or "docs-only">.
+
+### Results: 700k step, 3-rep median RX pps
+
+Judged configs and sizes follow `scripts/perf-targets.json` (rust-dpdk and
+native-dpdk at 64/512 B, tokio-dpdk at 64/512/1400 B, tokio-dpdk-concurrent at 64 B
+once its gate is enabled; 1400 B rust-dpdk and the concurrent 512/1400 B are
+report-only).
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) | App Drops |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|-----------|
+| native-dpdk | 64 B | <pps> | <+/-%> | <% of target, PASS/FAIL/report-only> | — | — | — | — |
+| rust-dpdk | 64 B | <pps> | <+/-%> | <%> <PASS/FAIL> | <% (WARN < 98%)> | <p50> | <p99> | <n> |
+| tokio-dpdk | 64 B | <pps> | <+/-%> | <%> <PASS/FAIL> | — | <p50> | <p99> | <n> |
+
+### Per-step throughput (rep 1; tokio-dpdk vs same-run rust-dpdk, gate >= 98 %)
+
+| Size | 70k | 140k | 350k |
+|------|-----|------|------|
+| 64 B | <%> | <%> | <%> |
+
+### poll-idle % (pre-traffic; tokio: share of empty polls, not CPU idle)
+
+| Config | idle% (first rx_pps=0 tick) |
+|--------|-----------------------------|
+| tokio-dpdk | <n> |
+
+### Gate verdict
+
+<PASS | FAIL | INVALID + the GATE FAIL / WARN / gate skipped lines verbatim>
+
+### Analysis
+
+<What moved and why. Any "known limitation" must link its ROADMAP item.>
+```
+
+
+## Run #52: tokio UDP perf (0.3.1): thread-safe `dpdk_udp::UdpSocket` — No Regression
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-03 |
+| **Git Hash** | `84a71a2` |
+| **Branch** | `agent/udp-thread-safe-guards` |
+| **PR** | [#147](https://github.com/gspivey/dpdk-stdlib-rust/pull/147) |
+| **GH Actions Run** | [41691663701](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41691663701) |
+| **Instance Type** | c6in.xlarge |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #51
+
+1. `84a71a2` — per-direction and per-hardware-queue guards plus per-socket `tx_state`/`rx_state` on `dpdk_udp::UdpSocket` (soundness fix; adds lock acquisitions on the sync hot path).
+
+### Results: 700k step, 3-rep median RX pps
+
+No prior entry uses the gated format, so **vs last run** is n/a; the lock-overhead check is the same-run rust-dpdk vs native-dpdk comparison.
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) | App Drops |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|-----------|
+| native-dpdk | 64 B | 690,437 | n/a | — | — | — | — | — |
+| native-dpdk | 512 B | 675,460 | n/a | — | — | — | — | — |
+| rust-dpdk | 64 B | 687,260 | n/a | 104.8% PASS (99.5% of native) | 98.3% | 4.6 | 7.9 | 0 |
+| rust-dpdk | 512 B | 665,897 | n/a | 103.8% PASS (98.6% of native) | 95.5% WARN | 10.1 | 18.2 | 0 |
+| rust-dpdk | 1400 B | 486,426 | n/a | 104.8% report-only (99.6% of native) | 102.2% | 19.5 | 33.2 | 0 |
+| tokio-dpdk | 64 B | 685,637 | n/a | 105.0% PASS (99.8% of rust-dpdk) | — | 2.4 | 4.6 | 0 |
+| tokio-dpdk | 512 B | 680,025 | n/a | 107.5% PASS (102.1% of rust-dpdk) | — | 5.1 | 16.6 | 0 |
+| tokio-dpdk | 1400 B | 484,554 | n/a | 104.9% PASS (99.6% of rust-dpdk) | — | 6.9 | 22.5 | 0 |
+| tokio-dpdk-concurrent | 64 B | 294,009 | n/a | 101.4% report-only | — | 6.8 | 9.6 | 0 |
+| tokio-dpdk-concurrent | 512 B | 214,562 | n/a | 74.0% report-only | — | 15.8 | 20.7 | 0 |
+| tokio-dpdk-concurrent | 1400 B | 165,560 | n/a | 57.1% report-only | — | 29.0 | 39.2 | 0 |
+
+### poll-idle % (pre-traffic; tokio: share of empty polls, not CPU idle)
+
+| Config | idle% (first rx_pps=0 tick) |
+|--------|-----------------------------|
+| rust-dpdk | 0.0 |
+| tokio-dpdk | 100.0 |
+| tokio-dpdk-concurrent | 100.0 |
+
+### Gate verdict
+
+PASS (workflow concluded success; no `GATE FAIL` lines). Verbatim non-gating lines:
+
+- report-only: rust-dpdk @ 1400B median=486,426 target=464,153 (104.8% of target, 99.6% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 64B median=294,009 target=290,000 (101.4% of target)
+- report-only: tokio-dpdk-concurrent @ 512B median=214,562 target=290,000 (74.0% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=165,560 target=290,000 (57.1% of target)
+- WARN: rust-dpdk @ 512B median=665,897 is 95.5% of 0.3.0 (697,552) — report-only, never gates
+
+### Analysis
+
+The new guards add no measurable hot-path cost: the deployment-normalized sync gate holds with wide margin (rust-dpdk 99.5% / 98.6% of same-run native-dpdk at 64 B / 512 B, gate 95%). The only soft signal is the report-only vs-0.3.0 WARN at 512 B (95.5%, below the 98% warn line), which is within the spread of the native-dpdk baseline in this run (673k-677k at 512 B) and never gates; flag it if it repeats in the next run.
+
+tokio-dpdk is a no-regression check here: 99.8% / 102.1% / 99.6% of same-run rust-dpdk at 64 / 512 / 1400 B, so the tokio gate passed in this run. Development's run 41643101939 had measured 93.3% (512 B) and 91.0% (1400 B) and failed that gate; it did not reproduce on this branch's run. This PR does not change the tokio path, so the difference is treated as run-to-run variance rather than a fix. The tokio gap remains tracked by ROADMAP items 48-50; do not read this entry as closing them.
 
 ## Run #51: docs: mark ROADMAP #35 complete — No Regression
 
@@ -5394,3 +5520,280 @@ The IPv6 UDP checksum validation adds an IPv6 parse fallback path to `process_fr
 **tokio-dpdk at 350K PPS, 64B**: 320,749 RX (8.4% drop) — consistent with Run #34's 309,176 (11.7%). Async overhead pattern unchanged.
 
 **Conclusion**: TCP DUT test binary additions have zero impact on UDP datapath performance, as expected (new crates only, no shared hot-path code modified).
+
+
+---
+
+## Run #36: tokio-echo fair/concurrent modes (ROADMAP item 45)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-10-26 |
+| **Git Hash** | `49b7b41` |
+| **Branch** | `agent/tokio-echo-fair-concurrent-modes` |
+| **PR** | [#138](https://github.com/gspivey/dpdk-stdlib-rust/pull/138) |
+| **GH Actions Run** | [40270657131](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/40270657131) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+
+### Changes Since Run #35
+
+1. **`49b7b41` — tokio-echo `--mode {fair|concurrent}` (tasks 1.1-1.7).** `apps/tokio-echo` now defaults to `fair`: the echo is sent inline in the receive task (no `to_vec`, `Semaphore`, `tokio::spawn` or `tokio::time::timeout`) and echoes the exact received bytes. The old spawn-per-packet behaviour is available as `--mode concurrent`. No library crate changed; this run records the new `tokio-dpdk` baseline. Numbers are from the GitHub Actions perf-tests job (perf-results artifact), not local runs.
+
+### Results: Hardware (TRex)
+
+#### 64-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 139,000 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,928 | 0.3% | 348,673 | 0.4% | 350,000 | 0.0% |
+| 700,000 | 647,690 | 7.5% | 595,073 | 15.0% | 699,956 | 0.0% |
+
+#### 512-byte packets
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,995 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 349,000 | 0.3% | 348,940 | 0.3% | 350,000 | 0.0% |
+| 700,000 | 697,889 | 0.3% | 550,103 | 21.4% | 699,528 | 0.1% |
+
+#### 1400-byte packets (near MTU)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 69,000 | 1.4% | 70,000 | 0.0% |
+| 140,000 | 139,000 | 0.7% | 138,993 | 0.7% | 140,000 | 0.0% |
+| 350,000 | 348,932 | 0.3% | 348,417 | 0.5% | 350,000 | 0.0% |
+| 700,000 | 474,395 | 0.4% | 438,262 | 8.0% | 476,333 | 0.0% |
+
+#### 8500-byte packets (jumbo)
+
+| Target PPS | rust-dpdk RX | Drop | Kernel RX | Drop | native-dpdk RX | Drop |
+|-----------|-------------|------|----------|------|---------------|------|
+| 70,000 | 69,000 | 1.4% | 33,503 | 52.1% | 70,000 | 0.0% |
+| 140,000 | 75,512 | 3.5% | 75,148 | 4.0% | 78,311 | 0.1% |
+| 350,000 | 77,860 | 0.6% | 78,013 | 0.4% | 78,140 | 0.3% |
+
+#### tokio-dpdk (async compat layer, fair mode)
+
+| Packet size | Target PPS | tokio-dpdk RX | Drop |
+|-------------|-----------|--------------|------|
+| 64B | 70,000 | 69,000 | 1.4% |
+| 64B | 140,000 | 139,000 | 0.7% |
+| 64B | 350,000 | 349,000 | 0.3% |
+| 64B | 700,000 | 681,301 | 2.7% |
+| 512B | 700,000 | 680,392 | 2.8% |
+| 1400B | 700,000 | 475,880 | 0.2% (TX-capped ~477K) |
+| 8500B | 350,000 | 77,790 | 0.7% (TX-capped ~78K) |
+
+### Analysis
+
+**tokio-dpdk improved substantially (expected effect of the fair loop).** At 350K PPS, 64B: 349,000 RX (0.3% drop) vs Run #35's 320,749 (8.4%). At 700K PPS, 64B: 681,301 RX (2.7% drop) vs Run #35's 320,776 (54.2%), roughly 2.1x. tokio-dpdk is now on par with rust-dpdk at 350K and ahead of it at 700K/64B in this run.
+
+**Regression check.** No regression attributable to this change: only `apps/tokio-echo` changed, so the rust-dpdk, plain-rust and native-dpdk datapaths are untouched.
+- **rust-dpdk at 700K PPS, 64B**: 647,690 RX (7.5% drop) vs Run #35's 694,115 (0.8%). This is the one number that moved the wrong way. rust-dpdk does not run `tokio-echo` and no shared code changed; the other rust-dpdk cells (512B 0.3%, 1400B 0.4%, 350K 0.3%) match Run #35, and the same 700K/64B cell has swung 0.2%-4.4%-1.4%-0.8% across Runs #32-#35. Treated as ENA scheduling variance, but flagged so a repeat in the next run gets investigated.
+- **rust-dpdk 700K, 512B**: 697,889 (0.3%) vs 693,133 (1.0%): improved.
+- **rust-dpdk 700K, 1400B**: 474,395 vs 565,823 in Run #35. The 700K/1400B cell is ENA bandwidth-ceiling limited (native-dpdk 476K here vs 639K); the ~476K value matches Runs #32/#33.
+- **native-dpdk 700K, 64B**: 699,956 (0.0%): unchanged.
+
+NIC drops instrumentation self-check: OK for rust-dpdk and tokio-dpdk (imissed 0, rx_nombuf 0; `ierrors` expected = actual).
+
+**Conclusion**: fair mode lifts the `tokio-dpdk` baseline from 320K to ~681K RX at 700K PPS/64B with no change to any other config's code path.
+
+## Run #37: tokio UDP perf — drop the tokio outer mutex (ROADMAP item 48)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-04 |
+| **Git Hash** | `c172d1a` |
+| **Branch** | `agent/tokio-drop-outer-mutex` |
+| **PR** | [#150](https://github.com/gspivey/dpdk-stdlib-rust/pull/150) |
+| **GH Actions Run** | [41755487034](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41755487034) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS (no `GATE FAIL` lines) |
+
+### Changes Since Run #36
+
+1. **`c172d1a` — `perf(tokio): drop the outer mutex around dpdk_udp::UdpSocket` (tasks 4.1-4.6).** `DpdkUdpSocket` now holds the socket directly, relying on the per-direction and per-queue guards from item 47. The `tokio-dpdk-concurrent` >= 290k @64B floor gate is enabled in this PR. Numbers are from the GitHub Actions perf-tests job.
+
+### Results: median at 700k PPS target
+
+| Config | 64B median RX | 512B median RX | 1400B median RX |
+|--------|--------------|---------------|----------------|
+| native-dpdk | 698,836 | 698,107 | 489,939 |
+| rust-dpdk | 695,655 | 693,024 | 487,988 |
+| tokio-dpdk | 696,177 | 691,614 | 489,304 (line-rate capped) |
+| tokio-dpdk-concurrent | 590,050 (floor gate PASS) | 413,496 | 334,093 |
+
+### Analysis
+
+**The tokio headline gap tracked since items 47-50 is closed at 64B/512B.** tokio-dpdk at 700k/64B is 696,177 vs rust-dpdk 695,655 and native-dpdk 698,836 (Run #36: 681,301). At 512B it reaches 691,614 (Run #36: 680,392). At 1400B tokio-dpdk (489,304) is ~= rust-dpdk (487,988); both are ENA line-rate capped.
+
+**`tokio-dpdk-concurrent`** clears its >= 290k @64B floor with 590,050, and is 142.6% / 115.2% of target at 512B / 1400B (report-only).
+
+## Run #38: tokio UDP perf — burst RX allocation + opt-in tokio idle backoff (ROADMAP item 49)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `f4a4974` |
+| **Branch** | `agent/tokio-udp-perf-cpu-efficiency` |
+| **PR** | [#151](https://github.com/gspivey/dpdk-stdlib-rust/pull/151) |
+| **GH Actions Run** | [41966836992](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41966836992) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #37
+
+1. **`44c8154` — `feat(udp,tokio): burst RX buffer reuse and opt-in tokio idle backoff` (tasks 5.1-5.6a).** Burst RX allocation reuse in the UDP receive path and an opt-in `--idle-backoff-ms` for tokio-echo.
+2. **`f4a4974` — `fix(perf): pass results_dir to evaluate so the idle-cpu gate is judged`.** Perf-harness only; makes the idle-CPU gate actually evaluated. Numbers are from the GitHub Actions perf-tests job.
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,425 | +0.08% | — | — | — | — |
+| native-dpdk | 512 B | 699,262 | +0.17% | — | — | — | — |
+| rust-dpdk | 64 B | 698,291 | +0.38% | 105.1% PASS | 99.9% | 3.9 | 6.3 |
+| rust-dpdk | 512 B | 697,452 | +0.64% | 105.0% PASS | 100.0% | — | — |
+| rust-dpdk | 1400 B | 489,588 | +0.33% | 105.0% report-only | 102.9% | — | — |
+| tokio-dpdk | 64 B | 698,054 | +0.27% | 105.2% PASS | — | 2.1 | 4.1 |
+| tokio-dpdk | 512 B | 695,093 | +0.50% | 104.9% PASS | — | — | — |
+| tokio-dpdk | 1400 B | 487,014 | -0.47% | 104.7% PASS | — | — | — |
+| tokio-dpdk-concurrent | 64 B | 625,005 | +5.9% | 215.5% PASS | — | 6.8 | 8.2 |
+| tokio-dpdk-concurrent | 512 B | 413,229 (n=1) | -0.06% | 142.5% report-only | — | — | — |
+| tokio-dpdk-concurrent | 1400 B | 307,092 (n=1) | -8.1% | 105.9% report-only | — | — | — |
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.16%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,588 target=466,280 (105.0% of target, 99.7% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=413,229 target=290,000 (142.5% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=307,092 target=290,000 (105.9% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+**No regression on any gated cell.** All judged cells pass their absolute targets (104.7%-105.2%) and move within +/-0.7% of Run #37. tokio-dpdk stays level with rust-dpdk (64 B 698,054 vs 698,291; 512 B 695,093 vs 697,452). The opt-in idle backoff takes tokio-echo to 0.00% of one vCPU at 0 pps.
+
+**tokio-dpdk-concurrent 1400 B is down 8.1%** (334,093 -> 307,092). It is a report-only cell with a single rep (n=1) and sits ENA bandwidth-limited at 37% drop; the gated concurrent 64 B cell rose 5.9% (590,050 -> 625,005). Treated as run-to-run variance on a non-gated, single-rep cell and flagged here so a repeat in the next run is investigated. The concurrent mode is not changed by the idle-backoff option.
+
+NIC drops instrumentation self-check: imissed 0 and rx_nombuf 0 for rust-dpdk, tokio-dpdk and tokio-dpdk-concurrent in all sizes.
+
+## Run #39: tokio UDP perf 0.3.1 — semver check, proving perf run (ROADMAP item 50)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `93532d2f` |
+| **Branch** | `agent/tokio-udp-semver-perf-proof` |
+| **PR** | [#152](https://github.com/gspivey/dpdk-stdlib-rust/pull/152) |
+| **GH Actions Run** | [41992394580](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/41992394580) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #38
+
+1. CI/workflow only: new `semver` job in `rust.yml` (`cargo semver-checks` vs v0.3.0; `dpdk-stdlib-tokio` with and without `--features dpdk`) and ROADMAP follow-ups 51/52. No data-path change, so this run is the done-gate proof for the 0.3.1 tokio UDP perf work (items 45-49).
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,703 | +0.04% | — | — | — | — |
+| native-dpdk | 512 B | 699,789 | +0.08% | — | — | — | — |
+| rust-dpdk | 64 B | 698,545 | +0.04% | 105.1% PASS | 99.9% | 3.9 | 6.6 |
+| rust-dpdk | 512 B | 698,296 | +0.12% | 105.0% PASS | 100.1% | 9.1 | 14.6 |
+| rust-dpdk | 1400 B | 489,353 | -0.05% | 105.0% report-only | 102.8% | 18.7 | 27.5 |
+| tokio-dpdk | 64 B | 698,434 | +0.05% | 105.2% PASS | — | 2.1 | 5.5 |
+| tokio-dpdk | 512 B | 695,946 | +0.12% | 104.9% PASS | — | 4.8 | 11.7 |
+| tokio-dpdk | 1400 B | 487,984 | +0.20% | 105.0% PASS | — | 4.8 | 18.7 |
+| tokio-dpdk-concurrent | 64 B | 637,310 | +2.0% | 219.8% PASS | — | 7.0 | 8.3 |
+| tokio-dpdk-concurrent | 512 B | 443,203 (n=1) | +7.3% | 152.8% report-only | — | 13.7 | 15.3 |
+| tokio-dpdk-concurrent | 1400 B | 326,742 (n=1) | +6.4% | 112.7% report-only | — | 26.8 | 29.3 |
+
+DUT p50/p99 are reported, not gated; all are > 0.0 at the 350k and 700k steps. App Drops columns are present and populated (0). tokio poll-idle% from the pre-traffic tick: tokio-dpdk 100.0, tokio-dpdk-concurrent 100.0.
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.17%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,353 target=466,011 (105.0% of target, 99.8% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=443,203 target=290,000 (152.8% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=326,742 target=290,000 (112.7% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+All gated cells pass (104.9%-105.2% of target) and sit within +/-0.2% of Run #38; tokio-dpdk is level with rust-dpdk at 64/512/1400 B, and rust-dpdk is ~100% of the same-run native-dpdk at 64/512 B. The concurrent 1400 B dip seen in Run #38 did not repeat (326,742 vs 307,092), consistent with run-to-run variance on that single-rep cell. NIC drops self-check: imissed 0 and rx_nombuf 0 for all DPDK configs.
+
+Follow-ups (non-0.3.1): rust-dpdk 1400 B at 81-87 % of native-dpdk when TRex is not line-rate capped (runs #43 #47 #48 #49 #51 of this log) is ROADMAP item 51; a deployment-normalized 1400 B gate is ROADMAP item 52.
+
+
+## Run #40: UDP checksum word-wise sum (ROADMAP item 51)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-05 |
+| **Git Hash** | `3f8a2530` |
+| **Branch** | `agent/udp-checksum-wordwise` |
+| **PR** | [#153](https://github.com/gspivey/dpdk-stdlib-rust/pull/153) |
+| **GH Actions Run** | [42121199815](https://github.com/gspivey/dpdk-stdlib-rust/actions/runs/42121199815) |
+| **Instance Type** | c6in.xlarge (4 vCPU, 6.25 Gbps baseline / 30 Gbps burst) |
+| **Traffic Generator** | TRex |
+| **Gate verdict** | PASS |
+
+### Changes Since Run #39
+
+1. `udp_checksum`, `verify_udp_checksum` (IPv4 RX) and the IPv6 `checksum_add` now sum the payload 4 bytes per step into a `u64` accumulator instead of a scalar 2-byte loop. Results are bit-identical (tested against the naive loop for lengths 0..=1600). Addresses ROADMAP item 51.
+
+### Results: 700k step, 3-rep median RX pps
+
+| Config | Size | Median RX pps | vs last run | vs target | vs 0.3.0 | DUT p50 (us) | DUT p99 (us) |
+|--------|------|--------------|-------------|-----------|----------|--------------|--------------|
+| native-dpdk | 64 B | 699,027 | -0.10% | — | — | — | — |
+| native-dpdk | 512 B | 694,015 | -0.83% | — | — | — | — |
+| native-dpdk | 1400 B | 489,638 (n=1) | — | — | — | — | — |
+| rust-dpdk | 64 B | 697,443 | -0.16% | 105.0% PASS | 99.8% | 3.8 | 6.4 |
+| rust-dpdk | 512 B | 689,780 | -1.22% | 104.6% PASS | 98.9% | 5.6 | 9.7 |
+| rust-dpdk | 1400 B | 489,680 | +0.07% | 105.3% report-only | 102.9% | 7.5 | 13.7 |
+| tokio-dpdk | 64 B | 696,949 | -0.21% | 105.2% PASS | — | 2.0 | 3.5 |
+| tokio-dpdk | 512 B | 695,156 | -0.11% | 106.1% PASS | — | 3.0 | 6.0 |
+| tokio-dpdk | 1400 B | 490,130 | +0.44% | 105.4% PASS | — | 1.6 | 4.5 |
+| tokio-dpdk-concurrent | 64 B | 629,255 | -1.26% | 217.0% PASS | — | 6.7 | 8.1 |
+| tokio-dpdk-concurrent | 512 B | 505,030 (n=1) | +13.9% | 174.1% report-only | — | 9.5 | 13.3 |
+| tokio-dpdk-concurrent | 1400 B | 391,730 (n=1) | +19.9% | 135.1% report-only | — | 14.4 | 21.6 |
+
+### Idle CPU (0-pps window, `--idle-backoff-ms 5`)
+
+tokio-echo process CPU: 0.00% of one vCPU (target <= 10%); mpstat all-CPU busy: 1.24%. PASS.
+
+### Gate verdict
+
+PASS. Report-only lines:
+
+- report-only: rust-dpdk @ 1400B median=489,680 target=465,156 (105.3% of target, 100.0% of native-dpdk)
+- report-only: tokio-dpdk-concurrent @ 512B median=505,030 target=290,000 (174.1% of target)
+- report-only: tokio-dpdk-concurrent @ 1400B median=391,730 target=290,000 (135.1% of target)
+- idle-cpu: 0.0% of one vCPU (target<=10%) PASS
+
+### Analysis
+
+No regression: all gated cells pass at 104.6%-106.1% of target. The 64/512 B moves vs Run #39 are within about 1.3 %, in the direction of run noise since those sizes are NIC- and generator-bound (rust-dpdk 512 B is 99.4% of same-run native). NIC drops self-check: imissed 0 and rx_nombuf 0 for all DPDK configs.
+
+This run does **not** show whether the item 51 gap closed. At 1400 B TRex was line-rate capped (TX ~490.9k pps): native-dpdk 489,638 and rust-dpdk 489,680 are equal because both hit the cap, the same condition under which earlier runs passed a 95 % check. The 81-87 % gap only appeared when TRex was not capped, so confirming the fix needs an uncapped deployment; that is ROADMAP item 53.

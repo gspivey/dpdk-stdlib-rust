@@ -11,11 +11,10 @@
 //! - **Multiple Backends** - DPDK, AF_PACKET raw sockets, or AF_PACKET with PACKET_MMAP
 //! - **Runtime Backend Selection** - Choose backend at runtime based on availability
 
-use std::cell::UnsafeCell;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -466,6 +465,30 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Sum `data` as big-endian 16-bit words (odd trailing byte padded with zero),
+/// folded to at most 16 bits. Equivalent to the naive 2-byte loop, but consumes
+/// 4 bytes per step into a `u64` accumulator: a big-endian 32-bit word `w`
+/// satisfies `w ≡ hi16 + lo16 (mod 65535)`, so adding whole words and folding
+/// at the end yields the same one's-complement sum.
+pub(crate) fn ones_complement_sum(data: &[u8]) -> u32 {
+    let mut acc: u64 = 0;
+    let mut chunks = data.chunks_exact(4);
+    for c in &mut chunks {
+        acc += u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as u64;
+    }
+    let rem = chunks.remainder();
+    if rem.len() >= 2 {
+        acc += (((rem[0] as u32) << 8) | rem[1] as u32) as u64;
+    }
+    if rem.len() % 2 == 1 {
+        acc += ((rem[rem.len() - 1] as u32) << 8) as u64;
+    }
+    while acc >> 16 != 0 {
+        acc = (acc & 0xFFFF) + (acc >> 16);
+    }
+    acc as u32
+}
+
 /// Calculate UDP checksum (optional for IPv4, but recommended)
 pub fn udp_checksum(
     src_ip: &[u8; 4],
@@ -497,15 +520,8 @@ pub fn udp_checksum(
         sum = sum.wrapping_add(word);
     }
 
-    // Payload
-    for i in (0..payload.len()).step_by(2) {
-        let word = if i + 1 < payload.len() {
-            ((payload[i] as u32) << 8) | (payload[i + 1] as u32)
-        } else {
-            (payload[i] as u32) << 8
-        };
-        sum = sum.wrapping_add(word);
-    }
+    // Payload (word-wise: this is the per-byte cost on the TX hot path)
+    sum = sum.wrapping_add(ones_complement_sum(payload));
 
     // Fold and complement
     while sum >> 16 != 0 {
@@ -629,14 +645,7 @@ pub fn verify_udp_checksum(frame: &[u8]) -> bool {
 
     // UDP segment (header + payload)
     let udp_data = &frame[udp_start..udp_start + udp_len];
-    for i in (0..udp_data.len()).step_by(2) {
-        let word = if i + 1 < udp_data.len() {
-            ((udp_data[i] as u32) << 8) | (udp_data[i + 1] as u32)
-        } else {
-            (udp_data[i] as u32) << 8
-        };
-        sum = sum.wrapping_add(word);
-    }
+    sum = sum.wrapping_add(ones_complement_sum(udp_data));
 
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -1302,6 +1311,166 @@ struct DpdkResources {
     active_rx_offload: u64,
     /// MTU the port was configured with. Drives mempool sizing and routing table init.
     mtu: u16,
+    /// Guards `port.rx_burst(0, ..)`. DPDK forbids concurrent bursts on one hardware queue,
+    /// and every socket on the port shares queue 0, so the guard lives here.
+    q_rx0: Mutex<()>,
+    /// Guards `port.tx_burst(0, ..)` (RTC send path, auto-replies, pipeline `send_fn`).
+    q_tx0: Mutex<()>,
+    /// Guards the pipeline's dedicated worker-direct TX queue (`port.tx_burst(1, ..)`).
+    q_tx_direct: Mutex<()>,
+    /// Per-guard acquisition counters, so tests can prove each burst site takes its guard.
+    #[cfg(test)]
+    guard_counts: GuardCounts,
+}
+
+/// Acquisition counters for the per-queue guards (test builds only).
+#[cfg(test)]
+#[derive(Default)]
+struct GuardCounts {
+    q_rx0: AtomicU64,
+    q_tx0: AtomicU64,
+    q_tx_direct: AtomicU64,
+}
+
+/// Lock a mutex, recovering the data if a previous holder panicked.
+///
+/// Every guard in this module protects plain data and no critical section panics, so a
+/// poisoned lock carries no broken invariant; recovering keeps the socket usable.
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Non-blocking variant of [`lock_or_recover`]: `None` when the lock is currently held,
+/// the (recovered) guard otherwise.
+fn try_lock_or_recover<T>(m: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+impl DpdkResources {
+    /// `tx_burst(0, ..)` under `q_tx0`.
+    fn send_guarded(&self, packets: &mut Vec<Mbuf>) -> dpdk::DpdkResult<u16> {
+        let _q = lock_or_recover(&self.q_tx0);
+        #[cfg(test)]
+        self.guard_counts.q_tx0.fetch_add(1, Ordering::Relaxed);
+        self.port.tx_burst(0, packets)
+    }
+
+    /// Like [`send_guarded`](Self::send_guarded) but returns `None` instead of blocking
+    /// when `q_tx0` is held.
+    fn try_send_guarded(&self, packets: &mut Vec<Mbuf>) -> Option<dpdk::DpdkResult<u16>> {
+        let _q = try_lock_or_recover(&self.q_tx0)?;
+        #[cfg(test)]
+        self.guard_counts.q_tx0.fetch_add(1, Ordering::Relaxed);
+        Some(self.port.tx_burst(0, packets))
+    }
+
+    /// `tx_burst(1, ..)` under `q_tx_direct`.
+    fn send_direct_guarded(&self, packets: &mut Vec<Mbuf>) -> dpdk::DpdkResult<u16> {
+        let _q = lock_or_recover(&self.q_tx_direct);
+        #[cfg(test)]
+        self.guard_counts.q_tx_direct.fetch_add(1, Ordering::Relaxed);
+        self.port.tx_burst(1, packets)
+    }
+
+    /// `rx_burst(0, max)` under `q_rx0`, returning the raw mbufs so the inline RX path
+    /// can read them in place (zero-copy).
+    fn recv_guarded(&self, max: u16) -> dpdk::DpdkResult<Vec<Mbuf>> {
+        let _q = lock_or_recover(&self.q_rx0);
+        #[cfg(test)]
+        self.guard_counts.q_rx0.fetch_add(1, Ordering::Relaxed);
+        self.port.rx_burst(0, max)
+    }
+
+    /// Like [`recv_guarded`](Self::recv_guarded) but returns `None` instead of blocking when
+    /// `q_rx0` is held.
+    fn try_recv_guarded(&self, max: u16) -> Option<dpdk::DpdkResult<Vec<Mbuf>>> {
+        let _q = try_lock_or_recover(&self.q_rx0)?;
+        #[cfg(test)]
+        self.guard_counts.q_rx0.fetch_add(1, Ordering::Relaxed);
+        Some(self.port.rx_burst(0, max))
+    }
+
+    /// Pipeline `recv_fn`: drain RX queue 0 into the frame pool.
+    fn make_recv_fn(
+        res: Arc<DpdkResources>,
+    ) -> impl Fn(usize, &FramePool) -> io::Result<Vec<FrameRef>> + Send + Sync + 'static {
+        move |max_frames: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
+            let packets = res.recv_guarded(max_frames as u16)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+            let mut refs = Vec::with_capacity(packets.len());
+            for mbuf in &packets {
+                if let Some(data) = mbuf.data() {
+                    let len = mbuf.data_len() as usize;
+                    let actual_len = len.min(data.len());
+                    // Write directly from mbuf into FramePool — eliminates the
+                    // intermediate Vec<u8> allocation and one full memcpy per packet.
+                    if let Some(frame_ref) = pool.alloc_copy(&data[..actual_len]) {
+                        refs.push(frame_ref);
+                    }
+                }
+            }
+            Ok(refs)
+        }
+    }
+
+    /// Pipeline `send_fn`: transmit one frame on TX queue 0 (tx_ring drain, ARP/ICMP replies).
+    fn make_send_fn(
+        res: Arc<DpdkResources>,
+    ) -> impl Fn(&[u8]) -> io::Result<usize> + Send + Sync + 'static {
+        move |frame: &[u8]| -> io::Result<usize> {
+            let mut mbuf = res.mempool.alloc()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
+            mbuf.set_data_len(frame.len() as u16);
+            mbuf.set_packet_len(frame.len() as u32);
+            let data = mbuf.data_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
+            data.copy_from_slice(frame);
+            let mut packets = vec![mbuf];
+            let sent = res.send_guarded(&mut packets)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
+            if sent == 0 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+            }
+            Ok(frame.len())
+        }
+    }
+
+    /// Pipeline worker-direct send: the app thread transmits on the dedicated TX queue 1,
+    /// bypassing the tx_ring → RX lcore → TX queue 0 hop.
+    fn make_direct_send_fn(
+        res: Arc<DpdkResources>,
+    ) -> Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync> {
+        Arc::new(move |frame: &[u8], hw_vlan_tci: Option<u16>| -> io::Result<usize> {
+            let mut mbuf = res.mempool.alloc()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
+            mbuf.set_data_len(frame.len() as u16);
+            mbuf.set_packet_len(frame.len() as u32);
+            let data = mbuf.data_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
+            data.copy_from_slice(frame);
+
+            // Hardware VLAN insert: set mbuf VLAN TCI so the NIC tags on wire
+            if let Some(tci) = hw_vlan_tci {
+                let tx_offload = res.active_tx_offload;
+                if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0 {
+                    mbuf.set_vlan_tci(tci);
+                    mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64);
+                }
+            }
+
+            let mut packets = vec![mbuf];
+            let sent = res.send_direct_guarded(&mut packets)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
+            if sent == 0 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
+            }
+            Ok(frame.len())
+        })
+    }
 }
 
 /// Global DPDK resources (initialized once per port)
@@ -1367,6 +1536,13 @@ fn get_or_init_dpdk(port_id: u16, mtu: u16) -> io::Result<Arc<DpdkResources>> {
         return Ok(Arc::clone(resources));
     }
 
+    let resources = init_dpdk_resources(port_id, mtu)?;
+    *guard = Some(Arc::clone(&resources));
+    Ok(resources)
+}
+
+/// Initialize EAL, the mempool and the port, and build the shared resources.
+fn init_dpdk_resources(port_id: u16, mtu: u16) -> io::Result<Arc<DpdkResources>> {
     // Initialize EAL
     // EAL args can be overridden via DPDK_EAL_ARGS env var (space-separated).
     // Default: program name + lcore 0 + 4 memory channels.
@@ -1445,9 +1621,13 @@ fn get_or_init_dpdk(port_id: u16, mtu: u16) -> io::Result<Arc<DpdkResources>> {
         active_tx_offload,
         active_rx_offload,
         mtu,
+        q_rx0: Mutex::new(()),
+        q_tx0: Mutex::new(()),
+        q_tx_direct: Mutex::new(()),
+        #[cfg(test)]
+        guard_counts: GuardCounts::default(),
     });
 
-    *guard = Some(Arc::clone(&resources));
     Ok(resources)
 }
 
@@ -1489,6 +1669,12 @@ impl SocketBackend {
     /// For Generic backends, `hw_vlan_tci` is ignored (the frame should already
     /// contain any VLAN tags in the Ethernet header).
     fn send_frame(&self, frame: &[u8], hw_vlan_tci: Option<u16>) -> io::Result<usize> {
+        self.send_frame_mode(frame, hw_vlan_tci, true)
+    }
+
+    /// [`send_frame`](Self::send_frame) with a choice of waiting for the TX queue guard
+    /// (`blocking`) or failing with `WouldBlock` when another thread holds it.
+    fn send_frame_mode(&self, frame: &[u8], hw_vlan_tci: Option<u16>, blocking: bool) -> io::Result<usize> {
         match self {
             SocketBackend::Dpdk(res) => {
                 let mut mbuf = res.mempool.alloc()
@@ -1600,8 +1786,14 @@ impl SocketBackend {
                 }
 
                 let mut packets = vec![mbuf];
-                let sent = res.port.tx_burst(0, &mut packets)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
+                let sent = if blocking {
+                    res.send_guarded(&mut packets)
+                } else {
+                    res.try_send_guarded(&mut packets).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::WouldBlock, "tx queue busy")
+                    })?
+                }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst failed: {}", e)))?;
                 if sent == 0 {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
                 }
@@ -1620,7 +1812,7 @@ impl SocketBackend {
     fn recv_frames(&self, max_frames: usize) -> io::Result<Vec<Vec<u8>>> {
         match self {
             SocketBackend::Dpdk(res) => {
-                let packets = res.port.rx_burst(0, max_frames as u16)
+                let packets = res.recv_guarded(max_frames as u16)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
                 let mut frames = Vec::with_capacity(packets.len());
                 for mbuf in &packets {
@@ -1832,7 +2024,14 @@ struct ReceiveQueue {
     max_bytes: usize,
     /// Current queued payload bytes.
     current_bytes: usize,
+    /// Free-list of recycled backing `Vec`s (capacity retained) so a buffered burst packet
+    /// reuses a prior allocation instead of calling the allocator. Bounded by `max_packets`
+    /// and `MAX_POOLED_BUFFERS`.
+    free_list: Vec<Vec<u8>>,
 }
+
+/// Upper bound on recycled buffers kept per queue (a burst is at most 32 packets).
+const MAX_POOLED_BUFFERS: usize = 256;
 
 impl ReceiveQueue {
     fn with_limits(max_packets: usize, max_bytes: usize) -> Self {
@@ -1842,12 +2041,44 @@ impl ReceiveQueue {
             max_packets,
             max_bytes,
             current_bytes: 0,
+            free_list: Vec::new(),
         }
+    }
+
+    /// Enqueue a copy of `payload`, reusing a recycled backing `Vec` when one is available.
+    /// Returns `false` (queue unchanged) when a packet or byte limit would be exceeded.
+    fn push_slice(&mut self, payload: &[u8], src: SocketAddr) -> bool {
+        let size = payload.len();
+        if self.packets.len() >= self.max_packets
+            || self.current_bytes.saturating_add(size) > self.max_bytes
+        {
+            return false;
+        }
+        let mut v = self.free_list.pop().unwrap_or_default();
+        v.clear();
+        v.extend_from_slice(payload);
+        self.current_bytes += size;
+        self.packets.push_back((v, src));
+        true
+    }
+
+    /// Pop the oldest packet, copy up to `buf.len()` bytes into `buf`, and recycle the
+    /// backing `Vec`. Returns `(copied_len, src)`.
+    fn pop_into(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        let (payload, src) = self.packets.pop_front()?;
+        self.current_bytes = self.current_bytes.saturating_sub(payload.len());
+        let copy_len = std::cmp::min(buf.len(), payload.len());
+        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        if self.free_list.len() < MAX_POOLED_BUFFERS {
+            self.free_list.push(payload);
+        }
+        Some((copy_len, src))
     }
 
     /// Try to enqueue a packet. On success returns `Ok(())`. On failure returns
     /// `Err(payload)` so the caller can inspect the dropped payload length for
     /// drop-counter accounting (and recover the allocation if desired).
+    #[cfg(test)]
     fn push(&mut self, payload: Vec<u8>, src: SocketAddr) -> Result<(), Vec<u8>> {
         let size = payload.len();
         if self.packets.len() >= self.max_packets
@@ -1860,13 +2091,13 @@ impl ReceiveQueue {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pop(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
         let (payload, src) = self.packets.pop_front()?;
         self.current_bytes = self.current_bytes.saturating_sub(payload.len());
         Some((payload, src))
     }
 
-    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.packets.is_empty()
     }
@@ -1942,92 +2173,48 @@ fn auto_detect_routing(local_ip: Ipv4Addr, arp_handler: &ArpHandler) -> RoutingT
 }
 
 // ============================================================================
-// TxBuffer — lock-free TX buffer for run-to-completion mode
+// Per-direction socket state
 // ============================================================================
+//
+// `UdpSocket` is `Send + Sync` and may be shared across threads via `Arc`. Its mutable
+// state is split per direction so a sender and a receiver never contend on socket state:
+//
+// - `tx_state` owns the reusable TX frame scratch buffer.
+// - `rx_state` owns the buffered receive queue and the app-ring round-robin index.
+//
+// The actual hardware bursts are serialized by the per-queue guards in `DpdkResources`
+// (`q_rx0`, `q_tx0`, `q_tx_direct`), shared by every socket on the port.
+//
+// Lock order (the only nesting that exists):
+//
+//     rx_state < q_rx0 < tx_state < q_tx0 < q_tx_direct
+//
+// - A send takes `tx_state`, then the TX queue guard; it never takes an RX lock.
+// - A receive takes `rx_state`, then `q_rx0`; an auto-reply (ARP/ICMP/NDP/ICMPv6) sends a
+//   prebuilt frame and takes only `q_tx0` — no `tx_state` — so RX-then-TX is the only
+//   cross-direction nesting.
+// - `process_frame_zerocopy` runs with `rx_state` held and takes `&mut RxState`; it never
+//   re-locks (`Mutex` is not reentrant).
+// - `resolve_arp` takes locks per loop iteration in the subsequence `rx_state < q_rx0 <
+//   q_tx0` and holds none across its sleep. It runs before the caller takes `tx_state`.
+// - Leaf locks (`connected_addr`, `connection_state`, ARP/NDP caches, `error_queue`) may be
+//   taken under the guards above but are never held while acquiring one.
+//
+// No critical section panics, so guards cannot be poisoned by this crate; `lock_or_recover`
+// recovers a poisoned guard anyway so one unrelated panic cannot wedge the socket.
 
-/// A reusable TX frame buffer that avoids `Mutex` overhead in run-to-completion mode.
-///
-/// In RTC mode (single-threaded `send_to` path), the inner `Vec<u8>` is accessed
-/// via `UnsafeCell` — no locking overhead. A debug-mode assertion verifies that
-/// concurrent access never occurs.
-///
-/// # Safety
-///
-/// This type is `Sync` because:
-/// - In RTC mode, only one thread ever calls `send_to`, so `borrow_mut` is
-///   called from a single thread. The `AtomicBool` guard catches violations in debug builds.
-/// - In multi-core mode, `send_to` uses `build_udp_frame` (allocates a new Vec)
-///   and enqueues to the TX ring — `TxBuffer` is never accessed.
-struct TxBuffer {
-    buf: UnsafeCell<Vec<u8>>,
-    #[cfg(debug_assertions)]
-    in_use: AtomicBool,
+/// TX-side per-socket state, guarded by `UdpSocket::tx_state`.
+struct TxState {
+    /// Reusable frame buffer — avoids per-packet heap allocation in `send_to`.
+    scratch: Vec<u8>,
 }
 
-// SAFETY: TxBuffer is only accessed in RTC mode from a single thread.
-// The debug-mode AtomicBool guard detects misuse.
-unsafe impl Sync for TxBuffer {}
-
-impl TxBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            buf: UnsafeCell::new(Vec::with_capacity(capacity)),
-            #[cfg(debug_assertions)]
-            in_use: AtomicBool::new(false),
-        }
-    }
-
-    /// Get a mutable reference to the inner buffer.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee that no other thread is accessing the buffer
-    /// concurrently. In debug builds, a runtime assertion enforces this.
-    #[inline]
-    fn borrow_mut(&self) -> TxBufferGuard<'_> {
-        #[cfg(debug_assertions)]
-        {
-            let was_in_use = self.in_use.swap(true, Ordering::Acquire);
-            debug_assert!(
-                !was_in_use,
-                "TxBuffer: concurrent access detected — this should only be used in RTC mode"
-            );
-        }
-        TxBufferGuard { tx_buf: self }
-    }
-}
-
-/// RAII guard that provides `&mut Vec<u8>` access and clears the in-use flag on drop.
-struct TxBufferGuard<'a> {
-    tx_buf: &'a TxBuffer,
-}
-
-impl<'a> std::ops::Deref for TxBufferGuard<'a> {
-    type Target = Vec<u8>;
-    fn deref(&self) -> &Vec<u8> {
-        // SAFETY: single-thread guarantee enforced by debug assertion in borrow_mut
-        unsafe { &*self.tx_buf.buf.get() }
-    }
-}
-
-impl<'a> std::ops::DerefMut for TxBufferGuard<'a> {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        // SAFETY: single-thread guarantee enforced by debug assertion in borrow_mut
-        unsafe { &mut *self.tx_buf.buf.get() }
-    }
-}
-
-impl<'a> Drop for TxBufferGuard<'a> {
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        self.tx_buf.in_use.store(false, Ordering::Release);
-    }
-}
-
-impl std::fmt::Debug for TxBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxBuffer").finish_non_exhaustive()
-    }
+/// RX-side per-socket state, guarded by `UdpSocket::rx_state`.
+struct RxState {
+    /// Packets received but not yet returned to the application.
+    queue: ReceiveQueue,
+    /// Round-robin index for polling per-worker app rings (pipeline mode).
+    rr_index: usize,
 }
 
 pub struct UdpSocket {
@@ -2048,8 +2235,8 @@ pub struct UdpSocket {
     icmpv6_handler: Icmpv6Handler,
     /// Connection state tracking (for connected sockets)
     connection_state: RwLock<Option<ConnectionState>>,
-    /// Receive queue for buffered packets
-    recv_queue: Mutex<ReceiveQueue>,
+    /// RX-side state: buffered receive queue + app-ring round-robin index.
+    rx_state: Mutex<RxState>,
     /// Whether to automatically respond to ARP requests
     auto_arp: bool,
     /// Whether to automatically respond to ICMP echo requests
@@ -2063,18 +2250,17 @@ pub struct UdpSocket {
     /// Multi-core pipeline topology (None = run-to-completion, the default).
     /// When active, recv_from() reads from app_ring and send_to() writes to tx_ring.
     topology: Mutex<Option<MultiCoreTopology>>,
-    /// Reusable TX frame buffer — avoids per-packet heap allocation in send_to.
-    /// Uses UnsafeCell (via TxBuffer) instead of Mutex for zero-overhead access
-    /// in run-to-completion mode. Only accessed from the RTC send path.
-    tx_buf: TxBuffer,
+    /// TX-side state: reusable frame buffer (avoids per-packet heap allocation in send_to).
+    tx_state: Mutex<TxState>,
     /// Performance counters — always available, zero-cost if not read.
     perf_counters: Arc<PerfCounters>,
     /// Latency sampler — samples 1 in N packets for percentile tracking.
     latency_sampler: Arc<LatencySampler>,
     /// Background perf reporter (None if not enabled).
     perf_reporter: Mutex<Option<PerfReporter>>,
-    /// Round-robin index for polling per-worker app rings in recv_from_pipeline.
-    recv_from_rr_index: AtomicUsize,
+    /// Auto-replies (ARP/ICMP/NDP/ICMPv6) dropped because a non-blocking receive found the
+    /// TX queue guard busy. Reported separately from receive-buffer drops.
+    auto_reply_drops: AtomicU64,
     // ---- Cached pipeline handles (set once during builder.bind()) ----
     // These avoid locking `topology` on every send/recv in the hot path.
     /// True when a multi-core pipeline is active (avoids topology.lock() in recv_from).
@@ -2089,7 +2275,8 @@ pub struct UdpSocket {
     // ---- Atomic fast-path flags to skip Mutex locks in hot path ----
     /// True after connect() is called — skip connected_addr.lock() when false.
     is_connected: AtomicBool,
-    /// True when recv_queue has buffered packets — skip recv_queue.lock() when false.
+    /// True when `rx_state.queue` has buffered packets. Maintained under `rx_state`: set after
+    /// every push, cleared when a pop empties the queue.
     has_buffered_packets: AtomicBool,
     /// True when connection_state is Some — skip connection_state.write() when false.
     has_connection_state: AtomicBool,
@@ -2146,6 +2333,13 @@ impl UdpSocket {
 
     /// Internal: bind to an IPv4 address.
     fn bind_v4(local_v4: SocketAddrV4) -> io::Result<UdpSocket> {
+        // Get or initialize DPDK resources (ENA supports 9001 MTU by default)
+        let resources = get_or_init_dpdk(0, 9001)?;
+        Self::bind_v4_on(local_v4, resources)
+    }
+
+    /// Internal: bind to an IPv4 address on the given DPDK resources.
+    fn bind_v4_on(local_v4: SocketAddrV4, resources: Arc<DpdkResources>) -> io::Result<UdpSocket> {
         // Allocate an ephemeral port if port 0 was requested
         let local_v4 = if local_v4.port() == 0 {
             let ephemeral = allocate_ephemeral_port();
@@ -2153,9 +2347,6 @@ impl UdpSocket {
         } else {
             local_v4
         };
-
-        // Get or initialize DPDK resources (ENA supports 9001 MTU by default)
-        let resources = get_or_init_dpdk(0, 9001)?;
 
         // Create protocol handlers with shared ARP cache
         let local_mac = resources.src_mac.octets();
@@ -2196,21 +2387,24 @@ impl UdpSocket {
             icmp_handler,
             icmpv6_handler,
             connection_state: RwLock::new(None),
-            recv_queue: Mutex::new(ReceiveQueue::with_limits(
-                DEFAULT_RECV_BUFFER_PACKETS,
-                DEFAULT_RECV_BUFFER_BYTES,
-            )),
+            rx_state: Mutex::new(RxState {
+                queue: ReceiveQueue::with_limits(
+                    DEFAULT_RECV_BUFFER_PACKETS,
+                    DEFAULT_RECV_BUFFER_BYTES,
+                ),
+                rr_index: 0,
+            }),
             auto_arp: true,
             auto_icmp: true,
             auto_garp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
+            tx_state: Mutex::new(TxState { scratch: Vec::with_capacity(MAX_FRAME_SIZE) }),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
-            recv_from_rr_index: AtomicUsize::new(0),
+            auto_reply_drops: AtomicU64::new(0),
             has_pipeline: AtomicBool::new(false),
             cached_app_rings: None,
             cached_frame_pool: None,
@@ -2286,21 +2480,24 @@ impl UdpSocket {
             icmp_handler,
             icmpv6_handler,
             connection_state: RwLock::new(None),
-            recv_queue: Mutex::new(ReceiveQueue::with_limits(
-                DEFAULT_RECV_BUFFER_PACKETS,
-                DEFAULT_RECV_BUFFER_BYTES,
-            )),
+            rx_state: Mutex::new(RxState {
+                queue: ReceiveQueue::with_limits(
+                    DEFAULT_RECV_BUFFER_PACKETS,
+                    DEFAULT_RECV_BUFFER_BYTES,
+                ),
+                rr_index: 0,
+            }),
             auto_arp: true,
             auto_icmp: true,
             auto_garp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
+            tx_state: Mutex::new(TxState { scratch: Vec::with_capacity(MAX_FRAME_SIZE) }),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
-            recv_from_rr_index: AtomicUsize::new(0),
+            auto_reply_drops: AtomicU64::new(0),
             has_pipeline: AtomicBool::new(false),
             cached_app_rings: None,
             cached_frame_pool: None,
@@ -2419,21 +2616,24 @@ impl UdpSocket {
             icmp_handler,
             icmpv6_handler,
             connection_state: RwLock::new(None),
-            recv_queue: Mutex::new(ReceiveQueue::with_limits(
-                DEFAULT_RECV_BUFFER_PACKETS,
-                DEFAULT_RECV_BUFFER_BYTES,
-            )),
+            rx_state: Mutex::new(RxState {
+                queue: ReceiveQueue::with_limits(
+                    DEFAULT_RECV_BUFFER_PACKETS,
+                    DEFAULT_RECV_BUFFER_BYTES,
+                ),
+                rr_index: 0,
+            }),
             auto_arp: true,
             auto_icmp: true,
             auto_garp: true,
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             topology: Mutex::new(None),
-            tx_buf: TxBuffer::new(MAX_FRAME_SIZE),
+            tx_state: Mutex::new(TxState { scratch: Vec::with_capacity(MAX_FRAME_SIZE) }),
             perf_counters: Arc::new(PerfCounters::new()),
             latency_sampler: Arc::new(LatencySampler::default()),
             perf_reporter: Mutex::new(None),
-            recv_from_rr_index: AtomicUsize::new(0),
+            auto_reply_drops: AtomicU64::new(0),
             has_pipeline: AtomicBool::new(false),
             cached_app_rings: None,
             cached_frame_pool: None,
@@ -2533,15 +2733,40 @@ impl UdpSocket {
     /// run-to-completion path. The multi-core topology path still allocates
     /// because the TX ring takes ownership of the frame.
     fn send_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.send_to_addr_mode(buf, addr, true)
+    }
+
+    /// [`send_to_addr`](Self::send_to_addr) with a choice of waiting for the per-direction and
+    /// queue guards (`blocking`) or returning `WouldBlock` when another thread holds one.
+    fn send_to_addr_mode(&self, buf: &[u8], addr: SocketAddr, blocking: bool) -> io::Result<usize> {
         // Dispatch based on destination address family
         match addr {
-            SocketAddr::V4(v4) => self.send_to_v4(buf, *v4.ip(), v4.port()),
-            SocketAddr::V6(v6) => self.send_to_v6(buf, *v6.ip(), v6.port()),
+            SocketAddr::V4(v4) => self.send_to_v4(buf, *v4.ip(), v4.port(), blocking),
+            SocketAddr::V6(v6) => self.send_to_v6(buf, *v6.ip(), v6.port(), blocking),
         }
     }
 
+    /// Non-blocking `send_to`: returns `WouldBlock` instead of waiting when another thread
+    /// holds this socket's TX guard or the TX queue guard.
+    ///
+    /// Internal entry point for the tokio compat layer's `try_send_to`; not part of the
+    /// documented API. An ARP miss still resolves synchronously (up to ~3 s), as in 0.3.0.
+    #[doc(hidden)]
+    pub fn try_send_to_nb(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.send_to_addr_mode(buf, addr, false)
+    }
+
+    /// Non-blocking `send` on a connected socket; see [`try_send_to_nb`](Self::try_send_to_nb).
+    #[doc(hidden)]
+    pub fn try_send_nb(&self, buf: &[u8]) -> io::Result<usize> {
+        let addr = (*lock_or_recover(&self.connected_addr)).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
+        })?;
+        self.send_to_addr_mode(buf, addr, false)
+    }
+
     /// Internal: send a UDP datagram over IPv4.
-    fn send_to_v4(&self, buf: &[u8], dst_ip: Ipv4Addr, dst_port: u16) -> io::Result<usize> {
+    fn send_to_v4(&self, buf: &[u8], dst_ip: Ipv4Addr, dst_port: u16, blocking: bool) -> io::Result<usize> {
         let (src_ip, src_port) = match self.local_addr {
             SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
             SocketAddr::V6(v6) => {
@@ -2615,11 +2840,16 @@ impl UdpSocket {
         //   GUE     -> encapsulate: outer-eth/outer-ip/outer-udp/gue/inner-ip/inner-udp/payload
         //   VLAN    -> tag or hardware-offload per VlanMode
         //   Plain   -> standard untagged UDP frame
-        let mut tx_buf = self.tx_buf.borrow_mut();
+        let mut tx = if blocking {
+            lock_or_recover(&self.tx_state)
+        } else {
+            try_lock_or_recover(&self.tx_state)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "tx busy"))?
+        };
         let hw_vlan_tci = if let Some(ref vxlan_cfg) = self.vxlan_config {
             // VXLAN tunnel encapsulation
             vxlan::build_vxlan_frame_into(
-                &mut tx_buf,
+                &mut tx.scratch,
                 &src_mac,
                 &dst_mac.octets(),
                 src_ip, vxlan_cfg.remote_ip,
@@ -2636,7 +2866,7 @@ impl UdpSocket {
             // GENEVE tunnel encapsulation
             let hdr = geneve::GeneveHeader::new(geneve_cfg.vni);
             geneve::build_geneve_frame_into(
-                &mut tx_buf,
+                &mut tx.scratch,
                 &src_mac,
                 &dst_mac.octets(),
                 src_ip, geneve_cfg.remote_ip,
@@ -2652,7 +2882,7 @@ impl UdpSocket {
         } else if let Some(ref gue_cfg) = self.gue_config {
             // GUE tunnel encapsulation
             gue::build_gue_frame_into(
-                &mut tx_buf,
+                &mut tx.scratch,
                 &src_mac,
                 &dst_mac.octets(),
                 src_ip, gue_cfg.remote_ip,
@@ -2669,7 +2899,7 @@ impl UdpSocket {
                 let use_hw = self.has_hw_vlan_insert() && !vlan_cfg.force_software;
                 if use_hw {
                     build_udp_frame_into(
-                        &mut tx_buf,
+                        &mut tx.scratch,
                         &src_mac,
                         &dst_mac.octets(),
                         src_ip, dst_ip,
@@ -2679,7 +2909,7 @@ impl UdpSocket {
                     Some(vlan_cfg.encode_tci())
                 } else {
                     build_udp_frame_into_vlan(
-                        &mut tx_buf,
+                        &mut tx.scratch,
                         &src_mac,
                         &dst_mac.octets(),
                         src_ip, dst_ip,
@@ -2691,7 +2921,7 @@ impl UdpSocket {
                 }
             } else {
                 build_udp_frame_into(
-                    &mut tx_buf,
+                    &mut tx.scratch,
                     &src_mac,
                     &dst_mac.octets(),
                     src_ip, dst_ip,
@@ -2705,13 +2935,13 @@ impl UdpSocket {
         // P3.5: Worker-direct TX uses cached send function (no topology.lock()).
         if let Some(ref direct_send) = self.cached_direct_send {
             // Worker-direct TX: send on dedicated TX queue (no ring hop)
-            if let Err(e) = direct_send(&tx_buf, hw_vlan_tci) {
+            if let Err(e) = direct_send(&tx.scratch, hw_vlan_tci) {
                 perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
             }
         } else {
             // Run-to-completion path: send via backend on TX queue 0
-            if let Err(e) = self.socket_backend.send_frame(&tx_buf, hw_vlan_tci) {
+            if let Err(e) = self.socket_backend.send_frame_mode(&tx.scratch, hw_vlan_tci, blocking) {
                 perf_inc!(self.perf_counters.tx_failures);
                 return Err(e);
             }
@@ -2734,7 +2964,7 @@ impl UdpSocket {
     }
 
     /// Internal: send a UDP datagram over IPv6.
-    fn send_to_v6(&self, buf: &[u8], dst_ip: Ipv6Addr, dst_port: u16) -> io::Result<usize> {
+    fn send_to_v6(&self, buf: &[u8], dst_ip: Ipv6Addr, dst_port: u16, blocking: bool) -> io::Result<usize> {
         let (src_ip, src_port) = match self.local_addr {
             SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
             SocketAddr::V4(_) => {
@@ -2768,7 +2998,7 @@ impl UdpSocket {
                 } else {
                     // Send NDP solicitation and use broadcast as fallback
                     if let Some(ns_frame) = self.ndp_handler.make_solicitation(&dst_ip) {
-                        let _ = self.socket_backend.send_frame(&ns_frame, None);
+                        let _ = self.socket_backend.send_frame_mode(&ns_frame, None, blocking);
                     }
                     // Use broadcast MAC as fallback (stub mode will accept it)
                     [0xff; 6]
@@ -2779,9 +3009,14 @@ impl UdpSocket {
         let src_mac = self.socket_backend.mac_address();
 
         // Build IPv6/UDP frame
-        let mut tx_buf = self.tx_buf.borrow_mut();
+        let mut tx = if blocking {
+            lock_or_recover(&self.tx_state)
+        } else {
+            try_lock_or_recover(&self.tx_state)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "tx busy"))?
+        };
         ipv6::build_udp6_frame_into(
-            &mut tx_buf,
+            &mut tx.scratch,
             &src_mac,
             &dst_mac,
             src_ip, dst_ip,
@@ -2790,7 +3025,7 @@ impl UdpSocket {
         ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("IPv6 packet build failed: {}", e)))?;
 
         // Send the frame
-        self.socket_backend.send_frame(&tx_buf, None)?;
+        self.socket_backend.send_frame_mode(&tx.scratch, None, blocking)?;
 
         // Increment TX counters
         perf_inc!(self.perf_counters.tx_packets);
@@ -2841,36 +3076,55 @@ impl UdpSocket {
     /// blocking `recv_from` uses between polls.
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
         if self.has_pipeline.load(Ordering::Acquire) {
-            return self.try_recv_from_pipeline(buf);
+            return self.try_recv_from_pipeline(buf, true);
         }
-        self.try_recv_from_inline(buf)
+        self.try_recv_from_inline(buf, true)
+    }
+
+    /// Non-blocking [`try_recv_from`](Self::try_recv_from): returns `WouldBlock` instead of
+    /// waiting when another thread holds this socket's RX guard or the RX queue guard, and
+    /// drops (and counts, see [`auto_reply_drops`](Self::auto_reply_drops)) an ARP/ICMP/NDP
+    /// auto-reply rather than wait for a busy TX queue.
+    ///
+    /// Internal entry point for the tokio compat layer; not part of the documented API.
+    #[doc(hidden)]
+    pub fn try_recv_from_nb(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        if self.has_pipeline.load(Ordering::Acquire) {
+            return self.try_recv_from_pipeline(buf, false);
+        }
+        self.try_recv_from_inline(buf, false)
+    }
+
+    /// Take `rx_state`, waiting for it (`blocking`) or failing with `WouldBlock` if held.
+    fn lock_rx(&self, blocking: bool) -> io::Result<std::sync::MutexGuard<'_, RxState>> {
+        if blocking {
+            Ok(lock_or_recover(&self.rx_state))
+        } else {
+            try_lock_or_recover(&self.rx_state)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "rx busy"))
+        }
     }
 
     /// Non-blocking pipeline recv: single dequeue attempt from app rings.
-    fn try_recv_from_pipeline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+    fn try_recv_from_pipeline(&self, buf: &mut [u8], blocking: bool) -> io::Result<Option<(usize, SocketAddr)>> {
         let app_rings = self.cached_app_rings.as_ref()
             .expect("try_recv_from_pipeline called without pipeline");
         let frame_pool = self.cached_frame_pool.as_ref()
             .expect("try_recv_from_pipeline called without pipeline");
 
+        // The app rings are single-consumer, so the dequeue (and `rr_index`) is under rx_state.
+        let mut rx = self.lock_rx(blocking)?;
+
         // Check buffered packets first.
         if self.has_buffered_packets.load(Ordering::Acquire) {
-            let mut queue = self.recv_queue.lock().unwrap();
-            if let Some((payload, src_addr)) = queue.pop() {
-                if queue.is_empty() {
-                    self.has_buffered_packets.store(false, Ordering::Release);
-                }
-                let copy_len = std::cmp::min(buf.len(), payload.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+            if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
                 return Ok(Some((copy_len, src_addr)));
             }
             self.has_buffered_packets.store(false, Ordering::Release);
         }
 
         // Single round-robin dequeue attempt across app rings.
-        let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
-        let packet = dequeue_app_rings(app_rings, &mut rr);
-        self.recv_from_rr_index.store(rr, Ordering::Relaxed);
+        let packet = dequeue_app_rings(app_rings, &mut rx.rr_index);
 
         if let Some(app_pkt) = packet {
             let start = app_pkt.payload_offset as usize;
@@ -2884,12 +3138,7 @@ impl UdpSocket {
             if self.is_connected.load(Ordering::Acquire) {
                 if let Some(connected) = *self.connected_addr.lock().unwrap() {
                     if app_pkt.src_addr != connected {
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        if queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr).is_err() {
-                            self.record_rx_drop(copy_len);
-                        } else {
-                            self.has_buffered_packets.store(true, Ordering::Release);
-                        }
+                        self.rx_enqueue(&mut rx, &buf[..copy_len], app_pkt.src_addr, copy_len);
                         return Ok(None);
                     }
                 }
@@ -2902,27 +3151,50 @@ impl UdpSocket {
     }
 
     /// Non-blocking inline recv: single poll of the backend, no sleep.
-    fn try_recv_from_inline(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+    ///
+    /// Run-to-completion (RTC/tokio) mode has no pipeline `worker_loop`, so the
+    /// `worker_idle_polls` / `worker_packets_processed` counters that feed
+    /// `worker_idle_pct` would otherwise stay 0. Count them here: an empty poll
+    /// is an idle poll, a delivered packet is a processed packet. The counters
+    /// are existing `PerfCounters` fields; no new public surface.
+    fn try_recv_from_inline(&self, buf: &mut [u8], blocking: bool) -> io::Result<Option<(usize, SocketAddr)>> {
+        let result = self.try_recv_from_inline_poll(buf, blocking)?;
+        match result {
+            Some(_) => {
+                perf_inc!(self.perf_counters.worker_packets_processed);
+            }
+            None => {
+                perf_inc!(self.perf_counters.worker_idle_polls);
+            }
+        }
+        Ok(result)
+    }
+
+    fn try_recv_from_inline_poll(&self, buf: &mut [u8], blocking: bool) -> io::Result<Option<(usize, SocketAddr)>> {
         let local_port = match self.local_addr {
             SocketAddr::V4(v4) => v4.port(),
             SocketAddr::V6(v6) => v6.port(),
         };
 
+        let mut rx = self.lock_rx(blocking)?;
+
         // Check buffered packets first.
-        {
-            let mut queue = self.recv_queue.lock().unwrap();
-            if let Some((payload, src_addr)) = queue.pop() {
-                let copy_len = std::cmp::min(buf.len(), payload.len());
-                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                return Ok(Some((copy_len, src_addr)));
-            }
+        if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
+            return Ok(Some((copy_len, src_addr)));
         }
 
         // Single poll of the backend.
         match &self.socket_backend {
             SocketBackend::Dpdk(res) => {
-                let packets = res.port.rx_burst(0, 32)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
+                let packets = if blocking {
+                    res.recv_guarded(32)
+                } else {
+                    match res.try_recv_guarded(32) {
+                        Some(r) => r,
+                        None => return Err(io::Error::new(io::ErrorKind::WouldBlock, "rx queue busy")),
+                    }
+                }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
 
                 if packets.is_empty() {
                     return Ok(None);
@@ -2947,7 +3219,7 @@ impl UdpSocket {
                         if stripped { Some(mbuf.vlan_tci()) } else { None }
                     };
 
-                    if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, hw_vlan_tci) {
+                    if let Some(r) = self.process_frame_zerocopy_locked(&mut rx, blocking, frame_data, local_port, buf, &mut result, hw_vlan_tci) {
                         if let Some(ts) = rx_timestamp {
                             let latency_ns = ts.elapsed().as_nanos() as u64;
                             self.latency_sampler.record(latency_ns);
@@ -2986,7 +3258,7 @@ impl UdpSocket {
                 let mut result: Option<(usize, SocketAddr)> = None;
 
                 for frame_data in &frames {
-                    if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, None) {
+                    if let Some(r) = self.process_frame_zerocopy_locked(&mut rx, blocking, frame_data, local_port, buf, &mut result, None) {
                         if let Some(ts) = rx_timestamp {
                             let latency_ns = ts.elapsed().as_nanos() as u64;
                             self.latency_sampler.record(latency_ns);
@@ -3040,25 +3312,21 @@ impl UdpSocket {
                 }
             }
 
+            // rx_state serializes the single-consumer app-ring dequeue and the buffered queue.
+            // It is released before the backoff below, never held across a sleep.
+            let mut rx = lock_or_recover(&self.rx_state);
+
             // Check buffered packets first (from connected socket filtering).
-            // Fast-path: skip the lock entirely when no packets are buffered.
+            // Fast-path: skip the queue when no packets are buffered.
             if self.has_buffered_packets.load(Ordering::Acquire) {
-                let mut queue = self.recv_queue.lock().unwrap();
-                if let Some((payload, src_addr)) = queue.pop() {
-                    if queue.is_empty() {
-                        self.has_buffered_packets.store(false, Ordering::Release);
-                    }
-                    let copy_len = std::cmp::min(buf.len(), payload.len());
-                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
                     return Ok((copy_len, src_addr));
                 }
                 self.has_buffered_packets.store(false, Ordering::Release);
             }
 
-            // Poll per-worker SPSC app rings round-robin (lock-free).
-            let mut rr = self.recv_from_rr_index.load(Ordering::Relaxed);
-            let packet = dequeue_app_rings(app_rings, &mut rr);
-            self.recv_from_rr_index.store(rr, Ordering::Relaxed);
+            // Poll per-worker SPSC app rings round-robin.
+            let packet = dequeue_app_rings(app_rings, &mut rx.rr_index);
 
             if let Some(app_pkt) = packet {
                 empty_polls = 0;
@@ -3080,12 +3348,7 @@ impl UdpSocket {
                 if self.is_connected.load(Ordering::Acquire) {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if app_pkt.src_addr != connected {
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            if queue.push(buf[..copy_len].to_vec(), app_pkt.src_addr).is_err() {
-                                self.record_rx_drop(copy_len);
-                            } else {
-                                self.has_buffered_packets.store(true, Ordering::Release);
-                            }
+                            self.rx_enqueue(&mut rx, &buf[..copy_len], app_pkt.src_addr, copy_len);
                             continue;
                         }
                     }
@@ -3104,6 +3367,7 @@ impl UdpSocket {
             }
 
             // No packet available — adaptive backoff (spin → yield → sleep 1us).
+            drop(rx);
             // Matches the worker thread backoff strategy instead of the old fixed
             // 100us sleep, which caused ~35 packets to pile up per idle cycle at 350k pps.
             empty_polls += 1;
@@ -3137,14 +3401,13 @@ impl UdpSocket {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"));
                 }
             }
+            // rx_state covers the buffered queue and the burst below; it is released before
+            // every sleep.
+            let mut rx = lock_or_recover(&self.rx_state);
+
             // First check if we have buffered packets
-            {
-                let mut queue = self.recv_queue.lock().unwrap();
-                if let Some((payload, src_addr)) = queue.pop() {
-                    let copy_len = std::cmp::min(buf.len(), payload.len());
-                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                    return Ok((copy_len, src_addr));
-                }
+            if let Some((copy_len, src_addr)) = self.rx_dequeue_into(&mut rx, buf) {
+                return Ok((copy_len, src_addr));
             }
 
             // Dispatch to the appropriate fast-path based on backend type.
@@ -3154,10 +3417,11 @@ impl UdpSocket {
                     // rx_burst returns mbufs whose data() borrows from the mbuf buffer —
                     // we parse and copy directly to the user buffer or recv_queue without
                     // any intermediate heap allocation.
-                    let packets = res.port.rx_burst(0, 32)
+                    let packets = res.recv_guarded(32)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
 
                     if packets.is_empty() {
+                        drop(rx);
                         std::thread::sleep(std::time::Duration::from_micros(100));
                         continue;
                     }
@@ -3184,7 +3448,7 @@ impl UdpSocket {
                             if stripped { Some(mbuf.vlan_tci()) } else { None }
                         };
 
-                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, hw_vlan_tci) {
+                        if let Some(r) = self.process_frame_zerocopy_locked(&mut rx, true, frame_data, local_port, buf, &mut result, hw_vlan_tci) {
                             // Record latency sample if applicable
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
@@ -3216,6 +3480,7 @@ impl UdpSocket {
                     let frames = backend.recv_frames(32)?;
 
                     if frames.is_empty() {
+                        drop(rx);
                         std::thread::sleep(std::time::Duration::from_micros(100));
                         continue;
                     }
@@ -3231,7 +3496,7 @@ impl UdpSocket {
                     let mut result: Option<(usize, SocketAddr)> = None;
 
                     for frame_data in &frames {
-                        if let Some(r) = self.process_frame_zerocopy(frame_data, local_port, buf, &mut result, None) {
+                        if let Some(r) = self.process_frame_zerocopy_locked(&mut rx, true, frame_data, local_port, buf, &mut result, None) {
                             if let Some(ts) = rx_timestamp {
                                 let latency_ns = ts.elapsed().as_nanos() as u64;
                                 self.latency_sampler.record(latency_ns);
@@ -3259,16 +3524,74 @@ impl UdpSocket {
         }
     }
 
+    /// Test convenience: [`process_frame_zerocopy_locked`](Self::process_frame_zerocopy_locked)
+    /// taking `rx_state` itself, as the receive paths do.
+    #[cfg(test)]
+    fn process_frame_zerocopy(
+        &self,
+        frame_data: &[u8],
+        local_port: u16,
+        buf: &mut [u8],
+        result: &mut Option<(usize, SocketAddr)>,
+        hw_vlan_tci: Option<u16>,
+    ) -> Option<(usize, SocketAddr)> {
+        let mut rx = lock_or_recover(&self.rx_state);
+        self.process_frame_zerocopy_locked(&mut rx, true, frame_data, local_port, buf, result, hw_vlan_tci)
+    }
+
+    /// Push a received payload into the buffered queue (caller holds `rx_state`), keeping
+    /// `has_buffered_packets` in step; a full queue counts as a receive drop.
+    fn rx_enqueue(&self, rx: &mut RxState, payload: &[u8], src: SocketAddr, payload_len: usize) {
+        if !rx.queue.push_slice(payload, src) {
+            self.record_rx_drop(payload_len);
+        } else {
+            self.has_buffered_packets.store(true, Ordering::Release);
+        }
+    }
+
+    /// Pop the oldest buffered packet into `buf` (caller holds `rx_state`), recycling its
+    /// backing `Vec` and clearing `has_buffered_packets` once the queue is empty.
+    /// Returns `(copied_len, src)`.
+    fn rx_dequeue_into(&self, rx: &mut RxState, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        let popped = rx.queue.pop_into(buf);
+        if rx.queue.is_empty() {
+            self.has_buffered_packets.store(false, Ordering::Release);
+        }
+        popped
+    }
+
+    /// Send a prebuilt auto-reply frame, taking only the TX queue guard (never `tx_state`).
+    ///
+    /// A non-blocking receive must not wait for the guard: if it is busy the reply is dropped
+    /// and counted in `auto_reply_drops`. ARP/NDP/ICMP are idempotent and the peer retries.
+    fn send_auto_reply(&self, frame: &[u8], blocking: bool) {
+        if let Err(e) = self.socket_backend.send_frame_mode(frame, None, blocking) {
+            if !blocking && e.kind() == io::ErrorKind::WouldBlock {
+                self.auto_reply_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Number of auto-replies dropped because a non-blocking receive found the TX queue busy.
+    #[doc(hidden)]
+    pub fn auto_reply_drops(&self) -> u64 {
+        self.auto_reply_drops.load(Ordering::Relaxed)
+    }
+
     /// Process a single frame with zero-copy parsing.
     ///
     /// Handles ARP/ICMP and parses UDP — copies payload directly to user buffer
-    /// or recv_queue without intermediate `Vec<u8>` allocation on the primary path.
+    /// or the buffered queue without intermediate `Vec<u8>` allocation on the primary path.
+    ///
+    /// Runs with `rx_state` held by the caller (`rx`); it must not re-lock it.
     ///
     /// Returns `Some((len, addr))` if this is the first matching packet AND
     /// `result` was already `Some` (meaning we had a prior match, so we need to
     /// return immediately). Otherwise returns `None` and sets `result` on first match.
-    fn process_frame_zerocopy(
+    fn process_frame_zerocopy_locked(
         &self,
+        rx: &mut RxState,
+        blocking: bool,
         frame_data: &[u8],
         local_port: u16,
         buf: &mut [u8],
@@ -3294,7 +3617,7 @@ impl UdpSocket {
         // Handle ARP (both tagged and untagged)
         if layout.ethertype == arp::ETH_TYPE_ARP && self.auto_arp {
             if let Some(reply_frame) = self.arp_handler.process_arp(frame_data) {
-                let _ = self.socket_backend.send_frame(&reply_frame, None);
+                let _ = self.send_auto_reply(&reply_frame, blocking);
             }
             perf_inc!(self.perf_counters.rx_arp_handled);
             return None;
@@ -3308,7 +3631,7 @@ impl UdpSocket {
                     match action {
                         icmp::IcmpAction::Reply(reply_frame) => {
                             if self.auto_icmp {
-                                let _ = self.socket_backend.send_frame(&reply_frame, None);
+                                let _ = self.send_auto_reply(&reply_frame, blocking);
                             }
                         }
                         icmp::IcmpAction::Error(error_info) => {
@@ -3348,7 +3671,7 @@ impl UdpSocket {
                 // Learns the sender's MAC and, for an NS aimed at one of our
                 // addresses, returns a unicast NA to send back.
                 if let Some(na_frame) = self.ndp_handler.process_ndp(frame_data) {
-                    let _ = self.socket_backend.send_frame(&na_frame, None);
+                    let _ = self.send_auto_reply(&na_frame, blocking);
                 }
                 perf_inc!(self.perf_counters.rx_arp_handled);
                 return None;
@@ -3363,7 +3686,7 @@ impl UdpSocket {
                         match action {
                             icmpv6::Icmpv6Action::Reply(reply_frame) => {
                                 if self.auto_icmp {
-                                    let _ = self.socket_backend.send_frame(&reply_frame, None);
+                                    let _ = self.send_auto_reply(&reply_frame, blocking);
                                 }
                             }
                             icmpv6::Icmpv6Action::Error(error_info) => {
@@ -3402,10 +3725,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                                self.record_rx_drop(payload_len);
-                            }
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3416,10 +3736,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                            self.record_rx_drop(payload_len);
-                        }
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3448,10 +3765,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                                self.record_rx_drop(payload_len);
-                            }
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3462,10 +3776,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                            self.record_rx_drop(payload_len);
-                        }
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3494,10 +3805,7 @@ impl UdpSocket {
                     if let Some(connected) = *self.connected_addr.lock().unwrap() {
                         if src_addr != connected {
                             let payload_len = decap.payload.len();
-                            let mut queue = self.recv_queue.lock().unwrap();
-                            if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                                self.record_rx_drop(payload_len);
-                            }
+                            self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                             return None;
                         }
                     }
@@ -3508,10 +3816,7 @@ impl UdpSocket {
                         *result = Some((copy_len, src_addr));
                     } else {
                         let payload_len = decap.payload.len();
-                        let mut queue = self.recv_queue.lock().unwrap();
-                        if queue.push(decap.payload.to_vec(), src_addr).is_err() {
-                            self.record_rx_drop(payload_len);
-                        }
+                        self.rx_enqueue(rx, decap.payload, src_addr, payload_len);
                     }
 
                     return None;
@@ -3554,10 +3859,7 @@ impl UdpSocket {
             if let Some(connected) = *self.connected_addr.lock().unwrap() {
                 if src_addr != connected {
                     let payload_len = parsed.payload.len();
-                    let mut queue = self.recv_queue.lock().unwrap();
-                    if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
-                        self.record_rx_drop(payload_len);
-                    }
+                    self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
                     return None;
                 }
             }
@@ -3575,10 +3877,7 @@ impl UdpSocket {
                 *result = Some((copy_len, src_addr));
             } else {
                 let payload_len = parsed.payload.len();
-                let mut queue = self.recv_queue.lock().unwrap();
-                if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
-                    self.record_rx_drop(payload_len);
-                }
+                self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
             }
 
             return None;
@@ -3616,10 +3915,7 @@ impl UdpSocket {
             if let Some(connected) = *self.connected_addr.lock().unwrap() {
                 if src_addr != connected {
                     let payload_len = parsed.payload.len();
-                    let mut queue = self.recv_queue.lock().unwrap();
-                    if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
-                        self.record_rx_drop(payload_len);
-                    }
+                    self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
                     return None;
                 }
             }
@@ -3637,10 +3933,7 @@ impl UdpSocket {
                 *result = Some((copy_len, src_addr));
             } else {
                 let payload_len = parsed.payload.len();
-                let mut queue = self.recv_queue.lock().unwrap();
-                if queue.push(parsed.payload.to_vec(), src_addr).is_err() {
-                    self.record_rx_drop(payload_len);
-                }
+                self.rx_enqueue(rx, parsed.payload, src_addr, payload_len);
             }
 
             return None;
@@ -4068,6 +4361,9 @@ impl UdpSocket {
             self.socket_backend.send_frame(&arp_frame, None)?;
 
             for _ in 0..POLLS_PER_ATTEMPT {
+                // rx_state is held for one poll only (buffering UDP that arrives meanwhile);
+                // the sleep below holds no lock.
+                let mut rx = lock_or_recover(&self.rx_state);
                 let frames = self.socket_backend.recv_frames(32)?;
                 for frame_data in &frames {
                     if frame_data.len() >= 14 {
@@ -4087,14 +4383,13 @@ impl UdpSocket {
                                     SocketAddrV4::new(parsed.src_ip, parsed.src_port)
                                 );
                                 let payload_len = parsed.payload.len();
-                                let mut queue = self.recv_queue.lock().unwrap();
-                                if queue.push(parsed.payload, src_addr).is_err() {
-                                    self.record_rx_drop(payload_len);
-                                }
+                                self.rx_enqueue(&mut rx, &parsed.payload, src_addr, payload_len);
                             }
                         }
                     }
                 }
+
+                drop(rx);
 
                 if let Some(mac) = self.arp_handler.resolve(target_ip) {
                     return Ok(mac);
@@ -4135,7 +4430,7 @@ impl UdpSocket {
 
     /// Get the number of packets in the receive queue.
     pub fn recv_queue_len(&self) -> usize {
-        self.recv_queue.lock().unwrap().len()
+        lock_or_recover(&self.rx_state).queue.len()
     }
 
     // ========================================================================
@@ -4148,7 +4443,7 @@ impl UdpSocket {
     /// payload bytes exceed this limit, incoming packets are dropped and the
     /// drop counters exposed by [`recv_drops`](Self::recv_drops) are bumped.
     pub fn recv_buffer_size(&self) -> usize {
-        self.recv_queue.lock().unwrap().max_bytes()
+        lock_or_recover(&self.rx_state).queue.max_bytes()
     }
 
     /// Set the socket receive buffer size in bytes.
@@ -4166,14 +4461,14 @@ impl UdpSocket {
                 "recv buffer size must be > 0",
             ));
         }
-        self.recv_queue.lock().unwrap().set_max_bytes(bytes);
+        lock_or_recover(&self.rx_state).queue.set_max_bytes(bytes);
         Ok(())
     }
 
     /// Returns the total bytes of queued payload currently held in the
     /// receive buffer. Useful for watermark-style monitoring.
     pub fn recv_buffer_bytes(&self) -> usize {
-        self.recv_queue.lock().unwrap().bytes()
+        lock_or_recover(&self.rx_state).queue.bytes()
     }
 
     /// Returns socket-level receive drop counters.
@@ -4202,7 +4497,7 @@ impl UdpSocket {
 
     /// Internal: record a receive-buffer drop (packet + bytes).
     ///
-    /// Called from every `recv_queue.push()` call site when the push fails
+    /// Called from every `rx.queue.push()` call site when the push fails
     /// because either the packet-count or byte limit would be exceeded. Also
     /// bumps the `rx_drops_buffer_full` perf counter for the perf reporter.
     #[inline]
@@ -4792,76 +5087,13 @@ impl UdpSocketBuilder {
             // Create backend closures that capture the socket's backend for the pipeline
             // We need raw function pointers since SocketBackend isn't Clone.
             // Use a shared reference approach via Arc.
-            let resources_for_recv = Arc::clone(&socket.resources);
-            let resources_for_send = Arc::clone(&socket.resources);
-
-            let recv_fn = move |max_frames: usize, pool: &FramePool| -> io::Result<Vec<FrameRef>> {
-                let packets = resources_for_recv.port.rx_burst(0, max_frames as u16)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rx_burst failed: {}", e)))?;
-                let mut refs = Vec::with_capacity(packets.len());
-                for mbuf in &packets {
-                    if let Some(data) = mbuf.data() {
-                        let len = mbuf.data_len() as usize;
-                        let actual_len = len.min(data.len());
-                        // Write directly from mbuf into FramePool — eliminates the
-                        // intermediate Vec<u8> allocation and one full memcpy per packet.
-                        if let Some(frame_ref) = pool.alloc_copy(&data[..actual_len]) {
-                            refs.push(frame_ref);
-                        }
-                    }
-                }
-                Ok(refs)
-            };
-
-            let send_fn = move |frame: &[u8]| -> io::Result<usize> {
-                let mut mbuf = resources_for_send.mempool.alloc()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
-                mbuf.set_data_len(frame.len() as u16);
-                mbuf.set_packet_len(frame.len() as u32);
-                let data = mbuf.data_mut()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
-                data.copy_from_slice(frame);
-                let mut packets = vec![mbuf];
-                let sent = resources_for_send.port.tx_burst(0, &mut packets)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
-                if sent == 0 {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
-                }
-                Ok(frame.len())
-            };
+            let recv_fn = DpdkResources::make_recv_fn(Arc::clone(&socket.resources));
+            let send_fn = DpdkResources::make_send_fn(Arc::clone(&socket.resources));
 
             // P3.5: Worker-direct TX — app thread sends on TX queue 1, bypassing
             // the tx_ring → RX lcore → TX queue 0 hop. This halves echo latency
             // by eliminating cross-thread synchronization on the TX path.
-            let resources_for_direct = Arc::clone(&socket.resources);
-            let direct_send_fn: Arc<dyn Fn(&[u8], Option<u16>) -> io::Result<usize> + Send + Sync> =
-                Arc::new(move |frame: &[u8], hw_vlan_tci: Option<u16>| -> io::Result<usize> {
-                    let mut mbuf = resources_for_direct.mempool.alloc()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mbuf alloc: {}", e)))?;
-                    mbuf.set_data_len(frame.len() as u16);
-                    mbuf.set_packet_len(frame.len() as u32);
-                    let data = mbuf.data_mut()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "mbuf data_mut failed"))?;
-                    data.copy_from_slice(frame);
-
-                    // Hardware VLAN insert: set mbuf VLAN TCI so the NIC tags on wire
-                    if let Some(tci) = hw_vlan_tci {
-                        let tx_offload = resources_for_direct.active_tx_offload;
-                        if (tx_offload & dpdk_sys::RTE_ETH_TX_OFFLOAD_VLAN_INSERT as u64) != 0 {
-                            mbuf.set_vlan_tci(tci);
-                            mbuf.set_ol_flags(dpdk_sys::RTE_MBUF_F_TX_VLAN as u64);
-                        }
-                    }
-
-                    let mut packets = vec![mbuf];
-                    // TX queue 1 = dedicated app thread TX queue (no RX lcore contention)
-                    let sent = resources_for_direct.port.tx_burst(1, &mut packets)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tx_burst: {}", e)))?;
-                    if sent == 0 {
-                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "tx queue full"));
-                    }
-                    Ok(frame.len())
-                });
+            let direct_send_fn = DpdkResources::make_direct_send_fn(Arc::clone(&socket.resources));
 
             let topo = topology::start_pipeline(
                 pipeline_config, recv_fn, send_fn, Some(direct_send_fn),
@@ -4903,6 +5135,9 @@ impl UdpSocket {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod thread_safety_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5060,6 +5295,58 @@ mod tests {
         // Verify checksum is valid (recalculating should give 0)
         let verify = ipv4_checksum(&header);
         assert_eq!(verify, 0);
+    }
+
+    /// Reference implementation: the original naive 16-bit loop.
+    fn naive_udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], hdr: &[u8], payload: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        sum += ((src_ip[0] as u32) << 8) | src_ip[1] as u32;
+        sum += ((src_ip[2] as u32) << 8) | src_ip[3] as u32;
+        sum += ((dst_ip[0] as u32) << 8) | dst_ip[1] as u32;
+        sum += ((dst_ip[2] as u32) << 8) | dst_ip[3] as u32;
+        sum += IP_PROTO_UDP as u32;
+        sum += (UDP_HEADER_LEN + payload.len()) as u32;
+        for i in (0..hdr.len()).step_by(2) {
+            if i == 6 { continue; }
+            sum += ((hdr[i] as u32) << 8) | hdr[i + 1] as u32;
+        }
+        for i in (0..payload.len()).step_by(2) {
+            let w = if i + 1 < payload.len() {
+                ((payload[i] as u32) << 8) | payload[i + 1] as u32
+            } else {
+                (payload[i] as u32) << 8
+            };
+            sum += w;
+        }
+        while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+        let r = !(sum as u16);
+        if r == 0 { 0xFFFF } else { r }
+    }
+
+    #[test]
+    fn test_udp_checksum_matches_naive_reference() {
+        let src_ip = [10, 0, 1, 7];
+        let dst_ip = [10, 0, 2, 9];
+        let hdr = [0x30, 0x39, 0x23, 0x28, 0x00, 0x00, 0x00, 0x00];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..=1600usize {
+            // Random data plus all-0xFF data (maximises carries).
+            let random: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let ones = vec![0xFFu8; len];
+            for payload in [&random, &ones] {
+                assert_eq!(
+                    udp_checksum(&src_ip, &dst_ip, &hdr, payload),
+                    naive_udp_checksum(&src_ip, &dst_ip, &hdr, payload),
+                    "len {}", len
+                );
+            }
+        }
     }
 
     #[test]
@@ -5988,7 +6275,8 @@ mod tests {
 
         // Push directly into the queue to simulate buffered packets.
         {
-            let mut q = socket.recv_queue.lock().unwrap();
+            let mut rx = lock_or_recover(&socket.rx_state);
+            let q = &mut rx.queue;
             q.push(vec![0u8; 500], test_src()).unwrap();
             q.push(vec![0u8; 700], test_src()).unwrap();
         }
@@ -6003,14 +6291,16 @@ mod tests {
 
         // Fill to 900 bytes.
         {
-            let mut q = socket.recv_queue.lock().unwrap();
+            let mut rx = lock_or_recover(&socket.rx_state);
+            let q = &mut rx.queue;
             q.push(vec![0u8; 900], test_src()).unwrap();
         }
 
         // Simulate a push attempt that overflows via the helper path.
         let rejected_len = 300usize;
         {
-            let mut q = socket.recv_queue.lock().unwrap();
+            let mut rx = lock_or_recover(&socket.rx_state);
+            let q = &mut rx.queue;
             if q.push(vec![0u8; rejected_len], test_src()).is_err() {
                 socket.record_rx_drop(rejected_len);
             }
@@ -6020,6 +6310,44 @@ mod tests {
         assert_eq!(drops.packets, 1);
         assert_eq!(drops.bytes, rejected_len as u64);
         assert_eq!(socket.recv_buffer_bytes(), 900, "queued bytes unchanged");
+    }
+
+    /// RTC/tokio mode has no pipeline `worker_loop`; the inline `try_recv_from`
+    /// path must feed `worker_idle_polls` / `worker_packets_processed` so the
+    /// reporter's `worker_idle_pct` is non-zero while the receiver is idle.
+    #[cfg(feature = "perf-counters")]
+    #[test]
+    fn try_recv_from_inline_feeds_worker_idle_counters() {
+        use std::sync::atomic::Ordering;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        let mut buf = [0u8; 64];
+
+        // Empty polls count as idle polls.
+        for _ in 0..3 {
+            assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+        }
+        let snap = socket.perf_counters.snapshot();
+        assert_eq!(snap.worker_idle_polls, 3);
+        assert_eq!(snap.worker_packets_processed, 0);
+        assert!(socket.perf_snapshot().worker_idle_pct > 99.0);
+
+        // A delivered (buffered) packet counts as processed.
+        {
+            let mut rx = lock_or_recover(&socket.rx_state);
+            let q = &mut rx.queue;
+            q.push(vec![7u8; 16], test_src()).unwrap();
+        }
+        let got = socket.try_recv_from(&mut buf).unwrap();
+        assert_eq!(got.map(|(n, _)| n), Some(16));
+        assert_eq!(
+            socket.perf_counters.worker_packets_processed.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            socket.perf_counters.worker_idle_polls.load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[test]

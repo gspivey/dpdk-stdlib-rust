@@ -73,12 +73,83 @@ The `dpdk-tokio` crate provides drop-in replacement sockets in `dpdk_tokio::comp
 | `into_std()` | ✅ | Implemented |
 | All socket options | ✅ | Same as std::net |
 
+### Opt-in idle backoff (additive extension, default OFF)
+
+`compat::tokio::UdpSocket` and `dpdk_stdlib_tokio::DpdkUdpSocket` gain two **additive inherent
+methods** (not on the `AsyncUdpSocket` trait, which is unchanged — semver-clean):
+
+| Method | Notes |
+|--------|-------|
+| `set_idle_backoff(&self, Option<Duration>)` | `Some(d)` enables the backoff; `None` disables (default). |
+| `idle_backoff(&self) -> Option<Duration>` | Returns the value exactly as passed (before clamping). |
+
+Behaviour when enabled: the DPDK `recv_from`/`recv` path keeps spinning with `yield_now` until the
+socket has had **no packet for `max(d, 2 ms)`**, then escalates to `tokio::time::sleep` in fixed
+~1 ms steps. The idle clock restarts the moment a packet arrives, so a loaded receiver never
+sleeps and throughput is unaffected. When disabled (the default) the path is exactly the 0.3.0
+spin (`try_recv_from` + `yield_now`), so callers who never opt in are unaffected.
+
+Tradeoffs and requirements:
+
+- **Latency:** tokio's timer resolution is ~1 ms, so the first packet after an idle period can be
+  delayed by up to **~1-2 ms**. Sub-millisecond precision is not claimed. This is why the feature
+  is opt-in.
+- **Time driver required:** the runtime must have the time driver enabled (`enable_time` /
+  `enable_all`; `#[tokio::main]` provides it). There is **no "cannot panic" guarantee**: on a
+  runtime built without timers, the backoff panics exactly like any other `tokio::time` call
+  once it reaches the sleep stage. A busy receiver never reaches that stage.
+- **Behaviour note:** with the backoff enabled the recv path sleeps when idle; with it disabled
+  nothing changes from 0.3.0.
+- On the kernel (`Tokio`) fallback variant of the compat socket the setter only stores the value
+  (`idle_backoff()` returns it): a kernel socket already parks on the reactor.
+
+`tokio-echo --idle-backoff-ms N` binds `DpdkUdpSocket` directly, calls `set_idle_backoff(Some(N ms))`
+and erases it to `Arc<dyn AsyncUdpSocket>`; if that bind fails it prints
+`idle backoff unavailable: falling back to the standard bind` and continues without backoff.
+
 ### Not Implemented (OS-specific, N/A for DPDK)
 
 - `AsRawFd` / `FromRawFd` / `IntoRawFd` (Unix)
 - `AsRawSocket` / `FromRawSocket` / `IntoRawSocket` (Windows)
 
 These traits don't apply to DPDK since it bypasses the kernel networking stack.
+
+### Thread Safety (`dpdk_udp::UdpSocket`)
+
+`UdpSocket` is `Send + Sync` and safe to share across threads via `Arc`, like
+`std::net::UdpSocket`. Concurrent `send_to` and `recv_from` from multiple threads are sound.
+
+- **Per direction.** Each socket serializes its TX side (`tx_state`: the frame scratch buffer)
+  and its RX side (`rx_state`: the buffered receive queue and the app-ring round-robin index)
+  independently, so a sender and a receiver never contend on socket state.
+- **Per hardware queue.** All sockets on a port serialize on shared guards for the actual burst
+  (`q_rx0`, `q_tx0`, and the pipeline's worker-direct TX queue `q_tx_direct`), because DPDK forbids
+  concurrent `rx_burst`/`tx_burst` on one queue. N senders are therefore serialized among
+  themselves, as `std::net::UdpSocket` effectively is at the syscall level.
+- **Lock order** (the only nesting that exists): `rx_state < q_rx0 < tx_state < q_tx0 < q_tx_direct`.
+  A send takes `tx_state` then a TX queue guard. A receive takes `rx_state` then `q_rx0`; an
+  ARP/ICMP/NDP/ICMPv6 auto-reply is a prebuilt frame and takes only `q_tx0`. `resolve_arp` locks
+  per poll iteration and holds nothing across its sleep.
+- **Leaf locks** (`connected_addr`, `connection_state`, the ARP/NDP caches, `error_queue`) may be
+  taken under the guards above but are never held while acquiring one.
+- **Poisoning.** No critical section panics; every guard is taken through a poison-tolerant helper
+  so one unrelated panic cannot wedge a socket.
+- **No loom model.** The design adds no lock-free protocol, only `std::sync::Mutex` guards.
+- **`Generic` backends** (`bind_with_backend`) bypass the queue guards; the backend synchronizes
+  itself.
+
+Behaviour notes for the non-blocking entry points (`#[doc(hidden)]` `try_send_to_nb`,
+`try_send_nb`, `try_recv_from_nb`, used by the tokio compat layer):
+
+1. They return `WouldBlock` when the per-direction or queue guard is held, but a `try_send_to` to
+   an **unresolved** peer still reaches `resolve_arp`, which can block up to ~3 s on an ARP miss
+   (unchanged 0.3.0 behaviour).
+2. On a `Generic` backend they can still wait inside the backend's own lock (for example
+   `DpdkBackend`'s single `Mutex<Port>`); the non-blocking contract covers only the guards above.
+   In pipeline mode the worker-direct send briefly waits on `q_tx_direct`.
+3. If a non-blocking receive pulls an ARP/ICMP/NDP/ICMPv6 frame while `q_tx0` is busy, the
+   auto-reply is **dropped and counted** in `auto_reply_drops()` rather than waited for (not in
+   App Drops). The peer retransmits; the next uncontended receive answers.
 
 ---
 
