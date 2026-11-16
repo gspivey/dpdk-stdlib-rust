@@ -56,7 +56,9 @@ if [[ ! -f "$DPDK_TARBALL" ]]; then
 fi
 # Point releases unpack to dpdk-stable-X.Y.Z, the .0 release to dpdk-X.Y.
 # Read the top-level directory from the tarball instead of guessing.
-DPDK_DIR=$(tar -tf "$DPDK_TARBALL" | head -1 | cut -d/ -f1)
+# sed reads the whole listing: `| head -1` would close the pipe early, tar
+# would die of SIGPIPE, and pipefail would fail the script (exit 141).
+DPDK_DIR=$(tar -tf "$DPDK_TARBALL" | sed -n '1s#/.*##p')
 if [[ -z "$DPDK_DIR" ]]; then
     echo "ERROR: could not read top-level directory from $DPDK_TARBALL" >&2
     exit 1

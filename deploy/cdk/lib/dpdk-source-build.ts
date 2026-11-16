@@ -44,7 +44,8 @@ export function dpdkSourceBuild(dpdkVersion: unknown): DpdkSourceBuild {
     `DPDK_VERSION="${dpdkVersion}"`,
     'curl -fL "https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz" -o "dpdk-${DPDK_VERSION}.tar.xz"',
     // Point releases unpack to dpdk-stable-X.Y.Z, the .0 release to dpdk-X.Y.
-    'DPDK_DIR=$(tar -tf "dpdk-${DPDK_VERSION}.tar.xz" | head -1 | cut -d/ -f1)',
+    // sed reads the whole listing; `| head -1` would SIGPIPE tar under pipefail.
+    'DPDK_DIR=$(tar -tf "dpdk-${DPDK_VERSION}.tar.xz" | sed -n "1s#/.*##p")',
     'tar -xf "dpdk-${DPDK_VERSION}.tar.xz"',
     'cd "$DPDK_DIR"',
     'echo "=== Building DPDK ${DPDK_VERSION} ==="',
