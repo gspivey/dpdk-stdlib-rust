@@ -94,7 +94,7 @@ jobs:
       - name: Validate Packer template
         run: |
           cd packer
-          packer validate dpdk-ami.pkr.hcl
+          packer validate -var "dpdk_version=${DPDK_VERSION}" dpdk-ami.pkr.hcl
 
       - name: Build AMI
         id: build

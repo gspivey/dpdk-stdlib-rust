@@ -91,7 +91,7 @@ jobs:
       - name: Validate Packer template
         run: |
           cd packer
-          packer validate dpdk-ami-graviton.pkr.hcl
+          packer validate -var "dpdk_version=${DPDK_VERSION}" dpdk-ami-graviton.pkr.hcl
 
       - name: Build AMI
         id: build
