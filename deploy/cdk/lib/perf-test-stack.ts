@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { Construct } from 'constructs';
+import { DPDK_VERSION_CONTEXT_KEY, dpdkSourceBuild } from './dpdk-source-build';
 
 export interface PerfTestStackProps extends cdk.StackProps {
   /** EC2 instance class for the DUT. Default: C6IN */
@@ -44,6 +45,9 @@ export class PerfTestStack extends cdk.Stack {
     const trexAmiId = this.node.tryGetContext('trexAmiId');
     const usePrebuiltDpdkAmi = !!dpdkAmiId;
     const usePrebuiltTrexAmi = !!trexAmiId;
+    // Without a pre-built DUT AMI, DPDK is built from source at the release
+    // given by -c dpdkVersion=<release>. CI always passes a per-line AMI.
+    const dutSourceBuild = dpdkSourceBuild(this.node.tryGetContext(DPDK_VERSION_CONTEXT_KEY));
 
     // VPC with same topology as integration tests
     const vpc = new ec2.Vpc(this, 'PerfTestVpc', {
@@ -299,6 +303,7 @@ export class PerfTestStack extends cdk.Stack {
     ];
 
     const dutFullBootstrap = [
+      ...dutSourceBuild.guard,
       'echo "=== Full DUT bootstrap ==="',
       'dnf update -y',
       'dnf groupinstall -y "Development Tools"',
@@ -310,16 +315,8 @@ export class PerfTestStack extends cdk.Stack {
       'echo "export HOME=/root" >> /etc/profile',
       'dnf install -y meson ninja-build python3-pip libbsd-devel libpcap-devel numactl-devel kernel-devel kernel-headers --allowerasing',
       'pip3 install pyelftools || pip3 install --break-system-packages pyelftools',
-      'cd /opt',
-      'DPDK_VERSION="22.11.6"',
-      'curl -L "https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz" -o "dpdk-${DPDK_VERSION}.tar.xz"',
-      'tar -xf "dpdk-${DPDK_VERSION}.tar.xz"',
-      'cd dpdk-stable-${DPDK_VERSION}',
-      'meson setup build --prefix=/usr/local --libdir=lib --buildtype=release -Denable_kmods=false -Ddisable_drivers=net/gve,net/ionic',
-      'ninja -C build',
-      'ninja -C build install',
-      'echo "/usr/local/lib" > /etc/ld.so.conf.d/dpdk.conf',
-      'ldconfig',
+      // Download and build DPDK (release from -c dpdkVersion=..., no default)
+      ...dutSourceBuild.build,
     ];
 
     const dutRuntimeConfig = [

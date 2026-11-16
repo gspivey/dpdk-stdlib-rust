@@ -21,6 +21,17 @@ new PerfTestStack(app, 'PerfTestStack', { env });
 // collide with the concurrent DpdkTestStack used by integration-tests.yml.
 new DpdkTestStack(app, 'DpdkTestStackQuic', { env });
 
+// ── Older supported DPDK LTS lines (x86_64, weekly) ──────────────────────────
+// One stack per older LTS line so the weekly integration-tests-dpdk-<line>.yml
+// runs never share a CloudFormation stack with the primary-line PR/nightly
+// runs (DpdkTestStack). The DPDK release comes from the per-line AMI the
+// workflow passes as -c amiId=...; nothing here pins a version. Remove a line
+// here, with its wrapper workflow, when upstream ends its LTS support.
+// Names must match the stack mapping in integration-tests-reusable.yml.
+for (const line of ['23.11', '24.11']) {
+  new DpdkTestStack(app, `DpdkTestStackDpdk${line.replace('.', '')}`, { env });
+}
+
 // ── Graviton (arm64) stacks ──────────────────────────────────────────────────
 // TRex stays on x86_64 in PerfTestStackGraviton — TRex does not support ARM.
 new DpdkTestStack(app, 'DpdkTestStackGraviton', {
