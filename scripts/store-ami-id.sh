@@ -5,10 +5,20 @@
 #   ./scripts/store-ami-id.sh put <ami-id>
 #   ./scripts/store-ami-id.sh get
 #   ./scripts/store-ami-id.sh check
+#
+# Works on the x86_64 AMI of one DPDK LTS line: DPDK_LINE (default 25.11,
+# the primary line). Parameter: /dpdk-stdlib-rust/ami/dpdk-<line>/latest.
+# The build workflow (build-dpdk-ami.yml) normally writes it; `put` is for
+# manual recovery only.
 
 set -euo pipefail
 
-SSM_PARAMETER="/dpdk-stdlib-rust/ami/latest"
+DPDK_LINE="${DPDK_LINE:-25.11}"
+if [[ ! "$DPDK_LINE" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+    echo "DPDK_LINE must look like 25.11, got '$DPDK_LINE'" >&2
+    exit 1
+fi
+SSM_PARAMETER="/dpdk-stdlib-rust/ami/dpdk-${DPDK_LINE}/latest"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 case "${1:-}" in

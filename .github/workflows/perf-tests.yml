@@ -113,9 +113,10 @@ jobs:
       - name: Fetch AMI IDs from SSM
         id: amis
         run: |
-          DPDK_AMI=$(aws ssm get-parameter \
-            --name /dpdk-stdlib-rust/ami/latest \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          # Primary DPDK LTS line (README "Supported DPDK versions"). Fails loudly
+          # when the per-line AMI is missing; no fallback to another DPDK release.
+          bash scripts/ci/resolve-dpdk-ami.sh 25.11 x86_64 > "$RUNNER_TEMP/dpdk-ami.env"
+          DPDK_AMI=$(sed -n "s/^ami_id=//p" "$RUNNER_TEMP/dpdk-ami.env")
           TREX_AMI=$(aws ssm get-parameter \
             --name /dpdk-stdlib-rust/ami/trex-latest \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")

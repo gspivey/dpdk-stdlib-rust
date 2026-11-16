@@ -1,0 +1,36 @@
+name: Integration Tests (DPDK 23.11, weekly)
+
+# Weekly EC2 integration tests on the older supported LTS line 23.11 (x86_64).
+# Upstream end of life: December 2026. Delete this file, its stack in
+# deploy/cdk/app.ts, its mapping in integration-tests-reusable.yml, its entry
+# in lts-compat-gate.yml and its README badge when the line reaches end of life.
+#
+# A red latest scheduled run on main blocks feature PRs (lts-compat-gate.yml)
+# until a fix lands; PRs that fix it carry the `lts-compat-fix` label.
+
+on:
+  schedule:
+    - cron: '0 9 * * 0' # Sunday 09:00 UTC, after the 04:00 AMI rebuild
+  workflow_dispatch: {}
+
+concurrency:
+  group: integration-tests-dpdk-23.11
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  dpdk-23-11:
+    uses: ./.github/workflows/integration-tests-reusable.yml
+    with:
+      dpdk_line: '23.11'
+      arch: x86_64
+      skip_passed_commit: false
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
