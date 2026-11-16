@@ -590,11 +590,17 @@ impl Port {
             dpdk_sys::rte_eth_link_get_nowait(self.port_id, &mut link);
         }
 
-        LinkStatus {
-            speed: link.link_speed,
-            full_duplex: link.link_duplex() != 0,
-            autoneg: link.link_autoneg() != 0,
-            link_up: link.link_status() != 0,
+        // rte_eth_link's layout differs across DPDK releases (24.07 moved the
+        // fields into an anonymous union), so read them through dpdk-sys
+        // accessors rather than bindgen field names.
+        let link_ptr: *const dpdk_sys::rte_eth_link = &link;
+        unsafe {
+            LinkStatus {
+                speed: dpdk_sys::eth_link_get_speed(link_ptr),
+                full_duplex: dpdk_sys::eth_link_get_duplex(link_ptr) != 0,
+                autoneg: dpdk_sys::eth_link_get_autoneg(link_ptr) != 0,
+                link_up: dpdk_sys::eth_link_get_status(link_ptr) != 0,
+            }
         }
     }
 

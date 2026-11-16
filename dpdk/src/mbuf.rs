@@ -134,7 +134,7 @@ impl Mbuf {
     /// in ol_flags. On TX, the application sets this and the NIC inserts the
     /// VLAN tag when `RTE_MBUF_F_TX_VLAN` is set.
     pub fn vlan_tci(&self) -> u16 {
-        unsafe { (*self.raw.as_ptr()).vlan_tci }
+        unsafe { dpdk_sys::mbuf_get_vlan_tci(self.raw.as_ptr()) }
     }
 
     /// Set the VLAN TCI field for hardware VLAN insertion on TX.
@@ -143,7 +143,7 @@ impl Mbuf {
     /// to actually insert the VLAN tag.
     pub fn set_vlan_tci(&mut self, tci: u16) {
         unsafe {
-            (*self.raw.as_ptr()).vlan_tci = tci;
+            dpdk_sys::mbuf_set_vlan_tci(self.raw.as_ptr(), tci);
         }
     }
 
