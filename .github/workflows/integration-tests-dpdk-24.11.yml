@@ -12,9 +12,16 @@ on:
   schedule:
     - cron: '0 12 * * 0' # Sunday 12:00 UTC, after the 04:00 AMI rebuild
   workflow_dispatch: {}
+  # TEMPORARY (PR #158 proof run): workflow_dispatch only reaches files on the
+  # default branch, so this trigger runs the wrapper once on the PR. Removed
+  # before merge.
+  pull_request:
+    branches: [development]
 
 concurrency:
-  group: integration-tests-dpdk-24.11
+  # TEMPORARY (PR #158 proof run): shares integration-tests-graviton's group so at most three
+  # test VPCs exist at once (5-VPC-per-region limit). Restored before merge.
+  group: integration-tests-graviton
   cancel-in-progress: false
 
 permissions:
