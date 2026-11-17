@@ -18,11 +18,17 @@ STACK="${1:?Usage: cleanup-cfn-stack.sh <stack-name>}"
 # deploys. This function finds VPCs tagged with the stack name and tears them
 # down completely. Safe to call when no orphans exist (no-ops).
 purge_orphaned_vpcs() {
-  local vpc_ids
-  vpc_ids=$(aws ec2 describe-vpcs \
+  local vpc_ids purge_failed=0
+  # No `|| true` here: expired credentials, throttling or an IAM deny must not
+  # read as "nothing to clean" -- that would report success while an abandoned
+  # instance keeps billing.
+  if ! vpc_ids=$(aws ec2 describe-vpcs \
     --filters "Name=tag:aws:cloudformation:stack-name,Values=$STACK" \
     --query 'Vpcs[*].VpcId' \
-    --output text 2>/dev/null || true)
+    --output text); then
+    echo "::error::describe-vpcs failed for $STACK; cannot check for orphaned resources"
+    return 1
+  fi
 
   if [[ -z "$vpc_ids" || "$vpc_ids" == "None" ]]; then
     echo "No orphaned VPCs found for stack $STACK"
@@ -135,11 +141,36 @@ purge_orphaned_vpcs() {
     # 8. Finally delete the VPC itself
     echo "  Deleting VPC $VPC_ID"
     if ! aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null; then
-      echo "::warning::Could not delete VPC $VPC_ID -- may still have attached resources. Manual cleanup needed."
+      echo "::error::Could not delete VPC $VPC_ID -- may still have attached resources. Manual cleanup needed."
+      purge_failed=1
     else
       echo "  VPC $VPC_ID deleted"
     fi
   done
+  return "$purge_failed"
+}
+
+# ── Terminate the stack's instances before deleting the stack ─────────────────
+# The DPDK ENI is bound to a userspace driver inside the running instance, so
+# CloudFormation's AWS::EC2::NetworkInterfaceAttachment delete cannot detach it
+# ("Exceeded attempts to wait", NotStabilized). The stack then lands in
+# DELETE_FAILED, force-delete abandons the VPC and the receiver instance, and
+# the instance keeps running (and billing). Terminating the instances first
+# releases the attachments, so the stack delete is clean.
+terminate_stack_instances() {
+  local ids
+  ids=$(aws ec2 describe-instances \
+    --filters "Name=tag:aws:cloudformation:stack-name,Values=$STACK" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[*].Instances[*].InstanceId' \
+    --output text)
+  if [[ -z "$ids" || "$ids" == "None" ]]; then
+    return 0
+  fi
+  echo "Terminating $STACK instances before the stack delete: $ids"
+  aws ec2 terminate-instances --instance-ids $ids > /dev/null
+  timeout 4m aws ec2 wait instance-terminated --instance-ids $ids
+  echo "  Instances terminated"
 }
 
 # ── Stack status check ────────────────────────────────────────────────────────
@@ -152,7 +183,10 @@ if ! OUT=$(aws cloudformation describe-stacks \
              --output text 2>&1); then
   if grep -q 'does not exist' <<< "$OUT"; then
     echo "No existing stack $STACK -- checking for orphaned VPCs"
-    purge_orphaned_vpcs
+    if ! purge_orphaned_vpcs; then
+      echo "::error::Orphaned resources from $STACK could not be fully removed"
+      exit 1
+    fi
     exit 0
   fi
   echo "::error::describe-stacks failed: $OUT"
@@ -177,7 +211,10 @@ case "$STATUS" in
       exit 1
     fi
     echo "$STACK successfully removed"
-    purge_orphaned_vpcs
+    if ! purge_orphaned_vpcs; then
+      echo "::error::Orphaned resources from $STACK could not be fully removed"
+      exit 1
+    fi
     exit 0
     ;;
   *_IN_PROGRESS)
@@ -185,6 +222,24 @@ case "$STATUS" in
     exit 1
     ;;
 esac
+
+# From here on this run owns the delete. Purge orphaned resources on EVERY exit
+# path, including a failed or timed-out delete: FORCE_DELETE_STACK abandons the
+# VPC and instances it cannot delete, and before this trap a failed wait exited
+# before the purge ran, leaving instances billing until the next run of the same
+# stack. A purge failure turns the exit code non-zero.
+finish() {
+  local rc=$?
+  trap - EXIT
+  if ! purge_orphaned_vpcs; then
+    echo "::error::Orphaned resources from $STACK could not be fully removed"
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+
+terminate_stack_instances
 
 print_failed_events() {
   aws cloudformation describe-stack-events \
@@ -207,9 +262,12 @@ if [ "$STATUS" != "DELETE_IN_PROGRESS" ]; then
   sleep 5   # allow IN_PROGRESS to register before the waiter polls
 fi
 
-# aws cloudformation wait default is 60 min, exceeding the 20-min step budget.
-# Wrap in timeout so the diagnostic branch runs before GitHub kills the step.
-if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+# Wait budget: callers allow 18-20 min (pre-deploy step timeout 20 min;
+# run-perf-tests.sh caps the script at 1080 s). terminate 4 + delete 9 +
+# force-delete 3 = 16 min, leaving time for the EXIT-trap purge to finish
+# before the caller kills the script. With the instances terminated first the
+# delete normally completes in a few minutes.
+if ! timeout 9m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
   # Check if we landed in DELETE_FAILED after a plain delete (stuck ENI, etc).
   # Retry once with force-delete so teardown clears debris in the same run
   # rather than leaving the stack stuck for the next run's pre-deploy step.
@@ -219,7 +277,7 @@ if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$ST
     echo "::warning::$STACK entered DELETE_FAILED -- retrying with force-delete"
     print_failed_events
     aws cloudformation delete-stack --stack-name "$STACK" --deletion-mode FORCE_DELETE_STACK
-    if ! timeout 10m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+    if ! timeout 3m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
       print_failed_events
       echo "::error::Force-delete of $STACK failed -- orphaned resources need manual cleanup"
       exit 1
@@ -231,9 +289,4 @@ if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$ST
   fi
 fi
 echo "$STACK successfully removed"
-
-# Always run orphaned VPC purge after any successful stack deletion.
-# FORCE_DELETE_STACK abandons resources it cannot delete; purge_orphaned_vpcs
-# finds them by the aws:cloudformation:stack-name tag and tears them down so
-# they do not accumulate and hit the 5-VPC-per-region account limit.
-purge_orphaned_vpcs
+# The EXIT trap (finish) runs the orphaned VPC purge.

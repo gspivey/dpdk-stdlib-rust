@@ -141,18 +141,11 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Fetch DPDK AMI ID from SSM
+      # QUIC runs on the primary DPDK LTS line only (README "Supported DPDK
+      # versions"). Fails loudly when the per-line AMI is missing.
+      - name: Resolve DPDK 25.11 x86_64 AMI
         id: ami
-        run: |
-          AMI_ID=$(aws ssm get-parameter \
-            --name /dpdk-stdlib-rust/ami/latest \
-            --query "Parameter.Value" \
-            --output text 2>/dev/null || echo "")
-          if [[ -n "$AMI_ID" ]]; then
-            echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ami_id=" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash scripts/ci/resolve-dpdk-ami.sh 25.11 x86_64
 
       - name: Resolve PR number
         id: pr
@@ -220,6 +213,7 @@ jobs:
             TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
             FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
             SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=${SKIPPED:-0}  # `| head -1 || echo` never fires: head succeeds
             echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
             TOTAL_TESTS=$((TOTAL_TESTS + TESTS))
             TOTAL_FAILURES=$((TOTAL_FAILURES + FAILURES))
@@ -320,4 +314,6 @@ jobs:
         if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic || echo "Safety net teardown failed (stack may already be gone)"
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic

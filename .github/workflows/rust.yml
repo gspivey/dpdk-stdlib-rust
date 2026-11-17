@@ -43,3 +43,118 @@ jobs:
       run: cargo test -p dpdk-stdlib-udp thread_safety && cargo test -p dpdk-stdlib-tokio --test dpdk_mock_backend
     - name: Auto-trait assertions (dpdk-stdlib-tokio without feature)
       run: cargo test -p dpdk-stdlib-tokio
+
+  dpdk-compat:
+    # Compiles the real-DPDK (bindgen) path against every supported DPDK LTS.
+    # The `build` job above only exercises the stub backend, and the EC2
+    # integration tests pin one DPDK release, so layout changes in newer DPDK
+    # headers (e.g. the anonymous unions added to rte_mbuf and rte_eth_link in
+    # 24.07) would otherwise go unnoticed. DPDK is built minimally (no apps,
+    # tests or examples; a few virtual drivers) and the install prefix is
+    # cached per version. Bump DPDK_BUILD_REV when changing the meson options.
+    #
+    # Support policy: exactly the DPDK LTS lines upstream still maintains, each
+    # dropped at its upstream end of life (https://core.dpdk.org/roadmap/).
+    #   23.11  EOL Dec 2026
+    #   24.11  EOL Dec 2027
+    #   25.11  EOL Dec 2028  (primary)
+    # The next LTS is tracked from its release candidates as a required leg, so
+    # it works on release day. Adding or retiring a line is one matrix entry.
+    # Released versions come from fast.dpdk.org pinned by sha256; release
+    # candidates are not published there, so they are cloned by tag and pinned
+    # by commit.
+    name: DPDK ${{ matrix.dpdk.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        dpdk:
+          - version: "23.11.8"
+            sha256: 17fa62321481618b735c029b652e37f8adf0e2233fced6dc1a2c9058c2d21259
+          - version: "24.11.8"
+            sha256: f3dbfac841b2db8e53a97d68a5e14ebc943327a955f0afb97f8c14f544fbc4aa
+          - version: "25.11.4"
+            sha256: 50272f214b2e7fd23dc9b6b4d5408b54798021b19611339298784faa5a189b43
+          - version: "26.11-rc3"
+            git_commit: e75a66edd20d1cf1f22984c53bfd2bce8c883953
+    env:
+      DPDK_BUILD_REV: "1"
+      DPDK_PREFIX: /home/runner/dpdk-install
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential meson ninja-build python3-pyelftools \
+          libnuma-dev pkg-config libclang-dev clang
+
+    - name: Identify OS image
+      id: os
+      run: |
+        . /etc/os-release
+        echo "id=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Cache DPDK install
+      id: dpdk-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.DPDK_PREFIX }}
+        key: dpdk-${{ matrix.dpdk.version }}-${{ matrix.dpdk.sha256 || matrix.dpdk.git_commit }}-${{ steps.os.outputs.id }}-rev${{ env.DPDK_BUILD_REV }}
+
+    - name: Build DPDK ${{ matrix.dpdk.version }}
+      if: steps.dpdk-cache.outputs.cache-hit != 'true'
+      run: |
+        cd "$RUNNER_TEMP"
+        VERSION="${{ matrix.dpdk.version }}"
+        if [ -n "${{ matrix.dpdk.git_commit }}" ]; then
+          # Release candidate: clone the tag and fail unless it is the pinned commit.
+          git clone --depth 1 --branch "v${VERSION}" https://dpdk.org/git/dpdk dpdk-src
+          actual="$(git -C dpdk-src rev-parse HEAD)"
+          if [ "$actual" != "${{ matrix.dpdk.git_commit }}" ]; then
+            echo "::error::tag v${VERSION} is ${actual}, expected ${{ matrix.dpdk.git_commit }}"
+            exit 1
+          fi
+        else
+          curl -fsSLO "https://fast.dpdk.org/rel/dpdk-${VERSION}.tar.xz"
+          echo "${{ matrix.dpdk.sha256 }}  dpdk-${VERSION}.tar.xz" | sha256sum -c -
+          mkdir dpdk-src
+          tar -xJf "dpdk-${VERSION}.tar.xz" -C dpdk-src --strip-components=1
+        fi
+        cd dpdk-src
+        meson setup build \
+          --prefix="$DPDK_PREFIX" \
+          -Dlibdir=lib \
+          -Dplatform=generic \
+          -Ddefault_library=shared \
+          -Dtests=false \
+          -Ddisable_apps='*' \
+          -Denable_drivers=bus/vdev,mempool/ring,net/null,net/ring
+        ninja -C build install
+
+    - name: Point pkg-config at DPDK
+      run: |
+        echo "PKG_CONFIG_PATH=$DPDK_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$DPDK_PREFIX/lib" >> "$GITHUB_ENV"
+        PKG_CONFIG_PATH="$DPDK_PREFIX/lib/pkgconfig" pkg-config --modversion libdpdk
+
+    - name: Build workspace (bindgen backend)
+      run: |
+        cargo build --workspace --features dpdk-stdlib-sys/bindgen 2>&1 | tee "$RUNNER_TEMP/build.log"
+        # build.rs only warns when it falls back to stubs; make that fatal here.
+        if grep -q "using stub implementations" "$RUNNER_TEMP/build.log"; then
+          echo "::error::dpdk-stdlib-sys fell back to stubs; the real-DPDK path was not compiled"
+          exit 1
+        fi
+        ls target/debug/build/dpdk-stdlib-sys-*/out/bindings.rs
+
+    - name: Build workspace tests (bindgen backend)
+      run: cargo test --workspace --features dpdk-stdlib-sys/bindgen --no-run
+
+    - name: Assert the real DPDK backend is active
+      run: DPDK_STDLIB_EXPECT_BACKEND=bindgen cargo test -p dpdk-stdlib-sys --features bindgen --test backend

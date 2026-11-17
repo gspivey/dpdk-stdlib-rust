@@ -1,0 +1,107 @@
+name: LTS Compat Gate
+
+# Blocks pull requests while the latest weekly EC2 run on an older supported
+# DPDK LTS line is red on main (README "Supported DPDK versions"). Support for
+# an older line is a promise; new features wait until it is kept again.
+#
+# A PR that fixes the older-line failure (or must merge regardless) carries the
+# `lts-compat-fix` label; the gate then passes and says so. No AWS access, no
+# EC2: it only reads workflow run conclusions through the GitHub API.
+#
+# Making this check required is a branch-protection setting on development
+# and main ("LTS Compat Gate / older-lts-weekly").
+
+on:
+  pull_request:
+    branches: [main, development]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: lts-compat-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  older-lts-weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the latest weekly run of each older LTS line on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          OVERRIDE_LABEL: lts-compat-fix
+          # One weekly wrapper per older supported LTS line. Remove a line's
+          # entry when it reaches upstream end of life.
+          WRAPPERS: |
+            23.11 integration-tests-dpdk-23.11.yml
+            24.11 integration-tests-dpdk-24.11.yml
+        run: |
+          set -euo pipefail
+          summary() { echo "$*" >> "$GITHUB_STEP_SUMMARY"; }
+
+          summary "## Older DPDK LTS lines (weekly EC2 runs on main)"
+          summary ""
+          summary "| Line | Latest scheduled run on main | Result |"
+          summary "|---|---|---|"
+
+          red=()
+          while read -r line wf; do
+            [[ -z "$line" ]] && continue
+            # 404 = the wrapper has never run (not on main yet): nothing red to report.
+            if ! out=$(gh api "repos/${REPO}/actions/workflows/${wf}/runs?branch=main&event=schedule&status=completed&per_page=20" 2>&1); then
+              if grep -q 'HTTP 404' <<<"$out"; then
+                summary "| ${line} | none yet (\`${wf}\` has not run on main) | ➖ |"
+                continue
+              fi
+              echo "::error::GitHub API error reading ${wf} runs: ${out}"
+              exit 1
+            fi
+            # Ignore runs cancelled or skipped before they produced a verdict.
+            run=$(jq -c '[.workflow_runs[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0] // empty' <<<"$out")
+            if [[ -z "$run" ]]; then
+              summary "| ${line} | none yet | ➖ |"
+              continue
+            fi
+            conclusion=$(jq -r .conclusion <<<"$run")
+            url=$(jq -r .html_url <<<"$run")
+            when=$(jq -r .run_started_at <<<"$run")
+            if [[ "$conclusion" == "success" ]]; then
+              summary "| ${line} | [${when}](${url}) | ✅ ${conclusion} |"
+            else
+              summary "| ${line} | [${when}](${url}) | ❌ ${conclusion} |"
+              red+=("DPDK ${line}: ${conclusion} (${url})")
+            fi
+          done <<<"$WRAPPERS"
+
+          summary ""
+          if [[ ${#red[@]} -eq 0 ]]; then
+            summary "All older supported LTS lines are green (or have not run yet)."
+            exit 0
+          fi
+
+          if jq -e --arg l "$OVERRIDE_LABEL" 'index($l) != null' <<<"$LABELS" >/dev/null; then
+            summary "**Passing because this PR has the \`${OVERRIDE_LABEL}\` label**, although these lines are red:"
+            for r in "${red[@]}"; do summary "- ${r}"; done
+            echo "::notice::Older LTS line(s) red, but the PR is labeled ${OVERRIDE_LABEL}: ${red[*]}"
+            exit 0
+          fi
+
+          summary "### Blocked"
+          summary ""
+          summary "The latest weekly run failed on these supported LTS lines:"
+          for r in "${red[@]}"; do summary "- ${r}"; done
+          summary ""
+          summary "New work waits until every supported DPDK line is green again. To unblock:"
+          summary ""
+          summary "1. Open the failed run above and fix the regression on that DPDK line (or the test infrastructure, if that is what failed)."
+          summary "2. Add the \`${OVERRIDE_LABEL}\` label to the PR with the fix. This gate passes for labeled PRs."
+          summary "3. Once the fix is on main, the next scheduled run of the wrapper (Sunday) turns the line green and this gate passes for every PR."
+          summary ""
+          summary "If a line has reached upstream end of life, drop it instead (README \"Supported DPDK versions\")."
+          for r in "${red[@]}"; do echo "::error::Latest weekly EC2 run is red on ${r}. Fix it in a PR labeled ${OVERRIDE_LABEL}; see the job summary."; done
+          exit 1

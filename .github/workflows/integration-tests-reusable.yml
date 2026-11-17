@@ -1,0 +1,814 @@
+name: Integration Tests (reusable)
+
+# EC2 integration tests for one supported DPDK LTS line on one architecture.
+# Not triggered directly; each caller owns its triggers, concurrency group and
+# README badge:
+#
+#   integration-tests.yml            primary line (25.11), x86_64, PR + nightly
+#   integration-tests-graviton.yml   primary line (25.11), arm64,  PR + nightly
+#   integration-tests-dpdk-24.11.yml 24.11, x86_64, weekly + manual
+#   integration-tests-dpdk-23.11.yml 23.11, x86_64, weekly + manual
+#
+# The AMI comes from the per-line SSM parameter (scripts/ci/resolve-dpdk-ami.sh);
+# a missing or mismatched AMI fails the run instead of falling back.
+# Supported lines follow upstream's LTS roadmap: README "Supported DPDK versions".
+
+on:
+  workflow_call:
+    inputs:
+      dpdk_line:
+        description: 'DPDK LTS line, e.g. 25.11'
+        type: string
+        required: true
+      arch:
+        description: 'x86_64 or arm64'
+        type: string
+        required: true
+      synthetic_perf:
+        description: 'Also run the mock-backend synthetic benchmarks (architecture-independent; primary x86 caller only)'
+        type: boolean
+        default: false
+      skip_passed_commit:
+        description: 'On schedule, skip EC2 jobs when this commit already passed a scheduled run of the caller (nightly callers). Weekly callers always run, so a fresh AMI or toolchain is still exercised.'
+        type: boolean
+        default: true
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # Maps (line, arch) to its CloudFormation stack and gates scheduled runs:
+  # skip every EC2 job when the commit already passed a scheduled run of the
+  # calling workflow. PR and manual runs always proceed.
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      stack: ${{ steps.map.outputs.stack }}
+      ami_context_key: ${{ steps.map.outputs.ami_context_key }}
+      suffix: ${{ steps.map.outputs.suffix }}
+      label: ${{ steps.map.outputs.label }}
+    steps:
+      - name: Map DPDK line and arch to a test stack
+        id: map
+        env:
+          LINE: ${{ inputs.dpdk_line }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          # Stack names must exist in deploy/cdk/app.ts. Artifact names for the
+          # primary x86 run stay unsuffixed (scripts/diagnose-ci-failure.sh).
+          case "${LINE}/${ARCH}" in
+            25.11/x86_64) stack=DpdkTestStack;          key=amiId;         suffix='' ;;
+            25.11/arm64)  stack=DpdkTestStackGraviton;  key=gravitonAmiId; suffix='-graviton' ;;
+            24.11/x86_64) stack=DpdkTestStackDpdk2411;  key=amiId;         suffix='-dpdk-24.11' ;;
+            23.11/x86_64) stack=DpdkTestStackDpdk2311;  key=amiId;         suffix='-dpdk-23.11' ;;
+            *) echo "::error::No EC2 test stack for DPDK ${LINE} on ${ARCH}. Supported: 25.11 x86_64/arm64, 24.11 x86_64, 23.11 x86_64."
+               exit 1 ;;
+          esac
+          {
+            echo "stack=${stack}"
+            echo "ami_context_key=${key}"
+            echo "suffix=${suffix}"
+            echo "label=DPDK ${LINE}, ${ARCH}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip a scheduled run whose commit already passed
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # In a called workflow the github context is the caller's, so this
+          # is e.g. .../integration-tests-dpdk-23.11.yml@refs/heads/main.
+          CALLER_REF: ${{ github.workflow_ref }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ inputs.skip_passed_commit }}" != "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          wf=$(basename "${CALLER_REF%%@*}")
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/${wf}/runs?event=schedule&status=success&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""' || echo "")
+          if [ "$last" = "${{ github.sha }}" ]; then
+            echo "Commit ${{ github.sha }} already passed a scheduled ${wf} run; skipping EC2 jobs."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Synthetic performance test (no AWS credentials needed) ─────────────────
+  # Measures framework overhead of the Tokio async wrapper vs sync dpdk_udp.
+  # Uses a mock PacketBackend so no real NIC is needed — runs in ~20 seconds.
+  # Posts results as a PR comment for fast regression detection.
+  synthetic-perf:
+    if: inputs.synthetic_perf
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-synth-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-synth-
+
+      - name: Run synthetic benchmark
+        id: bench
+        run: |
+          cargo build --release -p synthetic-bench
+          # stdout = markdown, stderr = progress + JSON
+          cargo run --release -p synthetic-bench > /tmp/bench-results.md 2>/tmp/bench-stderr.log
+          cat /tmp/bench-stderr.log >&2
+          cat /tmp/bench-results.md
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number, skipping comment"
+            exit 0
+          fi
+
+          REPORT="/tmp/synth-perf-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "## Synthetic Performance Results ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          cat /tmp/bench-results.md >> "$REPORT"
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post synthetic perf PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-bench-results
+          path: /tmp/bench-results.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ── Fast pre-flight validation (no AWS credentials needed) ──────────────────
+  # Synthesizes the CDK template locally and validates infrastructure invariants
+  # in seconds. Blocks the expensive integration-tests job if anything is wrong.
+  #
+  # Why this exists: the cfn-signal resource name bug (2026-02-18) caused
+  # CloudFormation to wait the full 20-minute timeout before failing. This check
+  # catches that class of problem at synth time (scripts/validate-cdk.sh).
+  validate-cdk:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.run == 'true'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Validate CDK template
+        run: |
+          chmod +x scripts/validate-cdk.sh
+          ./scripts/validate-cdk.sh
+
+  # ── TCP Synthetic performance test (no AWS credentials needed) ───────────────
+  # Measures framework overhead of TCP engine, connection establishment latency,
+  # single-stream throughput, and tick processing time with a mock PacketBackend.
+  # Runs in ~30 seconds. Posts results as a PR comment.
+  tcp-synthetic-perf:
+    if: inputs.synthetic_perf
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tcp-synth-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tcp-synth-
+
+      - name: Run TCP synthetic benchmark
+        id: bench
+        run: |
+          cargo build --release -p tcp-synthetic-bench
+          cargo run --release -p tcp-synthetic-bench > /tmp/tcp-bench-results.md 2>/tmp/tcp-bench-stderr.log
+          cat /tmp/tcp-bench-stderr.log >&2
+          cat /tmp/tcp-bench-results.md
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number, skipping comment"
+            exit 0
+          fi
+
+          REPORT="/tmp/tcp-synth-perf-report.md"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "## TCP Synthetic Performance Results ([run](${RUN_URL}))" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+          cat /tmp/tcp-bench-results.md >> "$REPORT"
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post TCP synthetic perf PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-synthetic-bench-results
+          path: /tmp/tcp-bench-results.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ── Full integration test suite (requires AWS) ──────────────────────────────
+  integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    needs: [setup, validate-cdk]   # only run if CDK pre-flight passes
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install tools first (no AWS credentials needed)
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      # AWS credentials needed from here onward
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve DPDK ${{ inputs.dpdk_line }} ${{ inputs.arch }} AMI
+        id: ami
+        run: bash scripts/ci/resolve-dpdk-ami.sh "${{ inputs.dpdk_line }}" "${{ inputs.arch }}"
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch: find PR for this branch
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"
+
+      - name: Run integration tests
+        id: tests
+        timeout-minutes: 45
+        run: |
+          chmod +x scripts/run-integration-tests.sh
+          chmod +x scripts/integration-tests/*.sh
+          ./scripts/run-integration-tests.sh --teardown --json-summary
+        env:
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          CDK_STACK_NAME: ${{ needs.setup.outputs.stack }}
+          CDK_AMI_CONTEXT_KEY: ${{ needs.setup.outputs.ami_context_key }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+
+      - name: Print failure diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          echo "=== Failure Diagnostics ==="
+
+          # Build a markdown report
+          REPORT="/tmp/failure-report.md"
+          echo "## Integration Test Failure — ${{ needs.setup.outputs.label }} (Run ${{ github.run_id }})" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${{ github.sha }}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          if [ -f instance-logs/failure-summary.json ]; then
+            echo "### failure-summary.json" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat instance-logs/failure-summary.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          else
+            echo "**No failure-summary.json found**" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Include key log files
+          for log in instance-logs/*-user-data.log instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            echo "### $(basename "$log") (${LOGSIZE} bytes, last 80 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -80 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # List all files in instance-logs
+          echo "### All instance-logs files" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          ls -la instance-logs/ >> "$REPORT" 2>/dev/null || echo "directory not found" >> "$REPORT"
+          echo '```' >> "$REPORT"
+
+          # Output to step log
+          cat "$REPORT"
+
+          # Post as PR comment — use resolved PR number (works for both PR and workflow_dispatch)
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+              || echo "::warning::Could not post PR comment (missing permission)"
+          else
+            echo "::warning::No PR number available, skipping PR comment"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post instance logs to PR
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping log posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/instance-logs-report.md"
+          OUTCOME="${{ steps.tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ Integration Tests Passed — ${{ needs.setup.outputs.label }} (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ Integration Tests Failed — ${{ needs.setup.outputs.label }} (Run [${{ github.run_id }}](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "?")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=${SKIPPED:-0}  # `| head -1 || echo` never fires: head succeeds
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+            if grep -q '<skipped' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<skipped[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -3 | while read -r msg; do
+                echo "  SKIP: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+
+          # Application logs — last 20 lines shown inline for quick context,
+          # full log (last 200 lines) in collapsible section.
+          echo "### Application Logs (last 20 lines)" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log instance-logs/*-test-client-iperf.log instance-logs/*-iperf3-server.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue  # skip near-empty files
+            LOGNAME=$(basename "$log")
+            echo "**${LOGNAME}**" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "" >> "$REPORT"
+
+          # Full application logs in collapsible section
+          echo "<details><summary>Full Application Logs (last 200 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-echo-server.log instance-logs/*-test-client.log instance-logs/*-test-client-iperf.log instance-logs/*-iperf3-server.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -200 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # SSM failure logs (critical for diagnosing ENI bind/unbind issues)
+          for log in instance-logs/*-ssm-failure.log; do
+            [ -f "$log" ] || continue
+            echo "<details><summary>⚠️ SSM Command Failures ($(basename "$log"))</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          # Network and PCI state
+          echo "<details><summary>Network & PCI State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-network-interfaces.log instance-logs/*-networking-diag-*.txt; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Crash diagnostics
+          HAS_CRASHES=false
+          for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+            [ -f "$log" ] || continue
+            if ! grep -qE '^(no crash|no coredump)' "$log" 2>/dev/null; then
+              HAS_CRASHES=true
+              break
+            fi
+          done
+          if [ "$HAS_CRASHES" = "true" ]; then
+            echo "<details><summary>⚠️ Crash Diagnostics</summary>" >> "$REPORT"
+            echo "" >> "$REPORT"
+            for log in instance-logs/*-dmesg-crashes.log instance-logs/*-crash-reports.log instance-logs/*-coredump-listing.log; do
+              [ -f "$log" ] || continue
+              grep -qE '^(no crash|no coredump)' "$log" 2>/dev/null && continue
+              echo "#### $(basename "$log")" >> "$REPORT"
+              echo '```' >> "$REPORT"
+              cat "$log" >> "$REPORT"
+              echo '```' >> "$REPORT"
+            done
+            echo "</details>" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Console output (kernel dmesg - useful for vfio/ena driver transitions)
+          echo "<details><summary>Kernel Console (dmesg)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-console-output.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log") (PCI/driver events only)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            grep -E '(vfio|ena |pci )' "$log" 2>/dev/null | tail -30 >> "$REPORT" || echo "(no PCI events)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Truncate if too long for GH comment (max 65536 chars)
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-report.md
+            echo "" >> /tmp/truncated-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-report.md
+            mv /tmp/truncated-report.md "$REPORT"
+          fi
+
+          # Post to PR
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post instance logs PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results${{ needs.setup.outputs.suffix }}
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-logs${{ needs.setup.outputs.suffix }}
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: EC2 Integration Tests (${{ needs.setup.outputs.label }})
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-error: true
+          fail-on-empty: false
+
+      # Re-assume the role first: the OIDC session from the first configure
+      # step lasts 1h, which a long run can outlive before teardown starts.
+      - name: Refresh AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own --teardown, and failure() is false on cancellation. The
+      # cleanup script is a no-op (plus orphaned-VPC purge) when nothing exists.
+      - name: Safety net teardown
+        if: always()
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"
+
+  # ── TCP integration tests (blocking) ────────────────────────────────────────
+  # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
+  # retransmit/flow-control, tier3 kernel-interop/std-parity) on EC2 with real
+  # DPDK hardware. A TCP failure fails CI.
+  tcp-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: [setup, validate-cdk, integration-tests]
+    if: always() && needs.validate-cdk.result == 'success' && inputs.arch == 'x86_64'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK dependencies
+        run: |
+          cd deploy/cdk
+          npm install
+
+      - name: Install Session Manager plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve DPDK ${{ inputs.dpdk_line }} ${{ inputs.arch }} AMI
+        id: ami
+        run: bash scripts/ci/resolve-dpdk-ami.sh "${{ inputs.dpdk_line }}" "${{ inputs.arch }}"
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            PR=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pre-deploy stack cleanup
+        timeout-minutes: 20
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"
+
+      - name: Run TCP integration tests
+        id: tcp-tests
+        timeout-minutes: 55
+        run: |
+          chmod +x scripts/run-integration-tests.sh
+          chmod +x scripts/integration-tests/*.sh
+          ./scripts/run-integration-tests.sh --teardown --json-summary --tier tcp-full
+        env:
+          DPDK_AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          CDK_STACK_NAME: ${{ needs.setup.outputs.stack }}
+          CDK_AMI_CONTEXT_KEY: ${{ needs.setup.outputs.ami_context_key }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+
+      - name: Post TCP test results to PR
+        if: always() && steps.tcp-tests.outcome != 'skipped'
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping TCP result posting"
+            exit 0
+          fi
+
+          REPORT="/tmp/tcp-integration-report.md"
+          OUTCOME="${{ steps.tcp-tests.outcome }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$OUTCOME" = "success" ]; then
+            echo "## ✅ TCP Integration Tests Passed — ${{ needs.setup.outputs.label }} ([run](${RUN_URL}))" > "$REPORT"
+          else
+            echo "## ❌ TCP Integration Tests Failed — ${{ needs.setup.outputs.label }} ([run](${RUN_URL}))" > "$REPORT"
+          fi
+          echo "" >> "$REPORT"
+          echo "Branch: \`${{ github.ref_name }}\` | Commit: \`${GITHUB_SHA:0:8}\`" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Include JUnit test result summaries
+          echo "### Test Results" >> "$REPORT"
+          TOTAL_TESTS=0
+          TOTAL_FAILURES=0
+          TOTAL_SKIPPED=0
+          for xml in test-results/*.xml; do
+            [ -f "$xml" ] || continue
+            BASENAME=$(basename "$xml")
+            TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=${SKIPPED:-0}  # `| head -1 || echo` never fires: head succeeds
+            echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
+            TOTAL_TESTS=$((TOTAL_TESTS + TESTS))
+            TOTAL_FAILURES=$((TOTAL_FAILURES + FAILURES))
+            TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+            if grep -q '<failure' "$xml" 2>/dev/null; then
+              echo '  ```' >> "$REPORT"
+              grep -oP '<failure[^>]*message="\K[^"]*' "$xml" 2>/dev/null | head -5 | while read -r msg; do
+                echo "  FAIL: $msg" >> "$REPORT"
+              done
+              echo '  ```' >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
+          echo "**Summary**: ${TOTAL_TESTS} tests, ${TOTAL_FAILURES} failures, ${TOTAL_SKIPPED} skipped" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Application logs (last 20 lines inline)
+          echo "<details><summary>Application Logs (last 20 lines each)</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-tcp-echo*.log instance-logs/*-tcp-test-client*.log; do
+            [ -f "$log" ] || continue
+            LOGSIZE=$(wc -c < "$log")
+            [ "$LOGSIZE" -gt 5 ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -20 "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Network state
+          echo "<details><summary>Network State</summary>" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for log in instance-logs/*-networking-diag-*.txt instance-logs/*-network-interfaces.log; do
+            [ -f "$log" ] || continue
+            echo "#### $(basename "$log")" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            cat "$log" >> "$REPORT"
+            echo '```' >> "$REPORT"
+          done
+          echo "</details>" >> "$REPORT"
+
+          # Truncate if too long
+          if [ "$(wc -c < "$REPORT")" -gt 60000 ]; then
+            head -c 59000 "$REPORT" > /tmp/truncated-tcp-report.md
+            echo "" >> /tmp/truncated-tcp-report.md
+            echo "*(truncated — see [artifacts](${RUN_URL}) for full logs)*" >> /tmp/truncated-tcp-report.md
+            mv /tmp/truncated-tcp-report.md "$REPORT"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$REPORT" --repo ${{ github.repository }} 2>/dev/null \
+            || echo "::warning::Could not post TCP integration test PR comment"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload TCP test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-integration-test-results${{ needs.setup.outputs.suffix }}
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload TCP instance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-instance-logs${{ needs.setup.outputs.suffix }}
+          path: instance-logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Publish TCP test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: TCP Integration Tests (${{ needs.setup.outputs.label }})
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
+
+      # Re-assume the role first: the OIDC session from the first configure
+      # step lasts 1h, which a long run can outlive before teardown starts.
+      - name: Refresh AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own --teardown, and failure() is false on cancellation. The
+      # cleanup script is a no-op (plus orphaned-VPC purge) when nothing exists.
+      - name: Safety net teardown
+        if: always()
+        run: |
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"

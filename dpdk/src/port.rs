@@ -415,6 +415,34 @@ impl Port {
             return Err(DpdkError::PortConfigFailed(ret));
         }
 
+        // Fit the descriptor counts to the device's ring limits. Limits vary by
+        // driver release and instance type: DPDK 25.11's ENA driver on
+        // Graviton caps TX rings at 512, so the 1024 default fails
+        // rte_eth_tx_queue_setup with -EINVAL without this step.
+        let mut nb_rx_desc = config.nb_rx_desc;
+        let mut nb_tx_desc = config.nb_tx_desc;
+        let ret = unsafe {
+            dpdk_sys::rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &mut nb_rx_desc, &mut nb_tx_desc)
+        };
+        if ret != 0 {
+            return Err(DpdkError::PortConfigFailed(ret));
+        }
+        // A count of 0 tells rte_eth_{rx,tx}_queue_setup to use the driver's
+        // default ring size, but the adjust call turns 0 into the device
+        // minimum. Keep 0 for any count the caller left at 0.
+        if config.nb_rx_desc == 0 {
+            nb_rx_desc = 0;
+        }
+        if config.nb_tx_desc == 0 {
+            nb_tx_desc = 0;
+        }
+        if nb_rx_desc != config.nb_rx_desc || nb_tx_desc != config.nb_tx_desc {
+            eprintln!(
+                "Warning: descriptor counts adjusted to device limits (rx {} -> {}, tx {} -> {})",
+                config.nb_rx_desc, nb_rx_desc, config.nb_tx_desc, nb_tx_desc
+            );
+        }
+
         // Get socket ID for this port (for NUMA awareness)
         let socket_id = unsafe { dpdk_sys::rte_socket_id() };
 
@@ -424,7 +452,7 @@ impl Port {
                 dpdk_sys::rte_eth_rx_queue_setup(
                     port_id,
                     queue_id,
-                    config.nb_rx_desc,
+                    nb_rx_desc,
                     socket_id as u32,
                     ptr::null(),
                     mempool.as_raw(),
@@ -441,7 +469,7 @@ impl Port {
                 dpdk_sys::rte_eth_tx_queue_setup(
                     port_id,
                     queue_id,
-                    config.nb_tx_desc,
+                    nb_tx_desc,
                     socket_id as u32,
                     ptr::null(),
                 )
@@ -465,6 +493,8 @@ impl Port {
             config: PortConfig {
                 nb_rx_queues,
                 nb_tx_queues,
+                nb_rx_desc,
+                nb_tx_desc,
                 ..config
             },
             started: false,
@@ -590,11 +620,17 @@ impl Port {
             dpdk_sys::rte_eth_link_get_nowait(self.port_id, &mut link);
         }
 
-        LinkStatus {
-            speed: link.link_speed,
-            full_duplex: link.link_duplex() != 0,
-            autoneg: link.link_autoneg() != 0,
-            link_up: link.link_status() != 0,
+        // rte_eth_link's layout differs across DPDK releases (24.07 moved the
+        // fields into an anonymous union), so read them through dpdk-sys
+        // accessors rather than bindgen field names.
+        let link_ptr: *const dpdk_sys::rte_eth_link = &link;
+        unsafe {
+            LinkStatus {
+                speed: dpdk_sys::eth_link_get_speed(link_ptr),
+                full_duplex: dpdk_sys::eth_link_get_duplex(link_ptr) != 0,
+                autoneg: dpdk_sys::eth_link_get_autoneg(link_ptr) != 0,
+                link_up: dpdk_sys::eth_link_get_status(link_ptr) != 0,
+            }
         }
     }
 

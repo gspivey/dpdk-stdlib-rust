@@ -335,11 +335,14 @@ fn bench_sync_tx_v6(payload_size: usize) -> u64 {
         backend.clone(),
     )
     .expect("bind_with_backend v6");
+    // TX-only loop never drains the backend's NDP advertisement, so without a
+    // static entry every send_to takes the cache-miss path (extra NS frame).
+    socket.add_ndp_entry(PEER_IPV6, PEER_MAC);
 
     let payload = vec![0xCDu8; payload_size];
     let dst = SocketAddr::V6(SocketAddrV6::new(PEER_IPV6, PEER_PORT, 0, 0));
 
-    // Warmup — first send triggers NDP resolution
+    // Warmup
     let warmup_end = Instant::now() + WARMUP_DURATION;
     while Instant::now() < warmup_end {
         let _ = socket.send_to(&payload, dst);
@@ -400,6 +403,8 @@ async fn bench_async_tx_v6(payload_size: usize) -> u64 {
         backend.clone(),
     )
     .expect("bind_with_backend v6");
+    // See bench_sync_tx_v6: prime the neighbor cache so no NS is sent per packet.
+    sync_socket.add_ndp_entry(PEER_IPV6, PEER_MAC);
 
     let payload = vec![0xCDu8; payload_size];
     let dst = SocketAddr::V6(SocketAddrV6::new(PEER_IPV6, PEER_PORT, 0, 0));
@@ -1035,6 +1040,28 @@ mod tests {
         let sent = socket.send_to(payload, dst).unwrap();
         assert_eq!(sent, payload.len());
         assert!(backend.tx_count() >= 1);
+    }
+
+    #[test]
+    fn test_v6_tx_with_primed_ndp_sends_one_frame_per_packet() {
+        let backend = Arc::new(SyntheticBackend::new(LOCAL_MAC));
+        let socket = UdpSocket::bind_with_backend(
+            SocketAddr::V6(SocketAddrV6::new(LOCAL_IPV6, LOCAL_PORT, 0, 0)),
+            backend.clone(),
+        )
+        .expect("bind v6");
+        socket.add_ndp_entry(PEER_IPV6, PEER_MAC);
+        let dst = SocketAddr::V6(SocketAddrV6::new(PEER_IPV6, PEER_PORT, 0, 0));
+        // bind() may emit a DAD solicitation; only the send loop is under test.
+        let queued_before = backend.rx_queue.lock().unwrap().len();
+        backend.tx_count.store(0, Ordering::Relaxed);
+        for _ in 0..100 {
+            socket.send_to(&[0u8; 64], dst).unwrap();
+        }
+        // No neighbor solicitations: exactly one frame per send_to, so the
+        // IPv6 TX benchmark measures the data path only.
+        assert_eq!(backend.tx_count(), 100);
+        assert_eq!(backend.rx_queue.lock().unwrap().len(), queued_before);
     }
 
     #[test]

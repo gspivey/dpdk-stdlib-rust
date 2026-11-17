@@ -608,10 +608,18 @@ ssm_run_command_async() {
 
 # Wait for an async SSM command to complete.
 # Usage: ssm_wait_command <instance_id> <command_id> <timeout_seconds>
+# ssm_wait_command <instance> <cmd_id> <timeout_secs> [expect-running]
+# Returns 0 on Success, 1 on failure or timeout. With "expect-running", the
+# command is a long-lived server (echo listener, iperf server) that keeps
+# serving after the client side has finished and produced the test result, so
+# still running at the timeout is the normal path: it is logged as INFO, no
+# failure log is saved, and the caller cancels it. A server that actually
+# Failed is still an error.
 ssm_wait_command() {
     local instance_id="$1"
     local cmd_id="$2"
     local timeout_secs="$3"
+    local expect_running="${4:-}"
 
     local elapsed=0
     local status=""
@@ -635,6 +643,10 @@ ssm_wait_command() {
         esac
     done
 
+    if [[ "$expect_running" == "expect-running" && ( "$status" == "InProgress" || "$status" == "Pending" ) ]]; then
+        log_info "Server still running on $instance_id after the client finished (expected); cancelling (cmd: $cmd_id)"
+        return 1
+    fi
     log_error "SSM command polling timed out on $instance_id after ${timeout_secs}s (last status: $status, cmd: $cmd_id)"
     ssm_save_failure_log "$instance_id" "$cmd_id" "$status" "Polling timeout after ${timeout_secs}s"
     return 1
@@ -877,7 +889,7 @@ run_tier1() {
     fi
 
     # Wait for listener to finish (or time out), then cancel if still running
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
@@ -924,7 +936,7 @@ run_tier2() {
     fi
 
     # Wait for listener to finish (or time out), then cancel if still running
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
@@ -969,7 +981,7 @@ run_tier3() {
         generate_failure_xml "tier3-our-app-sends" "our-app-sends test execution failed or timed out"
     fi
 
-    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$iperf_server_cmd_id" 30 || true
+    ssm_wait_command "$RECEIVER_INSTANCE_ID" "$iperf_server_cmd_id" 30 expect-running || true
 
     # ── Direction 2: iperf-sends ─────────────────────────────────────────
     log_info "Direction 2: iperf-sends (iperf3 -> dpdk-stdlib)"
@@ -988,7 +1000,7 @@ run_tier3() {
         generate_failure_xml "tier3-iperf-sends" "iperf-sends test execution failed or timed out"
     fi
 
-    ssm_wait_command "$SENDER_INSTANCE_ID" "$listener_cmd_id" 30 || true
+    ssm_wait_command "$SENDER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running || true
 
     log_info "Tier 3 execution complete"
 }
@@ -1036,7 +1048,7 @@ run_tier4() {
     fi
 
     # Wait for listener to finish
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
@@ -1087,7 +1099,7 @@ _tier1_tcp_impl() {
         generate_failure_xml "$suite" "Sender test execution failed or timed out"
     fi
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 }
@@ -1139,7 +1151,7 @@ run_tier2_tcp() {
         generate_failure_xml "tier2-tcp-echo" "Sender test execution failed or timed out"
     fi
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 
@@ -1193,7 +1205,7 @@ _run_tcp_dpdk_pair() {
         generate_failure_xml "$suite" "Client test execution failed or timed out"
     fi
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
     fi
 }
@@ -1240,7 +1252,7 @@ _run_tcp_dpdk_pair_lr() {
         generate_failure_xml "$suite" "Sender test execution failed or timed out"
     fi
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$listener_cmd_id"
     fi
 }
@@ -1308,7 +1320,7 @@ _run_tcp_kernel_interop() {
         generate_failure_xml "$suite" "Client test execution failed or timed out"
     fi
 
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
     fi
 }
@@ -1502,7 +1514,7 @@ run_quic_tier1() {
     fi
 
     # 6. Wait for / cancel the server (same as the TCP pair).
-    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30; then
+    if ! ssm_wait_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id" 30 expect-running; then
         ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$server_cmd_id"
     fi
 
@@ -2515,7 +2527,7 @@ Infrastructure ready.
                 if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier2-tcp-echo.sh --role sender --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier2-tcp-echo.xml"; then
                     generate_failure_xml "tier2-tcp-echo" "Sender test execution failed or timed out"
                 fi
-                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id"
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id" 30 expect-running                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t2tcp_listener_id"
             fi
             log_info "Phase A complete"
         fi
@@ -2549,7 +2561,7 @@ Infrastructure ready.
                 if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo.xml"; then
                     generate_failure_xml "tier1-tcp-echo" "Sender test execution failed or timed out"
                 fi
-                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id"
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id" 30 expect-running                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcp_listener_id"
             fi
 
             # tier1-tcp-echo (async) — still on DPDK, no rebind
@@ -2565,7 +2577,7 @@ Infrastructure ready.
                 if ! ssm_run_command "$SENDER_INSTANCE_ID" "$TEST_TIMEOUT"                     "cd /opt/dpdk-stdlib && bash scripts/integration-tests/tier1-tcp-echo.sh --role sender --bind-ip $SENDER_DPDK_ENI_IP --peer-ip $RECEIVER_DPDK_ENI_IP --port 9000 --output $RESULTS_REMOTE_DIR/tier1-tcp-echo-async.xml"; then
                     generate_failure_xml "tier1-tcp-echo-async" "Sender test execution failed or timed out"
                 fi
-                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id" 30                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id"
+                ssm_wait_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id" 30 expect-running                     || ssm_cancel_command "$RECEIVER_INSTANCE_ID" "$t1tcpa_listener_id"
             fi
 
             # tier4 jumbo (sender=DPDK, receiver=DPDK)

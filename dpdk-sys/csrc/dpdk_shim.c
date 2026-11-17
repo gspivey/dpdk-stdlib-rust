@@ -97,6 +97,43 @@ uint16_t dpdk_shim_get_mbuf_buf_len(const struct rte_mbuf *m) {
     return m->buf_len;
 }
 
+/* ---- Mbuf VLAN TCI access (rte_mbuf.h) ---- */
+/* DPDK 24.07 replaced the zero-length RTE_MARKER fields in rte_mbuf with
+   anonymous unions, which moved vlan_tci into the rx_descriptor_fields1
+   union.  Going through C keeps the Rust side independent of where the
+   field sits in the bindgen output. */
+
+uint16_t dpdk_shim_get_mbuf_vlan_tci(const struct rte_mbuf *m) {
+    return m->vlan_tci;
+}
+
+void dpdk_shim_set_mbuf_vlan_tci(struct rte_mbuf *m, uint16_t tci) {
+    m->vlan_tci = tci;
+}
+
+/* ---- Link status field access (rte_ethdev.h) ---- */
+/* DPDK 24.07 wrapped the rte_eth_link fields in an anonymous union with
+   a uint64_t val64 member, so bindgen nests link_speed and the
+   link_duplex/link_autoneg/link_status bitfields under generated
+   __bindgen_anon_N names.  These accessors read the fields by their C
+   names, which work on every supported DPDK release. */
+
+uint32_t dpdk_shim_get_eth_link_speed(const struct rte_eth_link *link) {
+    return link->link_speed;
+}
+
+uint16_t dpdk_shim_get_eth_link_duplex(const struct rte_eth_link *link) {
+    return link->link_duplex;
+}
+
+uint16_t dpdk_shim_get_eth_link_autoneg(const struct rte_eth_link *link) {
+    return link->link_autoneg;
+}
+
+uint16_t dpdk_shim_get_eth_link_status(const struct rte_eth_link *link) {
+    return link->link_status;
+}
+
 /* ---- Errno (rte_errno.h) ---- */
 
 int dpdk_shim_rte_errno(void) {

@@ -1,0 +1,176 @@
+name: AWS Orphan Sweep
+
+# Backstop for leaked test infrastructure. A test stack whose teardown fails can
+# leave EC2 instances and VPCs running (and billing) with no CloudFormation stack
+# left to own them, and the 5-VPC-per-region limit then blocks other test runs.
+#
+# Every 3 hours this looks for:
+#   - test instances (stack tag DpdkTestStack* / PerfTestStack*) launched more
+#     than MAX_AGE_HOURS ago, longer than any test job can run (longest job
+#     timeout: 150 min);
+#   - test VPCs whose CloudFormation stack no longer exists.
+#
+# Stack names are reused by every run (DpdkTestStack runs on every PR and every
+# night), so an old instance can carry the same stack tag as a LIVE run. The
+# sweep therefore decides per instance:
+#   - stack gone, or the stack itself is older than the cutoff and not
+#     mid-operation -> remove the whole stack with scripts/ci/cleanup-cfn-stack.sh
+#     (terminate first, then delete, then purge orphaned VPCs);
+#   - stack exists and was created after the cutoff (a live run reusing the
+#     name), or is *_IN_PROGRESS -> terminate only the old instance IDs and leave
+#     the live stack alone. Its orphaned VPC is collected by a later sweep once
+#     the live run has finished.
+# A stack kept on purpose with a perf workflow's teardown=false is older than the
+# cutoff after 4 h, so it is reaped too and the sweep reports it.
+#
+# Anything found makes the run FAIL after cleanup, so a leak shows up as a red
+# run instead of a bill. A clean account is a green no-op.
+on:
+  schedule:
+    - cron: '30 */3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aws-orphan-sweep
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  MAX_AGE_HOURS: '4'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find leaked test infrastructure
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ISO-8601 UTC strings in the same format compare correctly as text.
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%Y-%m-%dT%H:%M:%S+00:00)
+          cleanup_stacks=""
+          terminate_ids=""
+
+          # Prints "<status> <creation-time>" for a stack, or "ABSENT" when it
+          # does not exist. Any other API error fails the step.
+          stack_info() {
+            local out
+            if out=$(aws cloudformation describe-stacks --stack-name "$1" \
+                       --query 'Stacks[0].[StackStatus,CreationTime]' --output text 2>&1); then
+              echo "$out"
+            elif grep -q 'does not exist' <<< "$out"; then
+              echo ABSENT
+            else
+              echo "::error::describe-stacks $1 failed: $out" >&2
+              return 1
+            fi
+          }
+
+          # 1. Old test instances.
+          old=$(aws ec2 describe-instances \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=DpdkTestStack*,PerfTestStack*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='aws:cloudformation:stack-name']|[0].Value]" \
+            --output text | awk -v c="$cutoff" '$2 <= c')
+          while read -r id launched stack; do
+            [[ -z "${id:-}" ]] && continue
+            info=$(stack_info "$stack")
+            read -r status created <<< "$info"
+            if [[ "$status" == ABSENT ]]; then
+              echo "::warning::$id ($stack, launched $launched): stack is gone -> remove"
+              cleanup_stacks+=" $stack"
+            elif [[ "$status" != *_IN_PROGRESS && "$created" < "$cutoff" ]]; then
+              echo "::warning::$id ($stack, launched $launched): stack $status since $created -> remove stack"
+              cleanup_stacks+=" $stack"
+            else
+              echo "::warning::$id ($stack, launched $launched): a live $stack ($status, created $created) reuses the name -> terminate this instance only"
+              terminate_ids+=" $id"
+            fi
+          done <<< "$old"
+
+          # 2. Test VPCs whose stack is gone.
+          vpc_stacks=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=DpdkTestStack*,PerfTestStack*" \
+            --query "Vpcs[].Tags[?Key=='aws:cloudformation:stack-name']|[].Value" \
+            --output text)
+          for s in $vpc_stacks; do
+            # Assign first: inside [[ ]] a stack_info failure would be ignored
+            # and an API error would read as "stack exists", skipping the VPC.
+            info=$(stack_info "$s")
+            if [[ "$info" == ABSENT ]]; then
+              echo "::warning::VPC tagged $s has no stack -> remove"
+              cleanup_stacks+=" $s"
+            fi
+          done
+
+          uniq_words() { tr ' ' '\n' <<< "$1" | sed '/^$/d' | sort -u | tr '\n' ' '; }
+          cleanup_stacks=$(uniq_words "$cleanup_stacks")
+          terminate_ids=$(uniq_words "$terminate_ids")
+          echo "cleanup_stacks=${cleanup_stacks}" >> "$GITHUB_OUTPUT"
+          echo "terminate_ids=${terminate_ids}" >> "$GITHUB_OUTPUT"
+          echo "Stacks to remove: ${cleanup_stacks:-none}"
+          echo "Instances to terminate only: ${terminate_ids:-none}"
+
+      - name: Remove leaked infrastructure
+        if: steps.find.outputs.cleanup_stacks != '' || steps.find.outputs.terminate_ids != ''
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%Y-%m-%dT%H:%M:%S+00:00)
+          # Stack cleanups first, each re-checked right before it runs: a new
+          # run that reuses the stack name may have started since the find step.
+          for s in ${{ steps.find.outputs.cleanup_stacks }}; do
+            echo "::group::cleanup $s"
+            if ! out=$(aws cloudformation describe-stacks --stack-name "$s" \
+                         --query 'Stacks[0].[StackStatus,CreationTime]' --output text 2>&1); then
+              if ! grep -q 'does not exist' <<< "$out"; then
+                echo "::error::describe-stacks $s failed: $out"
+                rc=1; echo "::endgroup::"; continue
+              fi
+              out=ABSENT
+            fi
+            read -r status created <<< "$out"
+            if [[ "$status" == ABSENT || ( "$status" != *_IN_PROGRESS && "$created" < "$cutoff" ) ]]; then
+              bash scripts/ci/cleanup-cfn-stack.sh "$s" || rc=1
+            else
+              echo "::warning::$s is now $status (created $created): a new run reuses the name; skipping. The next sweep re-checks."
+            fi
+            echo "::endgroup::"
+          done
+          ids="${{ steps.find.outputs.terminate_ids }}"
+          if [[ -n "${ids// /}" ]]; then
+            echo "::group::terminate $ids"
+            aws ec2 terminate-instances --instance-ids $ids > /dev/null || rc=1
+            timeout 5m aws ec2 wait instance-terminated --instance-ids $ids || rc=1
+            echo "::endgroup::"
+          fi
+          {
+            echo "## Leaked test infrastructure removed"
+            echo
+            echo "Stacks removed: \`${{ steps.find.outputs.cleanup_stacks }}\`"
+            echo
+            echo "Instances terminated (live stack kept): \`${{ steps.find.outputs.terminate_ids }}\`"
+            echo
+            echo "A teardown failed somewhere (or a perf stack was kept with teardown=false)."
+            echo "Find the run that created these and check its teardown."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::Some leaked resources could not be removed; manual cleanup needed"
+          fi
+          echo "::error::Leaked test infrastructure was found (removal attempted)"
+          exit 1

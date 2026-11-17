@@ -787,6 +787,16 @@ pub extern "C" fn rte_eth_rx_queue_setup(
     0
 }
 
+/// The stub device has no ring limits, so the counts are left unchanged.
+#[no_mangle]
+pub extern "C" fn rte_eth_dev_adjust_nb_rx_tx_desc(
+    _port_id: u16,
+    _nb_rx_desc: *mut u16,
+    _nb_tx_desc: *mut u16,
+) -> c_int {
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn rte_eth_tx_queue_setup(
     _port_id: u16,
@@ -1037,6 +1047,42 @@ pub unsafe fn mbuf_set_data_off(m: *mut rte_mbuf, off: u16) {
 #[inline]
 pub unsafe fn mbuf_get_buf_len(m: *const rte_mbuf) -> u16 {
     (*m).buf_len
+}
+
+// Mbuf VLAN TCI accessors — mirror the C shim API (vlan_tci moved into an
+// anonymous union in DPDK 24.07, so real-DPDK callers must not touch it directly)
+
+#[inline]
+pub unsafe fn mbuf_get_vlan_tci(m: *const rte_mbuf) -> u16 {
+    (*m).vlan_tci
+}
+
+#[inline]
+pub unsafe fn mbuf_set_vlan_tci(m: *mut rte_mbuf, tci: u16) {
+    (*m).vlan_tci = tci;
+}
+
+// rte_eth_link accessors — mirror the C shim API (the fields moved into an
+// anonymous union in DPDK 24.07)
+
+#[inline]
+pub unsafe fn eth_link_get_speed(link: *const rte_eth_link) -> u32 {
+    (*link).link_speed
+}
+
+#[inline]
+pub unsafe fn eth_link_get_duplex(link: *const rte_eth_link) -> u16 {
+    (*link).link_duplex
+}
+
+#[inline]
+pub unsafe fn eth_link_get_autoneg(link: *const rte_eth_link) -> u16 {
+    (*link).link_autoneg
+}
+
+#[inline]
+pub unsafe fn eth_link_get_status(link: *const rte_eth_link) -> u16 {
+    (*link).link_status
 }
 
 #[cfg(test)]
