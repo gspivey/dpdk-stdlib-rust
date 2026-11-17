@@ -594,7 +594,9 @@ jobs:
         if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}" || echo "Safety net teardown failed (stack may already be gone)"
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"
 
   # ── TCP integration tests (blocking) ────────────────────────────────────────
   # Runs the full TCP test suite (tier1 handshake/echo/shutdown, tier2
@@ -805,4 +807,6 @@ jobs:
         if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}" || echo "Safety net teardown failed (stack may already be gone)"
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh "${{ needs.setup.outputs.stack }}"

@@ -313,4 +313,6 @@ jobs:
         if: always()
         run: |
           chmod +x scripts/ci/cleanup-cfn-stack.sh
-          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic || echo "Safety net teardown failed (stack may already be gone)"
+          # No `|| echo`: a failed teardown can leave instances billing, so it
+          # must fail the job. The script exits 0 when the stack is already gone.
+          scripts/ci/cleanup-cfn-stack.sh DpdkTestStackQuic

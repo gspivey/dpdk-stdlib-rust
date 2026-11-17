@@ -1,0 +1,107 @@
+name: AWS Orphan Sweep
+
+# Backstop for leaked test infrastructure. A test stack whose teardown fails can
+# leave EC2 instances and VPCs running (and billing) with no CloudFormation stack
+# left to own them, and the 5-VPC-per-region limit then blocks other test runs.
+# Every 3 hours this finds:
+#   - test instances (stack tag DpdkTestStack* / PerfTestStack*) older than
+#     MAX_AGE_HOURS, longer than any test job can run (longest timeout: 150 min);
+#   - test VPCs whose CloudFormation stack no longer exists.
+# It removes them with scripts/ci/cleanup-cfn-stack.sh and then FAILS, so a leak
+# shows up as a red run instead of a bill. A clean account is a green no-op.
+on:
+  schedule:
+    - cron: '30 */3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aws-orphan-sweep
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  MAX_AGE_HOURS: '4'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find leaked test infrastructure
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ISO-8601 UTC strings in the same format compare correctly as text.
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%Y-%m-%dT%H:%M:%S+00:00)
+          stacks=""
+
+          # Old test instances, by owning stack name.
+          old=$(aws ec2 describe-instances \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=DpdkTestStack*,PerfTestStack*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='aws:cloudformation:stack-name']|[0].Value]" \
+            --output text | awk -v c="$cutoff" '$2 <= c')
+          if [[ -n "$old" ]]; then
+            echo "::warning::Test instances older than ${MAX_AGE_HOURS}h:"
+            echo "$old"
+            stacks+=" $(awk '{print $3}' <<< "$old")"
+          fi
+
+          # Test VPCs whose stack is gone.
+          vpc_stacks=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=DpdkTestStack*,PerfTestStack*" \
+            --query "Vpcs[].Tags[?Key=='aws:cloudformation:stack-name']|[].Value" \
+            --output text)
+          for s in $vpc_stacks; do
+            if ! out=$(aws cloudformation describe-stacks --stack-name "$s" 2>&1); then
+              if grep -q 'does not exist' <<< "$out"; then
+                echo "::warning::VPC tagged $s has no stack"
+                stacks+=" $s"
+              else
+                echo "::error::describe-stacks $s failed: $out"
+                exit 1
+              fi
+            fi
+          done
+
+          stacks=$(tr ' ' '\n' <<< "$stacks" | sed '/^$/d' | sort -u | tr '\n' ' ')
+          echo "stacks=${stacks}" >> "$GITHUB_OUTPUT"
+          echo "Leaked stacks: ${stacks:-none}"
+
+      - name: Remove leaked infrastructure
+        if: steps.find.outputs.stacks != ''
+        shell: bash
+        run: |
+          set -uo pipefail
+          chmod +x scripts/ci/cleanup-cfn-stack.sh
+          rc=0
+          for s in ${{ steps.find.outputs.stacks }}; do
+            echo "::group::cleanup $s"
+            scripts/ci/cleanup-cfn-stack.sh "$s" || rc=1
+            echo "::endgroup::"
+          done
+          {
+            echo "## Leaked test infrastructure removed"
+            echo
+            echo "Stacks: \`${{ steps.find.outputs.stacks }}\`"
+            echo
+            echo "A teardown failed somewhere. Find the run that created these and fix its teardown."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::Some leaked resources could not be removed; manual cleanup needed"
+          fi
+          echo "::error::Leaked test infrastructure was found (and removal attempted): ${{ steps.find.outputs.stacks }}"
+          exit 1
