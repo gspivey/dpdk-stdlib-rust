@@ -12,8 +12,8 @@ readme = "README.md"
 [dependencies]
 s2n-quic = "=1.81.0"
 s2n-quic-core = "=0.81.0"
-dpdk-udp = { version = "0.3.0", path = "../dpdk-stdlib-udp", package = "dpdk-stdlib-udp" }
-dpdk = { version = "0.3.0", path = "../dpdk", package = "dpdk-stdlib" }
+dpdk-udp = { version = "0.3.1", path = "../dpdk-stdlib-udp", package = "dpdk-stdlib-udp" }
+dpdk = { version = "0.3.1", path = "../dpdk", package = "dpdk-stdlib" }
 thiserror = { workspace = true }
 futures = "0.3"
 tokio = { workspace = true }
