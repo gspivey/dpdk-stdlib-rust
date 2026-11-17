@@ -19,10 +19,16 @@ STACK="${1:?Usage: cleanup-cfn-stack.sh <stack-name>}"
 # down completely. Safe to call when no orphans exist (no-ops).
 purge_orphaned_vpcs() {
   local vpc_ids purge_failed=0
-  vpc_ids=$(aws ec2 describe-vpcs \
+  # No `|| true` here: expired credentials, throttling or an IAM deny must not
+  # read as "nothing to clean" -- that would report success while an abandoned
+  # instance keeps billing.
+  if ! vpc_ids=$(aws ec2 describe-vpcs \
     --filters "Name=tag:aws:cloudformation:stack-name,Values=$STACK" \
     --query 'Vpcs[*].VpcId' \
-    --output text 2>/dev/null || true)
+    --output text); then
+    echo "::error::describe-vpcs failed for $STACK; cannot check for orphaned resources"
+    return 1
+  fi
 
   if [[ -z "$vpc_ids" || "$vpc_ids" == "None" ]]; then
     echo "No orphaned VPCs found for stack $STACK"
@@ -163,7 +169,7 @@ terminate_stack_instances() {
   fi
   echo "Terminating $STACK instances before the stack delete: $ids"
   aws ec2 terminate-instances --instance-ids $ids > /dev/null
-  timeout 10m aws ec2 wait instance-terminated --instance-ids $ids
+  timeout 4m aws ec2 wait instance-terminated --instance-ids $ids
   echo "  Instances terminated"
 }
 
@@ -256,9 +262,12 @@ if [ "$STATUS" != "DELETE_IN_PROGRESS" ]; then
   sleep 5   # allow IN_PROGRESS to register before the waiter polls
 fi
 
-# aws cloudformation wait default is 60 min, exceeding the 20-min step budget.
-# Wrap in timeout so the diagnostic branch runs before GitHub kills the step.
-if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+# Wait budget: callers allow 18-20 min (pre-deploy step timeout 20 min;
+# run-perf-tests.sh caps the script at 1080 s). terminate 4 + delete 9 +
+# force-delete 3 = 16 min, leaving time for the EXIT-trap purge to finish
+# before the caller kills the script. With the instances terminated first the
+# delete normally completes in a few minutes.
+if ! timeout 9m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
   # Check if we landed in DELETE_FAILED after a plain delete (stuck ENI, etc).
   # Retry once with force-delete so teardown clears debris in the same run
   # rather than leaving the stack stuck for the next run's pre-deploy step.
@@ -268,7 +277,7 @@ if ! timeout 17m aws cloudformation wait stack-delete-complete --stack-name "$ST
     echo "::warning::$STACK entered DELETE_FAILED -- retrying with force-delete"
     print_failed_events
     aws cloudformation delete-stack --stack-name "$STACK" --deletion-mode FORCE_DELETE_STACK
-    if ! timeout 10m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+    if ! timeout 3m aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
       print_failed_events
       echo "::error::Force-delete of $STACK failed -- orphaned resources need manual cleanup"
       exit 1

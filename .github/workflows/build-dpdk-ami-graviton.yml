@@ -196,7 +196,7 @@ jobs:
           fi
           OLD_AMIS=$(aws ec2 describe-images \
             --owners self \
-            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=dpdk-stdlib-rust-dpdk-${DPDK_LINE}*" "Name=tag:Arch,Values=arm64" "Name=tag:DpdkLine,Values=${DPDK_LINE}" \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=dpdk-stdlib-rust-graviton-dpdk-${DPDK_LINE}*" "Name=tag:Arch,Values=arm64" "Name=tag:DpdkLine,Values=${DPDK_LINE}" \
             --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
             --output text)
 

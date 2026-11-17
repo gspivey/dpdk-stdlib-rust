@@ -13,8 +13,10 @@ on:
     - cron: '0 12 * * 0' # Sunday 12:00 UTC, after the 04:00 AMI rebuild
   workflow_dispatch: {}
 
+# One shared group for every older-LTS weekly run, so at most one of them holds
+# a VPC at a time (account limit: 5 VPCs per region, default VPC included).
 concurrency:
-  group: integration-tests-dpdk-24.11
+  group: integration-tests-older-lts
   cancel-in-progress: false
 
 permissions:

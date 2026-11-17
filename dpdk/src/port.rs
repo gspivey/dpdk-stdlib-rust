@@ -427,6 +427,15 @@ impl Port {
         if ret != 0 {
             return Err(DpdkError::PortConfigFailed(ret));
         }
+        // A count of 0 tells rte_eth_{rx,tx}_queue_setup to use the driver's
+        // default ring size, but the adjust call turns 0 into the device
+        // minimum. Keep 0 for any count the caller left at 0.
+        if config.nb_rx_desc == 0 {
+            nb_rx_desc = 0;
+        }
+        if config.nb_tx_desc == 0 {
+            nb_tx_desc = 0;
+        }
         if nb_rx_desc != config.nb_rx_desc || nb_tx_desc != config.nb_tx_desc {
             eprintln!(
                 "Warning: descriptor counts adjusted to device limits (rx {} -> {}, tx {} -> {})",

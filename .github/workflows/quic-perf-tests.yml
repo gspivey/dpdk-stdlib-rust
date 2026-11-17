@@ -250,10 +250,19 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+      - name: Refresh AWS credentials for teardown
+        if: always() && inputs.teardown != false && inputs.teardown != 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own teardown. No `|| echo`: a failed teardown can leave
+      # instances billing, so it fails the job. cleanup-cfn-stack.sh terminates
+      # the instances first (DPDK ENIs cannot detach from a running instance)
+      # and exits 0 when the stack is already gone. teardown=false keeps the
+      # stack for debugging; the AWS Orphan Sweep reaps it after 4 h.
       - name: Safety net teardown
-        if: failure() && steps.tests.outcome == 'failure'
-        run: |
-          if [[ "${{ inputs.teardown }}" != "false" ]]; then
-            cd deploy/cdk
-            npx cdk destroy DpdkTestStack --force || echo "Teardown failed (may already be destroyed)"
-          fi
+        if: always() && inputs.teardown != false && inputs.teardown != 'false'
+        run: bash scripts/ci/cleanup-cfn-stack.sh DpdkTestStack
