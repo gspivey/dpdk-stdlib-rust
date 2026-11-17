@@ -52,22 +52,32 @@ jobs:
     # 24.07) would otherwise go unnoticed. DPDK is built minimally (no apps,
     # tests or examples; a few virtual drivers) and the install prefix is
     # cached per version. Bump DPDK_BUILD_REV when changing the meson options.
-    name: DPDK ${{ matrix.dpdk.series }}
+    #
+    # Support policy: exactly the DPDK LTS lines upstream still maintains, each
+    # dropped at its upstream end of life (https://core.dpdk.org/roadmap/).
+    #   23.11  EOL Dec 2026
+    #   24.11  EOL Dec 2027
+    #   25.11  EOL Dec 2028  (primary)
+    # The next LTS is tracked from its release candidates as a required leg, so
+    # it works on release day. Adding or retiring a line is one matrix entry.
+    # Released versions come from fast.dpdk.org pinned by sha256; release
+    # candidates are not published there, so they are cloned by tag and pinned
+    # by commit.
+    name: DPDK ${{ matrix.dpdk.version }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         dpdk:
-          - series: "22.11"
-            version: "22.11.11"
-            sha256: 27a3bb1f57e02eb68c7c0a6f8bbf9fb74ec198c5aab74ed602da5b71c492a476
-          - series: "23.11"
-            version: "23.11.8"
+          - version: "23.11.8"
             sha256: 17fa62321481618b735c029b652e37f8adf0e2233fced6dc1a2c9058c2d21259
-          - series: "24.11"
-            version: "24.11.8"
+          - version: "24.11.8"
             sha256: f3dbfac841b2db8e53a97d68a5e14ebc943327a955f0afb97f8c14f544fbc4aa
+          - version: "25.11.4"
+            sha256: 50272f214b2e7fd23dc9b6b4d5408b54798021b19611339298784faa5a189b43
+          - version: "26.11-rc3"
+            git_commit: e75a66edd20d1cf1f22984c53bfd2bce8c883953
     env:
       DPDK_BUILD_REV: "1"
       DPDK_PREFIX: /home/runner/dpdk-install
@@ -101,10 +111,21 @@ jobs:
       if: steps.dpdk-cache.outputs.cache-hit != 'true'
       run: |
         cd "$RUNNER_TEMP"
-        curl -fsSLO "https://fast.dpdk.org/rel/dpdk-${{ matrix.dpdk.version }}.tar.xz"
-        echo "${{ matrix.dpdk.sha256 }}  dpdk-${{ matrix.dpdk.version }}.tar.xz" | sha256sum -c -
-        mkdir dpdk-src
-        tar -xJf "dpdk-${{ matrix.dpdk.version }}.tar.xz" -C dpdk-src --strip-components=1
+        VERSION="${{ matrix.dpdk.version }}"
+        if [ -n "${{ matrix.dpdk.git_commit }}" ]; then
+          # Release candidate: clone the tag and fail unless it is the pinned commit.
+          git clone --depth 1 --branch "v${VERSION}" https://dpdk.org/git/dpdk dpdk-src
+          actual="$(git -C dpdk-src rev-parse HEAD)"
+          if [ "$actual" != "${{ matrix.dpdk.git_commit }}" ]; then
+            echo "::error::tag v${VERSION} is ${actual}, expected ${{ matrix.dpdk.git_commit }}"
+            exit 1
+          fi
+        else
+          curl -fsSLO "https://fast.dpdk.org/rel/dpdk-${VERSION}.tar.xz"
+          echo "${{ matrix.dpdk.sha256 }}  dpdk-${VERSION}.tar.xz" | sha256sum -c -
+          mkdir dpdk-src
+          tar -xJf "dpdk-${VERSION}.tar.xz" -C dpdk-src --strip-components=1
+        fi
         cd dpdk-src
         meson setup build \
           --prefix="$DPDK_PREFIX" \
