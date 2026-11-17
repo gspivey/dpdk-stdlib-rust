@@ -12,9 +12,20 @@ variable "aws_region" {
   default = "us-east-1"
 }
 
+# Full DPDK release (e.g. 25.11.4). No default: the build workflow passes one
+# of the supported LTS releases (README "Supported DPDK versions").
 variable "dpdk_version" {
-  type    = string
-  default = "22.11.6"
+  type = string
+  validation {
+    condition     = can(regex("^[0-9]{2}\\.[0-9]{2}(\\.[0-9]+)?$", var.dpdk_version))
+    error_message = "The dpdk_version must look like 25.11.4."
+  }
+}
+
+locals {
+  # LTS line, e.g. "25.11" for 25.11.4. Tagged on the AMI so the build
+  # workflow prunes old AMIs per line and per architecture.
+  dpdk_line = regex("^[0-9]{2}\\.[0-9]{2}", var.dpdk_version)
 }
 
 variable "instance_type" {
@@ -52,6 +63,7 @@ source "amazon-ebs" "dpdk-graviton" {
   tags = {
     Name        = "${var.ami_name_prefix}-dpdk-${var.dpdk_version}"
     DpdkVersion = var.dpdk_version
+    DpdkLine    = local.dpdk_line
     BaseOS      = "Amazon Linux 2023 arm64"
     ManagedBy   = "packer"
     Repository  = "dpdk-stdlib-rust"
@@ -96,7 +108,7 @@ build {
   provisioner "shell" {
     inline = [
       "chmod +x /tmp/install_dpdk.sh",
-      "sudo bash /tmp/install_dpdk.sh /opt",
+      "sudo bash /tmp/install_dpdk.sh /opt ${var.dpdk_version}",
     ]
   }
 

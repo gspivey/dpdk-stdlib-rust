@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { Construct } from 'constructs';
+import { DPDK_VERSION_CONTEXT_KEY, dpdkSourceBuild } from './dpdk-source-build';
 
 export interface DpdkTestStackProps extends cdk.StackProps {
   /** EC2 instance class for sender and receiver. Default: C5N */
@@ -30,6 +31,9 @@ export class DpdkTestStack extends cdk.Stack {
     // Check for pre-built AMI via CDK context
     const amiId = this.node.tryGetContext(amiContextKey);
     const usePrebuiltAmi = !!amiId;
+    // Without a pre-built AMI, DPDK is built from source at the release given
+    // by -c dpdkVersion=<release>. CI always passes a per-line AMI instead.
+    const sourceBuild = dpdkSourceBuild(this.node.tryGetContext(DPDK_VERSION_CONTEXT_KEY));
 
     // VPC for our test instances
     const vpc = new ec2.Vpc(this, 'DpdkTestVpc', {
@@ -187,6 +191,7 @@ export class DpdkTestStack extends cdk.Stack {
 
       // Bootstrap commands: install system packages, Rust, and DPDK from source
       const fullBootstrap = [
+        ...sourceBuild.guard,
         'echo "=== Starting DPDK-STDLIB setup on Amazon Linux 3 ==="',
 
         // System packages (include unzip for project asset extraction)
@@ -210,23 +215,8 @@ export class DpdkTestStack extends cdk.Stack {
         'dnf install -y meson ninja-build python3-pip libbsd-devel libpcap-devel numactl-devel kernel-devel kernel-headers --allowerasing',
         'pip3 install pyelftools || pip3 install --break-system-packages pyelftools',
 
-        // Download and build DPDK
-        'echo "=== Downloading DPDK ==="',
-        'cd /opt',
-        'DPDK_VERSION="22.11.6"',
-        'curl -L "https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz" -o "dpdk-${DPDK_VERSION}.tar.xz"',
-        'tar -xf "dpdk-${DPDK_VERSION}.tar.xz"',
-        'cd dpdk-stable-${DPDK_VERSION}',
-
-        // Build DPDK — must match scripts/install_dpdk_amazon_linux.sh:
-        //   --libdir=lib   forces libs into $PREFIX/lib/ (not lib64/)
-        //   -Denable_kmods=false  avoids igb_uio build failures on AL2023 kernels
-        'echo "=== Building DPDK ==="',
-        'meson setup build --prefix=/usr/local --libdir=lib --buildtype=release -Denable_kmods=false -Ddisable_drivers=net/gve,net/ionic',
-        'ninja -C build',
-        'ninja -C build install',
-        'echo "/usr/local/lib" > /etc/ld.so.conf.d/dpdk.conf',
-        'ldconfig',
+        // Download and build DPDK (release from -c dpdkVersion=..., no default)
+        ...sourceBuild.build,
       ];
 
       // Pre-built AMI: DPDK, Rust, and system packages are already installed

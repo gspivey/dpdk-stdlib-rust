@@ -6,9 +6,11 @@
 [![dpdk-stdlib-tokio](https://img.shields.io/crates/v/dpdk-stdlib-tokio.svg?label=dpdk-stdlib-tokio)](https://crates.io/crates/dpdk-stdlib-tokio)
 [![dpdk-stdlib](https://img.shields.io/crates/v/dpdk-stdlib.svg?label=dpdk-stdlib)](https://crates.io/crates/dpdk-stdlib)
 [![Rust](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml/badge.svg?branch=development)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/rust.yml?query=branch%3Adevelopment)
-[![Integration Tests (x86, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml?query=event%3Aschedule)
-[![Integration Tests (Graviton, nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=event%3Aschedule)
-[![QUIC Integration (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml/badge.svg?branch=development&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml?query=event%3Aschedule)
+[![DPDK 25.11 x86 (nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml/badge.svg?branch=main&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests.yml?query=branch%3Amain+event%3Aschedule)
+[![DPDK 25.11 Graviton (nightly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml/badge.svg?branch=main&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-graviton.yml?query=branch%3Amain+event%3Aschedule)
+[![DPDK 24.11 x86 (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-dpdk-24.11.yml/badge.svg?branch=main&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-dpdk-24.11.yml?query=branch%3Amain+event%3Aschedule)
+[![DPDK 23.11 x86 (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-dpdk-23.11.yml/badge.svg?branch=main&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/integration-tests-dpdk-23.11.yml?query=branch%3Amain+event%3Aschedule)
+[![QUIC Integration (weekly)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml/badge.svg?branch=main&event=schedule)](https://github.com/gspivey/dpdk-stdlib-rust/actions/workflows/quic-integration-tests.yml?query=branch%3Amain+event%3Aschedule)
 
 Drop-in DPDK-accelerated replacements for Rust's UDP and TCP sockets (`std::net` and `tokio::net`), plus a native DPDK I/O provider for [s2n-quic](https://github.com/aws/s2n-quic). Bypass the Linux kernel network stack for high-throughput packet processing, with automatic fallback when DPDK is unavailable.
 
@@ -587,6 +589,33 @@ TCP and QUIC (IPv4) shipped in v0.3.0. Next:
 
 **QUIC IPv6** — IPv6 address support in the QUIC provider (additive over IPv4 QUIC).
 
+## Supported DPDK versions
+
+We support exactly the DPDK LTS lines that upstream still maintains, and drop
+each one when upstream ends it ([DPDK roadmap](https://core.dpdk.org/roadmap/)).
+The newest LTS is the primary target.
+
+| DPDK line | Release tested | Upstream end of life | EC2 integration tests |
+|-----------|----------------|----------------------|-----------------------|
+| 25.11 (primary) | 25.11.4 | December 2028 | x86_64 and Graviton: every PR and nightly |
+| 24.11 | 24.11.8 | December 2027 | x86_64: weekly |
+| 23.11 | 23.11.8 | December 2026 | x86_64: weekly |
+
+DPDK supports both x86_64 and Graviton (ENA driver) on every line above; the
+EC2 tests cover the combinations in the table. Each tested line has its own
+pre-built AMI and README badge. A red weekly
+run on an older line blocks pull requests until it is fixed (the
+`LTS Compat Gate` check; a PR carrying the fix gets the `lts-compat-fix`
+label). Release candidates of the next LTS are compile-checked only.
+
+When upstream releases a new LTS or ends one, update together:
+`SUPPORTED_DPDK_VERSIONS` in `.github/workflows/build-dpdk-ami.yml` (and
+`build-dpdk-ami-graviton.yml` for the primary line), the weekly
+`integration-tests-dpdk-<line>.yml` wrapper, the stack list in
+`deploy/cdk/app.ts`, the stack mapping in
+`.github/workflows/integration-tests-reusable.yml`, the wrapper list in
+`.github/workflows/lts-compat-gate.yml`, and this table and the badges.
+
 ## DPDK Installation (Optional)
 
 Development and testing work without DPDK. For production kernel bypass:
@@ -594,10 +623,11 @@ Development and testing work without DPDK. For production kernel bypass:
 ### Amazon Linux 2023
 
 ```bash
-sudo ./scripts/install_dpdk_amazon_linux.sh
+sudo ./scripts/install_dpdk_amazon_linux.sh /opt 25.11.4
 ```
 
-This installs DPDK 23.11 and configures hugepages.
+This builds the given DPDK release (any [supported version](#supported-dpdk-versions))
+and configures hugepages.
 
 ### Verify DPDK
 

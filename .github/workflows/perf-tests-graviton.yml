@@ -105,9 +105,10 @@ jobs:
       - name: Fetch AMI IDs from SSM
         id: amis
         run: |
-          DPDK_AMI=$(aws ssm get-parameter \
-            --name /dpdk-stdlib-rust/ami/graviton/latest \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          # Primary DPDK LTS line (README "Supported DPDK versions"). Fails loudly
+          # when the per-line AMI is missing; no fallback to another DPDK release.
+          bash scripts/ci/resolve-dpdk-ami.sh 25.11 arm64 > "$RUNNER_TEMP/dpdk-ami.env"
+          DPDK_AMI=$(sed -n "s/^ami_id=//p" "$RUNNER_TEMP/dpdk-ami.env")
           TREX_AMI=$(aws ssm get-parameter \
             --name /dpdk-stdlib-rust/ami/trex-latest \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
@@ -214,10 +215,19 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+      - name: Refresh AWS credentials for teardown
+        if: always() && inputs.teardown != false && inputs.teardown != 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # always(), not failure(): a timed-out or cancelled run never reaches the
+      # script's own teardown. No `|| echo`: a failed teardown can leave
+      # instances billing, so it fails the job. cleanup-cfn-stack.sh terminates
+      # the instances first (DPDK ENIs cannot detach from a running instance)
+      # and exits 0 when the stack is already gone. teardown=false keeps the
+      # stack for debugging; the AWS Orphan Sweep reaps it after 4 h.
       - name: Safety net teardown
-        if: failure() && steps.tests.outcome == 'failure'
-        run: |
-          if [[ "${{ inputs.teardown }}" != "false" ]]; then
-            cd deploy/cdk
-            npx cdk destroy PerfTestStackGraviton --force || echo "Teardown failed (may already be destroyed)"
-          fi
+        if: always() && inputs.teardown != false && inputs.teardown != 'false'
+        run: bash scripts/ci/cleanup-cfn-stack.sh PerfTestStackGraviton

@@ -1,14 +1,20 @@
 name: Build DPDK AMI
 
+# One AMI per supported DPDK LTS line (README "Supported DPDK versions").
+# Support follows upstream's LTS roadmap (core.dpdk.org/roadmap): a line is
+# added when upstream releases it and removed at its upstream end of life.
+# To change the supported set, edit SUPPORTED_DPDK_VERSIONS below, then the
+# Graviton AMI workflow, the integration wrappers and the README table.
+
 on:
   schedule:
     - cron: '0 4 * * 0' # Sunday 4:00 AM UTC (weekly); input changes rebuild via push below
   workflow_dispatch:
     inputs:
       dpdk_version:
-        description: 'DPDK version to build'
+        description: 'One supported DPDK release to build (e.g. 25.11.4). Leave empty to rebuild every supported line.'
         required: false
-        default: '22.11.6'
+        default: ''
   push:
     branches: [main, development]
     paths:
@@ -22,13 +28,48 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  SSM_AMI_PARAMETER: /dpdk-stdlib-rust/ami/latest
-  SSM_DPDK_VERSION_PARAMETER: /dpdk-stdlib-rust/ami/dpdk-version
+  # Latest point release of every upstream-maintained LTS line, oldest first.
+  SUPPORTED_DPDK_VERSIONS: '["23.11.8", "24.11.8", "25.11.4"]'
+  # Per-line SSM parameters: ${SSM_PREFIX}/dpdk-<line>/latest and .../dpdk-version.
+  # The legacy /dpdk-stdlib-rust/ami/latest is no longer written: every
+  # workflow reads the per-line parameter it tests (scripts/ci/resolve-dpdk-ami.sh).
+  SSM_PREFIX: /dpdk-stdlib-rust/ami
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+    steps:
+      - name: Pick the DPDK releases to build
+        id: plan
+        env:
+          REQUESTED: ${{ github.event.inputs.dpdk_version || '' }}
+        run: |
+          if [[ -z "$REQUESTED" ]]; then
+            echo "versions=$(jq -c . <<<"$SUPPORTED_DPDK_VERSIONS")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A manual build must be on a supported line; any point release of it is allowed.
+          if [[ ! "$REQUESTED" =~ ^([0-9]{2}\.[0-9]{2})(\.[0-9]+)?$ ]] \
+             || ! jq -e --arg l "${BASH_REMATCH[1]}." 'map(startswith($l)) | any' <<<"$SUPPORTED_DPDK_VERSIONS" >/dev/null; then
+            echo "::error::DPDK ${REQUESTED} is not on a supported LTS line. Supported: ${SUPPORTED_DPDK_VERSIONS}"
+            exit 1
+          fi
+          echo "versions=$(jq -cn --arg v "$REQUESTED" '[$v]')" >> "$GITHUB_OUTPUT"
+
   build-ami:
+    needs: plan
+    name: build-ami (DPDK ${{ matrix.dpdk_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        dpdk_version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    env:
+      DPDK_VERSION: ${{ matrix.dpdk_version }}
 
     steps:
       - name: Checkout
@@ -53,13 +94,13 @@ jobs:
       - name: Validate Packer template
         run: |
           cd packer
-          packer validate dpdk-ami.pkr.hcl
+          packer validate -var "dpdk_version=${DPDK_VERSION}" dpdk-ami.pkr.hcl
 
       - name: Build AMI
         id: build
         run: |
           cd packer
-          DPDK_VERSION="${{ github.event.inputs.dpdk_version || '22.11.6' }}"
+          DPDK_LINE=$(grep -oE '^[0-9]{2}\.[0-9]{2}' <<<"$DPDK_VERSION")
 
           # Run packer without pipefail swallowing diagnostics.
           # Capture exit code manually so we can dump logs on failure.
@@ -121,14 +162,14 @@ jobs:
           fi
 
           echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
-          echo "dpdk_version=${DPDK_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Built AMI: ${AMI_ID}"
+          echo "dpdk_line=${DPDK_LINE}" >> "$GITHUB_OUTPUT"
+          echo "Built AMI: ${AMI_ID} (DPDK ${DPDK_VERSION})"
 
       - name: Upload Packer log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: packer-output-log
+          name: packer-output-log-${{ matrix.dpdk_version }}
           path: packer/packer-output.log
           retention-days: 7
 
@@ -167,40 +208,55 @@ jobs:
       - name: Store AMI ID in SSM Parameter Store
         run: |
           AMI_ID="${{ steps.build.outputs.ami_id }}"
-          DPDK_VERSION="${{ steps.build.outputs.dpdk_version }}"
+          DPDK_LINE="${{ steps.build.outputs.dpdk_line }}"
 
-          if [[ -z "$AMI_ID" ]]; then
-            echo "::error::AMI ID is empty, cannot store in SSM"
+          if [[ -z "$AMI_ID" || -z "$DPDK_LINE" ]]; then
+            echo "::error::AMI ID or DPDK line is empty, cannot store in SSM"
             exit 1
           fi
 
-          echo "Storing AMI ID ${AMI_ID} in SSM..."
+          PARAM_DIR="${SSM_PREFIX}/dpdk-${DPDK_LINE}"
+          echo "Storing AMI ID ${AMI_ID} in SSM at ${PARAM_DIR}..."
           aws ssm put-parameter \
-            --name "${{ env.SSM_AMI_PARAMETER }}" \
+            --name "${PARAM_DIR}/latest" \
             --type String \
             --value "${AMI_ID}" \
             --overwrite \
-            --description "Latest DPDK AMI for dpdk-stdlib-rust integration tests"
+            --description "Latest x86_64 DPDK ${DPDK_LINE} AMI for dpdk-stdlib-rust integration tests"
 
           aws ssm put-parameter \
-            --name "${{ env.SSM_DPDK_VERSION_PARAMETER }}" \
+            --name "${PARAM_DIR}/dpdk-version" \
             --type String \
             --value "${DPDK_VERSION}" \
             --overwrite \
-            --description "DPDK version in the latest pre-built AMI"
+            --description "DPDK release in the latest x86_64 DPDK ${DPDK_LINE} AMI"
 
-          echo "Stored AMI ID ${AMI_ID} in SSM at ${{ env.SSM_AMI_PARAMETER }}"
+          echo "Stored AMI ID ${AMI_ID} (DPDK ${DPDK_VERSION}) at ${PARAM_DIR}/latest"
+          {
+            echo "### DPDK ${DPDK_VERSION} x86_64 AMI"
+            echo ""
+            echo "- AMI: \`${AMI_ID}\`"
+            echo "- SSM: \`${PARAM_DIR}/latest\`, \`${PARAM_DIR}/dpdk-version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Deregister old AMIs (keep last 3)
+      - name: Deregister old AMIs of this line (keep last 3)
         run: |
-          # List only x86 DPDK AMIs. TRex and Graviton AMIs have their own
-          # lifecycles. Every AMI name starts with "dpdk-stdlib-rust-", so a
-          # "*dpdk*" pattern matched TRex and Graviton AMIs too and deleted the
-          # live TRex AMI (ami-0e4c5917a5313cbfd, 2026-10-24). Match the exact
-          # DPDK name prefix and the x86_64 architecture instead.
+          # Prune only x86 DPDK AMIs of the line just built. TRex and Graviton
+          # AMIs, and other DPDK lines, have their own lifecycles. Every AMI
+          # name starts with "dpdk-stdlib-rust-", so a "*dpdk*" pattern matched
+          # TRex and Graviton AMIs too and deleted the live TRex AMI
+          # (ami-0e4c5917a5313cbfd, 2026-10-24). Match the exact DPDK name
+          # prefix, the x86_64 architecture and the DpdkLine tag instead.
+          # AMIs built before per-line tagging carry no DpdkLine tag and are
+          # never matched; deregister those by hand once nothing reads them.
+          DPDK_LINE="${{ steps.build.outputs.dpdk_line }}"
+          if [[ -z "$DPDK_LINE" ]]; then
+            echo "::error::DPDK line is empty, refusing to prune"
+            exit 1
+          fi
           OLD_AMIS=$(aws ec2 describe-images \
             --owners self \
-            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=dpdk-stdlib-rust-dpdk-*" "Name=architecture,Values=x86_64" \
+            --filters "Name=tag:ManagedBy,Values=packer" "Name=tag:Repository,Values=dpdk-stdlib-rust" "Name=name,Values=dpdk-stdlib-rust-dpdk-${DPDK_LINE}*" "Name=architecture,Values=x86_64" "Name=tag:DpdkLine,Values=${DPDK_LINE}" \
             --query "sort_by(Images, &CreationDate)[:-3].ImageId" \
             --output text)
 

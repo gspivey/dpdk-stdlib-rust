@@ -2660,12 +2660,22 @@ Packet sizes: \`$PACKET_SIZES\`"
 
         # Fetch AMI IDs from SSM if available
         local dpdk_ami trex_ami context_args=""
-        dpdk_ami=$(aws ssm get-parameter --name /dpdk-stdlib-rust/ami/latest \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "")
         trex_ami=$(aws ssm get-parameter --name /dpdk-stdlib-rust/ami/trex-latest \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
-        if [[ -n "${DPDK_AMI_ID:-}" ]]; then dpdk_ami="$DPDK_AMI_ID"; fi
+        # The DPDK AMI comes from the caller (CI passes DPDK_AMI_ID), else from
+        # the per-line SSM parameter of PERF_DPDK_LINE / PERF_DPDK_ARCH
+        # (default: the primary LTS line, x86_64). No silent fallback.
+        if [[ -n "${DPDK_AMI_ID:-}" ]]; then
+            dpdk_ami="$DPDK_AMI_ID"
+        else
+            dpdk_ami=$(bash "$REPO_ROOT/scripts/ci/resolve-dpdk-ami.sh" \
+                "${PERF_DPDK_LINE:-25.11}" "${PERF_DPDK_ARCH:-x86_64}" | sed -n 's/^ami_id=//p') || dpdk_ami=""
+            if [[ -z "$dpdk_ami" ]]; then
+                log_error "No DPDK ${PERF_DPDK_LINE:-25.11} ${PERF_DPDK_ARCH:-x86_64} AMI; set DPDK_AMI_ID or build the AMI first"
+                exit 1
+            fi
+        fi
         if [[ -n "${TREX_AMI_ID:-}" ]]; then trex_ami="$TREX_AMI_ID"; fi
 
         if [[ -n "$dpdk_ami" ]]; then

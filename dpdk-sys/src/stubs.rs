@@ -787,6 +787,16 @@ pub extern "C" fn rte_eth_rx_queue_setup(
     0
 }
 
+/// The stub device has no ring limits, so the counts are left unchanged.
+#[no_mangle]
+pub extern "C" fn rte_eth_dev_adjust_nb_rx_tx_desc(
+    _port_id: u16,
+    _nb_rx_desc: *mut u16,
+    _nb_tx_desc: *mut u16,
+) -> c_int {
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn rte_eth_tx_queue_setup(
     _port_id: u16,

@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: install_dpdk_amazon_linux.sh [WORK_DIR]
+# Usage: install_dpdk_amazon_linux.sh [WORK_DIR] [DPDK_VERSION]
 # WORK_DIR defaults to current directory. DPDK source is downloaded and built here.
+# DPDK_VERSION is a full release such as 25.11.4. It can also come from the
+# DPDK_VERSION environment variable. There is no default: the supported
+# versions are the upstream-maintained LTS lines listed in the README
+# ("Supported DPDK versions"), and the caller (Packer / CI) picks one.
 
 WORK_DIR="${1:-$(pwd)}"
+DPDK_VERSION="${2:-${DPDK_VERSION:-}}"
+if [[ ! "$DPDK_VERSION" =~ ^[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]]; then
+    echo "ERROR: DPDK version required (e.g. 25.11.4), got '${DPDK_VERSION}'" >&2
+    echo "Usage: $0 [WORK_DIR] DPDK_VERSION" >&2
+    exit 1
+fi
 cd "$WORK_DIR"
 
 echo "Installing DPDK on Amazon Linux 3..."
@@ -37,15 +47,23 @@ sudo dnf install -y kernel-devel kernel-headers 2>&1 || \
 # so install via pip. Use --break-system-packages for AL2023 PEP 668.
 pip3 install pyelftools || pip3 install --break-system-packages pyelftools
 
-DPDK_VERSION="22.11.6"
-DPDK_DIR="dpdk-stable-${DPDK_VERSION}"
 INSTALL_PREFIX="/usr/local"
+DPDK_TARBALL="dpdk-${DPDK_VERSION}.tar.xz"
 
 echo "Downloading DPDK ${DPDK_VERSION}..."
-if [[ ! -d "$DPDK_DIR" ]]; then
-    curl -L "https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz" -o "dpdk-${DPDK_VERSION}.tar.xz"
-    tar -xf "dpdk-${DPDK_VERSION}.tar.xz"
+if [[ ! -f "$DPDK_TARBALL" ]]; then
+    curl -fL "https://fast.dpdk.org/rel/${DPDK_TARBALL}" -o "$DPDK_TARBALL"
 fi
+# Point releases unpack to dpdk-stable-X.Y.Z, the .0 release to dpdk-X.Y.
+# Read the top-level directory from the tarball instead of guessing.
+# sed reads the whole listing: `| head -1` would close the pipe early, tar
+# would die of SIGPIPE, and pipefail would fail the script (exit 141).
+DPDK_DIR=$(tar -tf "$DPDK_TARBALL" | sed -n '1s#/.*##p')
+if [[ -z "$DPDK_DIR" ]]; then
+    echo "ERROR: could not read top-level directory from $DPDK_TARBALL" >&2
+    exit 1
+fi
+[[ -d "$DPDK_DIR" ]] || tar -xf "$DPDK_TARBALL"
 
 cd "$DPDK_DIR"
 
@@ -97,9 +115,16 @@ if [[ "$DPDK_LIB_COUNT" -eq 0 ]]; then
     exit 1
 fi
 
-DPDK_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo "unknown")
+INSTALLED_VERSION=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null || echo "unknown")
+# pkg-config reports 25.11.0 for the 25.11 release; compare on X.Y.Z.
+EXPECTED_VERSION="$DPDK_VERSION"
+[[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] && EXPECTED_VERSION="${EXPECTED_VERSION}.0"
+if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
+    echo "ERROR: requested DPDK ${DPDK_VERSION} but pkg-config reports ${INSTALLED_VERSION}" >&2
+    exit 1
+fi
 
 echo "DPDK installation complete!"
 echo "  Libraries installed: ${DPDK_LIB_COUNT}"
-echo "  DPDK version: ${DPDK_VERSION}"
+echo "  DPDK version: ${INSTALLED_VERSION}"
 echo "  Hugepages configured: $(cat /proc/sys/vm/nr_hugepages) x 2MB"
