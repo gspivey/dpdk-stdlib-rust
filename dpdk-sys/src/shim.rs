@@ -6,7 +6,7 @@
 //!   (compiled from `csrc/dpdk_shim.c`)
 //! - Constants defined as C preprocessor macros that bindgen skips
 
-use super::{rte_mbuf, rte_mempool};
+use super::{rte_eth_link, rte_mbuf, rte_mempool};
 
 // ---------------------------------------------------------------------------
 // Extern declarations for C shim wrappers (csrc/dpdk_shim.c)
@@ -52,6 +52,16 @@ extern "C" {
     fn dpdk_shim_get_mbuf_data_off(m: *const rte_mbuf) -> u16;
     fn dpdk_shim_set_mbuf_data_off(m: *mut rte_mbuf, off: u16);
     fn dpdk_shim_get_mbuf_buf_len(m: *const rte_mbuf) -> u16;
+
+    // Mbuf VLAN TCI accessors (vlan_tci moved into an anonymous union in DPDK 24.07)
+    fn dpdk_shim_get_mbuf_vlan_tci(m: *const rte_mbuf) -> u16;
+    fn dpdk_shim_set_mbuf_vlan_tci(m: *mut rte_mbuf, tci: u16);
+
+    // rte_eth_link accessors (fields moved into an anonymous union in DPDK 24.07)
+    fn dpdk_shim_get_eth_link_speed(link: *const rte_eth_link) -> u32;
+    fn dpdk_shim_get_eth_link_duplex(link: *const rte_eth_link) -> u16;
+    fn dpdk_shim_get_eth_link_autoneg(link: *const rte_eth_link) -> u16;
+    fn dpdk_shim_get_eth_link_status(link: *const rte_eth_link) -> u16;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +172,43 @@ pub unsafe fn mbuf_set_data_off(m: *mut rte_mbuf, off: u16) {
 #[inline]
 pub unsafe fn mbuf_get_buf_len(m: *const rte_mbuf) -> u16 {
     dpdk_shim_get_mbuf_buf_len(m)
+}
+
+// Mbuf VLAN TCI access — vlan_tci sits inside the rx_descriptor_fields1
+// anonymous union from DPDK 24.07 onward.
+
+#[inline]
+pub unsafe fn mbuf_get_vlan_tci(m: *const rte_mbuf) -> u16 {
+    dpdk_shim_get_mbuf_vlan_tci(m)
+}
+
+#[inline]
+pub unsafe fn mbuf_set_vlan_tci(m: *mut rte_mbuf, tci: u16) {
+    dpdk_shim_set_mbuf_vlan_tci(m, tci)
+}
+
+// rte_eth_link field access — from DPDK 24.07 the fields live inside an
+// anonymous union (alongside `uint64_t val64`), so bindgen names differ
+// between releases.  These read the fields by their C names instead.
+
+#[inline]
+pub unsafe fn eth_link_get_speed(link: *const rte_eth_link) -> u32 {
+    dpdk_shim_get_eth_link_speed(link)
+}
+
+#[inline]
+pub unsafe fn eth_link_get_duplex(link: *const rte_eth_link) -> u16 {
+    dpdk_shim_get_eth_link_duplex(link)
+}
+
+#[inline]
+pub unsafe fn eth_link_get_autoneg(link: *const rte_eth_link) -> u16 {
+    dpdk_shim_get_eth_link_autoneg(link)
+}
+
+#[inline]
+pub unsafe fn eth_link_get_status(link: *const rte_eth_link) -> u16 {
+    dpdk_shim_get_eth_link_status(link)
 }
 
 // ---------------------------------------------------------------------------

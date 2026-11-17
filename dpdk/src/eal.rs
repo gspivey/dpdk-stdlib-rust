@@ -29,7 +29,10 @@ impl Drop for Eal {
     }
 }
 
-#[cfg(test)]
+// These tests drive the stateful stub EAL (stub_eal_* helpers), which only
+// exists in the stub backend; with real DPDK they would need hugepages and a
+// live EAL, so they are compiled only for the stub build.
+#[cfg(all(test, dpdk_stubs))]
 mod tests {
     use super::*;
     use serial_test::serial;
