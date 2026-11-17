@@ -105,7 +105,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ${{ env.DPDK_PREFIX }}
-        key: dpdk-${{ matrix.dpdk.version }}-${{ steps.os.outputs.id }}-rev${{ env.DPDK_BUILD_REV }}
+        key: dpdk-${{ matrix.dpdk.version }}-${{ matrix.dpdk.sha256 || matrix.dpdk.git_commit }}-${{ steps.os.outputs.id }}-rev${{ env.DPDK_BUILD_REV }}
 
     - name: Build DPDK ${{ matrix.dpdk.version }}
       if: steps.dpdk-cache.outputs.cache-hit != 'true'
