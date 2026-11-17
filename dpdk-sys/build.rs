@@ -18,13 +18,18 @@ fn main() {
     // Try to find DPDK
     let dpdk_found = try_find_dpdk();
 
+    // `backend` metadata is exposed to direct dependents' build scripts as
+    // DEP_DPDK_BACKEND (via `links = "dpdk"`), so they can gate stub-only
+    // code such as tests that call the stub_eal_* helpers.
     if dpdk_found && cfg!(feature = "bindgen") {
         println!("cargo:rustc-cfg=dpdk_bindgen");
+        println!("cargo:backend=bindgen");
         #[cfg(feature = "bindgen")]
         generate_bindings();
         compile_shim();
     } else {
         println!("cargo:rustc-cfg=dpdk_stubs");
+        println!("cargo:backend=stubs");
         if !dpdk_found {
             println!("cargo:warning=DPDK not found, using stub implementations");
         } else {
