@@ -108,7 +108,10 @@ jobs:
             --query "Vpcs[].Tags[?Key=='aws:cloudformation:stack-name']|[].Value" \
             --output text)
           for s in $vpc_stacks; do
-            if [[ "$(stack_info "$s")" == ABSENT ]]; then
+            # Assign first: inside [[ ]] a stack_info failure would be ignored
+            # and an API error would read as "stack exists", skipping the VPC.
+            info=$(stack_info "$s")
+            if [[ "$info" == ABSENT ]]; then
               echo "::warning::VPC tagged $s has no stack -> remove"
               cleanup_stacks+=" $s"
             fi
@@ -128,6 +131,27 @@ jobs:
         run: |
           set -uo pipefail
           rc=0
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%Y-%m-%dT%H:%M:%S+00:00)
+          # Stack cleanups first, each re-checked right before it runs: a new
+          # run that reuses the stack name may have started since the find step.
+          for s in ${{ steps.find.outputs.cleanup_stacks }}; do
+            echo "::group::cleanup $s"
+            if ! out=$(aws cloudformation describe-stacks --stack-name "$s" \
+                         --query 'Stacks[0].[StackStatus,CreationTime]' --output text 2>&1); then
+              if ! grep -q 'does not exist' <<< "$out"; then
+                echo "::error::describe-stacks $s failed: $out"
+                rc=1; echo "::endgroup::"; continue
+              fi
+              out=ABSENT
+            fi
+            read -r status created <<< "$out"
+            if [[ "$status" == ABSENT || ( "$status" != *_IN_PROGRESS && "$created" < "$cutoff" ) ]]; then
+              bash scripts/ci/cleanup-cfn-stack.sh "$s" || rc=1
+            else
+              echo "::warning::$s is now $status (created $created): a new run reuses the name; skipping. The next sweep re-checks."
+            fi
+            echo "::endgroup::"
+          done
           ids="${{ steps.find.outputs.terminate_ids }}"
           if [[ -n "${ids// /}" ]]; then
             echo "::group::terminate $ids"
@@ -135,11 +159,6 @@ jobs:
             timeout 5m aws ec2 wait instance-terminated --instance-ids $ids || rc=1
             echo "::endgroup::"
           fi
-          for s in ${{ steps.find.outputs.cleanup_stacks }}; do
-            echo "::group::cleanup $s"
-            bash scripts/ci/cleanup-cfn-stack.sh "$s" || rc=1
-            echo "::endgroup::"
-          done
           {
             echo "## Leaked test infrastructure removed"
             echo

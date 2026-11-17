@@ -30,7 +30,7 @@ on:
 
 # Only one TCP perf test run at a time (shared CloudFormation stack)
 concurrency:
-  group: perf-tests-tcp
+  group: perf-test-stack
   cancel-in-progress: false
 
 permissions:

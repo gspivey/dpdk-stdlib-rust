@@ -213,6 +213,7 @@ jobs:
             TESTS=$(grep -oP 'tests="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
             FAILURES=$(grep -oP 'failures="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
             SKIPPED=$(grep -oP 'skipped="\K[^"]+' "$xml" 2>/dev/null | head -1 || echo "0")
+            SKIPPED=${SKIPPED:-0}  # `| head -1 || echo` never fires: head succeeds
             echo "- **${BASENAME}**: ${TESTS} tests, ${FAILURES} failures, ${SKIPPED} skipped" >> "$REPORT"
             TOTAL_TESTS=$((TOTAL_TESTS + TESTS))
             TOTAL_FAILURES=$((TOTAL_FAILURES + FAILURES))
