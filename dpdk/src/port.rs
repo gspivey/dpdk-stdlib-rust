@@ -415,6 +415,25 @@ impl Port {
             return Err(DpdkError::PortConfigFailed(ret));
         }
 
+        // Fit the descriptor counts to the device's ring limits. Limits vary by
+        // driver release and instance type: DPDK 25.11's ENA driver on
+        // Graviton caps TX rings at 512, so the 1024 default fails
+        // rte_eth_tx_queue_setup with -EINVAL without this step.
+        let mut nb_rx_desc = config.nb_rx_desc;
+        let mut nb_tx_desc = config.nb_tx_desc;
+        let ret = unsafe {
+            dpdk_sys::rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &mut nb_rx_desc, &mut nb_tx_desc)
+        };
+        if ret != 0 {
+            return Err(DpdkError::PortConfigFailed(ret));
+        }
+        if nb_rx_desc != config.nb_rx_desc || nb_tx_desc != config.nb_tx_desc {
+            eprintln!(
+                "Warning: descriptor counts adjusted to device limits (rx {} -> {}, tx {} -> {})",
+                config.nb_rx_desc, nb_rx_desc, config.nb_tx_desc, nb_tx_desc
+            );
+        }
+
         // Get socket ID for this port (for NUMA awareness)
         let socket_id = unsafe { dpdk_sys::rte_socket_id() };
 
@@ -424,7 +443,7 @@ impl Port {
                 dpdk_sys::rte_eth_rx_queue_setup(
                     port_id,
                     queue_id,
-                    config.nb_rx_desc,
+                    nb_rx_desc,
                     socket_id as u32,
                     ptr::null(),
                     mempool.as_raw(),
@@ -441,7 +460,7 @@ impl Port {
                 dpdk_sys::rte_eth_tx_queue_setup(
                     port_id,
                     queue_id,
-                    config.nb_tx_desc,
+                    nb_tx_desc,
                     socket_id as u32,
                     ptr::null(),
                 )
@@ -465,6 +484,8 @@ impl Port {
             config: PortConfig {
                 nb_rx_queues,
                 nb_tx_queues,
+                nb_rx_desc,
+                nb_tx_desc,
                 ..config
             },
             started: false,
